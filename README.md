@@ -1,6 +1,6 @@
 # lite
 
-一个**精简的 native coding agent**：基于 [Pi](https://github.com/badlogic/pi-mono) 的极简 harness 思路，并借鉴 [Reasonix](https://github.com/esengine/reasonix) 的 DeepSeek 原生与缓存优先设计，用 **LuaJIT + libcurl + C** 重新实现，不依赖 Node/Python 运行时。
+一个**精简的 native coding agent**：基于 [Pi](https://github.com/badlogic/pi-mono) 的极简 harness 思路，借鉴 [Reasonix](https://github.com/esengine/reasonix) 的 DeepSeek 原生与缓存优先设计，并参考 [opencode](https://github.com/anomalyco/opencode) 的工具行为与 diff/session 交互，用 **LuaJIT + libcurl + C** 重新实现，不依赖 Node/Python 运行时。
 
 当前包含无 UI `--once`、本地 TUI、diff pager、TODO 列表、serve/attach 与本地 KV 记忆。
 
@@ -260,4 +260,5 @@ C ABI 固定为 `char *lite_helper(const char *input)` + 可选 `lite_helper_fre
 
 - Pi: <https://github.com/badlogic/pi-mono>
 - Reasonix: <https://github.com/esengine/reasonix>
-- 本仓库 `design.md`：两个项目的源码架构与 code search 探索流程
+- opencode: <https://github.com/anomalyco/opencode>
+- 本仓库 `design.md`：三个项目的源码架构、横向对比与 code search 探索流程

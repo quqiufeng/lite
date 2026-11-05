@@ -1,6 +1,6 @@
-# Pi / Reasonix 代码架构与 Code Search 探索
+# Pi / Reasonix / opencode 代码架构与 Code Search 探索
 
-> 本文基于 `/opt/pi-mono` 与 `/opt/reasonix` 的实际源码，以及 `/opt/my_db` 的 code search 索引。
+> 本文基于 `/opt/pi-mono`、`/opt/reasonix` 与 `/opt/opencode` 的实际源码，以及 `/opt/my_db` 的 code search 索引。
 > 所有结论标注为 `[static]`（静态索引/源码）；未做运行时 build/断点验证。
 
 ---
@@ -11,11 +11,13 @@
 |---|---|---|---|---|
 | Pi | `/opt/pi-mono` | `/opt/code_caches/pi-mono_cache` | 17,099 | 6,518 |
 | Reasonix | `/opt/reasonix` | `/opt/code_caches/reasonix_cache` | 109,141 | 16,968 |
+| opencode | `/opt/opencode` | `/opt/code_caches/opencode_cache` | 12,418 | 3,370 |
 
 KV 命名空间：
 
 - `/code/pi-mono`
 - `/code/reasonix`（symbols 234,338 / callers 18,193 / callees 28,048）
+- `/code/opencode`（TypeScript monorepo；`cache_import` 前 `context/symbol` 不可用）
 
 索引命令：
 
@@ -23,6 +25,7 @@ KV 命名空间：
 cd /opt/my_db
 ./analyze_nodejs_repo.sh /opt/pi-mono  /code/pi-mono  --jobs 4
 ./analyze_nodejs_repo.sh /opt/reasonix /code/reasonix --jobs 4
+./analyze_nodejs_repo.sh /opt/opencode /code/opencode --jobs 4
 ```
 
 > Reasonix 源码是 **Go**；`npx reasonix` 只是分发包装。`analyze_nodejs_repo.sh` 的 TypeScript 插件只影响 TS 文件，Go 文件走 ctags + 默认解析。
@@ -210,6 +213,16 @@ lite/
 - 单次工具输出上限（32KB）；
 - 前缀稳定（system prompt + tool schema 固定，消息只追加）以命中 DeepSeek 缓存；
 - approval/sandbox 先不做，但保留 hook 位置。
+
+**从 opencode 抄行为（不抄体量）**
+
+opencode 是成熟产品，架构不适合照搬；只借可验证的具体交互与工具语义：
+
+- `tool/read.ts` 的图片 → attachments（文本带行号、二进制拒绝），见 §8.28；
+- diff viewer 的 split/unified 双模式、`MIN_SPLIT_WIDTH`、hunk 跳转、单文件模式，见 §8.12；
+- `session_input` 的待处理 prompt 队列语义，见 §8.19；
+- `session_context_epoch` 的上下文裁剪/digest 思路（简化版），见 §8.20；
+- `acp/permission` 的 once / always / reject 三态，见 §8.25。
 
 **不要抄**
 
