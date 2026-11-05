@@ -148,6 +148,8 @@ function M.run(opts)
         elseif t == "wake" then
             transcript:add("info", string.format("scheduled wake #%d%s",
                 ev.run or 0, ev.task and (" · " .. tostring(ev.task)) or ""))
+        elseif t == "image" then
+            transcript:add("info", "image: " .. tostring(ev.path or ""))
         elseif t == "approval" then
             approval_id = ev.id
             approval_view = ApprovalView.new(ev, { width = w, height = h })
@@ -225,10 +227,16 @@ function M.run(opts)
         if k == "enter" then
             local text = composer:get_text()
             if text ~= "" then
-                composer:push_history(text)
-                composer:clear()
-                transcript:reset_scroll()
-                send_obj({ type = "submit", text = text })
+                local word = text:lower()
+                if word == "quit" or word == "exit" or word == ":q" then
+                    composer:clear()
+                    running = false
+                else
+                    composer:push_history(text)
+                    composer:clear()
+                    transcript:reset_scroll()
+                    send_obj({ type = "submit", text = text })
+                end
             end
         elseif k == "newline" then
             composer:insert("\n")

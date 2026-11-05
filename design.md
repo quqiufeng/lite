@@ -670,3 +670,20 @@ opencode 用 SQLite（`[static]`：`packages/core/src/session/sql.ts` 的 `sessi
 - TUI/serve：每 tick `proc:poll()`；完成后 resume agent。`Ctrl+C` / `cancel` 调 `proc:cancel()`（SIGKILL）并回填 `[cancelled]`。
 - 仍受审批/沙箱约束：先 approval，再启动 proc。
 - 验证：225 单测；真实 TUI `sleep 8` 显示 `tool:bash` 不冻结，Ctrl+C 后输出 `[cancelled]` 并继续回复。
+
+### 8.27 UTF-8 清洗与调试日志
+
+- 400 `invalid unicode code point` 根因：KV 记忆/工具输出可能混入非法 UTF-8 或 surrogate；cjson 原样编码后被 DeepSeek 拒绝。
+- `lua/core/text.lua`：请求前清洗所有 `content` 与 `tool_calls.arguments/name`，非法字节替换为 U+FFFD；保持 JSON 有效。
+- `lua/core/debug.lua` + `LITE_DEBUG_LOG` / `--debug-log PATH`：JSONL 记录 `request`（消息数/字节/修复数）与 `response`（status/rc/error）。
+- 验证：向 KV 写入含 `\xff` 的 fact，触发 `utf8_repaired=1`，真实请求成功；232 单测。
+
+### 8.28 read 图片 / 目录（对齐 opencode）
+
+参考 opencode `packages/opencode/src/tool/read.ts`：图片/PDF 通过 attachments 返回，文本带行号。
+
+- 文本：1-based 行号，默认 2000 行/50KB，单行 2000 字符；目录列出条目（子目录带 `/`）；二进制拒绝。
+- 图片：按 magic 识别 JPEG/PNG/GIF/WebP，最大 20MB；`Tools:read` 设置 `pending_attachment`，返回 `Image read successfully: path`。
+- Agent：工具结果后追加 **user** 消息 `[{type=text},{type=image_url,url=data:...;base64,...}]`；图片只能放 user，避免 DeepSeek 400。
+- 图片 base64 不写 KV（1MB value 限制），JSONL/工具结果保留路径；TUI/serve 发 `image` 事件。
+- 验证：真实 API 读取红色 PNG，只回复 `red`；240 单测。

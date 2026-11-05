@@ -53,6 +53,7 @@ local RULES = {
     "Keep bash commands scoped to the workspace; avoid destructive operations.",
     "Use edit for small changes; write only for new files or full rewrites.",
     "Tool output is truncated; narrow reads/commands when output is large.",
+    "Use read for files, directories, and images (JPEG/PNG/GIF/WebP); images are attached for visual understanding.",
     "Be concise, use the user's language, and show file paths clearly.",
     "For multi-step work, keep a todo list with the todo tool; mark one item in_progress and update it as you go.",
 }
@@ -166,7 +167,7 @@ function M.recall_query(text, messages)
     local n = #(messages or {})
     for i = n - 1, 1, -1 do
         local m = messages[i]
-        if m.role == "user" and m.content and m.content ~= latest then
+        if m.role == "user" and type(m.content) == "string" and m.content ~= latest then
             prev = m.content
             break
         end

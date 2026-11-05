@@ -126,6 +126,7 @@ function M.load(env)
             or file.reasoning_effort,
         max_retries = tonumber(getv("LITE_MAX_RETRIES") or file.max_retries) or 2,
         approval = getv("LITE_APPROVAL") or file.approval or "auto",
+        debug_log = getv("LITE_DEBUG_LOG") or file.debug_log,
         sandbox = getv("LITE_SANDBOX") or file.sandbox,
         sandbox_net = (function()
             local v = getv("LITE_SANDBOX_NET")

@@ -2,11 +2,16 @@
 local Todos = require("core.todos")
 local Sandbox = require("core.sandbox")
 local Proc = require("core.proc")
+local Text = require("core.text")
 
 local M = {}
 M.__index = M
 
 local MAX_OUT = 30000
+local IMAGE_MAX = 20 * 1024 * 1024
+local READ_MAX_LINES = 2000
+local READ_MAX_BYTES = 50 * 1024
+local READ_LINE_MAX = 2000
 
 local function shq(s)
     return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
@@ -24,6 +29,58 @@ local function read_file(path)
     local s = f:read("*a")
     f:close()
     return s
+end
+
+local function file_size(path)
+    local f = io.open(path, "rb")
+    if not f then return nil end
+    local size = f:seek("end")
+    f:close()
+    return size
+end
+
+local function is_dir(path)
+    local p = io.popen("test -d " .. shq(path) .. " && echo 1 || echo 0")
+    if not p then return false end
+    local s = p:read("*l")
+    p:close()
+    return s == "1"
+end
+
+local function read_head(path, n)
+    local f = io.open(path, "rb")
+    if not f then return nil end
+    local s = f:read(n or 4096)
+    f:close()
+    return s or ""
+end
+
+local function sniff_image(sample)
+    if #sample >= 8
+        and sample:sub(1, 8) == string.char(0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A) then
+        return "image/png"
+    end
+    if #sample >= 3 and sample:byte(1) == 0xFF and sample:byte(2) == 0xD8 and sample:byte(3) == 0xFF then
+        return "image/jpeg"
+    end
+    if #sample >= 6 and (sample:sub(1, 6) == "GIF87a" or sample:sub(1, 6) == "GIF89a") then
+        return "image/gif"
+    end
+    if #sample >= 12 and sample:sub(1, 4) == "RIFF" and sample:sub(9, 12) == "WEBP" then
+        return "image/webp"
+    end
+    return nil
+end
+
+local function looks_binary(sample)
+    if #sample == 0 then return false end
+    local bad = 0
+    for i = 1, #sample do
+        local b = sample:byte(i)
+        if b == 0 then return true end
+        if b < 9 or (b > 13 and b < 32) then bad = bad + 1 end
+    end
+    return bad / #sample > 0.3
 end
 
 local function split_lines(s)
@@ -129,9 +186,37 @@ function M.new(opts)
         todos = Todos.new(opts.ctx, opts.memory),
         sandbox = Sandbox.enabled(opts.sandbox),
         sandbox_net = opts.sandbox_net ~= false,
+        pending_attachment = nil,
     }, M)
     self.real_root = realpath(cwd) or normalize(cwd):gsub("/+$", "")
+
+    local function exists(path)
+        local f = io.open(path, "rb")
+        if f then f:close(); return true end
+        return false
+    end
+    local root = os.getenv("LITE_ROOT")
+    local candidates = {
+        root and (root:gsub("/+$", "") .. "/third_party/luajit/src/luajit"),
+        normalize(cwd):gsub("/+$", "") .. "/third_party/luajit/src/luajit",
+    }
+    for _, p in ipairs(candidates) do
+        if p and exists(p) then self.luajit = p; break end
+    end
     return self
+end
+
+function M:_env_prefix()
+    if not self.luajit then return "" end
+    local dir = self.luajit:match("^(.*)/[^/]+$")
+    return "export PATH=" .. shq(dir) .. ":\"$PATH\"; "
+        .. "export LITE_LUAJIT=" .. shq(self.luajit) .. "; "
+end
+
+function M:take_attachment()
+    local att = self.pending_attachment
+    self.pending_attachment = nil
+    return att
 end
 
 function M:resolve(p)
@@ -171,7 +256,9 @@ function M:schemas()
             type = "function",
             ["function"] = {
                 name = "read",
-                description = "Read a text file in the workspace.",
+                description = "Read a text file, list a directory, or read an image "
+                    .. "(JPEG/PNG/GIF/WebP) in the workspace. Image data is attached "
+                    .. "to the conversation for visual understanding.",
                 parameters = {
                     type = "object",
                     properties = {
@@ -277,30 +364,32 @@ end
 
 function M:start_bash(command)
     local run
+    local command2 = self:_env_prefix() .. command
     if self.sandbox then
-        local wrapped, serr = Sandbox.wrap(command, {
+        local wrapped, serr = Sandbox.wrap(command2, {
             cwd = self.real_root or normalize(self.cwd),
             network = self.sandbox_net,
         })
         if not wrapped then return nil, serr end
         run = wrapped
     else
-        run = "bash -lc " .. shq(command)
+        run = "bash -lc " .. shq(command2)
     end
     return Proc.new(run, { timeout = 120 })
 end
 
 function M:bash(command)
     local cmd
+    local command2 = self:_env_prefix() .. command
     if self.sandbox then
-        local wrapped, serr = Sandbox.wrap(command, {
+        local wrapped, serr = Sandbox.wrap(command2, {
             cwd = self.real_root or normalize(self.cwd),
             network = self.sandbox_net,
         })
         if not wrapped then return "error: " .. tostring(serr) end
         cmd = wrapped
     else
-        cmd = "bash -lc " .. shq(command)
+        cmd = "bash -lc " .. shq(command2)
     end
 
     local p = io.popen("timeout 120 " .. cmd .. " 2>&1", "r")
@@ -311,21 +400,96 @@ function M:bash(command)
     return truncate(out)
 end
 
+local function read_dir(abs, offset, limit)
+    local p = io.popen("ls -1ap " .. shq(abs) .. " 2>&1", "r")
+    if not p then return "error: cannot list directory: " .. abs end
+    local items = {}
+    for line in p:lines() do
+        if line ~= "./" and line ~= "../" then items[#items + 1] = line end
+    end
+    p:close()
+
+    local first = math.max(1, tonumber(offset) or 1)
+    local lim = tonumber(limit) or READ_MAX_LINES
+    local out = {}
+    for i = first, math.min(#items, first + lim - 1) do
+        out[#out + 1] = items[i]
+    end
+    return table.concat(out, "\n") .. string.format("\n(%d entries)", #items)
+end
+
+local function read_text(abs, offset, limit)
+    local s, err = read_file(abs)
+    if not s then return "error: " .. err end
+    local first = math.max(1, tonumber(offset) or 1)
+    local lim = tonumber(limit) or READ_MAX_LINES
+    local total, count, bytes, more = 0, 0, 0, false
+    local out = {}
+
+    for line in (s .. "\n"):gmatch("(.-)\n") do
+        total = total + 1
+        if total >= first and count < lim then
+            local text = line
+            if #text > READ_LINE_MAX then text = text:sub(1, READ_LINE_MAX) .. " ..." end
+            local item = string.format("%d: %s", total, text)
+            if bytes + #item + 1 > READ_MAX_BYTES then
+                more = true
+                break
+            end
+            out[#out + 1] = item
+            bytes = bytes + #item + 1
+            count = count + 1
+        end
+        if count >= lim then
+            more = true
+            break
+        end
+    end
+
+    local res = table.concat(out, "\n")
+    if more then
+        res = res .. string.format("\n\n(Showing lines %d-%d. Use offset=%d to continue.)",
+            first, first + count - 1, first + count)
+    else
+        res = res .. string.format("\n\n(End of file - total %d lines)", total)
+    end
+    return res
+end
+
 function M:read(path, offset, limit)
     local abs, err = self:resolve(path)
     if not abs then return "error: " .. err end
-    local s, rerr = read_file(abs)
-    if not s then return "error: " .. rerr end
-    if offset or limit then
-        local lines = {}
-        for line in (s .. "\n"):gmatch("(.-)\n") do lines[#lines + 1] = line end
-        local first = math.max(1, tonumber(offset) or 1)
-        local last = limit and (first + tonumber(limit) - 1) or #lines
-        local out = {}
-        for i = first, math.min(last, #lines) do out[#out + 1] = lines[i] end
-        s = table.concat(out, "\n")
+
+    if is_dir(abs) then return read_dir(abs, offset, limit) end
+
+    local size = file_size(abs)
+    if not size then return "error: cannot stat file: " .. abs end
+
+    local head = read_head(abs, 4096) or ""
+    if head:sub(1, 4) == "%PDF" then
+        return "error: PDF read is not supported by this model; convert it to an image or text"
     end
-    return truncate(s)
+
+    local mime = sniff_image(head)
+    if mime then
+        if size > IMAGE_MAX then
+            return string.format("error: image too large (%d bytes > %d)", size, IMAGE_MAX)
+        end
+        local bytes, rerr = read_file(abs)
+        if not bytes then return "error: " .. rerr end
+        self.pending_attachment = {
+            mime = mime,
+            data = Text.base64(bytes),
+            path = abs,
+            size = size,
+        }
+        return string.format("Image read successfully: %s (%s, %d bytes)", abs, mime, size)
+    end
+
+    if looks_binary(head) then
+        return "error: cannot read binary file: " .. abs
+    end
+    return read_text(abs, offset, limit)
 end
 
 function M:write(path, content)

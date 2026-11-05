@@ -1,6 +1,7 @@
 -- Agent 循环：messages → provider → tool calls → messages。
 local cjson = require("cjson")
 local Prompt = require("core.prompt")
+local Text = require("core.text")
 local Approval = require("core.approval")
 
 local M = {}
@@ -55,7 +56,7 @@ function M:window_messages(reserve)
     local used, turns, trimmed = 0, 0, false
     for i = #msgs, 1, -1 do
         local m = msgs[i]
-        local size = #(m.content or "") + 80
+        local size = #Text.content_text(m.content) + 80
         if m.tool_calls then
             for _, tc in ipairs(m.tool_calls) do
                 local fn = tc["function"] or {}
@@ -104,7 +105,7 @@ function M:update_context_block(dropped)
     local lines = {}
     for _, m in ipairs(dropped or {}) do
         if m.role == "user" or m.role == "assistant" then
-            local text = one_line(m.content, 300)
+            local text = one_line(Text.content_text(m.content), 300)
             if text ~= "" then
                 lines[#lines + 1] = (m.role == "user" and "U: " or "A: ") .. text
             end
@@ -297,6 +298,22 @@ function M:_loop(text, stream)
             }
             ctx:add_message(msg)
             self.session:append(msg)
+
+            local att = self.tools.take_attachment and self.tools:take_attachment()
+            if att then
+                -- 图片只能放在 user 消息；不落 KV（base64 可能超过 1MB value 限制）。
+                local image_msg = {
+                    role = "user",
+                    content = {
+                        { type = "text", text = "[image read: " .. tostring(att.path or "") .. "]" },
+                        { type = "image_url", image_url = {
+                            url = "data:" .. tostring(att.mime or "image/png") .. ";base64," .. tostring(att.data or ""),
+                        } },
+                    },
+                }
+                ctx:add_message(image_msg)
+                ctx:emit("image", { path = att.path, mime = att.mime })
+            end
         end
         if self.memory then self.memory:tick() end
         ctx:set_status("thinking")

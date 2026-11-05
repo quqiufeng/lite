@@ -37,7 +37,7 @@ TUI 完成后，“看见”会进一步包含对话界面与截图，形成完�
 ## 特性
 
 - **DeepSeek 流式对话**：OpenAI 兼容 `/chat/completions` + SSE；支持 `thinking` / `reasoning_effort`，TUI 用灰色 `…` 块显示思考过程。
-- **工具循环**：`bash / read / write / edit / todo`，文件工具限制在 workspace；TUI 即时显示 `tool:<name>` 与结果。`bash` 异步执行，长命令不冻结 TUI，`Ctrl+C` 可取消；`edit` 成功返回 unified diff。
+- **工具循环**：`bash / read / write / edit / todo`，文件工具限制在 workspace；TUI 即时显示 `tool:<name>` 与结果。`bash` 异步执行，长命令不冻结 TUI，`Ctrl+C` 可取消；`read` 支持文本/目录/图片（JPEG/PNG/GIF/WebP，图片以 user `image_url` 传入）；`edit` 成功返回 unified diff。
 - **工具审批**：`--approval ask|deny`；危险工具弹出 once / always / reject，always 按 session 记忆；serve/attach 通过协议审批。
 - **本地上下文记忆**：
   - 每个项目目录生成 `mem.bin` + `mem.idx`；
@@ -45,7 +45,7 @@ TUI 完成后，“看见”会进一步包含对话界面与截图，形成完�
   - 前缀 / 范围 / 正则 / 模糊 / 标签搜索；
   - 旧轮次不进 prompt，需要时用 `recall` 查回。
 - **有界上下文**：system + 最近 2 轮 + 相关记忆块（默认 8k 字符预算）。
-- **TUI + diff**：`--tui` 交互；assistant Markdown/代码块渲染、`Tab` 文件路径补全、`?` 帮助、启动时自动恢复同 cwd 最近会话；`/session` 选择/新建会话；`Ctrl+G` 打开 `git diff`，支持 split/unified、hunk 跳转、单文件、大 diff 虚拟滚动。
+- **TUI + diff**：`--tui` 交互；assistant Markdown/代码块渲染、`Tab` 文件路径补全、`?` 帮助、`quit` + Enter 退出、启动时自动恢复同 cwd 最近会话；`/session` 选择/新建会话；`Ctrl+G` 打开 `git diff`，支持 split/unified、hunk 跳转、单文件、大 diff 虚拟滚动。
 - **Todo list**：`todo` 工具维护多步任务；状态栏 `todo:done/total`，`Ctrl+T` 打开列表；持久化到本地记忆并随 serve/attach 广播。
 - **serve / attach**：`lite serve --port 8765` 启动 headless 服务端；`lite attach --port 8765` 在任意终端或 tmux tab 实时显示并交互，所有客户端共享同一会话与事件流。待处理 prompt 持久化在 KV，重启可恢复；attach 连接时回放会话历史；SIGINT/SIGTERM 优雅退出。
 - **定时唤醒**：`serve --wake 300 --task "检查 CI"`（或 `--task-file` / `.lite/wake.md`）；空闲时自动提交，记录上次结果并随 attach 广播。无人值守仍需先补工具审批/沙箱。
@@ -180,6 +180,7 @@ build/liblite_cache.so  C 共享库
 | `LITE_THINKING` | — | `1` 启用 thinking |
 | `LITE_REASONING_EFFORT` | — | `high` / `medium` / `low` |
 | `LITE_MAX_RETRIES` | `2` | 429/5xx/网络错误重试次数 |
+| `LITE_DEBUG_LOG` | — | JSONL 调试日志（request/response/utf8 修复） |
 | `LITE_APPROVAL` | `auto` | 工具审批：`auto` / `ask` / `deny` |
 | `LITE_SANDBOX` | — | `1`/`enforce` 启用 bwrap bash 沙箱 |
 | `LITE_SANDBOX_NET` | `1` | 沙箱内是否允许网络 |

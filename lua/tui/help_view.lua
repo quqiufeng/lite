@@ -13,6 +13,7 @@ local ITEMS = {
     { "Ctrl+L", "redraw screen" },
     { "Ctrl+C", "cancel request / clear input" },
     { "Ctrl+D", "quit" },
+    { "quit + Enter", "quit the TUI" },
     { "/session", "pick / new session" },
     { "/new", "start a new session" },
     { "?", "toggle this help" },

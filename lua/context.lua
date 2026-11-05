@@ -31,6 +31,7 @@ function M.new(opts)
             reasoning_effort = opts.reasoning_effort,
             max_retries = opts.max_retries or 2,
             approval = opts.approval or "auto",
+            debug_log = opts.debug_log,
         },
         ui = { dirty = true },
         listeners = {},

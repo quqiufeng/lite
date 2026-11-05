@@ -13,6 +13,7 @@ local ApprovalView = require("tui.approval_view")
 local Complete = require("tui.complete")
 local SessionView = require("tui.session_view")
 local Session = require("core.session")
+local CoreText = require("core.text")
 local http = require("core.http")
 
 local M = {}
@@ -61,9 +62,11 @@ function M.run(ctx, agent, memory, opts)
         transcript:add("info", HINT)
         for _, m in ipairs(messages or {}) do
             if m.role == "user" then
-                transcript:add("user", m.content or "")
+                local txt = CoreText.content_text(m.content)
+                if txt ~= "" then transcript:add("user", txt) end
             elseif m.role == "assistant" then
-                if (m.content or "") ~= "" then transcript:add("assistant", m.content) end
+                local txt = CoreText.content_text(m.content)
+                if txt ~= "" then transcript:add("assistant", txt) end
             elseif m.role == "tool" then
                 local s = tostring(m.content or "")
                 if #s > 4000 then s = s:sub(1, 4000) .. "\n... [truncated]" end
@@ -202,6 +205,9 @@ function M.run(ctx, agent, memory, opts)
         if todo_view then todo_view:set_items(todo_items) end
         if draw then draw() end
     end)
+    ctx:on("image", function(info)
+        transcript:add("info", "image: " .. tostring(info.path or ""))
+    end)
 
     local resume_agent
 
@@ -250,6 +256,12 @@ function M.run(ctx, agent, memory, opts)
     local function submit()
         local text = composer:get_text()
         if text == "" then return end
+        local word = text:lower()
+        if word == "quit" or word == "exit" or word == ":q" then
+            composer:clear()
+            quitting = true
+            return
+        end
         if text:sub(1, 1) == "/" then
             composer:push_history(text)
             composer:clear()

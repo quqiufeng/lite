@@ -76,7 +76,7 @@ cd /opt/my_db
 - 记忆接入：agent 自动注入相关记忆并在回答后写入 turn；工具新增 `remember/recall`。
 - `tools/`：依赖检查、构建、运行、测试、打包、安装。
 - `design.md`：Pi / Reasonix 源码架构 + code search 探索流程。
-- **TUI**：`--tui`（纯 ANSI + `curl_multi` 异步流式 + 输入/滚动/工具显示 + 记忆命中 `mem:N hit:H`；Markdown/代码块、`?` help、`Tab` 补全、自动恢复最近会话、`/session` 选择/新建；记忆按 session_id 隔离）。
+- **TUI**：`--tui`（纯 ANSI + `curl_multi` 异步流式 + 输入/滚动/工具显示 + 记忆命中 `mem:N hit:H`；Markdown/代码块、`?` help、`Tab` 补全、`quit`+Enter 退出、自动恢复最近会话、`/session` 选择/新建；记忆按 session_id 隔离）。
 - **diff 视图**：`Ctrl+G` 全屏 pager，split/unified、hunk 跳转、单文件、wrap 高度前缀和虚拟化。
 - **todo list**：`todo` 工具 + `ctx.session.todos`；状态栏 `todo:done/total`，`Ctrl+T` 覆盖层，持久化并随 serve/attach 广播。
 - **serve / attach**：`lite serve --port 8765`（TCP JSONL 广播 + KV prompt 队列）+ `lite attach --port 8765`（远程 TUI，连接回放历史），支持 `--tmux` 新窗口。
@@ -262,8 +262,10 @@ artifacts/<timestamp>/<case>/
 - Prompt：自动加载 `AGENTS.md`/`CLAUDE.md`/`.lite/instructions.md`；`LITE_INSTRUCTIONS_FILE` 覆盖，`/dev/null` 禁用；`LITE_INSTRUCTIONS_CHARS` 截断上限。
 - Thinking：`LITE_THINKING` / `DEEPSEEK_THINKING`；`LITE_REASONING_EFFORT` / `DEEPSEEK_REASONING_EFFORT`；TUI/serve 也支持 `--thinking` / `--reasoning-effort`。
 - 重试：`LITE_MAX_RETRIES`（默认 2，429/5xx/网络错误）；serve 用 signalfd 处理 SIGINT/SIGTERM。
+- 调试：`LITE_DEBUG_LOG` / `--debug-log PATH`；provider 请求前用 `core/text.lua` 清洗非法 UTF-8（替换 U+FFFD）。
 - 沙箱：`LITE_SANDBOX=1` 用 bwrap（只读根 + workspace 可写），不可用则 fail closed；`LITE_SANDBOX_NET=0` 禁止网络。
 - 异步 bash：`core/proc.lua` 后台进程 + 临时输出文件；TUI/serve 轮询，长命令不冻结，`Ctrl+C` 取消。
+- read：文本（行号/2000 行/50KB）、目录列表、图片（magic 检测，base64 data URL 走 user `image_url`）；图片消息不写 KV。
 - 审批：`LITE_APPROVAL=auto|ask|deny` / `--approval`；ask 时 TUI/serve 弹 once/always/reject，always 记在 `/agent/session/<id>/approvals`。
 - 上下文：窗口裁剪生成 `<session_context>` digest（`/agent/session/<id>/context`），预算扣除 memory/todo/digest；细节仍用 `recall`。
 - serve/wake：`LITE_SERVE_PORT` / `LITE_WAKE_SEC` / `LITE_WAKE_TASK` / `LITE_WAKE_TASK_FILE` / `LITE_WAKE_MAX`。

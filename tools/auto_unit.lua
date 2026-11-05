@@ -129,6 +129,7 @@ do
     local block = Prompt.memory_block(items, { max_chars = 300 })
     check(block:find("LITE-42", 1, true) ~= nil, "prompt memory item")
     check(block:find("recall", 1, true) ~= nil, "prompt memory recall hint")
+    check(sp:find("images are attached", 1, true) ~= nil, "prompt image rule")
 
     local msgs = {
         { role = "user", content = "previous question" },
@@ -169,8 +170,53 @@ do
     end
     check(t:execute("read", { path = "a.txt" }):find("lite", 1, true) ~= nil, "tools edit read")
     check(t:execute("bash", { command = "printf hi" }) == "hi", "tools bash")
+    check(t:execute("bash", { command = "luajit -e 'print(6*7)'" }):find("42", 1, true) ~= nil,
+        "tools bundled luajit")
     local abs, err = t:resolve("../escape")
     check(abs == nil and err ~= nil, "tools path escape")
+    os.execute("rm -rf " .. shq(dir))
+end
+
+-- tools read: text / directory / image / binary
+do
+    local dir = os.tmpname()
+    os.remove(dir)
+    os.execute("mkdir -p " .. shq(dir .. "/sub"))
+    local Tools = require("core.tools")
+    local t = Tools.new({ cwd = dir })
+
+    local f = assert(io.open(dir .. "/t.txt", "wb"))
+    f:write("a\nb\n")
+    f:close()
+    local read_desc
+    for _, s in ipairs(t:schemas()) do
+        if s["function"].name == "read" then read_desc = s["function"].description end
+    end
+    check(read_desc and read_desc:find("image", 1, true) ~= nil,
+        "tools read image schema")
+
+    local txt = t:read("t.txt")
+    check(txt:find("1: a", 1, true) ~= nil and txt:find("2: b", 1, true) ~= nil,
+        "tools read lines")
+
+    local list = t:read(".")
+    check(list:find("sub/", 1, true) ~= nil and list:find("t.txt", 1, true) ~= nil,
+        "tools read directory")
+
+    local png = string.char(0x89) .. "PNG\r\n" .. string.char(26) .. "\n" .. "image-bytes"
+    local pf = assert(io.open(dir .. "/img.png", "wb"))
+    pf:write(png)
+    pf:close()
+    local img = t:read("img.png")
+    check(img:find("Image read successfully", 1, true) ~= nil, "tools read image")
+    local att = t:take_attachment()
+    check(att and att.mime == "image/png" and #att.data > 0, "tools read image attachment")
+
+    local bf = assert(io.open(dir .. "/bin.dat", "wb"))
+    bf:write(string.char(0, 1, 2, 3))
+    bf:close()
+    check(t:read("bin.dat"):find("binary file", 1, true) ~= nil, "tools read binary")
+
     os.execute("rm -rf " .. shq(dir))
 end
 
@@ -311,6 +357,29 @@ do
     check(P.retryable("HTTP 500: boom"), "provider retry 500")
     check(not P.retryable("HTTP 401: auth"), "provider no retry 401")
     check(P.retryable("http error: timeout"), "provider retry network")
+end
+
+-- utf8 sanitize / debug log
+do
+    local T = require("core.text")
+    local s, n = T.sanitize("hello \255 world")
+    check(n == 1 and s:find("hello", 1, true) ~= nil, "text invalid byte")
+    local ok, n2 = T.sanitize("ok ✓")
+    check(n2 == 0 and ok == "ok ✓", "text valid utf8")
+    local _, n3 = T.sanitize("\237\160\128")
+    check(n3 > 0, "text surrogate")
+    check(T.base64("abc") == "YWJj", "text base64")
+
+    local Debug = require("core.debug")
+    local path = os.tmpname()
+    local d = assert(Debug.new(path))
+    d:log("test", { a = 1 })
+    d:close()
+    local f = assert(io.open(path))
+    local line = f:read("*l")
+    f:close()
+    os.remove(path)
+    check(line and line:find('"event":"test"', 1, true) ~= nil, "debug log")
 end
 
 -- agent loop（mock provider/tools/session）
@@ -565,6 +634,50 @@ do
     check(ok and y and y.kind == "proc", "agent proc yield")
     local ok2, y2 = coroutine.resume(co, "async-output")
     check(ok2 and coroutine.status(co) == "dead" and y2 == "done", "agent proc resume")
+end
+
+-- agent image attachment message
+do
+    local Context = require("context")
+    local Agent = require("core.agent")
+    local ctx = Context.new({ cwd = "/tmp", max_turns = 2 })
+    local calls, captured = 0, nil
+    local provider = {
+        stream_async = function(msgs)
+            calls = calls + 1
+            if calls == 1 then
+                return {
+                    role = "assistant", content = "",
+                    tool_calls = { { id = "c1", type = "function",
+                        ["function"] = { name = "read", arguments = '{"path":"img.png"}' } } },
+                }
+            end
+            captured = msgs
+            return { role = "assistant", content = "done" }
+        end,
+    }
+    local tools = {
+        schemas = function() return {} end,
+        execute = function() return "Image read successfully" end,
+        take_attachment = function()
+            return { mime = "image/png", data = "AAAA", path = "/tmp/img.png" }
+        end,
+    }
+    local session = { append = function() end }
+    local agent = Agent.new(ctx, provider, tools, session)
+    local co = agent:run_async("hi")
+    local ok = coroutine.resume(co)
+    check(ok and coroutine.status(co) == "dead", "agent image run")
+
+    local found = false
+    for _, m in ipairs(captured or {}) do
+        if m.role == "user" and type(m.content) == "table" then
+            for _, p in ipairs(m.content) do
+                if p.type == "image_url" then found = true end
+            end
+        end
+    end
+    check(found, "agent image message")
 end
 
 -- agent reasoning event

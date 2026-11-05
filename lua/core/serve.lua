@@ -11,6 +11,7 @@ local net = require("core.net")
 local Scheduler = require("core.scheduler")
 local Inputs = require("core.inputs")
 local Signal = require("core.signal")
+local Text = require("core.text")
 
 local M = {}
 
@@ -96,6 +97,8 @@ function M.run(opts)
         return nil, mlerr
     end
     ctx.settings.multi = multi
+    local logger = require("core.debug").new(config.debug_log)
+    if logger then ctx.settings.debug = logger end
 
     local restored_turn = 0
     for _, meta in ipairs(memory:list_sessions(config.cwd, 1)) do
@@ -198,6 +201,9 @@ function M.run(opts)
     end)
     ctx:on("todos", function(items)
         push({ type = "todos", items = items or {} })
+    end)
+    ctx:on("image", function(info)
+        push({ type = "image", path = info.path, mime = info.mime })
     end)
 
     local function state_obj()
@@ -372,9 +378,11 @@ function M.run(opts)
     local function restore_history()
         for _, m in ipairs(ctx.session.messages or {}) do
             if m.role == "user" then
-                push({ type = "user", text = m.content or "" })
-            elseif m.role == "assistant" and (m.content or "") ~= "" then
-                push({ type = "assistant", content = m.content })
+                local text = Text.content_text(m.content)
+                if text ~= "" then push({ type = "user", text = text }) end
+            elseif m.role == "assistant" then
+                local text = Text.content_text(m.content)
+                if text ~= "" then push({ type = "assistant", content = text }) end
             elseif m.role == "tool" then
                 push({
                     type = "tool_result", name = "tool",
@@ -497,6 +505,7 @@ function M.run(opts)
     for fd in pairs(clients) do net.close(fd) end
     net.close(server.fd)
     if sigfd then net.close(sigfd) end
+    if logger then logger:close() end
     memory:close()
     http.multi_free(multi)
 

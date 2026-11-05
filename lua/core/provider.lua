@@ -1,6 +1,7 @@
 -- DeepSeek（OpenAI 兼容）流式 provider + SSE 解析。
 local cjson = require("cjson")
 local http = require("core.http")
+local Text = require("core.text")
 
 local M = {}
 
@@ -94,14 +95,74 @@ function M.finish(p)
     return msg
 end
 
+local function clean_messages(messages)
+    local out, fixed = {}, 0
+    for i, m in ipairs(messages or {}) do
+        local c = {}
+        for k, v in pairs(m) do c[k] = v end
+        if type(c.content) == "string" then
+            local s, f = Text.sanitize(c.content)
+            c.content = s
+            fixed = fixed + f
+        elseif type(c.content) == "table" then
+            local parts = {}
+            for k, part in ipairs(c.content) do
+                if type(part) == "table" then
+                    local p = {}
+                    for kk, vv in pairs(part) do p[kk] = vv end
+                    if p.type == "text" and type(p.text) == "string" then
+                        local s, f = Text.sanitize(p.text)
+                        p.text = s
+                        fixed = fixed + f
+                    end
+                    if p.type == "image_url" and type(p.image_url) == "table" then
+                        local u = {}
+                        for kk, vv in pairs(p.image_url) do u[kk] = vv end
+                        if type(u.url) == "string" then u.url = Text.sanitize(u.url) end
+                        p.image_url = u
+                    end
+                    parts[k] = p
+                else
+                    parts[k] = part
+                end
+            end
+            c.content = parts
+        end
+        if type(c.tool_calls) == "table" then
+            local tcs = {}
+            for j, tc in ipairs(c.tool_calls) do
+                local t = {}
+                for k, v in pairs(tc) do t[k] = v end
+                local fn = tc["function"]
+                if type(fn) == "table" then
+                    local f2 = {}
+                    for k, v in pairs(fn) do f2[k] = v end
+                    if type(f2.name) == "string" then
+                        local s, f = Text.sanitize(f2.name); f2.name = s; fixed = fixed + f
+                    end
+                    if type(f2.arguments) == "string" then
+                        local s, f = Text.sanitize(f2.arguments); f2.arguments = s; fixed = fixed + f
+                    end
+                    t["function"] = f2
+                end
+                tcs[j] = t
+            end
+            c.tool_calls = tcs
+        end
+        out[i] = c
+    end
+    return out, fixed
+end
+
 local function build_request(messages, tools, opts)
     if not opts.api_key or opts.api_key == "" then
         return nil, nil, nil, "missing DEEPSEEK_API_KEY"
     end
 
+    local cleaned, fixed = clean_messages(messages)
     local body = {
         model = opts.model or "deepseek-flash",
-        messages = messages,
+        messages = cleaned,
         stream = true,
         temperature = opts.temperature or 0,
     }
@@ -113,6 +174,29 @@ local function build_request(messages, tools, opts)
 
     local ok, payload = pcall(cjson.encode, body)
     if not ok then return nil, nil, nil, "encode request failed: " .. tostring(payload) end
+
+    if opts.debug then
+        local images, image_bytes = 0, 0
+        for _, m in ipairs(cleaned) do
+            if type(m.content) == "table" then
+                for _, p in ipairs(m.content) do
+                    if type(p) == "table" and p.type == "image_url"
+                        and type(p.image_url) == "table" then
+                        images = images + 1
+                        image_bytes = image_bytes + #tostring(p.image_url.url or "")
+                    end
+                end
+            end
+        end
+        opts.debug:log("request", {
+            model = body.model,
+            messages = #cleaned,
+            bytes = #payload,
+            images = images,
+            image_bytes = image_bytes,
+            utf8_repaired = fixed,
+        })
+    end
 
     local base = (opts.base_url or "https://api.deepseek.com"):gsub("/+$", "")
     local headers = {
@@ -166,6 +250,15 @@ function M.stream(messages, tools, opts, on_delta, on_reasoning)
             feed_parser(parser, chunk, d, r)
         end)
 
+        if opts.debug then
+            opts.debug:log("response", {
+                attempt = attempt,
+                status = status,
+                rc = rc,
+                error = rc ~= 0 and tostring(raw) or nil,
+            })
+        end
+
         if rc == 0 and status == 200 then return M.finish(parser) end
         if rc ~= 0 then
             last_err = "http error: " .. tostring(raw)
@@ -193,10 +286,18 @@ function M.start(multi, messages, tools, opts, on_delta, on_reasoning)
     end)
     if not req then return nil, rerr end
     req.parser = parser
+    req.debug = opts.debug
     return req
 end
 
 function M.finish_request(req)
+    if req.debug then
+        req.debug:log("response", {
+            status = req.status,
+            rc = req.rc,
+            error = req.err,
+        })
+    end
     if req.rc ~= 0 then
         return nil, "http error: " .. tostring(req.err or req.rc)
     end

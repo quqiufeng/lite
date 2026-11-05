@@ -83,7 +83,11 @@ grep -q -- "+.*new line" "$TMP/unified.txt" || fail "unified new sign"
 
 tmux send-keys -t "$S" -l "q"
 sleep 0.2
-tmux send-keys -t "$S" C-d
-sleep 0.3
+tmux send-keys -t "$S" -l "quit"
+tmux send-keys -t "$S" Enter
+sleep 0.5
+if tmux has-session -t "$S" 2>/dev/null; then
+    fail "quit + Enter did not exit"
+fi
 
 echo "OK tui.smoke"

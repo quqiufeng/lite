@@ -30,6 +30,7 @@ lite — DeepSeek 终端 coding agent
   --reasoning-effort LEVEL     high | medium | low
   --sandbox                    bash 使用 bwrap 沙箱（需安装 bubblewrap）
   --approval auto|ask|deny     工具审批策略（默认 auto）
+  --debug-log PATH             写 JSONL 调试日志（provider/HTTP）
 
 环境:
   DEEPSEEK_API_KEY             必需
@@ -123,6 +124,9 @@ local function parse_flags(list)
         elseif a == "--approval" then
             flags.approval = list[i + 1]
             i = i + 2
+        elseif a == "--debug-log" then
+            flags.debug_log = list[i + 1]
+            i = i + 2
         else
             pos[#pos + 1] = a
             i = i + 1
@@ -145,6 +149,7 @@ elseif cmd == "serve" or cmd == "--serve" then
     if flags.reasoning_effort then config.reasoning_effort = flags.reasoning_effort end
     if flags.sandbox then config.sandbox = "enforce" end
     if flags.approval then config.approval = flags.approval end
+    if flags.debug_log then config.debug_log = flags.debug_log end
     if not config.api_key or config.api_key == "" then
         io.stderr:write("lite: missing DEEPSEEK_API_KEY\n")
         os.exit(2)
@@ -281,6 +286,7 @@ elseif cmd == "--tui" then
     if flags.reasoning_effort then config.reasoning_effort = flags.reasoning_effort end
     if flags.sandbox then config.sandbox = "enforce" end
     if flags.approval then config.approval = flags.approval end
+    if flags.debug_log then config.debug_log = flags.debug_log end
     if not flags.snapshot and (not config.api_key or config.api_key == "") then
         io.stderr:write("lite: missing DEEPSEEK_API_KEY\n")
         os.exit(2)
@@ -307,7 +313,11 @@ elseif cmd == "--tui" then
         reasoning_effort = config.reasoning_effort,
         max_retries = config.max_retries,
         approval = config.approval,
+        debug_log = config.debug_log,
     })
+    local Debug = require("core.debug")
+    local logger = Debug.new(config.debug_log)
+    if logger then ctx.settings.debug = logger end
     local memory, merr = Memory.new({
         dir = config.memory_dir or config.cwd,
         max_mb = config.memory_mb,
@@ -386,6 +396,7 @@ elseif cmd == "--tui" then
         })
         memory:close()
         http.multi_free(multi)
+        if logger then logger:close() end
         if not ok then
             io.stderr:write("lite snapshot: " .. tostring(err) .. "\n")
             os.exit(1)
@@ -399,6 +410,7 @@ elseif cmd == "--tui" then
     })
     memory:close()
     http.multi_free(multi)
+    if logger then logger:close() end
     if not ok then
         io.stderr:write("lite: " .. tostring(err) .. "\n")
         os.exit(1)
@@ -439,7 +451,11 @@ elseif cmd == "--once" then
         reasoning_effort = config.reasoning_effort,
         max_retries = config.max_retries,
         approval = config.approval,
+        debug_log = config.debug_log,
     })
+    local Debug = require("core.debug")
+    local logger = Debug.new(config.debug_log)
+    if logger then ctx.settings.debug = logger end
     local memory, merr = Memory.new({
         dir = config.memory_dir or config.cwd,
         max_mb = config.memory_mb,
@@ -500,6 +516,7 @@ elseif cmd == "--once" then
         io.flush()
     end
     memory:close()
+    if logger then logger:close() end
     if err then os.exit(1) end
     os.exit(0)
 else
