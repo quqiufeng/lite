@@ -79,6 +79,34 @@ do
     })
     check(cfg2.model == "override", "config env over dotenv")
     os.execute("rm -rf " .. shq(dir))
+
+    -- 向上查找父目录 .env
+    local root = os.tmpname()
+    os.remove(root)
+    os.execute("mkdir -p " .. shq(root .. "/sub"))
+    local upfile = io.open(root .. "/.env", "w")
+    upfile:write("DEEPSEEK_API_KEY=sk-up\n")
+    upfile:close()
+    local up = require("core.config").load({ HOME = "/tmp", PWD = root .. "/sub" })
+    check(up.api_key == "sk-up", "config dotenv parent")
+
+    -- 全局 ~/.config/lite/.env
+    local home = os.tmpname()
+    os.remove(home)
+    os.execute("mkdir -p " .. shq(home .. "/.config/lite"))
+    local gfile = io.open(home .. "/.config/lite/.env", "w")
+    gfile:write("DEEPSEEK_API_KEY=sk-global\n")
+    gfile:close()
+    local glob = require("core.config").load({ HOME = home, PWD = home })
+    check(glob.api_key == "sk-global", "config dotenv global")
+
+    -- 父级 .env 没有 key 时，应由全局 .env 补齐
+    local hfile = io.open(home .. "/.env", "w")
+    hfile:write("OTHER=1\n")
+    hfile:close()
+    local merged = require("core.config").load({ HOME = home, PWD = home })
+    check(merged.api_key == "sk-global", "config dotenv merge")
+    os.execute("rm -rf " .. shq(root) .. " " .. shq(home))
 end
 
 -- prompt assembly

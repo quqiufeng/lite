@@ -212,7 +212,7 @@ PREFIX=$HOME/.local ./tools/release.sh   # 安装到用户目录
 - 默认安装到 `/usr/local`：二进制链接 `<prefix>/bin/lite`，应用在 `<prefix>/share/lite`。
 - 目标目录不可写时自动用 `sudo`（可用 `--prefix DIR` 或 `PREFIX=DIR` 改前缀）。
 - `--no-install` 只构建并生成 `dist/lite-linux-x64.tar.gz`。
-- `.env` 不会被打包；key 放在运行目录 `.env` 或 `~/.config/lite/config.lua`。
+- `.env` 不会被打包；key 放在运行目录/父目录 `.env`、`~/.config/lite/.env` 或 `~/.config/lite/config.lua`。
 - 发布后自检：`lite --version`、`lite --check`、`lite state --json`。
 
 - `tools/lite-lua`：带 LUA_PATH/LUA_CPATH 的 LuaJIT 包装。
@@ -257,6 +257,7 @@ artifacts/<timestamp>/<case>/
 - 工具：先 `bash/read/write/edit`；输出截断（单次 ≤ 32KB）。
 - 会话：先线性 JSONL；树/分支后续再做。
 - 配置：`DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL`，或 `~/.config/lite/config.lua`。
+- `.env` 搜索/合并：cwd → 父目录 → `~/.config/lite/.env` → 安装目录；近处键优先，缺失键由全局补。
 - 记忆：`LITE_MEMORY_MB` / `LITE_MEMORY_FLUSH` / `LITE_CONTEXT_CHARS` / `LITE_CONTEXT_TURNS`。
 - Prompt：自动加载 `AGENTS.md`/`CLAUDE.md`/`.lite/instructions.md`；`LITE_INSTRUCTIONS_FILE` 覆盖，`/dev/null` 禁用；`LITE_INSTRUCTIONS_CHARS` 截断上限。
 - Thinking：`LITE_THINKING` / `DEEPSEEK_THINKING`；`LITE_REASONING_EFFORT` / `DEEPSEEK_REASONING_EFFORT`；TUI/serve 也支持 `--thinking` / `--reasoning-effort`。

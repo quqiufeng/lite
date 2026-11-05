@@ -60,6 +60,7 @@ TUI 完成后，“看见”会进一步包含对话界面与截图，形成完�
 ./tools/build.sh
 
 export DEEPSEEK_API_KEY="sk-..."
+# 也可写入 .env（自动搜索 cwd → 父目录 → ~/.config/lite/.env → 安装目录，多层合并）
 
 # 交互式 TUI（Ctrl+G 查看 git diff）
 ./tools/run.sh --tui

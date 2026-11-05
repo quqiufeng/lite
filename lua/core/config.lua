@@ -29,20 +29,59 @@ local function load_dotenv(path)
     return out
 end
 
-local function find_dotenv(get)
+local function current_dir(get)
+    local p = get("PWD")
+    if p and p ~= "" and p:sub(1, 1) == "/" then return p end
+    local h = io.popen("pwd 2>/dev/null", "r")
+    if h then
+        local s = h:read("*l")
+        h:close()
+        if s and s ~= "" then return s end
+    end
+    return "."
+end
+
+local function candidate_dotenvs(get, cwd)
     local explicit = get("LITE_ENV_FILE")
     if explicit then
-        if explicit == "" or explicit == "/dev/null" then return nil end
-        return explicit
+        if explicit == "" or explicit == "/dev/null" then return {} end
+        if explicit:sub(1, 1) ~= "/" then explicit = cwd .. "/" .. explicit end
+        return { explicit }
     end
-    for _, dir in ipairs({ get("PWD") or ".", get("LITE_ROOT") }) do
-        if dir then
-            local path = dir:gsub("/+$", "") .. "/.env"
-            local f = io.open(path, "r")
-            if f then f:close(); return path end
+
+    local out, seen = {}, {}
+    local function add(path)
+        if path and not seen[path] then
+            seen[path] = true
+            out[#out + 1] = path
         end
     end
-    return nil
+
+    -- 近处优先：cwd → 父目录 → ~/.config/lite/.env → 安装目录。
+    local dir = cwd
+    for _ = 1, 10 do
+        add(dir:gsub("/+$", "") .. "/.env")
+        local parent = dir:match("^(.*)/[^/]+$")
+        if not parent or parent == "" or parent == dir then break end
+        dir = parent
+    end
+    local home = get("HOME")
+    if home and home ~= "" then add(home .. "/.config/lite/.env") end
+    local root = get("LITE_ROOT")
+    if root and root ~= "" then add(root:gsub("/+$", "") .. "/.env") end
+    return out
+end
+
+-- 合并多层 .env：近处键优先，缺失键由全局/安装目录补。
+local function load_dotenv_merged(get, cwd)
+    local merged = {}
+    for _, path in ipairs(candidate_dotenvs(get, cwd)) do
+        local d = load_dotenv(path)
+        for k, v in pairs(d) do
+            if merged[k] == nil then merged[k] = v end
+        end
+    end
+    return merged
 end
 
 -- 优先级：注入 env / 进程环境 > .env > ~/.config/lite/config.lua > 默认值。
@@ -52,7 +91,8 @@ function M.load(env)
         return os.getenv(k)
     end
 
-    local dotenv = load_dotenv(find_dotenv(get) or "")
+    local cwd = current_dir(get)
+    local dotenv = load_dotenv_merged(get, cwd)
 
     local function getv(k)
         local v = get(k)
@@ -67,7 +107,7 @@ function M.load(env)
         api_key = getv("DEEPSEEK_API_KEY") or file.api_key,
         base_url = getv("DEEPSEEK_BASE_URL") or file.base_url or "https://api.deepseek.com",
         model = getv("DEEPSEEK_MODEL") or file.model or "deepseek-flash",
-        cwd = getv("LITE_CWD") or file.cwd or get("PWD") or ".",
+        cwd = getv("LITE_CWD") or file.cwd or cwd,
         max_turns = tonumber(getv("LITE_MAX_TURNS") or file.max_turns) or 16,
         temperature = tonumber(getv("LITE_TEMPERATURE") or file.temperature) or 0,
         memory_dir = getv("LITE_MEMORY_DIR") or file.memory_dir,
