@@ -402,3 +402,106 @@ C.close(h)
 - 打包：`dist/lite-linux-x64.tar.gz` 含 `build/liblite_cache.so`；包内 `core.memory` 可用。
 - 手动验证：在项目目录运行 `lite --recall "关键词"`，会使用该目录的 `mem.bin`。
 - 未做真实 DeepSeek 请求验证（需要 `DEEPSEEK_API_KEY`）。
+
+---
+
+## 8. TUI 技术方案（待实现）
+
+### 8.1 定位
+
+TUI 只是 frontend：`core/*` 继续通过 `context` 事件驱动；TUI 订阅事件、提交输入，不反向依赖。渲染层自己写，不引入 ncurses/notcurses，用 LuaJIT FFI + ANSI + 自建 cell buffer。
+
+### 8.2 模块
+
+```
+lua/tui/
+├── screen.lua       cell buffer / 宽字符 / 行 diff / snapshot
+├── terminal.lua     termios raw / ioctl size / ANSI / alt-screen
+├── input.lua        键序列解析（方向键 / Ctrl / 粘贴 / UTF-8）
+├── composer.lua     多行输入 / 历史 / Ctrl+C·D·L
+├── transcript.lua   消息块 / 工具输出折叠 / 流式追加 / 滚动
+├── status.lua       model / turn / cwd / memory 命中数
+└── tui.lua          布局 + 事件循环 + 提交
+```
+
+### 8.3 虚拟屏幕（核心）
+
+`screen.lua` 用二维 cell 数组渲染：
+
+```lua
+cell = { ch = "字", fg = 0, bg = 0, attr = 0 }
+```
+
+- 宽字符（CJK）占 2 列；换行、截断、滚动都在虚拟屏幕完成。
+- 真实终端和测试/截图共用同一份渲染结果。
+- 提供 `snapshot_text()` / `snapshot_html()`，AI 可直接读取，无需真实终端。
+- 行级 diff：只重绘变化行，降低闪烁和 I/O。
+
+### 8.4 终端适配
+
+- termios FFI：`tcgetattr/tcsetattr` 进入 raw（`-icanon -echo min 1 time 0`），退出恢复。
+- `ioctl(TIOCGWINSZ)` 取尺寸；窗口变化可定时轮询（简单）或 self-pipe + SIGWINCH（后续）。
+- ANSI：alt-screen、隐藏/显示光标、清行、光标定位、256/truecolor。
+- 退出/异常必须恢复终端状态。
+
+### 8.5 输入
+
+- `input.lua` 解析字节流：方向键、PageUp/Down、Home/End、Ctrl+字母、粘贴、UTF-8。
+- `composer.lua`：单/多行输入、历史、光标移动、kill 行。
+- 键位建议：
+  - Enter 提交；Ctrl+J 换行；Ctrl+C 取消/清空；Ctrl+D 退出（空输入时）。
+  - PgUp/PgDn 滚动 transcript；Ctrl+L 重绘。
+  - 后续加 Tab 补全、Ctrl+R 历史搜索。
+
+### 8.6 Transcript / Status
+
+- block 类型：`user / assistant / tool / error / info`。
+- 工具输出默认折叠（显示首行 + 行数），Enter 展开。
+- assistant 流式追加；滚动时保持视图锚点。
+- 状态栏：model、turn、cwd、记忆命中数、当前工具。
+- 记忆块不直接铺在 transcript，只在状态栏提示“memory: N”。
+
+### 8.7 异步 Agent / HTTP（关键改造）
+
+现在 `http.lua` 是阻塞 `curl_easy_perform`，TUI 期间无法响应输入。改为：
+
+```
+curl_multi_init / add_handle / multi_perform / multi_info_read / remove_handle
+```
+
+- `http.lua` 提供 `start/post_stream` 返回 handle；`poll(timeout_ms)` 推进并分发 SSE。
+- `agent.lua` 改成状态机（或协程）：`idle / streaming / tool / done`；TUI 每个 tick 推进。
+- TUI 主循环：poll stdin + curl_multi + 定时器（记忆 flush、状态刷新），合并重绘。
+- 支持流式中滚动、Ctrl+C 取消（`curl_multi_remove_handle`）。
+
+### 8.8 事件流
+
+```
+input → agent:submit(text)
+agent → ctx:emit("delta"/"tool_start"/"tool_result"/"assistant"/"error")
+TUI  → 订阅事件，更新 block / status / screen
+memory → 请求前 recall、回答后 remember；TUI 只显示命中数
+```
+
+### 8.9 测试与可观测
+
+- `screen.lua` 纯逻辑单测：宽字符、换行、滚动、diff、工具折叠。
+- `--tui --snapshot <path>`（或 `LITE_TUI=1` + 测试 harness）把虚拟屏幕输出为文本/HTML；AI 读文件即可验收。
+- 失败时保存 `artifacts/<timestamp>/<case>/screen.txt|html`、`events.jsonl`、`app.log`。
+- 真实终端行为（raw/ANSI）单独做 smoke；不阻塞单元测试。
+
+### 8.10 分阶段
+
+1. **P0 渲染核心**：`screen` + `composer` + `transcript` + 虚拟屏幕单测。
+2. **P1 真实终端**：termios / ANSI / alt-screen / 输入；`--once` 保持。
+3. **P2 异步流式**：curl_multi + agent 状态机；流式滚动/取消。
+4. **P3 交互完善**：历史、工具展开、记忆命中、`state` 自动化。
+5. **P4 可观测**：虚拟屏幕截图/HTML 接入 artifacts 与回归。
+
+### 8.11 待定决策
+
+- 颜色：256 色优先，truecolor 可选。
+- 是否支持鼠标滚动 / 选择复制。
+- 工具审批 UI（当前全自动，后续按 Reasonix 风格加 ask 覆盖层）。
+- 多行提交键：Ctrl+J 还是 Shift+Enter（终端差异）。
+- 取消语义：Ctrl+C 一次取消当前请求，空输入时二次退出。
