@@ -15,7 +15,12 @@ if [ -z "$LUA" ]; then
 fi
 
 export LITE_ROOT="$ROOT"
-export LD_LIBRARY_PATH="$ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# 不要把 $ROOT/lib 塞进 LD_LIBRARY_PATH：
+# 该变量会被 exec 出的子进程（bash 工具、native helper、外部脚本）继承，
+# 而随包附带的 libonnxruntime.so.1 会遮蔽系统同名库（缺 VERS_1.20.1 等版本符号），
+# 让依赖系统 onnxruntime 的工具静默失败。
+# 自带 .so 一律靠 $ORIGIN RUNPATH 定位同目录依赖；例外由 FFI 层按绝对路径
+# ffi.load 预加载（见 lua/ffi/ocr.lua 的 load_ort）。
 export LUA_PATH="$ROOT/lua/?.lua;$ROOT/lua/?/init.lua;$ROOT/automation/?.lua;;${LUA_PATH:-}"
 export LUA_CPATH="$ROOT/third_party/cjson/lua/5.1/?.so;;${LUA_CPATH:-}"
 

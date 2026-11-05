@@ -69,6 +69,22 @@ else
     echo "[WARN] OCR      missing lib/models (ocr tool disabled)"
 fi
 
+# 回归：lite 不得通过 LD_LIBRARY_PATH 注入自带 .so。
+# 该变量会被子进程继承，随包附带的 libonnxruntime.so.1 会遮蔽系统同名库
+# （缺 VERS_1.20.1 等版本符号），使依赖系统 onnxruntime 的外部工具静默失败。
+if [ -f "$OCR_LIB" ] && [ -f "$OCR_MODELS/ch_PP-OCRv4_det_infer.onnx" ]; then
+    if env -u LD_LIBRARY_PATH LITE_ROOT="$ROOT" "$ROOT/tools/lite-lua" -e '
+local ok, m = pcall(require, "ffi.ocr")
+local ready, err = ok and m.ready()
+if not ready then io.stderr:write(tostring(err) .. "\n"); os.exit(1) end
+' >/dev/null 2>&1; then
+        echo "[OK]   ocr      self-contained (no LD_LIBRARY_PATH needed)"
+    else
+        echo "[FAIL] ocr      requires LD_LIBRARY_PATH (would shadow system libs)"
+        fail=1
+    fi
+fi
+
 if command -v tmux >/dev/null 2>&1; then
     echo "[OK]   tmux     $(tmux -V 2>/dev/null || echo present)"
 else

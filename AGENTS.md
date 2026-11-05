@@ -68,6 +68,7 @@ LuaJIT 自带 FFI：系统有 `.so` 就直接 `ffi.cdef` + `ffi.load`，封装�
 
 - C 导出 `int lite_<feature>_...` + `const char *lite_<feature>_error(void)`；失败返回非 0。
 - `.so` 设 `$ORIGIN` RPATH；`package.sh` 复制 `.so` 及非 libc 依赖到 `dist/lib/`。
+- **禁止把 `$ROOT/lib` 注入 `LD_LIBRARY_PATH`**：该变量被 exec 的子进程（`bash` 工具、native helper、外部脚本）继承，随包的 `libonnxruntime.so.1` 会遮蔽系统同名库（缺 `VERS_1.20.1` 等版本符号），让依赖系统 onnxruntime 的 `ai_code_search.sh` 等工具**静默失败**。自带 `.so` 靠 `$ORIGIN`；无 RPATH 的第三方库（如 `libocr_simple.so`）由 FFI 层按绝对路径 `ffi.load(path, true)` 预加载。回归由 `check_deps.sh` 的 `ocr self-contained` 项守护。
 - 热重载：Lua 清 `package.loaded[...]` 重新 require；TUI `/reload`。C `.so` 不卸载，C 改动需重启。
 
 ## 7 native helper
