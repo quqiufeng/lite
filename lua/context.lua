@@ -29,6 +29,8 @@ function M.new(opts)
             context_turns = opts.context_turns or 2,
             thinking = opts.thinking,
             reasoning_effort = opts.reasoning_effort,
+            max_retries = opts.max_retries or 2,
+            approval = opts.approval or "auto",
         },
         ui = { dirty = true },
         listeners = {},

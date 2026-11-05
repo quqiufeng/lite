@@ -51,6 +51,7 @@ dist/
 artifacts/
 mem.bin
 mem.idx
+mem.lock
 
 # keep vendored cjson shared object
 !third_party/cjson/lua/5.1/cjson.so

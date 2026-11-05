@@ -628,3 +628,45 @@ opencode 用 SQLite（`[static]`：`packages/core/src/session/sql.ts` 的 `sessi
 - Agent：`ctx:emit("reasoning", text)`；不把 reasoning 写回 messages（避免污染后续请求）。
 - TUI：灰色 `…` 思考块，assistant 内容开始时自动结束；serve/attach 广播并显示；`--once --json` 输出 `{"type":"reasoning"}`。
 - 验证：190 单测；真实 API 收到 72 条 reasoning 事件；tmux 显示 `… Simple: 9.9 > 9.11...`。
+
+### 8.22 性能与一致性优化
+
+- `mem.lock`：写进程 `flock(LOCK_EX|LOCK_NB)` 独占，防止 TUI/serve 多写覆盖；`--recall/state/sessions` 只读不加锁，可在运行中诊断。
+- `Session:append` 维护 `meta.messages`；`session_messages` 用 `search_range` 取尾部窗口，避免 `max_results=0` 全量扫描。
+- transcript `build_lines` 增加签名缓存：空闲滚动不重建；流式/折叠/换行变化自动失效。
+- 验证：196 单测 + CLI/TUI/serve 冒烟；TUI 运行时 `state --json` 可正常读取。
+
+### 8.23 重试与优雅退出
+
+- HTTP 重试：`LITE_MAX_RETRIES`（默认 2）；429 / 5xx / 网络错误重试。
+  - 阻塞 `--once`：指数退避（0.5s/1s）。
+  - 协程 TUI/serve：重新发起 `M.start` 并 yield 新请求；一旦已输出 delta/reasoning 则不再重试，避免重复内容。
+- serve 优雅退出：`core/signal.lua` 用 `sigprocmask + signalfd` 把 SIGINT/SIGTERM 变成 poll fd；收到后停止 loop，关闭 clients/server/multi，`memory:close()` 同步落盘。
+- 验证：201 单测；serve smoke 发送 SIGTERM 并确认进程退出。
+
+### 8.24 bash 沙箱与路径越界防护
+
+参考 Reasonix `internal/safety/sandbox`（bwrap、write roots、network、fail closed）与 `internal/safety/permission`（deny > ask > allow）。
+
+- `lua/core/sandbox.lua`：`bwrap --die-with-parent --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --bind <cwd> <cwd> --chdir <cwd>`；`LITE_SANDBOX_NET=0` 时加 `--unshare-net`。
+- 启用：`LITE_SANDBOX=1` / `--sandbox`；bwrap 缺失时 **fail closed**，不会退回无沙箱执行。
+- 文件工具 `resolve` 增加 `realpath -m` 二次校验，阻止 workspace 内 symlink 指向外部。
+- 测试：206 单测；沙箱内写 workspace 成功、写外部失败；symlink 越界被拒。
+
+### 8.25 工具审批（已实现）
+
+参考 Reasonix `permission.Policy::Decide`（deny > ask > allow）与 opencode `acp/permission`（once / always / reject）。
+
+- `core/approval.lua`：`auto|ask|deny`；read/recall/remember/todo 直接 allow；session allow 持久化到 `/agent/session/<id>/approvals`。
+- Agent：tool 执行前 `decide`；`ask` 时协程 `yield {kind="approval", name, args}`。
+- TUI：`ApprovalView` 覆盖层，`y` once / `a` always / `n`/Esc reject；非交互 `--once` 遇到 ask 直接拒绝。
+- serve/attach：广播 `approval`，客户端回 `{"type":"approval","id",decision}`；60s 超时自动 reject；`cancel` 也 reject。
+- 验证：217 单测；真实 TUI `--approval ask` 弹层 → `y` → 执行 bash → done。
+
+### 8.26 异步 bash（已实现）
+
+- `core/proc.lua`：后台 `bash -c {command} > tmp 2>&1`，退出码写 status 文件；主循环非阻塞 poll 增量输出。
+- Agent：async 模式下 `bash` 走 `tools:start_bash`，`yield {kind="proc", proc}`；其余工具同步。
+- TUI/serve：每 tick `proc:poll()`；完成后 resume agent。`Ctrl+C` / `cancel` 调 `proc:cancel()`（SIGKILL）并回填 `[cancelled]`。
+- 仍受审批/沙箱约束：先 approval，再启动 proc。
+- 验证：225 单测；真实 TUI `sleep 8` 显示 `tool:bash` 不冻结，Ctrl+C 后输出 `[cancelled]` 并继续回复。

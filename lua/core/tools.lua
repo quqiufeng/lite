@@ -1,5 +1,7 @@
 -- 工具集：bash / read / write / edit / todo（全部自动，限制在 workspace 内）。
 local Todos = require("core.todos")
+local Sandbox = require("core.sandbox")
+local Proc = require("core.proc")
 
 local M = {}
 M.__index = M
@@ -96,16 +98,6 @@ local function make_edit_diff(root, abs, before, i, old, new)
     return table.concat(out, "\n")
 end
 
-function M.new(opts)
-    opts = opts or {}
-    return setmetatable({
-        cwd = opts.cwd or os.getenv("PWD") or ".",
-        memory = opts.memory,
-        ctx = opts.ctx,
-        todos = Todos.new(opts.ctx, opts.memory),
-    }, M)
-end
-
 local function normalize(path)
     local parts = {}
     for seg in tostring(path):gmatch("[^/]+") do
@@ -118,16 +110,47 @@ local function normalize(path)
     return "/" .. table.concat(parts, "/")
 end
 
+local function realpath(path)
+    local p = io.popen("realpath -m " .. shq(path) .. " 2>/dev/null", "r")
+    if not p then return nil end
+    local s = p:read("*l")
+    p:close()
+    if not s or s == "" then return nil end
+    return s
+end
+
+function M.new(opts)
+    opts = opts or {}
+    local cwd = opts.cwd or os.getenv("PWD") or "."
+    local self = setmetatable({
+        cwd = cwd,
+        memory = opts.memory,
+        ctx = opts.ctx,
+        todos = Todos.new(opts.ctx, opts.memory),
+        sandbox = Sandbox.enabled(opts.sandbox),
+        sandbox_net = opts.sandbox_net ~= false,
+    }, M)
+    self.real_root = realpath(cwd) or normalize(cwd):gsub("/+$", "")
+    return self
+end
+
 function M:resolve(p)
     if not p or p == "" then return nil, "empty path" end
     local root = normalize(self.cwd):gsub("/+$", "")
     local abs = p
     if p:sub(1, 1) ~= "/" then abs = root .. "/" .. p end
     abs = normalize(abs)
-    if abs == root or abs:sub(1, #root + 1) == root .. "/" then
+    if not (abs == root or abs:sub(1, #root + 1) == root .. "/") then
+        return nil, "path outside workspace: " .. abs
+    end
+
+    -- 防 symlink 越界：解析真实路径后再校验一次。
+    local real = realpath(abs) or abs
+    local real_root = self.real_root or root
+    if real == real_root or real:sub(1, #real_root + 1) == real_root .. "/" then
         return abs
     end
-    return nil, "path outside workspace: " .. abs
+    return nil, "path outside workspace (symlink): " .. real
 end
 
 function M:schemas()
@@ -252,8 +275,35 @@ function M:schemas()
     }
 end
 
+function M:start_bash(command)
+    local run
+    if self.sandbox then
+        local wrapped, serr = Sandbox.wrap(command, {
+            cwd = self.real_root or normalize(self.cwd),
+            network = self.sandbox_net,
+        })
+        if not wrapped then return nil, serr end
+        run = wrapped
+    else
+        run = "bash -lc " .. shq(command)
+    end
+    return Proc.new(run, { timeout = 120 })
+end
+
 function M:bash(command)
-    local p = io.popen("timeout 120 bash -lc " .. shq(command) .. " 2>&1", "r")
+    local cmd
+    if self.sandbox then
+        local wrapped, serr = Sandbox.wrap(command, {
+            cwd = self.real_root or normalize(self.cwd),
+            network = self.sandbox_net,
+        })
+        if not wrapped then return "error: " .. tostring(serr) end
+        cmd = wrapped
+    else
+        cmd = "bash -lc " .. shq(command)
+    end
+
+    local p = io.popen("timeout 120 " .. cmd .. " 2>&1", "r")
     if not p then return "error: cannot start bash" end
     local out = p:read("*a") or ""
     local ok = p:close()

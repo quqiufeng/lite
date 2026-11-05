@@ -102,4 +102,17 @@ else
     echo "SKIP serve.attach (tmux missing)"
 fi
 
+if [ -n "$SRV_PID" ]; then
+    kill -TERM "$SRV_PID" 2>/dev/null || true
+    for _ in $(seq 1 50); do
+        if ! kill -0 "$SRV_PID" 2>/dev/null; then break; fi
+        sleep 0.1
+    done
+    if kill -0 "$SRV_PID" 2>/dev/null; then
+        fail "serve did not exit on SIGTERM"
+    fi
+    wait "$SRV_PID" 2>/dev/null || true
+    SRV_PID=""
+fi
+
 echo "OK serve.smoke"

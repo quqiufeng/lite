@@ -10,6 +10,7 @@ local http = require("core.http")
 local net = require("core.net")
 local Scheduler = require("core.scheduler")
 local Inputs = require("core.inputs")
+local Signal = require("core.signal")
 
 local M = {}
 
@@ -79,6 +80,8 @@ function M.run(opts)
         context_turns = config.context_turns,
         thinking = config.thinking,
         reasoning_effort = config.reasoning_effort,
+        max_retries = config.max_retries,
+        approval = config.approval,
     })
     local memory, merr = Memory.new({
         dir = config.memory_dir or config.cwd,
@@ -107,7 +110,13 @@ function M.run(opts)
     ctx.session.turn = restored_turn
     memory:ensure_session(ctx.session.id, config.cwd, config.model)
 
-    local tools = Tools.new({ cwd = config.cwd, memory = memory, ctx = ctx })
+    local tools = Tools.new({
+        cwd = config.cwd,
+        memory = memory,
+        ctx = ctx,
+        sandbox = config.sandbox,
+        sandbox_net = config.sandbox_net,
+    })
     if tools.todos then tools.todos:load() end
     local msg_count = memory:session_message_count(ctx.session.id)
     local session = Session.new(ctx, {
@@ -134,6 +143,10 @@ function M.run(opts)
     local busy = false
     local co, active_req
     local scheduler
+    local pending_approval
+    local active_proc
+    local approval_seq = 0
+    local approval_deadline
     local last_hits = 0
 
     local function encode(obj)
@@ -200,6 +213,7 @@ function M.run(opts)
             hits = last_hits,
             todos = ctx.session.todos or {},
             queued = #queue,
+            approval = pending_approval,
             wake = scheduler and {
                 runs = scheduler.runs,
                 every = scheduler.every,
@@ -235,8 +249,15 @@ function M.run(opts)
             start_next()
             return
         end
-        if type(y) == "table" and y.kind == "http" then
+        if type(y) == "table" and y.kind == "approval" then
+            approval_seq = approval_seq + 1
+            pending_approval = { id = approval_seq, name = y.name, args = y.args }
+            approval_deadline = os.time() + 60
+            push({ type = "approval", id = approval_seq, name = y.name, args = y.args })
+        elseif type(y) == "table" and y.kind == "http" then
             active_req = y.req
+        elseif type(y) == "table" and y.kind == "proc" then
+            active_proc = y.proc
         end
     end
 
@@ -285,7 +306,19 @@ function M.run(opts)
     end
 
     local function cancel()
-        if active_req and multi then
+        if pending_approval then
+            local p = pending_approval
+            pending_approval = nil
+            approval_deadline = nil
+            push({ type = "approval_reply", id = p.id, decision = "reject" })
+            resume_agent("reject")
+            return
+        end
+        if active_proc then
+            local out = active_proc:cancel()
+            active_proc = nil
+            resume_agent(out)
+        elseif active_req and multi then
             http.cancel(multi, active_req)
             active_req = nil
             resume_agent(nil, "cancelled")
@@ -305,6 +338,16 @@ function M.run(opts)
             submit(tostring(obj.text or ""))
         elseif t == "cancel" then
             cancel()
+        elseif t == "approval" then
+            if pending_approval and tonumber(obj.id) == pending_approval.id then
+                local decision = tostring(obj.decision or "reject")
+                if decision ~= "once" and decision ~= "always" then decision = "reject" end
+                local p = pending_approval
+                pending_approval = nil
+                approval_deadline = nil
+                push({ type = "approval_reply", id = p.id, decision = decision })
+                resume_agent(decision)
+            end
         elseif t == "state" then
             send_obj(fd, state_obj())
         elseif t == "ping" then
@@ -352,16 +395,37 @@ function M.run(opts)
         end
     end
 
+    local sigfd = Signal.sigfd()
+    local running = true
+
     local function loop()
-        while true do
+        while running do
+            if pending_approval and approval_deadline and os.time() >= approval_deadline then
+                local p = pending_approval
+                pending_approval = nil
+                approval_deadline = nil
+                push({ type = "approval_reply", id = p.id, decision = "reject" })
+                resume_agent("reject")
+            end
+
             local fds = { server.fd }
             local conns = {}
             for fd in pairs(clients) do
                 fds[#fds + 1] = fd
                 conns[#conns + 1] = fd
             end
+            local sig_index
+            if sigfd then
+                fds[#fds + 1] = sigfd
+                sig_index = #fds
+            end
 
             local _, revs = net.poll(fds, 20)
+            if sig_index and revs[sig_index] and revs[sig_index] ~= 0 then
+                Signal.drain(sigfd)
+                running = false
+                break
+            end
             if revs[1] and revs[1] ~= 0 then
                 while true do
                     local cfd = net.accept(server)
@@ -406,6 +470,18 @@ function M.run(opts)
                 end
             end
 
+            if active_proc then
+                local done, out = active_proc:poll()
+                if done then
+                    local code = active_proc.exit_code
+                    active_proc = nil
+                    if code and code ~= 0 then
+                        out = out .. "\n[exit " .. tostring(code) .. "]"
+                    end
+                    resume_agent(out)
+                end
+            end
+
             memory:tick()
             if scheduler then scheduler:tick(os.time()) end
         end
@@ -417,8 +493,10 @@ function M.run(opts)
 
     local ok, err = pcall(loop)
 
+    if active_proc then active_proc:cancel() end
     for fd in pairs(clients) do net.close(fd) end
     net.close(server.fd)
+    if sigfd then net.close(sigfd) end
     memory:close()
     http.multi_free(multi)
 

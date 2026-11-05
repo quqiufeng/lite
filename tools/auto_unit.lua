@@ -45,6 +45,8 @@ do
     })
     check(cfg.model == "deepseek-flash-x", "config env override")
     check(cfg.max_turns == 16, "config default max_turns")
+    check(cfg.max_retries == 2, "config max retries")
+    check(cfg.approval == "auto", "config approval")
 
     local cfg2 = require("core.config").load({
         HOME = "/tmp",
@@ -144,6 +146,79 @@ do
     os.execute("rm -rf " .. shq(dir))
 end
 
+-- async proc
+do
+    local Proc = require("core.proc")
+    local p, perr = Proc.new("echo hi; sleep 0.1", { timeout = 5 })
+    check(p ~= nil, "proc start: " .. tostring(perr))
+    if p then
+        local out
+        for _ = 1, 100 do
+            local done, o = p:poll()
+            out = o
+            if done then break end
+            os.execute("sleep 0.05")
+        end
+        check(out:find("hi", 1, true) ~= nil, "proc output")
+        check(p.exit_code == 0, "proc exit")
+    end
+
+    local q = assert(Proc.new("sleep 5", { timeout = 5 }))
+    os.execute("sleep 0.05")
+    local cancelled = q:cancel()
+    check(cancelled:find("cancelled", 1, true) ~= nil, "proc cancel")
+end
+
+-- tools sandbox / symlink escape
+do
+    local dir = os.tmpname()
+    os.remove(dir)
+    os.execute("mkdir -p " .. shq(dir))
+    local outside = os.tmpname()
+    os.remove(outside)
+    os.execute("mkdir -p " .. shq(outside))
+
+    local Tools = require("core.tools")
+    local Sandbox = require("core.sandbox")
+    local t = Tools.new({ cwd = dir })
+
+    local ap, aerr = t:start_bash("echo async")
+    check(ap ~= nil, "tools start_bash: " .. tostring(aerr))
+    if ap then
+        local out
+        for _ = 1, 100 do
+            local done, o = ap:poll()
+            out = o
+            if done then break end
+            os.execute("sleep 0.05")
+        end
+        check(out:find("async", 1, true) ~= nil, "tools start_bash output")
+    end
+
+    os.execute("ln -s " .. shq(outside) .. " " .. shq(dir .. "/link"))
+    local abs, err = t:resolve("link/x")
+    check(abs == nil and err ~= nil, "tools symlink escape")
+    local blocked = t:execute("write", { path = "link/x", content = "bad" })
+    check(blocked:find("error", 1, true) ~= nil, "tools symlink write blocked")
+
+    if Sandbox.available() then
+        local st = Tools.new({ cwd = dir, sandbox = true })
+        local out = st:execute("bash", { command = "echo hi > in.txt; pwd" })
+        check(out:find(dir, 1, true) ~= nil, "tools sandbox pwd")
+        local f = io.open(dir .. "/in.txt", "r")
+        check(f ~= nil, "tools sandbox inside write")
+        if f then f:close() end
+
+        local marker = outside .. "/escaped"
+        st:execute("bash", { command = "echo x > " .. shq(marker) })
+        local ef = io.open(marker, "r")
+        check(ef == nil, "tools sandbox outside write")
+        if ef then ef:close() end
+    end
+
+    os.execute("rm -rf " .. shq(dir) .. " " .. shq(outside))
+end
+
 -- todo tool + persistence
 do
     local dir = os.tmpname()
@@ -204,6 +279,10 @@ do
     check(msg.tool_calls and #msg.tool_calls == 1, "provider tool calls")
     check(msg.tool_calls[1]["function"].name == "bash", "provider tool name")
     check(msg.tool_calls[1]["function"].arguments == '{"command":"echo hi"}', "provider tool args")
+    check(P.retryable("HTTP 429: rate limit"), "provider retry 429")
+    check(P.retryable("HTTP 500: boom"), "provider retry 500")
+    check(not P.retryable("HTTP 401: auth"), "provider no retry 401")
+    check(P.retryable("http error: timeout"), "provider retry network")
 end
 
 -- agent loop（mock provider/tools/session）
@@ -279,6 +358,11 @@ do
     local mem, merr = Memory.new({ dir = dir, max_mb = 32 })
     check(mem ~= nil, "memory open: " .. tostring(merr))
     if mem then
+        local locked, lerr = Memory.new({ dir = dir, max_mb = 32 })
+        check(locked == nil and lerr ~= nil, "memory lock")
+        local reader = Memory.new({ dir = dir, max_mb = 32, readonly = true })
+        check(reader ~= nil, "memory readonly lock")
+        if reader then reader:close() end
         check(mem:remember_fact("cpp", "move semantics", { "cpp" }) == true, "memory fact")
         local v = mem:get("/agent/knowledge", "cpp")
         check(v ~= nil and v.c == "move semantics", "memory get")
@@ -363,6 +447,96 @@ do
         if m.role == "user" then user_idx = i end
     end
     check(mem_idx ~= nil and user_idx ~= nil and mem_idx < user_idx, "agent memory order")
+end
+
+-- approval policy
+do
+    local A = require("core.approval")
+    local ask = A.new({ mode = "ask" })
+    check(ask:decide("read") == "allow", "approval readonly")
+    check(ask:decide("bash") == "ask", "approval ask")
+    ask:remember("bash")
+    check(ask:decide("bash") == "allow", "approval always")
+    check(A.new({ mode = "deny" }):decide("write") == "deny", "approval deny")
+    check(A.new({ mode = "auto" }):decide("bash") == "allow", "approval auto")
+
+    local V = require("tui.approval_view")
+    local S = require("tui.screen")
+    local v = V.new({ name = "bash", args = { command = "echo hi" } }, { width = 60, height = 12 })
+    local s = S.new(60, 12)
+    v:render(s, 60, 12)
+    local txt = s:snapshot_text()
+    check(txt:find("APPROVAL", 1, true) ~= nil
+        and txt:find("bash", 1, true) ~= nil
+        and txt:find("echo hi", 1, true) ~= nil, "approval view render")
+    check(v:handle({ key = "char", text = "a" }) == "always", "approval view always")
+    check(v:handle({ key = "escape" }) == "reject", "approval view reject")
+end
+
+-- agent approval yield
+do
+    local Context = require("context")
+    local Agent = require("core.agent")
+    local ctx = Context.new({ cwd = "/tmp", max_turns = 2, approval = "ask" })
+    local calls, executed = 0, false
+    local provider = {
+        stream_async = function()
+            calls = calls + 1
+            if calls == 1 then
+                return {
+                    role = "assistant", content = "",
+                    tool_calls = { { id = "c1", type = "function",
+                        ["function"] = { name = "bash", arguments = '{"command":"echo hi"}' } } },
+                }
+            end
+            return { role = "assistant", content = "done" }
+        end,
+    }
+    local tools = {
+        schemas = function() return {} end,
+        execute = function() executed = true; return "ok" end,
+    }
+    local session = { append = function() end }
+    local agent = Agent.new(ctx, provider, tools, session)
+    local co = agent:run_async("hi")
+    local ok, y = coroutine.resume(co)
+    check(ok and y and y.kind == "approval" and y.name == "bash", "agent approval yield")
+    local ok2, y2 = coroutine.resume(co, "once")
+    check(ok2 and executed and coroutine.status(co) == "dead" and y2 == "done",
+        "agent approval once")
+end
+
+-- agent async proc yield
+do
+    local Context = require("context")
+    local Agent = require("core.agent")
+    local ctx = Context.new({ cwd = "/tmp", max_turns = 2 })
+    local calls = 0
+    local provider = {
+        stream_async = function()
+            calls = calls + 1
+            if calls == 1 then
+                return {
+                    role = "assistant", content = "",
+                    tool_calls = { { id = "c1", type = "function",
+                        ["function"] = { name = "bash", arguments = '{"command":"echo hi"}' } } },
+                }
+            end
+            return { role = "assistant", content = "done" }
+        end,
+    }
+    local tools = {
+        schemas = function() return {} end,
+        execute = function() error("should use start_bash") end,
+        start_bash = function(_, command) return { command = command } end,
+    }
+    local session = { append = function() end }
+    local agent = Agent.new(ctx, provider, tools, session)
+    local co = agent:run_async("hi")
+    local ok, y = coroutine.resume(co)
+    check(ok and y and y.kind == "proc", "agent proc yield")
+    local ok2, y2 = coroutine.resume(co, "async-output")
+    check(ok2 and coroutine.status(co) == "dead" and y2 == "done", "agent proc resume")
 end
 
 -- agent reasoning event
@@ -616,6 +790,9 @@ do
         end
     end
     check(saw_reason, "tui transcript reasoning")
+    check(t:build_lines(40) == lines, "tui transcript cache")
+    t:reasoning_append(".")
+    check(t:build_lines(40) ~= lines, "tui transcript cache invalidate")
 
     local s = S.new(30, 6)
     t:render(s, 1, 1, 30, 4)
@@ -964,6 +1141,10 @@ do
     check(#msgs == 2 and msgs[2].tool_calls and msgs[2].tool_calls[1].id == "c1",
         "session messages kv")
     check(mem:session_message_count("kv1") == 2, "session message count")
+    s:append({ role = "user", content = "third" })
+    check(mem:session_message_count("kv1") == 3, "session message count tail")
+    local tail = mem:session_messages("kv1", 2)
+    check(#tail == 2 and tail[2].content == "third", "session messages tail")
 
     local t = Todos.new(ctx, mem)
     t:set({ { content = "a", status = "pending" } })

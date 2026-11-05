@@ -37,7 +37,8 @@ TUI 完成后，“看见”会进一步包含对话界面与截图，形成完�
 ## 特性
 
 - **DeepSeek 流式对话**：OpenAI 兼容 `/chat/completions` + SSE；支持 `thinking` / `reasoning_effort`，TUI 用灰色 `…` 块显示思考过程。
-- **工具循环**：`bash / read / write / edit / todo`，自动执行，文件工具限制在 workspace；TUI 即时显示 `tool:<name>` 与结果。`edit` 成功返回 unified diff，小 diff 自动展开，`Ctrl+G` 可全屏查看。
+- **工具循环**：`bash / read / write / edit / todo`，文件工具限制在 workspace；TUI 即时显示 `tool:<name>` 与结果。`bash` 异步执行，长命令不冻结 TUI，`Ctrl+C` 可取消；`edit` 成功返回 unified diff。
+- **工具审批**：`--approval ask|deny`；危险工具弹出 once / always / reject，always 按 session 记忆；serve/attach 通过协议审批。
 - **本地上下文记忆**：
   - 每个项目目录生成 `mem.bin` + `mem.idx`；
   - C 引擎 mmap 零拷贝载入，约 30 秒落盘一次；
@@ -46,7 +47,7 @@ TUI 完成后，“看见”会进一步包含对话界面与截图，形成完�
 - **有界上下文**：system + 最近 2 轮 + 相关记忆块（默认 8k 字符预算）。
 - **TUI + diff**：`--tui` 交互；assistant Markdown/代码块渲染、`Tab` 文件路径补全、`?` 帮助、启动时自动恢复同 cwd 最近会话；`/session` 选择/新建会话；`Ctrl+G` 打开 `git diff`，支持 split/unified、hunk 跳转、单文件、大 diff 虚拟滚动。
 - **Todo list**：`todo` 工具维护多步任务；状态栏 `todo:done/total`，`Ctrl+T` 打开列表；持久化到本地记忆并随 serve/attach 广播。
-- **serve / attach**：`lite serve --port 8765` 启动 headless 服务端；`lite attach --port 8765` 在任意终端或 tmux tab 实时显示并交互，所有客户端共享同一会话与事件流。待处理 prompt 持久化在 KV，重启可恢复；attach 连接时回放会话历史。
+- **serve / attach**：`lite serve --port 8765` 启动 headless 服务端；`lite attach --port 8765` 在任意终端或 tmux tab 实时显示并交互，所有客户端共享同一会话与事件流。待处理 prompt 持久化在 KV，重启可恢复；attach 连接时回放会话历史；SIGINT/SIGTERM 优雅退出。
 - **定时唤醒**：`serve --wake 300 --task "检查 CI"`（或 `--task-file` / `.lite/wake.md`）；空闲时自动提交，记录上次结果并随 attach 广播。无人值守仍需先补工具审批/沙箱。
 - **纯 native**：LuaJIT + C KV cache；无 Node / WebView / Electron。
 
@@ -124,6 +125,7 @@ return {
 - `Session:append` 会把完整消息（含 tool_calls/tool result）镜像到 KV 的 `/msg/<seq>`；`/session` 优先用它精确重建，turn 摘要仅兜底。
 - todo 按 `session_id` 存在 `/agent/session/<id>/todos`。
 - `mem.bin` 用 `MAP_SHARED` mmap，`mem.idx` 只读 mmap；`cache_get/prefix` 返回指针，C 层零拷贝，Lua 解码 JSON 时才复制。
+- `mem.lock`：TUI/serve 写进程持独占锁，防止多写覆盖；`--recall/state/sessions` 只读不加锁，可在运行中诊断。
 - 轮次按 `session_id` 存；请求召回只注入当前 session 的轮次，facts/working 全局。
 - `/session` 优先从 KV 列同 cwd 会话并重建 messages；JSONL 仅作兼容/兜底，不引入 SQLite。
 - TUI 状态栏显示 `mem:<总条数>`；本轮召回命中显示为 `hit:<n>`。
@@ -176,6 +178,10 @@ build/liblite_cache.so  C 共享库
 | `LITE_INSTRUCTIONS_CHARS` | 4000 | 指令文件截断上限 |
 | `LITE_THINKING` | — | `1` 启用 thinking |
 | `LITE_REASONING_EFFORT` | — | `high` / `medium` / `low` |
+| `LITE_MAX_RETRIES` | `2` | 429/5xx/网络错误重试次数 |
+| `LITE_APPROVAL` | `auto` | 工具审批：`auto` / `ask` / `deny` |
+| `LITE_SANDBOX` | — | `1`/`enforce` 启用 bwrap bash 沙箱 |
+| `LITE_SANDBOX_NET` | `1` | 沙箱内是否允许网络 |
 | `LITE_JSON` | — | 设为 `1` 等价 `--json` |
 | `LITE_SERVE_PORT` | `8765` | serve/attach 默认端口 |
 | `LITE_WAKE_SEC` | — | 定时唤醒间隔（秒） |

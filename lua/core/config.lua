@@ -84,6 +84,17 @@ function M.load(env)
         end)(),
         reasoning_effort = getv("LITE_REASONING_EFFORT") or getv("DEEPSEEK_REASONING_EFFORT")
             or file.reasoning_effort,
+        max_retries = tonumber(getv("LITE_MAX_RETRIES") or file.max_retries) or 2,
+        approval = getv("LITE_APPROVAL") or file.approval or "auto",
+        sandbox = getv("LITE_SANDBOX") or file.sandbox,
+        sandbox_net = (function()
+            local v = getv("LITE_SANDBOX_NET")
+            if v == nil then v = file.sandbox_net end
+            if v == nil then return true end
+            if type(v) == "boolean" then return v end
+            v = tostring(v):lower()
+            return not (v == "0" or v == "false" or v == "off" or v == "no")
+        end)(),
     }
 end
 

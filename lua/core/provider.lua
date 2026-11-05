@@ -134,23 +134,51 @@ local function feed_parser(parser, chunk, on_delta, on_reasoning)
     end
 end
 
--- 阻塞请求（--once / 单测）。
+function M.retryable(err)
+    if not err then return false end
+    err = tostring(err)
+    if err:find("HTTP 429", 1, true) then return true end
+    if err:match("^HTTP 5%d%d") then return true end
+    if err:find("http error", 1, true) then return true end
+    return false
+end
+
+-- 阻塞请求（--once / 单测）；429/5xx/网络错误重试。
 function M.stream(messages, tools, opts, on_delta, on_reasoning)
-    local url, headers, payload, err = build_request(messages, tools, opts)
-    if not url then return nil, err end
-
-    local parser = M.new_parser()
-    local rc, status, raw = http.post_stream(url, headers, payload, function(chunk)
-        feed_parser(parser, chunk, on_delta, on_reasoning)
-    end)
-
-    if rc ~= 0 then
-        return nil, "http error: " .. tostring(raw)
+    local max_retries = tonumber(opts.max_retries) or 2
+    local emitted = false
+    local function d(t)
+        emitted = true
+        if on_delta then on_delta(t) end
     end
-    if status ~= 200 then
-        return nil, string.format("HTTP %d: %s", status, tostring(raw):sub(1, 800))
+    local function r(t)
+        emitted = true
+        if on_reasoning then on_reasoning(t) end
     end
-    return M.finish(parser)
+
+    local last_err
+    for attempt = 0, max_retries do
+        local url, headers, payload, err = build_request(messages, tools, opts)
+        if not url then return nil, err end
+
+        local parser = M.new_parser()
+        local rc, status, raw = http.post_stream(url, headers, payload, function(chunk)
+            feed_parser(parser, chunk, d, r)
+        end)
+
+        if rc == 0 and status == 200 then return M.finish(parser) end
+        if rc ~= 0 then
+            last_err = "http error: " .. tostring(raw)
+        else
+            last_err = string.format("HTTP %d: %s", status, tostring(raw):sub(1, 800))
+        end
+
+        if emitted or attempt >= max_retries or not M.retryable(last_err) then
+            return nil, last_err
+        end
+        os.execute("sleep " .. tostring(0.5 * (attempt + 1)))
+    end
+    return nil, last_err
 end
 
 -- 非阻塞请求（TUI）：返回 req，完成后用 finish_request(req) 取结果。
@@ -178,11 +206,31 @@ function M.finish_request(req)
     return M.finish(req.parser)
 end
 
--- 协程入口：yield 一次 {kind="http", req=...}，由驱动方 poll 后 resume 结果。
+-- 协程入口：yield {kind="http", req=...}；可重试时重新发起请求。
 function M.stream_async(messages, tools, opts, on_delta, on_reasoning)
-    local req, err = M.start(opts.multi, messages, tools, opts, on_delta, on_reasoning)
-    if not req then return nil, err end
-    return coroutine.yield({ kind = "http", req = req })
+    local max_retries = tonumber(opts.max_retries) or 2
+    local emitted = false
+    local function d(t)
+        emitted = true
+        if on_delta then on_delta(t) end
+    end
+    local function r(t)
+        emitted = true
+        if on_reasoning then on_reasoning(t) end
+    end
+
+    local last_err
+    for attempt = 0, max_retries do
+        local req, err = M.start(opts.multi, messages, tools, opts, d, r)
+        if not req then return nil, err end
+        local assistant, err2 = coroutine.yield({ kind = "http", req = req })
+        if assistant then return assistant end
+        last_err = err2
+        if emitted or attempt >= max_retries or not M.retryable(err2) then
+            return nil, err2
+        end
+    end
+    return nil, last_err
 end
 
 return M

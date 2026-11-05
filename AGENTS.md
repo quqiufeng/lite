@@ -10,6 +10,12 @@
 
 任何新功能或架构决策（TUI、diff、agent、provider、工具、记忆等）动手前，**必须**先用 code search 查 Pi / Reasonix / opencode 的参考实现，再决定方案；结论标注证据等级（`[static]` / `[verified]`）。不要凭记忆猜。
 
+**检索配比：90% code search / 10% 精确定位。**
+
+- **90%**：用 `ai_code_search.sh search`、`ctx.py`、`cache_query` 做语义、调用图、数据流探索，回答“在哪、谁调用、什么形态”。
+- **10%**：只对命中的文件/符号做精确读取（`read` / `snippet`），确认签名、分支、schema。
+- **不要**全仓 `grep`/`find` 猜实现；静态索引只是线索，关键行为仍要测试/运行验证（`[static]` → `[verified]`）。
+
 工具与缓存（命令都在 `/opt/my_db` 下执行）：
 
 | 仓库 | 源码 | 缓存 | KV 命名空间 |
@@ -64,7 +70,7 @@ cd /opt/my_db
 - 无 UI 核心：DeepSeek streaming provider、bash/read/write/edit 工具、agent 循环、JSONL 会话。
 - `lua/main.lua --once "<prompt>"`：无 UI 流式执行 + 工具循环。
 - **上下文记忆**：`/opt/my_db` KV cache C 引擎（mmap 零拷贝）→ `liblite_cache.so` → `lua/ffi/cache.lua` → `lua/core/memory.lua`。
-- 记忆文件：在**当前目录**生成 `mem.bin` + `mem.idx`，启动时 mmap 载入（`MAP_SHARED`/只读，C 层零拷贝），约 30 秒落盘一次（`LITE_MEMORY_FLUSH`）。
+- 记忆文件：在**当前目录**生成 `mem.bin` + `mem.idx`，启动时 mmap 载入（`MAP_SHARED`/只读，C 层零拷贝），约 30 秒落盘一次（`LITE_MEMORY_FLUSH`）。`mem.lock` 为写进程独占锁；只读诊断命令不加锁。
 - 会话存储：KV 内 `/agent/session/<id>/meta` + `/agent/index/cwd/<hash>/<id>` + `/msg/<seq>`（完整消息）+ `/turn/<n>`（摘要）+ `/todos`（session 级）；`/session` 从 KV 列会话/重建上下文，JSONL 仅兜底。
 - 上下文策略：prompt 只留 system + 最近 2 轮 + 相关记忆块（8k 字符预算）；旧信息写入 `mem.bin`，需要时用 `recall` 工具/`--recall` 查询。
 - 记忆接入：agent 自动注入相关记忆并在回答后写入 turn；工具新增 `remember/recall`。
@@ -241,6 +247,10 @@ artifacts/<timestamp>/<case>/
 - 记忆：`LITE_MEMORY_MB` / `LITE_MEMORY_FLUSH` / `LITE_CONTEXT_CHARS` / `LITE_CONTEXT_TURNS`。
 - Prompt：自动加载 `AGENTS.md`/`CLAUDE.md`/`.lite/instructions.md`；`LITE_INSTRUCTIONS_FILE` 覆盖，`/dev/null` 禁用；`LITE_INSTRUCTIONS_CHARS` 截断上限。
 - Thinking：`LITE_THINKING` / `DEEPSEEK_THINKING`；`LITE_REASONING_EFFORT` / `DEEPSEEK_REASONING_EFFORT`；TUI/serve 也支持 `--thinking` / `--reasoning-effort`。
+- 重试：`LITE_MAX_RETRIES`（默认 2，429/5xx/网络错误）；serve 用 signalfd 处理 SIGINT/SIGTERM。
+- 沙箱：`LITE_SANDBOX=1` 用 bwrap（只读根 + workspace 可写），不可用则 fail closed；`LITE_SANDBOX_NET=0` 禁止网络。
+- 异步 bash：`core/proc.lua` 后台进程 + 临时输出文件；TUI/serve 轮询，长命令不冻结，`Ctrl+C` 取消。
+- 审批：`LITE_APPROVAL=auto|ask|deny` / `--approval`；ask 时 TUI/serve 弹 once/always/reject，always 记在 `/agent/session/<id>/approvals`。
 - 上下文：窗口裁剪生成 `<session_context>` digest（`/agent/session/<id>/context`），预算扣除 memory/todo/digest；细节仍用 `recall`。
 - serve/wake：`LITE_SERVE_PORT` / `LITE_WAKE_SEC` / `LITE_WAKE_TASK` / `LITE_WAKE_TASK_FILE` / `LITE_WAKE_MAX`。
 - 当前目录的 `mem.bin` / `mem.idx` 属于项目数据，不要提交。

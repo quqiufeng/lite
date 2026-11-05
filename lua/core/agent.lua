@@ -1,18 +1,26 @@
 -- Agent 循环：messages → provider → tool calls → messages。
 local cjson = require("cjson")
 local Prompt = require("core.prompt")
+local Approval = require("core.approval")
 
 local M = {}
 M.__index = M
 
 function M.new(ctx, provider, tools, session, memory)
-    return setmetatable({
+    local self = setmetatable({
         ctx = ctx,
         provider = provider,
         tools = tools,
         session = session,
         memory = memory,
+        async = false,
     }, M)
+    self.approval = Approval.new({
+        mode = ctx.settings.approval,
+        memory = memory,
+        session_id = ctx.session.id,
+    })
+    return self
 end
 
 function M:system_prompt()
@@ -245,7 +253,35 @@ function M:_loop(text, stream)
             else
                 ctx:set_status("tool")
                 ctx:emit("tool_start", name, args)
-                result = self.tools:execute(name, args)
+
+                local function run_tool()
+                    if self.async and name == "bash" and self.tools.start_bash then
+                        local proc, perr = self.tools:start_bash(args.command or "")
+                        if not proc then return "error: " .. tostring(perr) end
+                        local out = coroutine.yield({ kind = "proc", proc = proc })
+                        return tostring(out or "")
+                    end
+                    return self.tools:execute(name, args)
+                end
+
+                local decision = self.approval:decide(name)
+                if decision == "allow" then
+                    result = run_tool()
+                elseif decision == "deny" then
+                    result = "error: tool call denied by policy"
+                elseif not self.async then
+                    result = "error: approval required (non-interactive)"
+                else
+                    local answer = coroutine.yield({
+                        kind = "approval", name = name, args = args,
+                    })
+                    if answer == "always" then self.approval:remember(name) end
+                    if answer == "once" or answer == "always" then
+                        result = run_tool()
+                    else
+                        result = "error: tool call rejected by user"
+                    end
+                end
             end
             ctx:emit("tool_result", name, result)
             tool_notes[#tool_notes + 1] = {
@@ -274,6 +310,7 @@ end
 
 -- 阻塞入口：--once / 单测。
 function M:run(text)
+    self.async = false
     return self:_loop(text, function(messages, tools, opts, on_delta, on_reasoning)
         return self.provider.stream(messages, tools, opts, on_delta, on_reasoning)
     end)
@@ -281,6 +318,7 @@ end
 
 -- 协程入口：TUI 驱动，yield {kind="http", req=...}。
 function M:run_async(text)
+    self.async = true
     return coroutine.create(function()
         return self:_loop(text, function(messages, tools, opts, on_delta, on_reasoning)
             return self.provider.stream_async(messages, tools, opts, on_delta, on_reasoning)

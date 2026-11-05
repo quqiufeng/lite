@@ -9,6 +9,7 @@ local Diff = require("tui.diff")
 local DiffView = require("tui.diff_view")
 local TodoView = require("tui.todo_view")
 local HelpView = require("tui.help_view")
+local ApprovalView = require("tui.approval_view")
 local Complete = require("tui.complete")
 local SessionView = require("tui.session_view")
 local Session = require("core.session")
@@ -40,6 +41,9 @@ function M.run(ctx, agent, memory, opts)
     local diff_view
     local todo_view
     local help_view
+    local approval_view
+    local active_approval
+    local active_proc
     local session_view
     local todo_items = ctx.session.todos or {}
     local last_tool_diff
@@ -206,6 +210,12 @@ function M.run(ctx, agent, memory, opts)
         co = nil
         active_req = nil
         current_tool = nil
+        approval_view = nil
+        active_approval = nil
+        if active_proc then
+            active_proc:cancel()
+            active_proc = nil
+        end
         transcript:end_stream()
     end
 
@@ -221,6 +231,13 @@ function M.run(ctx, agent, memory, opts)
         end
         if type(y) == "table" and y.kind == "http" then
             active_req = y.req
+        elseif type(y) == "table" and y.kind == "approval" then
+            active_approval = y
+            approval_view = ApprovalView.new(y, { width = w, height = h })
+            if draw then draw() end
+        elseif type(y) == "table" and y.kind == "proc" then
+            active_proc = y.proc
+            if draw then draw() end
         end
     end
 
@@ -322,6 +339,15 @@ function M.run(ctx, agent, memory, opts)
     end
 
     local function handle(ev)
+        if approval_view then
+            local decision = approval_view:handle(ev)
+            if decision then
+                approval_view = nil
+                active_approval = nil
+                resume_agent(decision)
+            end
+            return
+        end
         if help_view then
             if help_view:handle(ev) == "close" then help_view = nil end
             return
@@ -351,7 +377,11 @@ function M.run(ctx, agent, memory, opts)
 
         if k == "ctrl" then
             if ev.char == "c" then
-                if busy then
+                if active_proc then
+                    local out = active_proc:cancel()
+                    active_proc = nil
+                    resume_agent(out)
+                elseif busy then
                     cancel()
                 elseif not composer:is_empty() then
                     composer:clear()
@@ -412,7 +442,10 @@ function M.run(ctx, agent, memory, opts)
 
     draw = function()
         screen:clear()
-        if help_view then
+        if approval_view then
+            approval_view:render(screen, w, h)
+            screen.cursor.visible = false
+        elseif help_view then
             help_view:render(screen, w, h)
             screen.cursor.visible = false
         elseif session_view then
@@ -453,6 +486,7 @@ function M.run(ctx, agent, memory, opts)
             if diff_view then diff_view:set_size(w, h) end
             if todo_view then todo_view:set_size(w, h) end
             if help_view then help_view:set_size(w, h) end
+            if approval_view then approval_view:set_size(w, h) end
             if session_view then session_view:set_size(w, h) end
         end
 
@@ -476,6 +510,18 @@ function M.run(ctx, agent, memory, opts)
             end
         end
 
+        if active_proc then
+            local done, out = active_proc:poll()
+            if done then
+                local code = active_proc.exit_code
+                active_proc = nil
+                if code and code ~= 0 then
+                    out = out .. "\n[exit " .. tostring(code) .. "]"
+                end
+                resume_agent(out)
+            end
+        end
+
         if memory then memory:tick() end
         local now = os.time()
         if now ~= last_stats then
@@ -486,6 +532,8 @@ function M.run(ctx, agent, memory, opts)
 
         draw()
     end
+
+    if active_proc then active_proc:cancel() end
 end
 
 function M.layout(h, composer)

@@ -1,7 +1,21 @@
 -- 上下文记忆：基于 my_db KV cache（mmap 零拷贝 + 前缀/模糊/标签搜索）。
 local cjson = require("cjson")
+local ffi = require("ffi")
+local bit = require("bit")
 local cache = require("ffi.cache")
 local Prompt = require("core.prompt")
+local net = require("core.net")
+
+pcall(ffi.cdef, [[
+int open(const char *pathname, int flags, unsigned int mode);
+int flock(int fd, int operation);
+]])
+
+local O_CREAT = 0x40
+local O_RDWR = 2
+local LOCK_EX = 2
+local LOCK_NB = 4
+local LOCK_UN = 8
 
 local M = {}
 M.__index = M
@@ -40,11 +54,27 @@ function M.new(opts)
         base = opts.cwd or os.getenv("PWD") or "."
     end
     os.execute("mkdir -p '" .. base:gsub("'", "'\\''") .. "'")
+
+    local lock_fd = ffi.C.open(base .. "/mem.lock", bit.bor(O_CREAT, O_RDWR), 420)
+    if lock_fd < 0 then
+        return nil, "cannot open " .. base .. "/mem.lock"
+    end
+    -- 写进程持独占锁；只读诊断命令不加锁，允许在 TUI/serve 运行时读取。
+    if not opts.readonly and ffi.C.flock(lock_fd, bit.bor(LOCK_EX, LOCK_NB)) ~= 0 then
+        net.close(lock_fd)
+        return nil, "memory already in use: " .. base
+    end
+
     local h = cache.open(base, (opts.max_mb or 100) * 1024 * 1024)
-    if not h then return nil, "cache_open failed: " .. base end
+    if not h then
+        ffi.C.flock(lock_fd, LOCK_UN)
+        net.close(lock_fd)
+        return nil, "cache_open failed: " .. base
+    end
     return setmetatable({
         h = h,
         dir = base,
+        lock_fd = lock_fd,
         flush_ms = (tonumber(opts.flush_sec) or 30) * 1000,
         last_sync = os.time() * 1000,
     }, M)
@@ -55,6 +85,11 @@ function M:close()
         cache.sync(self.h)
         cache.close(self.h)
         self.h = nil
+    end
+    if self.lock_fd then
+        ffi.C.flock(self.lock_fd, LOCK_UN)
+        net.close(self.lock_fd)
+        self.lock_fd = nil
     end
 end
 
@@ -95,6 +130,10 @@ end
 
 function M:search_prefix(prefix, opts)
     return cache.search_prefix(self.h, prefix, opts or { max_results = 100 })
+end
+
+function M:search_range(start_key, end_key, opts)
+    return cache.search_range(self.h, start_key, end_key, opts or { max_results = 100 })
 end
 
 function M:session_meta(id)
@@ -263,6 +302,8 @@ end
 
 -- 从记忆导入某个 session 的历史轮次（JSONL 缺失时兜底）。
 function M:session_message_count(id)
+    local meta = self:session_meta(id)
+    if meta and tonumber(meta.messages) then return tonumber(meta.messages) end
     local rows = self:search_prefix(
         string.format("/agent/session/%s/msg/", tostring(id)),
         { max_results = 0 })
@@ -273,9 +314,19 @@ function M:session_messages(session_id, limit)
     limit = limit or 20
     local id = tostring(session_id)
 
-    local msg_rows = self:search_prefix(
-        string.format("/agent/session/%s/msg/", id),
-        { max_results = 0 })
+    local msg_prefix = string.format("/agent/session/%s/msg/", id)
+    local meta = self:session_meta(id)
+    local count = meta and tonumber(meta.messages) or nil
+    local msg_rows
+    if count and count > 0 then
+        local start = math.max(1, count - limit + 1)
+        msg_rows = self:search_range(
+            msg_prefix .. string.format("%08d", start),
+            msg_prefix .. "99999999~",
+            { max_results = limit })
+    else
+        msg_rows = self:search_prefix(msg_prefix, { max_results = 0 })
+    end
     if #msg_rows > 0 then
         local msgs = {}
         for _, r in ipairs(msg_rows) do

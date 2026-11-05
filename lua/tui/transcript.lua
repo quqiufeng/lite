@@ -66,6 +66,7 @@ function M.new()
         scroll = 0,
         total = 0,
         max_scroll = 0,
+        _cache = nil,
     }, M)
 end
 
@@ -81,6 +82,7 @@ function M:clear()
     self.reasoning_block = nil
     self.last_tool = nil
     self.scroll = 0
+    self._cache = nil
 end
 
 function M:stream_append(text)
@@ -133,10 +135,24 @@ end
 
 function M:toggle_last_tool()
     local b = self.last_tool
-    if b then b.expanded = not b.expanded end
+    if b then
+        b.expanded = not b.expanded
+        self._cache = nil
+    end
 end
 
 function M:build_lines(w)
+    local sig_parts = { tostring(w) }
+    for _, b in ipairs(self.blocks) do
+        local t = b.text or ""
+        local r = b.result or ""
+        sig_parts[#sig_parts + 1] = string.format("%d:%d:%d:%s:%s:%s:%s",
+            #t, #r, b.expanded and 1 or 0,
+            t:sub(1, 16), t:sub(-16), r:sub(1, 16), r:sub(-16))
+    end
+    local sig = table.concat(sig_parts, "|")
+    if self._cache and self._cache.sig == sig then return self._cache.lines end
+
     local lines = {}
     for _, b in ipairs(self.blocks) do
         local text = b.text or ""
@@ -190,6 +206,7 @@ function M:build_lines(w)
             end
         end
     end
+    self._cache = { sig = sig, lines = lines }
     return lines
 end
 

@@ -28,6 +28,8 @@ lite — DeepSeek 终端 coding agent
   --json                       机器可读 JSONL 输出（AI agent 友好）
   --thinking                   启用 DeepSeek thinking（reasoning_content）
   --reasoning-effort LEVEL     high | medium | low
+  --sandbox                    bash 使用 bwrap 沙箱（需安装 bubblewrap）
+  --approval auto|ask|deny     工具审批策略（默认 auto）
 
 环境:
   DEEPSEEK_API_KEY             必需
@@ -115,6 +117,12 @@ local function parse_flags(list)
         elseif a == "--reasoning-effort" then
             flags.reasoning_effort = list[i + 1]
             i = i + 2
+        elseif a == "--sandbox" then
+            flags.sandbox = true
+            i = i + 1
+        elseif a == "--approval" then
+            flags.approval = list[i + 1]
+            i = i + 2
         else
             pos[#pos + 1] = a
             i = i + 1
@@ -135,6 +143,8 @@ elseif cmd == "serve" or cmd == "--serve" then
     local config = require("core.config").load()
     if flags.thinking then config.thinking = true end
     if flags.reasoning_effort then config.reasoning_effort = flags.reasoning_effort end
+    if flags.sandbox then config.sandbox = "enforce" end
+    if flags.approval then config.approval = flags.approval end
     if not config.api_key or config.api_key == "" then
         io.stderr:write("lite: missing DEEPSEEK_API_KEY\n")
         os.exit(2)
@@ -180,6 +190,7 @@ elseif cmd == "state" or cmd == "--state" or cmd == "sessions" or cmd == "--sess
         dir = config.memory_dir or config.cwd,
         max_mb = config.memory_mb,
         flush_sec = config.memory_flush,
+        readonly = true,
     })
     if not memory then
         io.stderr:write("lite: " .. tostring(merr) .. "\n")
@@ -244,6 +255,7 @@ elseif cmd == "--recall" then
         dir = config.memory_dir or config.cwd,
         max_mb = config.memory_mb,
         flush_sec = config.memory_flush,
+        readonly = true,
     })
     if not memory then
         if json then emit({ type = "error", error = tostring(merr) })
@@ -267,6 +279,8 @@ elseif cmd == "--tui" then
     local config = require("core.config").load()
     if flags.thinking then config.thinking = true end
     if flags.reasoning_effort then config.reasoning_effort = flags.reasoning_effort end
+    if flags.sandbox then config.sandbox = "enforce" end
+    if flags.approval then config.approval = flags.approval end
     if not flags.snapshot and (not config.api_key or config.api_key == "") then
         io.stderr:write("lite: missing DEEPSEEK_API_KEY\n")
         os.exit(2)
@@ -291,6 +305,8 @@ elseif cmd == "--tui" then
         context_turns = config.context_turns,
         thinking = config.thinking,
         reasoning_effort = config.reasoning_effort,
+        max_retries = config.max_retries,
+        approval = config.approval,
     })
     local memory, merr = Memory.new({
         dir = config.memory_dir or config.cwd,
@@ -310,7 +326,13 @@ elseif cmd == "--tui" then
     end
     ctx.settings.multi = multi
 
-    local tools = Tools.new({ cwd = config.cwd, memory = memory, ctx = ctx })
+    local tools = Tools.new({
+        cwd = config.cwd,
+        memory = memory,
+        ctx = ctx,
+        sandbox = config.sandbox,
+        sandbox_net = config.sandbox_net,
+    })
 
     local restored, restored_id, restored_turn = {}, nil, 0
     for _, meta in ipairs(memory:list_sessions(config.cwd, 5)) do
@@ -415,6 +437,8 @@ elseif cmd == "--once" then
         context_turns = config.context_turns,
         thinking = config.thinking,
         reasoning_effort = config.reasoning_effort,
+        max_retries = config.max_retries,
+        approval = config.approval,
     })
     local memory, merr = Memory.new({
         dir = config.memory_dir or config.cwd,
@@ -427,7 +451,13 @@ elseif cmd == "--once" then
         os.exit(2)
     end
 
-    local tools = Tools.new({ cwd = config.cwd, memory = memory, ctx = ctx })
+    local tools = Tools.new({
+        cwd = config.cwd,
+        memory = memory,
+        ctx = ctx,
+        sandbox = config.sandbox,
+        sandbox_net = config.sandbox_net,
+    })
     local session = Session.new(ctx, { memory = memory })
     local agent = Agent.new(ctx, Provider, tools, session, memory)
 

@@ -113,6 +113,12 @@ function M:append(msg)
         local ttl = self.memory.TTL and self.memory.TTL.long or 0
         self.memory:put("/agent/session",
             self.id .. "/msg/" .. string.format("%08d", self.seq), msg, ttl)
+        local meta = self.memory:session_meta(self.id)
+        if meta then
+            meta.messages = self.seq
+            self.memory:put("/agent/session", self.id .. "/meta", meta,
+                self.memory.TTL and self.memory.TTL.permanent or 0)
+        end
     end
     return ok
 end

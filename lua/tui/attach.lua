@@ -10,6 +10,7 @@ local Diff = require("tui.diff")
 local DiffView = require("tui.diff_view")
 local TodoView = require("tui.todo_view")
 local HelpView = require("tui.help_view")
+local ApprovalView = require("tui.approval_view")
 local net = require("core.net")
 
 local M = {}
@@ -52,6 +53,8 @@ function M.run(opts)
     local diff_view
     local todo_view
     local help_view
+    local approval_view
+    local approval_id
     local todo_items = {}
     local current_tool
     local hits = 0
@@ -145,6 +148,14 @@ function M.run(opts)
         elseif t == "wake" then
             transcript:add("info", string.format("scheduled wake #%d%s",
                 ev.run or 0, ev.task and (" · " .. tostring(ev.task)) or ""))
+        elseif t == "approval" then
+            approval_id = ev.id
+            approval_view = ApprovalView.new(ev, { width = w, height = h })
+        elseif t == "approval_reply" then
+            if approval_id == ev.id then
+                approval_view = nil
+                approval_id = nil
+            end
         elseif t == "diff" then
             open_diff(ev.patch)
         end
@@ -164,6 +175,15 @@ function M.run(opts)
     end
 
     local function handle(ev)
+        if approval_view then
+            local decision = approval_view:handle(ev)
+            if decision then
+                send_obj({ type = "approval", id = approval_id, decision = decision })
+                approval_view = nil
+                approval_id = nil
+            end
+            return
+        end
         if help_view then
             if help_view:handle(ev) == "close" then help_view = nil end
             return
@@ -251,6 +271,7 @@ function M.run(opts)
                 if diff_view then diff_view:set_size(w, h) end
                 if todo_view then todo_view:set_size(w, h) end
                 if help_view then help_view:set_size(w, h) end
+                if approval_view then approval_view:set_size(w, h) end
             end
 
             local _, revs = net.poll({ 0, fd }, 15)
@@ -273,7 +294,10 @@ function M.run(opts)
             if busy then spinner_i = (spinner_i + 1) % #SPINNER end
 
             screen:clear()
-            if help_view then
+            if approval_view then
+                approval_view:render(screen, w, h)
+                screen.cursor.visible = false
+            elseif help_view then
                 help_view:render(screen, w, h)
                 screen.cursor.visible = false
             elseif todo_view then
