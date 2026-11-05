@@ -199,8 +199,21 @@ automation/                可选的 ACP/外部客户端
 ./tools/run.sh --help
 ./tools/test.sh            # check + unit + cli + tui + serve smoke
 ./tools/package.sh         # dist/lite-linux-x64.tar.gz
-./tools/install.sh         # 可选：安装到 ~/.local/share/lite
+./tools/release.sh         # build + package + install /usr/local/bin
+./tools/release.sh --no-install          # 只构建打包
+PREFIX=$HOME/.local ./tools/release.sh   # 安装到用户目录
+./tools/install.sh         # 可选：安装到 $PREFIX/share/lite
 ```
+
+### 4.1 编译发布
+
+`tools/release.sh` = `build.sh` + `package.sh` + `install.sh`。
+
+- 默认安装到 `/usr/local`：二进制链接 `<prefix>/bin/lite`，应用在 `<prefix>/share/lite`。
+- 目标目录不可写时自动用 `sudo`（可用 `--prefix DIR` 或 `PREFIX=DIR` 改前缀）。
+- `--no-install` 只构建并生成 `dist/lite-linux-x64.tar.gz`。
+- `.env` 不会被打包；key 放在运行目录 `.env` 或 `~/.config/lite/config.lua`。
+- 发布后自检：`lite --version`、`lite --check`、`lite state --json`。
 
 - `tools/lite-lua`：带 LUA_PATH/LUA_CPATH 的 LuaJIT 包装。
 - `tools/lite`：启动入口（等同 run.sh）。
