@@ -11,11 +11,34 @@ local CSI_KEYS = {
     ["1~"] = "home", ["7~"] = "home", ["4~"] = "end", ["8~"] = "end",
 }
 
+local function mouse_event(code, x, y)
+    if code and code >= 64 then
+        local b = code % 4
+        if b == 0 then return { key = "wheel", dy = 1, x = x, y = y } end
+        if b == 1 then return { key = "wheel", dy = -1, x = x, y = y } end
+    end
+    return { key = "mouse" }
+end
+
+local function parse_mouse(seq)
+    local btn, x, y = seq:match("^<(%-?%d+);(%d+);(%d+)[Mm]$")
+    if not btn then return nil end
+    return mouse_event(tonumber(btn), tonumber(x), tonumber(y))
+end
+
 local function parse_escape(buf, i)
     local b2 = buf:byte(i + 1)
     if not b2 then return nil end
 
     if b2 == 0x5b then -- '['
+        -- X10 mouse: ESC [ M Cb Cx Cy（未启用 SGR 的终端）
+        if buf:byte(i + 2) == 0x4d then
+            if #buf < i + 5 then return nil end
+            local code = buf:byte(i + 3) - 32
+            local x = buf:byte(i + 4) - 32
+            local y = buf:byte(i + 5) - 32
+            return "x10", i + 6, mouse_event(code, x, y)
+        end
         local final
         for j = i + 2, #buf do
             local b = buf:byte(j)
@@ -25,6 +48,8 @@ local function parse_escape(buf, i)
         local seq = buf:sub(i + 2, final)
         local key = CSI_KEYS[seq]
         if key then return seq, final + 1, { key = key } end
+        local mouse = parse_mouse(seq)
+        if mouse then return seq, final + 1, mouse end
         return seq, final + 1, { key = "escape", seq = seq }
     elseif b2 == 0x4f then -- 'O'
         local b3 = buf:byte(i + 2)
@@ -56,6 +81,11 @@ function M:feed(s)
                 if not endp then break end
                 events[#events + 1] = { key = "paste", text = buf:sub(i + 6, endp - 1) }
                 i = endp + 6
+            elseif buf:byte(i + 1) == 0x1b then
+                -- 连续 ESC：两个独立按键，不能吞成一个。
+                events[#events + 1] = { key = "escape" }
+                events[#events + 1] = { key = "escape" }
+                i = i + 2
             else
                 local _, ni, ev = parse_escape(buf, i)
                 if not ni then break end

@@ -13,6 +13,7 @@ local ApprovalView = require("tui.approval_view")
 local Complete = require("tui.complete")
 local SessionView = require("tui.session_view")
 local Session = require("core.session")
+local Reload = require("core.reload")
 local CoreText = require("core.text")
 local http = require("core.http")
 
@@ -39,6 +40,8 @@ function M.run(ctx, agent, memory, opts)
     local busy = false
     local quitting = false
     local co, active_req
+    local queue = {}
+    local last_escape = 0
     local diff_view
     local todo_view
     local help_view
@@ -55,7 +58,7 @@ function M.run(ctx, agent, memory, opts)
     local mem_count = 0
     local last_stats = -1
 
-    local HINT = "lite TUI · Enter 发送 · Ctrl+J 换行 · Tab 补全 · /session 会话 · Ctrl+G diff · Ctrl+T todo · ? help · Ctrl+D 退出"
+    local HINT = "lite TUI · Enter 发送 · Ctrl+J 换行 · Tab 补全 · /session 会话 · Esc×2 终止 · Ctrl+G diff · Ctrl+T todo · ? help · Ctrl+D 退出"
 
     local function populate(messages, label)
         transcript:clear()
@@ -166,6 +169,17 @@ function M.run(ctx, agent, memory, opts)
             switch_new()
         elseif name == "help" then
             help_view = HelpView.new({ width = w, height = h })
+        elseif name == "reload" then
+            if busy then
+                transcript:add("info", "无法重载：当前正在执行")
+            else
+                local ok, err = Reload.lua(agent, ctx)
+                if ok then
+                    transcript:add("info", "reloaded lua (tools/prompt/ffi); C .so changes need restart")
+                else
+                    transcript:add("info", "reload failed: " .. tostring(err))
+                end
+            end
         elseif name == "quit" then
             quitting = true
         else
@@ -210,6 +224,7 @@ function M.run(ctx, agent, memory, opts)
     end)
 
     local resume_agent
+    local start_next
 
     local function finish_agent()
         busy = false
@@ -223,16 +238,19 @@ function M.run(ctx, agent, memory, opts)
             active_proc = nil
         end
         transcript:end_stream()
+        last_escape = 0
     end
 
     local function on_resume(ok, y)
         if not ok then
             finish_agent()
             transcript:add("error", tostring(y))
+            if start_next then start_next() end
             return
         end
         if coroutine.status(co) == "dead" then
             finish_agent()
+            if start_next then start_next() end
             return
         end
         if type(y) == "table" and y.kind == "http" then
@@ -253,6 +271,29 @@ function M.run(ctx, agent, memory, opts)
         on_resume(ok, y)
     end
 
+    local function start_prompt(text, block)
+        if block then
+            block.kind = "user"
+            transcript._cache = nil
+        else
+            transcript:add("user", text)
+        end
+        transcript:reset_scroll()
+        memory_hits = 0
+        last_escape = 0
+        busy = true
+        co = agent:run_async(text)
+        resume_agent()
+        if draw then draw() end
+    end
+
+    start_next = function()
+        if #queue == 0 then return false end
+        local item = table.remove(queue, 1)
+        start_prompt(item.text, item.block)
+        return true
+    end
+
     local function submit()
         local text = composer:get_text()
         if text == "" then return end
@@ -268,15 +309,17 @@ function M.run(ctx, agent, memory, opts)
             handle_command(text)
             return
         end
-        if busy then return end
+
         composer:push_history(text)
         composer:clear()
-        transcript:add("user", text)
-        transcript:reset_scroll()
-        memory_hits = 0
-        busy = true
-        co = agent:run_async(text)
-        resume_agent()
+        if busy then
+            local block = transcript:add("queued", text)
+            queue[#queue + 1] = { text = text, block = block }
+            transcript:reset_scroll()
+            if draw then draw() end
+            return
+        end
+        start_prompt(text)
     end
 
     local function cancel()
@@ -351,6 +394,18 @@ function M.run(ctx, agent, memory, opts)
     end
 
     local function handle(ev)
+        if ev.key == "wheel" then
+            if not (approval_view or help_view or session_view or todo_view or diff_view) then
+                local _, th = M.layout(h, composer)
+                if ev.dy > 0 then
+                    transcript:scroll_up(3)
+                else
+                    transcript:scroll_down(3)
+                end
+                if draw then draw() end
+            end
+            return
+        end
         if approval_view then
             local decision = approval_view:handle(ev)
             if decision then
@@ -386,6 +441,22 @@ function M.run(ctx, agent, memory, opts)
         end
 
         local k = ev.key
+        if k ~= "escape" then last_escape = 0 end
+
+        if k == "escape" then
+            if busy then
+                local now = os.time()
+                if last_escape > 0 and now - last_escape <= 2 then
+                    last_escape = 0
+                    cancel()
+                else
+                    last_escape = now
+                    transcript:add("info", "再按一次 Esc 终止当前回复")
+                    if draw then draw() end
+                end
+            end
+            return
+        end
 
         if k == "ctrl" then
             if ev.char == "c" then
@@ -480,12 +551,13 @@ function M.run(ctx, agent, memory, opts)
                 mem = mem_count,
                 hits = memory_hits,
                 todos = todo_items,
+                queue = #queue,
                 spinner = busy and SPINNER[spinner_i + 1] or nil,
                 status = current_tool and ("tool:" .. current_tool) or nil,
             })
             screen.cursor.x = cur_x
             screen.cursor.y = cur_y
-            screen.cursor.visible = not busy
+            screen.cursor.visible = (not busy) or not composer:is_empty()
         end
         Terminal.write(screen:render())
     end

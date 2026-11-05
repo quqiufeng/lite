@@ -14,6 +14,7 @@ function M.new(ctx, provider, tools, session, memory)
         tools = tools,
         session = session,
         memory = memory,
+        prompt = Prompt,
         async = false,
     }, M)
     self.approval = Approval.new({
@@ -25,7 +26,7 @@ function M.new(ctx, provider, tools, session, memory)
 end
 
 function M:system_prompt()
-    return Prompt.system_prompt(self.ctx, { tools = self.tools:schemas() })
+    return self.prompt.system_prompt(self.ctx, { tools = self.tools:schemas() })
 end
 
 function M:ensure_system()
@@ -138,7 +139,7 @@ end
 function M:request_messages(text)
     local block = ""
     if self.memory then
-        local query = Prompt.recall_query(text, self.ctx.session.messages)
+        local query = self.prompt.recall_query(text, self.ctx.session.messages)
         local items
         block, items = self.memory:context(query, {
             limit = 8,
@@ -148,7 +149,7 @@ function M:request_messages(text)
         self.ctx:emit("memory", items or {})
     end
 
-    local todo_block = Prompt.todos_block(self.ctx.session.todos)
+    local todo_block = self.prompt.todos_block(self.ctx.session.todos)
     local base_reserve = #block + #todo_block + 200
     local msgs, trimmed, dropped = self:window_messages(base_reserve)
 
@@ -319,7 +320,7 @@ function M:_loop(text, stream)
         ctx:set_status("thinking")
     end
 
-    local err = "max turns reached"
+    local err = string.format("max turns reached (%d; raise with --max-turns or LITE_MAX_TURNS)", ctx.settings.max_turns)
     ctx:fail(err)
     ctx:end_turn()
     return nil, err

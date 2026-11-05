@@ -7,6 +7,7 @@ M.__index = M
 
 local STYLE = {
     user = "cyan",
+    queued = "yellow",
     assistant = "default",
     reasoning = "gray",
     tool = "yellow",
@@ -16,6 +17,7 @@ local STYLE = {
 
 local PREFIX = {
     user = "› ",
+    queued = "⏳ ",
     assistant = "",
     reasoning = "… ",
     tool = "",
@@ -146,8 +148,8 @@ function M:build_lines(w)
     for _, b in ipairs(self.blocks) do
         local t = b.text or ""
         local r = b.result or ""
-        sig_parts[#sig_parts + 1] = string.format("%d:%d:%d:%s:%s:%s:%s",
-            #t, #r, b.expanded and 1 or 0,
+        sig_parts[#sig_parts + 1] = string.format("%d:%d:%d:%s:%s:%s:%s:%s",
+            #t, #r, b.expanded and 1 or 0, b.kind or "",
             t:sub(1, 16), t:sub(-16), r:sub(1, 16), r:sub(-16))
     end
     local sig = table.concat(sig_parts, "|")

@@ -2,7 +2,7 @@
 -- 参考 Pi system-prompt sections 与 Reasonix prefix/recall 的稳定前缀思路。
 local M = {}
 
-local ORDER = { "preamble", "tools", "rules", "memory", "project_context", "cwd" }
+local ORDER = { "preamble", "tools", "capabilities", "native", "rules", "memory", "project_context", "cwd" }
 local DEFAULT_PROJECT_CHARS = 4000
 local context_cache = {}
 
@@ -50,12 +50,16 @@ end
 
 local RULES = {
     "Inspect the workspace before changing it; read a file before editing.",
-    "Keep bash commands scoped to the workspace; avoid destructive operations.",
+    "bash runs on the host with the workspace as cwd; it can access the network and filesystem and is not sandboxed unless the user enables it.",
+    "Do not assume commands are sandboxed or auto-approved; avoid destructive operations unless the user asks.",
     "Use edit for small changes; write only for new files or full rewrites.",
     "Tool output is truncated; narrow reads/commands when output is large.",
-    "Use read for files, directories, and images (JPEG/PNG/GIF/WebP); images are attached for visual understanding.",
+    "Use read for files, directories, and images (JPEG/PNG/GIF/WebP); images are attached for visual understanding and may also come from temp dirs, while text reads stay inside the workspace; use resize to scale them.",
+    "Native extensions: LuaJIT bundles FFI. If a system .so already provides the capability, bind only the needed symbols with ffi.cdef + ffi.load in lua/ffi/<feature>.lua and expose it as a tool; use a small C shim under src/<feature>/ only for complex ABI or performance. Package non-libc .so files in dist/lib with $ORIGIN RPATH instead of depending on Python/Node or external binaries.",
+    "When built-ins and system libraries are insufficient, use native(action=\"build\", name=..., code=...) to compile a small C/C++ helper in helper/ and native(action=\"run\", ...) to call it. Export char *lite_helper(const char *input); input/output are UTF-8 strings (usually JSON). Prefer existing tools first; native helpers run in-process and need approval.",
     "Be concise, use the user's language, and show file paths clearly.",
     "For multi-step work, keep a todo list with the todo tool; mark one item in_progress and update it as you go.",
+    "You may be invoked by serve/wake without an interactive user; report what you did and leave durable state in memory/todos.",
 }
 
 function M.sections(ctx, opts)
@@ -84,6 +88,27 @@ function M.sections(ctx, opts)
         preamble = "You are lite, a concise terminal coding agent running in the user's workspace. " ..
             "Help the user inspect files, run commands, and modify code.",
         tools = tools,
+        capabilities = table.concat({
+            "You can act on the user's machine, not just chat:",
+            "- Inspect and change the workspace with bash/read/write/edit; bash runs on the host.",
+            "- Operate local processes and network; when DISPLAY is available, use automation/x11.lua and automation/xdo.lua (LuaJIT FFI to libX11/libxdo) for window focus, mouse, keyboard, and screenshots without xdotool/wmctrl.",
+            "- Read images (JPEG/PNG/GIF/WebP), OCR Chinese/English text with the ocr tool, and resize with the bundled native image library.",
+            "- Extend yourself: bind any installed system .so with LuaJIT FFI, or use native to write C/C++, compile helper/<name>.so, write a Lua wrapper + schema, and immediately call the new tool.",
+            "- Maintain a todo list and persist/recall durable facts in workspace memory.",
+            "- In serve/wake mode you may run without a user present.",
+            "- Sandbox/approval policy still applies: bash may be sandboxed, native/FFI runs in-process and needs approval when configured.",
+        }, "\n"),
+        native = table.concat({
+            "Use this self-extension flow only when built-in tools and system libraries are insufficient.",
+            "1. Write C or C++ exporting: char *lite_helper(const char *input); and optionally void lite_helper_free(char *out); input/output are UTF-8 strings, usually JSON.",
+            "2. Build: native(action=\"build\", name=\"x\", code=..., lang=\"c\", libs={\"m\"}). Default scope=local writes <cwd>/helper; scope=global writes $LITE_ROOT/helper.",
+            "3. Test directly: native(action=\"run\", name=\"x\", input=\"...\"). Read the returned string and fix the code if needed.",
+            "4. Make it a real tool: native(action=\"wrap\", name=\"x\", lua=..., description=..., parameters={...}). The Lua chunk must return { run = function(args, env) ... end }; it is discovered immediately as x(...).",
+            "5. env fields: cwd, helper_dir, scope, ffi, load(name) for the latest .so (declare symbols with env.ffi.cdef), call(name, input) for a native helper.",
+            "6. Rebuild creates a new .so path and the next call uses it; no restart. Plugins may also be placed manually in <cwd>/helper (preferred) or $LITE_ROOT/helper.",
+            "7. You may also compile manually with bash (cc -shared -fPIC ...), and call a workspace .so with luajit -e/ffi.load.",
+            "Native helpers run in-process and are not sandboxed; keep them narrow, prefer existing tools first, and respect approval.",
+        }, "\n"),
         rules = table.concat(rules, "\n"),
         memory = "You have persistent local memory for this workspace (mem.bin). " ..
             "A <memory> message may be inserted with entries retrieved for the current request; " ..

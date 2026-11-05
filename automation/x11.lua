@@ -1,6 +1,6 @@
 -- x11.lua — native_reader 的 LuaJIT 原生窗口控制（FFI libxdo / X11）
 --
--- 复用 /opt/WordCard 的自动化思路：不启动 xdotool / wmctrl 进程，
+-- 原生自动化：不启动 xdotool / wmctrl 进程，
 -- 直接调 libxdo，因此在 luajit -e 里做动态测试非常快。
 --
 --   package.path = "/home/quqiufeng/Desktop/reader/automation/?.lua;" .. package.path
@@ -9,7 +9,7 @@
 --   w:center(); w:capture("/tmp/opencode/native_reader.png")
 --   w:click(120, 240); w:key("ctrl+l"); w:type("hello")
 --
--- 截屏复用 /opt/my-agent/agentkit/lib/libagentkit.so（FFI，无命令）。
+-- 截屏用 lite 自带 liblite_capture.so（FFI，无外部命令）。
 -- 注意：native_reader 优先使用应用自截图（SDL_RenderReadPixels），X11 截图仅作兜底。
 
 local ffi = require("ffi")
@@ -17,12 +17,13 @@ local Xdo = require("xdo")
 
 local M = {}
 
--- pcall：避免与 /opt/my-agent/agentkit 的 x11.lua 同时加载时重复 cdef。
+-- pcall：避免重复 cdef。
 pcall(ffi.cdef, [[
 int setenv(const char* name, const char* value, int overwrite);
 ]])
 pcall(ffi.cdef, [[
-int ak_capture(int x, int y, int w, int h, const char* out_png);
+int lite_capture(int x, int y, int w, int h, const char* out_png);
+const char *lite_capture_error(void);
 ]])
 
 local _xdo
@@ -48,7 +49,7 @@ function M.ensure_display()
         xa = env:match("XAUTHORITY=([^\n]+)") or ""
     end
     if (os.getenv("DISPLAY") or "") == "" then
-        ffi.C.setenv("DISPLAY", os.getenv("READER_DISPLAY") or os.getenv("AGENTKIT_DISPLAY") or ":0", 1)
+        ffi.C.setenv("DISPLAY", os.getenv("LITE_DISPLAY") or os.getenv("READER_DISPLAY") or ":0", 1)
     end
     if xa ~= "" then ffi.C.setenv("XAUTHORITY", xa, 1) end
 end
@@ -63,21 +64,32 @@ local function display()
 end
 M.display = display
 
-local function agentkit()
-    if M._agentkit ~= nil then return M._agentkit or nil end
-    local path = os.getenv("AGENTKIT_LIB")
-        or "/opt/my-agent/agentkit/lib/libagentkit.so"
-    local f = io.open(path, "rb")
-    if not f then
-        M._agentkit = false
-        return nil
+local function capture_lib()
+    if M._capture_lib ~= nil then return M._capture_lib or nil end
+    local root = os.getenv("LITE_ROOT")
+    local candidates = {
+        root and (root:gsub("/+$", "") .. "/lib/liblite_capture.so"),
+        root and (root:gsub("/+$", "") .. "/build/liblite_capture.so"),
+        "/usr/local/share/lite/lib/liblite_capture.so",
+        "liblite_capture.so",
+    }
+    for _, path in ipairs(candidates) do
+        if path then
+            local f = io.open(path, "rb")
+            if f then
+                f:close()
+                local ok, lib = pcall(ffi.load, path)
+                if ok then
+                    M._capture_lib = lib
+                    return lib
+                end
+            end
+        end
     end
-    f:close()
-    local ok, lib = pcall(ffi.load, path)
-    M._agentkit = ok and lib or false
-    return ok and lib or nil
+    M._capture_lib = false
+    return nil, "liblite_capture.so not found"
 end
-M.agentkit = agentkit
+M.capture_lib = capture_lib
 
 -- 全部窗口（id/name/geom）
 function M.windows()
@@ -177,25 +189,34 @@ function Win:type(text, delay)
     return display():type(0, text, delay)
 end
 
--- 截图窗口区域（FFI libagentkit）
+-- 截图窗口区域（lite 自带 X11 + PNG）
 function Win:capture(path)
     self:activate()
     self:refresh()
     path = path or "/tmp/opencode/native_reader.png"
-    local lib = agentkit()
-    if not lib then return false, "libagentkit.so not found" end
-    local rc = lib.ak_capture(self.x, self.y, self.w, self.h, path)
-    return rc == 0, path
+    local lib, err = capture_lib()
+    if not lib then return false, err end
+    local rc = lib.lite_capture(self.x, self.y, self.w, self.h, path)
+    if rc ~= 0 then
+        local msg = lib.lite_capture_error()
+        return false, msg ~= nil and ffi.string(msg) or "capture failed"
+    end
+    return true, path
 end
 
--- 全屏截图（FFI libagentkit）
+-- 全屏截图（lite 自带 X11 + PNG）
 function M.capture_screen(path)
     M.ensure_display()
     path = path or "/tmp/opencode/screen.png"
-    local lib = agentkit()
-    if not lib then return false, "libagentkit.so not found" end
+    local lib, err = capture_lib()
+    if not lib then return false, err end
     local sw, sh = display():display_size()
-    return lib.ak_capture(0, 0, sw, sh, path) == 0, path
+    local rc = lib.lite_capture(0, 0, sw, sh, path)
+    if rc ~= 0 then
+        local msg = lib.lite_capture_error()
+        return false, msg ~= nil and ffi.string(msg) or "capture failed"
+    end
+    return true, path
 end
 
 -- 便于 luajit -e 的一行式：

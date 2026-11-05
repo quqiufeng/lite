@@ -6,13 +6,47 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DIST="$ROOT/dist/lite-linux-x64"
 
 rm -rf "$DIST"
-mkdir -p "$DIST/lua" "$DIST/tools" "$DIST/third_party" "$DIST/automation" "$DIST/build"
+mkdir -p "$DIST/lua" "$DIST/tools" "$DIST/third_party" "$DIST/automation" "$DIST/build" "$DIST/lib" "$DIST/helper" "$DIST/models"
 
 cp -r "$ROOT/lua/." "$DIST/lua/"
 cp -r "$ROOT/automation/." "$DIST/automation/"
+if [ -d "$ROOT/helper" ]; then
+    find "$ROOT/helper" -maxdepth 1 -type f ! -name '.gitkeep' -exec cp {} "$DIST/helper/" \;
+fi
 cp "$ROOT/AGENTS.md" "$ROOT/design.md" "$DIST/"
 if [ -f "$ROOT/build/liblite_cache.so" ]; then
     cp "$ROOT/build/liblite_cache.so" "$DIST/build/"
+fi
+
+if [ -f "$ROOT/build/liblite_capture.so" ]; then
+    cp "$ROOT/build/liblite_capture.so" "$DIST/lib/"
+fi
+
+if [ -d "$ROOT/third_party/ocr/lib" ]; then
+    for src in "$ROOT/third_party/ocr/lib/"*.so*; do
+        [ -e "$src" ] || continue
+        bn="$(basename "$src")"
+        ln -sfn "../../../third_party/ocr/lib/$bn" "$DIST/lib/$bn"
+    done
+fi
+if [ -d "$ROOT/third_party/ocr/models/ocr" ]; then
+    ln -sfn "../../../third_party/ocr/models/ocr" "$DIST/models/ocr"
+fi
+
+if [ -f "$ROOT/build/liblite_image.so" ]; then
+    cp "$ROOT/build/liblite_image.so" "$DIST/lib/"
+    LDD_TMP="$(mktemp)"
+    ldd "$ROOT/build/liblite_image.so" >"$LDD_TMP" 2>/dev/null || true
+    while read -r so arrow path _; do
+        [ "$arrow" = "=>" ] || continue
+        case "$so" in
+            libc.so.*|libm.so.*|libgcc_s.so.*|libpthread.so.*|libdl.so.*|librt.so.*|ld-linux*) continue ;;
+        esac
+        if [ -n "$path" ] && [ -f "$path" ]; then
+            cp -L "$path" "$DIST/lib/$so"
+        fi
+    done <"$LDD_TMP"
+    rm -f "$LDD_TMP"
 fi
 
 for f in lite-lua lite run.sh check_deps.sh build.sh test.sh install.sh package.sh release.sh launch.sh; do
@@ -33,5 +67,5 @@ if command -v strip >/dev/null 2>&1; then
     strip --strip-unneeded "$DIST/third_party/luajit/src/luajit" 2>/dev/null || true
 fi
 
-tar -czf "$ROOT/dist/lite-linux-x64.tar.gz" -C "$ROOT/dist" lite-linux-x64
+tar -czhf "$ROOT/dist/lite-linux-x64.tar.gz" -C "$ROOT/dist" lite-linux-x64
 echo "package: $ROOT/dist/lite-linux-x64.tar.gz"

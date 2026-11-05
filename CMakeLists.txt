@@ -6,6 +6,11 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 find_package(OpenMP REQUIRED)
+find_package(PkgConfig REQUIRED)
+find_package(X11 REQUIRED)
+pkg_check_modules(PNG REQUIRED libpng)
+pkg_check_modules(JPEG REQUIRED libjpeg)
+pkg_check_modules(WEBP REQUIRED libwebp)
 
 add_library(lite_cache SHARED
     src/cache/cache.c
@@ -29,3 +34,25 @@ target_link_libraries(lite_cache PRIVATE m OpenMP::OpenMP_C)
 set_target_properties(lite_cache PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
     OUTPUT_NAME lite_cache)
+
+add_library(lite_image SHARED src/image/image.c)
+target_include_directories(lite_image PRIVATE
+    ${PNG_INCLUDE_DIRS} ${JPEG_INCLUDE_DIRS} ${WEBP_INCLUDE_DIRS})
+target_link_libraries(lite_image PRIVATE
+    ${PNG_LIBRARIES} ${JPEG_LIBRARIES} ${WEBP_LIBRARIES} m)
+target_compile_options(lite_image PRIVATE -O2 -Wall -Wextra)
+set_target_properties(lite_image PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+    OUTPUT_NAME lite_image
+    BUILD_RPATH "$ORIGIN"
+    INSTALL_RPATH "$ORIGIN")
+
+add_library(lite_capture SHARED src/x11/capture.c)
+target_include_directories(lite_capture PRIVATE ${X11_INCLUDE_DIR} ${PNG_INCLUDE_DIRS})
+target_link_libraries(lite_capture PRIVATE ${X11_LIBRARIES} ${PNG_LIBRARIES} m)
+target_compile_options(lite_capture PRIVATE -O2 -Wall -Wextra)
+set_target_properties(lite_capture PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+    OUTPUT_NAME lite_capture
+    BUILD_RPATH "$ORIGIN"
+    INSTALL_RPATH "$ORIGIN")

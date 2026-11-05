@@ -83,6 +83,11 @@ grep -q -- "+.*new line" "$TMP/unified.txt" || fail "unified new sign"
 
 tmux send-keys -t "$S" -l "q"
 sleep 0.2
+
+tmux send-keys -t "$S" -l "/reload"
+tmux send-keys -t "$S" Enter
+wait_for "reloaded lua" 4 || fail "reload lua"
+
 tmux send-keys -t "$S" -l "quit"
 tmux send-keys -t "$S" Enter
 sleep 0.5

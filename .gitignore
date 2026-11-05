@@ -55,3 +55,9 @@ mem.lock
 
 # keep vendored cjson shared object
 !third_party/cjson/lua/5.1/cjson.so
+!third_party/ocr/lib/*.so
+!third_party/ocr/lib/*.so.*
+
+# generated native helpers
+helper/*.so
+helper/*.json

@@ -15,6 +15,7 @@ if [ -z "$LUA" ]; then
 fi
 
 export LITE_ROOT="$ROOT"
+export LD_LIBRARY_PATH="$ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export LUA_PATH="$ROOT/lua/?.lua;$ROOT/lua/?/init.lua;$ROOT/automation/?.lua;;${LUA_PATH:-}"
 export LUA_CPATH="$ROOT/third_party/cjson/lua/5.1/?.so;;${LUA_CPATH:-}"
 

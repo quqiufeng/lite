@@ -44,7 +44,7 @@ do
         DEEPSEEK_MODEL = "deepseek-flash-x",
     })
     check(cfg.model == "deepseek-flash-x", "config env override")
-    check(cfg.max_turns == 16, "config default max_turns")
+    check(cfg.max_turns == 128, "config default max_turns")
     check(cfg.max_retries == 2, "config max retries")
     check(cfg.approval == "auto", "config approval")
 
@@ -122,6 +122,8 @@ do
     check(sp:find("<tools>", 1, true) ~= nil
         and sp:find("- bash: run commands", 1, true) ~= nil, "prompt tools")
     check(sp:find("<rules>", 1, true) ~= nil, "prompt rules")
+    check(sp:find("<native>", 1, true) ~= nil and sp:find("lite_helper", 1, true) ~= nil,
+        "prompt native flow")
     check(sp:find("<memory>", 1, true) ~= nil, "prompt memory policy")
     check(sp:find("<cwd>", 1, true) ~= nil and sp:find("/tmp", 1, true) ~= nil, "prompt cwd")
 
@@ -513,6 +515,228 @@ do
     os.execute("rm -rf " .. shq(dir))
 end
 
+-- native image resize
+do
+    local Image = require("ffi.image")
+    if Image.available() then
+        local dir = os.tmpname()
+        os.remove(dir)
+        os.execute("mkdir -p " .. shq(dir))
+        local function unhex(s)
+            return (s:gsub("..", function(h) return string.char(tonumber(h, 16)) end))
+        end
+        local png_hex = "89504e470d0a1a0a0000000d49484452000000040000000208060000007fa87d630000001349444154789c63e41291fbcf80049818d0000025b4013f4c5aa1c90000000049454e44ae426082"
+        local f = assert(io.open(dir .. "/in.png", "wb"))
+        f:write(unhex(png_hex))
+        f:close()
+
+        local Tools = require("core.tools")
+        local t = Tools.new({ cwd = dir })
+        local out = t:execute("resize", { path = "in.png", width = 2, height = 1, force = true, output = "out.png" })
+        check(out:find("resized", 1, true) ~= nil, "tools resize png")
+        local of = io.open(dir .. "/out.png", "rb")
+        local png = of and of:read("*a") or ""
+        if of then of:close() end
+        local w = #png >= 24 and (png:byte(17) * 16777216 + png:byte(18) * 65536 + png:byte(19) * 256 + png:byte(20)) or 0
+        local h = #png >= 24 and (png:byte(21) * 16777216 + png:byte(22) * 65536 + png:byte(23) * 256 + png:byte(24)) or 0
+        check(w == 2 and h == 1, "tools resize png size")
+
+        local aspect = t:execute("resize", { path = "in.png", width = 2, output = "aspect.png" })
+        check(aspect:find("resized", 1, true) ~= nil, "tools resize aspect")
+        local af = io.open(dir .. "/aspect.png", "rb")
+        local apng = af and af:read("*a") or ""
+        if af then af:close() end
+        local aw = #apng >= 24 and (apng:byte(17) * 16777216 + apng:byte(18) * 65536 + apng:byte(19) * 256 + apng:byte(20)) or 0
+        local ah = #apng >= 24 and (apng:byte(21) * 16777216 + apng:byte(22) * 65536 + apng:byte(23) * 256 + apng:byte(24)) or 0
+        check(aw == 2 and ah == 1, "tools resize aspect size")
+
+        local jpg = t:execute("resize", { path = "in.png", width = 2, height = 1, force = true, output = "out.jpg" })
+        check(jpg:find("resized", 1, true) ~= nil, "tools resize jpeg encode")
+        local jf = io.open(dir .. "/out.jpg", "rb")
+        local jhead = jf and jf:read(3) or ""
+        if jf then jf:close() end
+        check(jhead:byte(1) == 0xFF and jhead:byte(2) == 0xD8 and jhead:byte(3) == 0xFF,
+            "tools resize jpeg magic")
+        local jpg2 = t:execute("resize", { path = "out.jpg", width = 4, height = 2, force = true, output = "out2.jpg" })
+        check(jpg2:find("resized", 1, true) ~= nil, "tools resize jpeg decode")
+
+        local webp = t:execute("resize", { path = "in.png", width = 2, height = 1, force = true, output = "out.webp" })
+        check(webp:find("resized", 1, true) ~= nil, "tools resize webp encode")
+        local wf = io.open(dir .. "/out.webp", "rb")
+        local whead = wf and wf:read(12) or ""
+        if wf then wf:close() end
+        check(whead:sub(1, 4) == "RIFF" and whead:sub(9, 12) == "WEBP", "tools resize webp magic")
+        local webp2 = t:execute("resize", { path = "out.webp", width = 4, height = 2, force = true, output = "out2.webp" })
+        check(webp2:find("resized", 1, true) ~= nil, "tools resize webp decode")
+
+        os.execute("rm -rf " .. shq(dir))
+    else
+        print("SKIP native image resize (liblite_image not built)")
+    end
+end
+
+-- lua hot reload
+do
+    local dir = os.tmpname()
+    os.remove(dir)
+    os.execute("mkdir -p " .. shq(dir))
+    local Tools = require("core.tools")
+    local Prompt = require("core.prompt")
+    local t = Tools.new({ cwd = dir })
+    t.image_native = { old = true }
+    local agent = {
+        tools = t,
+        prompt = Prompt,
+        system_prompt = function() return "reloaded system" end,
+    }
+    local ctx = { session = { messages = { { role = "system", content = "old" } } } }
+    local ok, err = require("core.reload").lua(agent, ctx)
+    check(ok, "reload lua: " .. tostring(err))
+    check(type(t.schemas) == "function", "reload tools methods")
+    check(t.image_native == nil, "reload clears image cache")
+    check(agent.prompt == require("core.prompt"), "reload prompt module")
+    check(ctx.session.messages[1].content == "reloaded system", "reload system prompt")
+    os.execute("rm -rf " .. shq(dir))
+end
+
+-- read image from temp dir
+do
+    local dir = os.tmpname()
+    os.remove(dir)
+    os.execute("mkdir -p " .. shq(dir))
+    local function unhex(h)
+        return (h:gsub("..", function(c) return string.char(tonumber(c, 16)) end))
+    end
+    local png_hex = "89504e470d0a1a0a0000000d49484452000000040000000208060000007fa87d630000001349444154789c63e41291fbcf80049818d0000025b4013f4c5aa1c90000000049454e44ae426082"
+    local img = os.tmpname()
+    local f = assert(io.open(img, "wb"))
+    f:write(unhex(png_hex))
+    f:close()
+    local Tools = require("core.tools")
+    local t = Tools.new({ cwd = dir })
+    local out = t:read(img)
+    check(out:find("Image read", 1, true) ~= nil, "read temp image")
+    local att = t:take_attachment()
+    check(att and att.mime == "image/png", "read temp image attachment")
+    local txt = img .. ".txt"
+    local tf = io.open(txt, "wb")
+    tf:write("outside")
+    tf:close()
+    local denied = t:read(txt)
+    check(denied:find("outside workspace", 1, true) ~= nil, "read temp text denied")
+    os.remove(img)
+    os.remove(txt)
+    os.execute("rm -rf " .. shq(dir))
+end
+
+-- OCR (optional system PP-OCRv4)
+do
+    local sample = (arg[0]:match("^(.*)/[^/]+$") or ".") .. "/../testdata/ocr_sample.png"
+    local sf = io.open(sample, "rb")
+    local OCR = require("ffi.ocr")
+    local ready = OCR.ready()
+    if sf and ready then
+        local bytes = sf:read("*a")
+        sf:close()
+        local img = os.tmpname() .. ".png"
+        local f = assert(io.open(img, "wb"))
+        f:write(bytes)
+        f:close()
+        local dir = os.tmpname()
+        os.remove(dir)
+        os.execute("mkdir -p " .. shq(dir))
+        local Tools = require("core.tools")
+        local t = Tools.new({ cwd = dir })
+        local out = t:execute("ocr", { path = img })
+        check(#out > 20 and (out:find("Wordcard", 1, true) ~= nil or out:find("时代", 1, true) ~= nil),
+            "tools ocr")
+        local with_boxes = t:execute("ocr", { path = img, boxes = true })
+        check(with_boxes:find('"x"', 1, true) ~= nil, "tools ocr boxes")
+        os.remove(img)
+        os.execute("rm -rf " .. shq(dir))
+    else
+        if sf then sf:close() end
+        print("SKIP tools ocr (OCR/onnxruntime/model unavailable)")
+    end
+end
+
+-- X11 capture (only with a live display)
+do
+    local display = os.getenv("DISPLAY")
+    if display and display ~= "" then
+        local ok, x11 = pcall(require, "x11")
+        if ok then
+            local img = os.tmpname() .. ".png"
+            local captured, err = x11.capture_screen(img)
+            check(captured, "x11 capture: " .. tostring(err))
+            local f = io.open(img, "rb")
+            local head = f and f:read(8) or ""
+            if f then f:close() end
+            check(head == "\137PNG\13\10\26\10", "x11 capture png")
+            os.remove(img)
+        else
+            print("SKIP x11 capture (module unavailable)")
+        end
+    else
+        print("SKIP x11 capture (no DISPLAY)")
+    end
+end
+
+-- native helper build/run
+do
+    local has_cc = os.execute("command -v cc >/dev/null 2>&1") == 0
+    if has_cc then
+        local dir = os.tmpname()
+        os.remove(dir)
+        os.execute("mkdir -p " .. shq(dir))
+        local Tools = require("core.tools")
+        local t = Tools.new({ cwd = dir })
+        local code = [[
+#include <stdlib.h>
+#include <stdio.h>
+char *lite_helper(const char *input) {
+    char *out = malloc(128);
+    snprintf(out, 128, "native:%s", input ? input : "");
+    return out;
+}
+void lite_helper_free(char *p) { free(p); }
+]]
+        local built = t:execute("native", { action = "build", name = "echo", code = code })
+        check(built:find("built native helper", 1, true) ~= nil, "native build")
+        local ran = t:execute("native", { action = "run", name = "echo", input = "x" })
+        check(ran == "native:x", "native run")
+        local listed = t:execute("native", { action = "list" })
+        check(listed:find("echo.c", 1, true) ~= nil, "native list")
+        local bad = t:execute("native", { action = "run", name = "missing" })
+        check(bad:find("not built", 1, true) ~= nil, "native missing")
+        local traversal = t:execute("native", { action = "run", name = "../escape" })
+        check(traversal:find("invalid helper name", 1, true) ~= nil, "native name guard")
+
+        local lua_code = [[
+local M = {}
+function M.run(args, env)
+    return env.call("echo", args.value or "")
+end
+return M
+]]
+        local wrapped = t:execute("native", {
+            action = "wrap", name = "echo_tool", lua = lua_code,
+            description = "echo helper",
+            parameters = { type = "object", properties = { value = { type = "string" } } },
+        })
+        check(wrapped:find("installed helper tool", 1, true) ~= nil, "native wrap")
+        local found = false
+        for _, schema in ipairs(t:schemas()) do
+            if schema["function"].name == "echo_tool" then found = true end
+        end
+        check(found, "native schema discovered")
+        check(t:execute("echo_tool", { value = "wrapped" }) == "native:wrapped", "native helper call")
+        os.execute("rm -rf " .. shq(dir))
+    else
+        print("SKIP native helper (cc missing)")
+    end
+end
+
 -- agent memory injection
 do
     local Context = require("context")
@@ -843,6 +1067,18 @@ do
     local evs_tab = I.new():feed("\9")
     check(#evs_tab == 1 and evs_tab[1].key == "tab", "tui input tab")
 
+    local evs_esc = I.new():feed("\27\27")
+    check(#evs_esc == 2 and evs_esc[1].key == "escape" and evs_esc[2].key == "escape",
+        "tui input double escape")
+
+    local evs_wheel = I.new():feed("\27[<64;10;5M\27[<65;10;5M")
+    check(#evs_wheel == 2 and evs_wheel[1].key == "wheel" and evs_wheel[1].dy == 1
+        and evs_wheel[2].key == "wheel" and evs_wheel[2].dy == -1, "tui input mouse wheel")
+
+    local evs_x10 = I.new():feed("\27[M\96\42\42\27[M\97\42\42")
+    check(#evs_x10 == 2 and evs_x10[1].key == "wheel" and evs_x10[1].dy == 1
+        and evs_x10[2].key == "wheel" and evs_x10[2].dy == -1, "tui input x10 wheel")
+
     local evs2 = inp:feed("\27[")
     check(#evs2 == 0, "tui input partial")
     evs2 = inp:feed("5~")
@@ -934,6 +1170,21 @@ do
     check(t:build_lines(40) == lines, "tui transcript cache")
     t:reasoning_append(".")
     check(t:build_lines(40) ~= lines, "tui transcript cache invalidate")
+
+    t:add("queued", "later")
+    local qlines = t:build_lines(40)
+    local saw_queued = false
+    for _, l in ipairs(qlines) do
+        if line_text(l):find("⏳ later", 1, true) then saw_queued = true end
+    end
+    check(saw_queued, "tui transcript queued")
+    t.blocks[#t.blocks].kind = "user"
+    local ulines = t:build_lines(40)
+    local saw_user = false
+    for _, l in ipairs(ulines) do
+        if line_text(l):find("› later", 1, true) then saw_user = true end
+    end
+    check(saw_user, "tui transcript queued becomes user")
 
     local s = S.new(30, 6)
     t:render(s, 1, 1, 30, 4)
@@ -1155,10 +1406,12 @@ do
             { content = "a", status = "completed" },
             { content = "b", status = "pending" },
         },
+        queue = 3,
     })
     local txt = s:snapshot_text()
     check(txt:find("hit:2", 1, true) ~= nil, "tui status memory hits")
     check(txt:find("todo:1/2", 1, true) ~= nil, "tui status todos")
+    check(txt:find("queue:3", 1, true) ~= nil, "tui status queue")
 end
 
 -- tui todo view

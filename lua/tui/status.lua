@@ -33,7 +33,8 @@ function M.render(screen, y, w, ctx, info)
         end
         todo = string.format(" todo:%d/%d", done, #todos)
     end
-    local right = mem .. todo .. " · " .. status .. " "
+    local queued = (info.queue or 0) > 0 and string.format(" queue:%d", info.queue) or ""
+    local right = mem .. todo .. queued .. " · " .. status .. " "
     local lw, rw = utf8.width_str(left), utf8.width_str(right)
     if lw + rw + 1 > w then
         local keep = math.max(1, w - rw - 2)

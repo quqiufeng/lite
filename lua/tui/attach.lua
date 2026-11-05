@@ -177,6 +177,17 @@ function M.run(opts)
     end
 
     local function handle(ev)
+        if ev.key == "wheel" then
+            if not (approval_view or help_view or todo_view or diff_view) then
+                local _, th = layout(h, composer)
+                if ev.dy > 0 then
+                    transcript:scroll_up(3)
+                else
+                    transcript:scroll_down(3)
+                end
+            end
+            return
+        end
         if approval_view then
             local decision = approval_view:handle(ev)
             if decision then

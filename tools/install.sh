@@ -13,7 +13,7 @@ fi
 
 rm -rf "$APP"
 mkdir -p "$APP" "$BIN"
-cp -r "$DIST/." "$APP/"
+cp -rL "$DIST/." "$APP/"
 chmod +x "$APP/tools/lite" "$APP/tools/lite-lua" "$APP/tools/run.sh"
 
 ln -sf "$APP/tools/lite" "$BIN/lite"

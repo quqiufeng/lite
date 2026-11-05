@@ -1,4 +1,5 @@
--- 工具集：bash / read / write / edit / todo（全部自动，限制在 workspace 内）。
+-- 工具集：bash / read / write / edit / resize / native / todo；文件路径限制在 workspace 内。
+local cjson = require("cjson")
 local Todos = require("core.todos")
 local Sandbox = require("core.sandbox")
 local Proc = require("core.proc")
@@ -12,6 +13,10 @@ local IMAGE_MAX = 20 * 1024 * 1024
 local READ_MAX_LINES = 2000
 local READ_MAX_BYTES = 50 * 1024
 local READ_LINE_MAX = 2000
+local BUILTIN_TOOLS = {
+    bash = true, read = true, resize = true, native = true,
+    write = true, edit = true, remember = true, recall = true, todo = true,
+}
 
 local function shq(s)
     return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
@@ -239,7 +244,7 @@ function M:resolve(p)
 end
 
 function M:schemas()
-    return {
+    local list = {
         {
             type = "function",
             ["function"] = {
@@ -267,6 +272,68 @@ function M:schemas()
                         limit = { type = "integer" },
                     },
                     required = { "path" },
+                },
+            },
+        },
+        {
+            type = "function",
+            ["function"] = {
+                name = "ocr",
+                description = "OCR an image (Chinese/English, PP-OCRv4). "
+                    .. "Path may be in the workspace or temp dirs; set boxes=true for coordinates.",
+                parameters = {
+                    type = "object",
+                    properties = {
+                        path = { type = "string" },
+                        boxes = { type = "boolean" },
+                    },
+                    required = { "path" },
+                },
+            },
+        },
+        {
+            type = "function",
+            ["function"] = {
+                name = "resize",
+                description = "Resize an image (PNG/JPEG/WebP) in the workspace. "
+                    .. "Uses lite's bundled native image library; keeps aspect ratio "
+                    .. "unless force is true and both width and height are given.",
+                parameters = {
+                    type = "object",
+                    properties = {
+                        path = { type = "string" },
+                        width = { type = "integer" },
+                        height = { type = "integer" },
+                        output = { type = "string" },
+                        force = { type = "boolean" },
+                    },
+                    required = { "path" },
+                },
+            },
+        },
+        {
+            type = "function",
+            ["function"] = {
+                name = "native",
+                description = "Self-extend: build/run a C/C++ helper .so in helper/ via LuaJIT FFI, "
+                    .. "or wrap it as a Lua tool. C ABI: char *lite_helper(const char *input) and "
+                    .. "optional void lite_helper_free(char *out); input/output are UTF-8 strings "
+                    .. "(usually JSON). wrap writes helper/<name>.lua + schema so it becomes callable.",
+                parameters = {
+                    type = "object",
+                    properties = {
+                        action = { type = "string", enum = { "build", "run", "wrap", "remove", "list" } },
+                        name = { type = "string" },
+                        code = { type = "string" },
+                        lang = { type = "string", enum = { "c", "c++" } },
+                        libs = { type = "array", items = { type = "string" } },
+                        input = { type = "string" },
+                        lua = { type = "string" },
+                        description = { type = "string" },
+                        parameters = { type = "object" },
+                        scope = { type = "string", enum = { "local", "global" } },
+                    },
+                    required = { "action" },
                 },
             },
         },
@@ -360,6 +427,10 @@ function M:schemas()
             },
         },
     }
+    for _, schema in ipairs(self:_helper_schemas()) do
+        list[#list + 1] = schema
+    end
+    return list
 end
 
 function M:start_bash(command)
@@ -456,9 +527,44 @@ local function read_text(abs, offset, limit)
     return res
 end
 
+local function read_roots()
+    local env = os.getenv("LITE_READ_DIRS")
+    local raw
+    if env ~= nil then
+        raw = {}
+        for part in env:gmatch("[^:]+") do raw[#raw + 1] = part end
+    else
+        raw = { os.getenv("TMPDIR") or "/tmp", "/tmp", "/var/tmp" }
+    end
+    local out, seen = {}, {}
+    for _, path in ipairs(raw) do
+        local root = normalize(path):gsub("/+$", "")
+        if root ~= "" and not seen[root] then
+            seen[root] = true
+            out[#out + 1] = root
+        end
+    end
+    return out
+end
+
+function M:_resolve_external_image(path)
+    if not path or path:sub(1, 1) ~= "/" then return nil end
+    local real = realpath(path) or normalize(path)
+    for _, root in ipairs(read_roots()) do
+        if real == root or real:sub(1, #root + 1) == root .. "/" then
+            local head = read_head(real, 16) or ""
+            if sniff_image(head) then return real end
+        end
+    end
+    return nil
+end
+
 function M:read(path, offset, limit)
     local abs, err = self:resolve(path)
-    if not abs then return "error: " .. err end
+    if not abs then
+        abs = self:_resolve_external_image(path)
+        if not abs then return "error: " .. err end
+    end
 
     if is_dir(abs) then return read_dir(abs, offset, limit) end
 
@@ -490,6 +596,527 @@ function M:read(path, offset, limit)
         return "error: cannot read binary file: " .. abs
     end
     return read_text(abs, offset, limit)
+end
+
+function M:ocr(path, boxes)
+    local abs, err = self:resolve(path)
+    if not abs then
+        abs = self:_resolve_external_image(path)
+        if not abs then return "error: " .. err end
+    end
+    if is_dir(abs) then return "error: cannot OCR a directory: " .. abs end
+    if not file_size(abs) then return "error: cannot stat file: " .. abs end
+
+    if self.ocr_module == nil then
+        local ok, mod = pcall(require, "ffi.ocr")
+        self.ocr_module = ok and mod or false
+    end
+    if not self.ocr_module then return "error: OCR module not available" end
+    local ready, rerr = self.ocr_module.ready()
+    if not ready then return "error: OCR unavailable: " .. tostring(rerr) end
+
+    local text, list, terr = self.ocr_module.text(abs)
+    if terr then return "error: OCR failed: " .. tostring(terr) end
+    if boxes then
+        return text .. "\n\n" .. cjson.encode(list or {})
+    end
+    if text == "" then return "(no text detected)" end
+    return text
+end
+
+function M:_command_backend()
+    if self.image_backend ~= nil then return self.image_backend or nil end
+    local function ok(cmd)
+        local rc = os.execute(cmd .. " >/dev/null 2>&1")
+        return rc == 0 or rc == true
+    end
+    if ok("python3 -c 'import PIL'") then
+        self.image_backend = "pil"
+    elseif ok("command -v convert") then
+        self.image_backend = "convert"
+    elseif ok("command -v magick") then
+        self.image_backend = "magick"
+    elseif ok("command -v ffmpeg") then
+        self.image_backend = "ffmpeg"
+    else
+        self.image_backend = false
+    end
+    return self.image_backend or nil
+end
+
+function M:_native_image_modules()
+    if self.image_native ~= nil then return self.image_native end
+    local mods = {}
+    local ok, Lite = pcall(require, "ffi.image")
+    if ok and Lite.available() then
+        mods[#mods + 1] = { name = "lite_image", mod = Lite }
+    end
+    local ok2, Magick = pcall(require, "ffi.magick")
+    if ok2 and Magick.available() then
+        mods[#mods + 1] = { name = "magick", mod = Magick }
+    end
+    self.image_native = mods
+    return mods
+end
+
+function M:resize(path, width, height, output, force)
+    local abs, err = self:resolve(path)
+    if not abs then return "error: " .. err end
+    if is_dir(abs) then return "error: cannot resize a directory: " .. abs end
+    if not file_size(abs) then return "error: cannot stat file: " .. abs end
+
+    local w = tonumber(width)
+    local h = tonumber(height)
+    if w and w <= 0 then w = nil end
+    if h and h <= 0 then h = nil end
+    if not w and not h then return "error: width or height is required" end
+    if w then w = math.floor(w) end
+    if h then h = math.floor(h) end
+
+    local out_abs
+    if output and output ~= "" then
+        out_abs, err = self:resolve(output)
+        if not out_abs then return "error: " .. err end
+    else
+        local dir, base, ext = abs:match("^(.*)/([^/]+)%.([%w]+)$")
+        if not dir then return "error: cannot derive output path; pass output" end
+        out_abs = string.format("%s/%s-%sx%s.%s", dir, base,
+            w and tostring(w) or "auto", h and tostring(h) or "auto", ext)
+    end
+    if out_abs == abs then
+        return "error: output path equals input; choose a different output"
+    end
+
+    local errors = {}
+    for _, item in ipairs(self:_native_image_modules()) do
+        local ok, nerr = item.mod.resize(abs, out_abs, w or 0, h or 0, force)
+        if ok and file_size(out_abs) then
+            return string.format("resized %s -> %s (%s)", abs, out_abs,
+                (w and tostring(w) or "auto") .. "x" .. (h and tostring(h) or "auto"))
+        end
+        errors[#errors + 1] = item.name .. ": " .. tostring(nerr)
+        os.remove(out_abs)
+    end
+
+    local backend = self:_command_backend()
+    if not backend then
+        if #errors > 0 then return "error: " .. table.concat(errors, "; ") end
+        return "error: no image backend available (need liblite_image, ImageMagick, Python PIL, or ffmpeg)"
+    end
+
+    local command
+    if backend == "pil" then
+        local script = table.concat({
+            "import sys",
+            "from PIL import Image",
+            "s=Image.open(sys.argv[1])",
+            "w=int(sys.argv[3]); h=int(sys.argv[4]); force=sys.argv[5]=='1'",
+            "if force and w>0 and h>0:",
+            " s=s.resize((w,h))",
+            "else:",
+            " tw=w if w>0 else 10**9; th=h if h>0 else 10**9",
+            " r=min(tw/s.width, th/s.height)",
+            " s=s.resize((max(1,round(s.width*r)), max(1,round(s.height*r))))",
+            "s.save(sys.argv[2])",
+        }, "\n")
+        command = string.format("python3 -c %s %s %s %d %d %s",
+            shq(script), shq(abs), shq(out_abs), w or 0, h or 0,
+            (force and w and h) and "1" or "0")
+    else
+        local geometry
+        if w and h then
+            geometry = w .. "x" .. h
+        elseif w then
+            geometry = w .. "x"
+        else
+            geometry = "x" .. h
+        end
+        if backend == "convert" or backend == "magick" then
+            local exe = backend == "convert" and "convert" or "magick"
+            if force and w and h then geometry = geometry .. "!" end
+            command = string.format("%s %s -resize %s %s",
+                exe, shq(abs), shq(geometry), shq(out_abs))
+        else
+            local scale
+            if w and h then
+                scale = w .. ":" .. h
+                if not force then
+                    scale = scale .. ":force_original_aspect_ratio=decrease"
+                end
+            elseif w then
+                scale = w .. ":-1"
+            else
+                scale = "-1:" .. h
+            end
+            command = string.format("ffmpeg -y -v error -i %s -vf %s %s",
+                shq(abs), shq("scale=" .. scale), shq(out_abs))
+        end
+    end
+
+    local run = self:bash(command)
+    if not file_size(out_abs) then
+        errors[#errors + 1] = backend .. ": " .. tostring(run)
+        return "error: resize failed: " .. table.concat(errors, "; ")
+    end
+    return string.format("resized %s -> %s (%s)", abs, out_abs,
+        (w and tostring(w) or "auto") .. "x" .. (h and tostring(h) or "auto"))
+end
+
+local NATIVE_ABI = "char *lite_helper(const char *input); void lite_helper_free(char *out);"
+
+local function lite_root_dir()
+    local root = os.getenv("LITE_ROOT")
+    if not root or root == "" then return nil end
+    return normalize(root):gsub("/+$", "")
+end
+
+local function write_abs(path, content)
+    local dir = path:match("^(.*)/[^/]+$")
+    if dir and dir ~= "" then os.execute("mkdir -p " .. shq(dir)) end
+    local f, err = io.open(path, "wb")
+    if not f then return nil, tostring(err) end
+    f:write(content or "")
+    f:close()
+    return true
+end
+
+function M:_helper_roots()
+    local roots = {}
+    local local_dir = normalize(self.cwd):gsub("/+$", "") .. "/helper"
+    roots[#roots + 1] = { scope = "local", dir = local_dir }
+    local root = lite_root_dir()
+    if root then
+        local global_dir = root .. "/helper"
+        if global_dir ~= local_dir then
+            roots[#roots + 1] = { scope = "global", dir = global_dir }
+        end
+    end
+    return roots
+end
+
+function M:_helper_root(scope)
+    scope = scope or "local"
+    for _, root in ipairs(self:_helper_roots()) do
+        if root.scope == scope then return root end
+    end
+    return nil, "unknown helper scope: " .. tostring(scope)
+end
+
+function M:_helper_name(name)
+    name = tostring(name or "")
+    if not name:match("^[%w_][%w_%-]*$") then
+        return nil, "invalid helper name (use letters, digits, _ or -)"
+    end
+    return name
+end
+
+function M:_helper_paths(name, scope)
+    local ok, err = self:_helper_name(name)
+    if not ok then return nil, err end
+    local root, rerr = self:_helper_root(scope)
+    if not root then return nil, rerr end
+    local dir = root.dir
+    return {
+        name = name,
+        scope = root.scope,
+        dir = dir,
+        src = dir .. "/" .. name .. ".c",
+        lua = dir .. "/" .. name .. ".lua",
+        tool = dir .. "/" .. name .. ".tool.json",
+        manifest = dir .. "/" .. name .. ".json",
+        so = dir .. "/" .. name .. ".so",
+    }
+end
+
+local function unique_so(path)
+    local base = path:gsub("%.so$", "")
+    local stamp = os.time()
+    local candidate = string.format("%s-%d.so", base, stamp)
+    local n = 0
+    while file_size(candidate) do
+        n = n + 1
+        candidate = string.format("%s-%d-%d.so", base, stamp, n)
+    end
+    return candidate
+end
+
+function M:_helper_so_abs(name)
+    local ok, err = self:_helper_name(name)
+    if not ok then return nil, err end
+    for _, root in ipairs(self:_helper_roots()) do
+        local so_path
+        local f = io.open(root.dir .. "/" .. name .. ".json", "rb")
+        if f then
+            local raw = f:read("*a")
+            f:close()
+            local ok, manifest = pcall(cjson.decode, raw or "")
+            if ok and type(manifest) == "table" and type(manifest.so) == "string" then
+                local rel = manifest.so:gsub("^helper/", "")
+                if rel:sub(1, 1) ~= "/" and not rel:find("%.%.") then
+                    so_path = root.dir .. "/" .. rel
+                end
+            end
+        end
+        if not so_path then so_path = root.dir .. "/" .. name .. ".so" end
+        if file_size(so_path) then return so_path end
+    end
+    return nil, "helper not built (run native action=build first)"
+end
+
+function M:_helper_find(name, need_lua)
+    for _, root in ipairs(self:_helper_roots()) do
+        local paths = self:_helper_paths(name, root.scope)
+        if paths then
+            if need_lua then
+                if file_size(paths.tool) and file_size(paths.lua) then return paths end
+            elseif file_size(paths.src) or file_size(paths.manifest) then
+                return paths
+            end
+        end
+    end
+    return nil
+end
+
+function M:native_build(name, code, lang, libs, scope)
+    local p, err = self:_helper_paths(name, scope)
+    if not p then return "error: " .. err end
+    code = tostring(code or "")
+    if code == "" then return "error: code is required" end
+    lang = (lang == "c++" or lang == "cpp" or lang == "cxx") and "c++" or "c"
+
+    local src = p.src
+    if lang == "c++" then src = src:gsub("%.c$", ".cpp") end
+    local ok, werr = write_abs(src, code)
+    if not ok then return "error: " .. tostring(werr) end
+
+    local so_abs = unique_so(p.so)
+    local cc = lang == "c++" and "c++" or "cc"
+    local parts = { cc, "-shared", "-fPIC", "-O2", "-Wall", "-Wextra" }
+    if lang == "c++" then parts[#parts + 1] = "-std=c++17" end
+    parts[#parts + 1] = "-o"
+    parts[#parts + 1] = shq(so_abs)
+    parts[#parts + 1] = shq(src)
+    if type(libs) == "string" then libs = { libs } end
+    for _, lib in ipairs(libs or {}) do
+        lib = tostring(lib)
+        if lib:match("^[%w_%+%-%.]+$") then
+            parts[#parts + 1] = "-l" .. lib
+        end
+    end
+
+    local out = self:bash(table.concat(parts, " "))
+    if not file_size(so_abs) then
+        return "error: helper build failed\n" .. tostring(out)
+    end
+
+    local manifest = {
+        name = p.name,
+        scope = p.scope,
+        lang = lang,
+        source = src:match("[^/]+$"),
+        so = so_abs:match("[^/]+$"),
+        built_at = os.time(),
+        abi = NATIVE_ABI,
+    }
+    local mok, merr = write_abs(p.manifest, cjson.encode(manifest))
+    if not mok then return "error: " .. tostring(merr) end
+
+    local cleanup = io.popen("ls -1 " .. shq(p.dir) .. " 2>/dev/null")
+    if cleanup then
+        local pattern = "^" .. p.name:gsub("%-", "%%-") .. "%-.*%.so$"
+        for line in cleanup:lines() do
+            if line:match(pattern) then
+                local old = p.dir .. "/" .. line
+                if old ~= so_abs then os.remove(old) end
+            end
+        end
+        cleanup:close()
+    end
+
+    return "built native helper " .. p.name .. " (" .. p.scope .. ") -> " ..
+        so_abs:match("[^/]+$") ..
+        "\nABI: " .. NATIVE_ABI ..
+        "\nCall: native(action=\"run\", name=\"" .. p.name .. "\", input=\"...\")"
+end
+
+function M:native_run(name, input)
+    local so_abs, serr = self:_helper_so_abs(name)
+    if not so_abs then return "error: " .. tostring(serr) end
+
+    local ffi = require("ffi")
+    pcall(ffi.cdef, [[
+        char *lite_helper(const char *input);
+        void lite_helper_free(char *out);
+    ]])
+    local ok, lib = pcall(ffi.load, so_abs)
+    if not ok then return "error: ffi.load failed: " .. tostring(lib) end
+    local okf, fn = pcall(function() return lib.lite_helper end)
+    if not okf or fn == nil then return "error: helper does not export lite_helper" end
+
+    local arg
+    if type(input) == "table" then
+        arg = cjson.encode(input)
+    elseif input == nil then
+        arg = "{}"
+    else
+        arg = tostring(input)
+    end
+
+    local out = fn(arg)
+    if out == nil then return "(helper returned NULL)" end
+    local s = ffi.string(out)
+    local free_ok, free = pcall(function() return lib.lite_helper_free end)
+    if free_ok and free ~= nil then pcall(free, out) end
+    if s == "" then return "(empty output)" end
+    return truncate(s)
+end
+
+function M:native_list()
+    local roots = self:_helper_roots()
+    local lines = {}
+    for _, root in ipairs(roots) do
+        local p = io.popen("ls -1 " .. shq(root.dir) .. " 2>/dev/null")
+        if p then
+            for line in p:lines() do
+                if line:sub(1, 1) ~= "." then
+                    lines[#lines + 1] = string.format("[%s] %s", root.scope, line)
+                end
+            end
+            p:close()
+        end
+    end
+    if #lines == 0 then return "(no native helpers)" end
+    return table.concat(lines, "\n")
+end
+
+function M:_helper_schemas()
+    local seen = {}
+    local out = {}
+    for _, root in ipairs(self:_helper_roots()) do
+        local p = io.popen("ls -1 " .. shq(root.dir) .. " 2>/dev/null")
+        if p then
+            for line in p:lines() do
+                local name = line:match("^([%w_][%w_%-]*)%.tool%.json$")
+                if name and not BUILTIN_TOOLS[name] and not seen[name] then
+                    local f = io.open(root.dir .. "/" .. line, "rb")
+                    if f then
+                        local raw = f:read("*a")
+                        f:close()
+                        local ok, schema = pcall(cjson.decode, raw or "")
+                        if ok and type(schema) == "table"
+                            and (schema.name == nil or schema.name == name)
+                            and type(schema.parameters) == "table" then
+                            seen[name] = true
+                            out[#out + 1] = {
+                                type = "function",
+                                ["function"] = {
+                                    name = name,
+                                    description = schema.description or "",
+                                    parameters = schema.parameters,
+                                },
+                            }
+                        end
+                    end
+                end
+            end
+            p:close()
+        end
+    end
+    return out
+end
+
+function M:_run_helper_tool(name, args)
+    if BUILTIN_TOOLS[name] then return nil end
+    local p = self:_helper_find(name, true)
+    if not p then return nil end
+
+    local chunk, lerr = loadfile(p.lua)
+    if not chunk then
+        return "error: helper lua load failed: " .. tostring(lerr)
+    end
+    local ok, mod = pcall(chunk)
+    if not ok or type(mod) ~= "table" or type(mod.run) ~= "function" then
+        return "error: helper lua must return { run = function(args, env) }"
+    end
+
+    local ffi = require("ffi")
+    local env = {
+        cwd = normalize(self.cwd):gsub("/+$", ""),
+        helper_dir = p.dir,
+        scope = p.scope,
+        ffi = ffi,
+        load = function(n)
+            local so, serr = self:_helper_so_abs(n)
+            if not so then error(serr) end
+            return ffi.load(so)
+        end,
+        call = function(n, input)
+            return self:native_run(n, input)
+        end,
+    }
+    local ok2, res = pcall(mod.run, args or {}, env)
+    if not ok2 then
+        return "error: helper " .. name .. ": " .. tostring(res)
+    end
+    if res == nil then return "(helper returned nil)" end
+    return truncate(tostring(res))
+end
+
+function M:native_wrap(name, lua_code, description, parameters, scope)
+    local p, err = self:_helper_paths(name, scope)
+    if not p then return "error: " .. err end
+    if BUILTIN_TOOLS[name] then return "error: cannot override built-in tool " .. name end
+    lua_code = tostring(lua_code or "")
+    if lua_code == "" then return "error: lua code is required" end
+    if type(parameters) ~= "table" then
+        return "error: parameters must be a JSON schema object"
+    end
+    local ok, werr = write_abs(p.lua, lua_code)
+    if not ok then return "error: " .. tostring(werr) end
+    local schema = {
+        name = name,
+        description = tostring(description or ("native helper " .. name)),
+        parameters = parameters,
+    }
+    local ok2, werr2 = write_abs(p.tool, cjson.encode(schema))
+    if not ok2 then return "error: " .. tostring(werr2) end
+    return "installed helper tool " .. name .. " (" .. p.scope .. ")" ..
+        "; call it as " .. name .. "(...)"
+end
+
+function M:native_remove(name, scope)
+    local p, err = self:_helper_paths(name, scope)
+    if not p then return "error: " .. err end
+    for _, path in ipairs({
+        p.lua, p.tool, p.manifest, p.so, p.src,
+        p.src:gsub("%.c$", ".cpp"),
+    }) do
+        os.remove(path)
+    end
+    local listing = io.popen("ls -1 " .. shq(p.dir) .. " 2>/dev/null")
+    if listing then
+        local pattern = "^" .. p.name:gsub("%-", "%%-") .. "%-.*%.so$"
+        for line in listing:lines() do
+            if line:match(pattern) then os.remove(p.dir .. "/" .. line) end
+        end
+        listing:close()
+    end
+    return "removed helper " .. name .. " (" .. p.scope .. ")"
+end
+
+function M:native(action, name, code, lang, libs, input, lua_code, description, parameters, scope)
+    if action == "build" then
+        return self:native_build(name, code, lang, libs, scope)
+    elseif action == "run" then
+        return self:native_run(name, input)
+    elseif action == "wrap" then
+        return self:native_wrap(name, lua_code, description, parameters, scope)
+    elseif action == "remove" then
+        return self:native_remove(name, scope)
+    elseif action == "list" then
+        return self:native_list()
+    end
+    return "error: action must be build, run, wrap, remove, or list"
 end
 
 function M:write(path, content)
@@ -532,6 +1159,13 @@ function M:execute(name, args)
             return self:bash(args.command or "")
         elseif name == "read" then
             return self:read(args.path, args.offset, args.limit)
+        elseif name == "ocr" then
+            return self:ocr(args.path, args.boxes)
+        elseif name == "resize" then
+            return self:resize(args.path, args.width, args.height, args.output, args.force)
+        elseif name == "native" then
+            return self:native(args.action, args.name, args.code, args.lang, args.libs,
+                args.input, args.lua, args.description, args.parameters, args.scope)
         elseif name == "write" then
             return self:write(args.path, args.content or "")
         elseif name == "edit" then
@@ -554,6 +1188,8 @@ function M:execute(name, args)
             if not self.todos then return "error: todo disabled" end
             return self.todos:set(args.items)
         end
+        local helper_out = self:_run_helper_tool(name, args)
+        if helper_out ~= nil then return helper_out end
         return "error: unknown tool " .. tostring(name)
     end)
     if not ok then return "error: " .. tostring(out) end

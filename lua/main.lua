@@ -30,6 +30,7 @@ lite — DeepSeek 终端 coding agent
   --reasoning-effort LEVEL     high | medium | low
   --sandbox                    bash 使用 bwrap 沙箱（需安装 bubblewrap）
   --approval auto|ask|deny     工具审批策略（默认 auto）
+  --max-turns N                单次任务工具循环上限（默认 128）
   --debug-log PATH             写 JSONL 调试日志（provider/HTTP）
 
 环境:
@@ -37,7 +38,7 @@ lite — DeepSeek 终端 coding agent
   DEEPSEEK_BASE_URL            默认 https://api.deepseek.com
   DEEPSEEK_MODEL               默认 deepseek-flash
   LITE_CWD                     默认当前目录
-  LITE_MAX_TURNS               默认 16
+  LITE_MAX_TURNS               默认 128
   LITE_JSON=1                  等价于 --json
 
 状态: --tui 为交互入口；--once 用于脚本/CI。
@@ -124,6 +125,9 @@ local function parse_flags(list)
         elseif a == "--approval" then
             flags.approval = list[i + 1]
             i = i + 2
+        elseif a == "--max-turns" then
+            flags.max_turns = tonumber(list[i + 1])
+            i = i + 2
         elseif a == "--debug-log" then
             flags.debug_log = list[i + 1]
             i = i + 2
@@ -149,6 +153,7 @@ elseif cmd == "serve" or cmd == "--serve" then
     if flags.reasoning_effort then config.reasoning_effort = flags.reasoning_effort end
     if flags.sandbox then config.sandbox = "enforce" end
     if flags.approval then config.approval = flags.approval end
+    if flags.max_turns then config.max_turns = flags.max_turns end
     if flags.debug_log then config.debug_log = flags.debug_log end
     if not config.api_key or config.api_key == "" then
         io.stderr:write("lite: missing DEEPSEEK_API_KEY\n")
@@ -286,6 +291,7 @@ elseif cmd == "--tui" then
     if flags.reasoning_effort then config.reasoning_effort = flags.reasoning_effort end
     if flags.sandbox then config.sandbox = "enforce" end
     if flags.approval then config.approval = flags.approval end
+    if flags.max_turns then config.max_turns = flags.max_turns end
     if flags.debug_log then config.debug_log = flags.debug_log end
     if not flags.snapshot and (not config.api_key or config.api_key == "") then
         io.stderr:write("lite: missing DEEPSEEK_API_KEY\n")
@@ -417,7 +423,8 @@ elseif cmd == "--tui" then
     end
     os.exit(0)
 elseif cmd == "--once" then
-    local prompt = rest[1]
+    local flags, pos = parse_flags(rest)
+    local prompt = pos[1]
     if not prompt or prompt == "" then
         if json then emit({ type = "error", error = "missing prompt" })
         else io.stderr:write("lite: --once requires a prompt\n") end
@@ -425,6 +432,7 @@ elseif cmd == "--once" then
     end
 
     local config = require("core.config").load()
+    if flags.max_turns then config.max_turns = flags.max_turns end
     if not config.api_key or config.api_key == "" then
         if json then emit({ type = "error", error = "missing DEEPSEEK_API_KEY" })
         else io.stderr:write("lite: missing DEEPSEEK_API_KEY\n") end

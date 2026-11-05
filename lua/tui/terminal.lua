@@ -76,14 +76,14 @@ function M.enter()
     raw.c_cc[VTIME] = 0
     ffi.C.tcsetattr(0, TCSANOW, raw)
 
-    M.write("\27[?1049h\27[?25l\27[2J\27[H")
+    M.write("\27[?1049h\27[?25l\27[?1000h\27[?1006h\27[2J\27[H")
     return { orig = orig, active = true }
 end
 
 function M.leave(t)
     if not t or not t.active then return end
     t.active = false
-    M.write("\27[0m\27[?25h\27[?1049l")
+    M.write("\27[0m\27[?25h\27[?1006l\27[?1000l\27[?1049l")
     ffi.C.tcsetattr(0, TCSANOW, t.orig)
 end
 
