@@ -40,6 +40,11 @@ luac.out
 *.hex
 
 
+# local secrets
+.env
+.env.*
+!.env.example
+
 # lite runtime / build artifacts
 build/
 dist/

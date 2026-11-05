@@ -1,0 +1,499 @@
+-- TUI 事件循环：stdin + curl_multi + 定时器 + 重绘。
+local Terminal = require("tui.terminal")
+local Screen = require("tui.screen")
+local Input = require("tui.input")
+local Composer = require("tui.composer")
+local Transcript = require("tui.transcript")
+local Status = require("tui.status")
+local Diff = require("tui.diff")
+local DiffView = require("tui.diff_view")
+local TodoView = require("tui.todo_view")
+local HelpView = require("tui.help_view")
+local Complete = require("tui.complete")
+local SessionView = require("tui.session_view")
+local Session = require("core.session")
+local http = require("core.http")
+
+local M = {}
+
+local SPINNER = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
+
+local function shq(s)
+    return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+end
+
+function M.run(ctx, agent, memory, opts)
+    opts = opts or {}
+    local multi = opts.multi
+    local provider = agent.provider
+
+    local input = Input.new()
+    local composer = Composer.new()
+    local transcript = Transcript.new()
+
+    local w, h = Terminal.size()
+    local screen = Screen.new(w, h)
+
+    local busy = false
+    local quitting = false
+    local co, active_req
+    local diff_view
+    local todo_view
+    local help_view
+    local session_view
+    local todo_items = ctx.session.todos or {}
+    local last_tool_diff
+    local current_tool
+    local memory_hits = 0
+    local draw
+    local spinner_i = 0
+    local mem_count = 0
+    local last_stats = -1
+
+    local HINT = "lite TUI · Enter 发送 · Ctrl+J 换行 · Tab 补全 · /session 会话 · Ctrl+G diff · Ctrl+T todo · ? help · Ctrl+D 退出"
+
+    local function populate(messages, label)
+        transcript:clear()
+        transcript:add("info", HINT)
+        for _, m in ipairs(messages or {}) do
+            if m.role == "user" then
+                transcript:add("user", m.content or "")
+            elseif m.role == "assistant" then
+                if (m.content or "") ~= "" then transcript:add("assistant", m.content) end
+            elseif m.role == "tool" then
+                local s = tostring(m.content or "")
+                if #s > 4000 then s = s:sub(1, 4000) .. "\n... [truncated]" end
+                local b = transcript:add("tool", "● tool result\n" .. s)
+                b.tool = true
+            end
+        end
+        if label then transcript:add("info", label) end
+        transcript:reset_scroll()
+    end
+
+    populate(opts.messages, opts.messages and #opts.messages > 0
+        and ("restored " .. #opts.messages .. " messages") or nil)
+
+    local function switch_to(id)
+        if busy then
+            transcript:add("info", "无法切换：当前正在执行")
+            return
+        end
+        local mem_msgs, max_turn = {}, 0
+        if memory then mem_msgs, max_turn = memory:session_messages(id, 50) end
+
+        local s = Session.new(ctx, { id = id, memory = memory })
+        local file_msgs = Session.clean(s:load())
+        local msgs = #mem_msgs > 0 and mem_msgs or file_msgs
+        local total = memory and memory:session_message_count(id) or 0
+        s.seq = math.max(#file_msgs, total)
+        local turn = max_turn or 0
+        if #mem_msgs == 0 then
+            for _, m in ipairs(msgs) do
+                if m.role == "user" then turn = turn + 1 end
+            end
+        end
+
+        ctx.session.id = id
+        ctx.session.messages = msgs
+        ctx.session.turn = turn
+        agent.session = s
+        if memory then
+            memory:ensure_session(id, ctx.session.cwd, ctx.session.model)
+        end
+        if agent.tools and agent.tools.todos then
+            agent.tools.todos:load()
+            ctx:emit("todos", ctx.session.todos)
+        end
+        local source = #mem_msgs > 0 and ("memory " .. #mem_msgs) or ("jsonl " .. #file_msgs)
+        populate(msgs, string.format("session %s · %s", id, source))
+    end
+
+    local function switch_new()
+        if busy then
+            transcript:add("info", "无法切换：当前正在执行")
+            return
+        end
+        local id = Session.new_id()
+        ctx.session.id = id
+        ctx.session.messages = {}
+        ctx.session.turn = 0
+        agent.session = Session.new(ctx, { id = id, memory = memory })
+        if memory then
+            memory:ensure_session(id, ctx.session.cwd, ctx.session.model)
+        end
+        if agent.tools and agent.tools.todos then
+            agent.tools.todos:load()
+            ctx:emit("todos", ctx.session.todos)
+        end
+        populate({}, "new session " .. id)
+    end
+
+    local function handle_command(text)
+        local name, arg = text:match("^/(%S+)%s*(.*)$")
+        if not name then return end
+        if name == "session" then
+            if arg == "new" then
+                switch_new()
+            elseif arg ~= "" then
+                switch_to(arg)
+            else
+                local sessions = {}
+                if memory then
+                    for _, meta in ipairs(memory:list_sessions(ctx.session.cwd, 10)) do
+                        sessions[#sessions + 1] = { id = meta.id, preview = meta.title or "" }
+                    end
+                end
+                if #sessions == 0 then
+                    for _, s in ipairs(Session.for_cwd(ctx.session.cwd, 10)) do
+                        sessions[#sessions + 1] = { id = s.id, preview = s.preview }
+                    end
+                end
+                session_view = SessionView.new(sessions, {
+                    current = ctx.session.id,
+                    width = w,
+                    height = h,
+                })
+            end
+        elseif name == "new" then
+            switch_new()
+        elseif name == "help" then
+            help_view = HelpView.new({ width = w, height = h })
+        elseif name == "quit" then
+            quitting = true
+        else
+            transcript:add("info", "unknown command /" .. name)
+        end
+    end
+
+    ctx:on("reasoning", function(t) transcript:reasoning_append(t) end)
+    ctx:on("delta", function(t)
+        transcript:end_reasoning()
+        transcript:stream_append(t)
+    end)
+    ctx:on("assistant", function()
+        transcript:end_reasoning()
+        transcript:end_stream()
+    end)
+    ctx:on("tool_start", function(name, args)
+        current_tool = name
+        transcript:tool_start(name, args)
+        if draw then draw() end
+    end)
+    ctx:on("tool_result", function(name, result)
+        transcript:tool_result(name, result)
+        if type(result) == "string" and result:find("diff --git ", 1, true) then
+            last_tool_diff = result
+        end
+        current_tool = nil
+        if draw then draw() end
+    end)
+    ctx:on("error", function(err) transcript:add("error", tostring(err)) end)
+    ctx:on("memory", function(items)
+        memory_hits = #(items or {})
+        if draw then draw() end
+    end)
+    ctx:on("todos", function(items)
+        todo_items = items or {}
+        if todo_view then todo_view:set_items(todo_items) end
+        if draw then draw() end
+    end)
+
+    local resume_agent
+
+    local function finish_agent()
+        busy = false
+        co = nil
+        active_req = nil
+        current_tool = nil
+        transcript:end_stream()
+    end
+
+    local function on_resume(ok, y)
+        if not ok then
+            finish_agent()
+            transcript:add("error", tostring(y))
+            return
+        end
+        if coroutine.status(co) == "dead" then
+            finish_agent()
+            return
+        end
+        if type(y) == "table" and y.kind == "http" then
+            active_req = y.req
+        end
+    end
+
+    resume_agent = function(a, e)
+        if not co then return end
+        local ok, y = coroutine.resume(co, a, e)
+        on_resume(ok, y)
+    end
+
+    local function submit()
+        local text = composer:get_text()
+        if text == "" then return end
+        if text:sub(1, 1) == "/" then
+            composer:push_history(text)
+            composer:clear()
+            handle_command(text)
+            return
+        end
+        if busy then return end
+        composer:push_history(text)
+        composer:clear()
+        transcript:add("user", text)
+        transcript:reset_scroll()
+        memory_hits = 0
+        busy = true
+        co = agent:run_async(text)
+        resume_agent()
+    end
+
+    local function cancel()
+        if not busy then return end
+        if active_req and multi then
+            http.cancel(multi, active_req)
+            active_req = nil
+            resume_agent(nil, "cancelled")
+        else
+            transcript:add("info", "tool 执行中，无法中断")
+        end
+    end
+
+    local function load_diff()
+        local cwd = ctx.session.cwd or "."
+        local p = io.popen("cd " .. shq(cwd)
+            .. " && git --no-pager diff --no-color --no-ext-diff -U3 2>/dev/null", "r")
+        local out = ""
+        if p then out = p:read("*a") or ""; p:close() end
+        if out == "" then
+            p = io.popen("cd " .. shq(cwd)
+                .. " && git --no-pager diff --cached --no-color --no-ext-diff -U3 2>/dev/null", "r")
+            if p then out = p:read("*a") or ""; p:close() end
+        end
+        return out
+    end
+
+    local function open_diff()
+        local text = load_diff()
+        if not text or text == "" then text = last_tool_diff end
+        if not text or text == "" then
+            transcript:add("info", "没有可显示的 git diff")
+            return
+        end
+        local files = Diff.parse(text)
+        if #files == 0 then
+            transcript:add("info", "没有可显示的 git diff")
+            return
+        end
+        diff_view = DiffView.new(files, {
+            width = w,
+            height = h,
+            mode = w >= 100 and "split" or "unified",
+        })
+    end
+
+    local function complete_path()
+        local line = composer.lines[composer.cy] or ""
+        local token, start = Complete.token(line, composer.cx)
+        if token == "" or token:sub(1, 1) == "/" or token:find("..", 1, true) then return end
+
+        local dir, base = "", token
+        local slash = token:match("^(.*/)([^/]*)$")
+        if slash then
+            dir = slash
+            base = token:match("([^/]*)$")
+        end
+
+        local p = io.popen("ls -1ap " .. shq(ctx.session.cwd .. "/" .. dir) .. " 2>/dev/null", "r")
+        if not p then return end
+        local names = {}
+        for n in p:lines() do
+            if n ~= "./" and n ~= "../" then names[#names + 1] = n end
+        end
+        p:close()
+
+        local matches, common = Complete.candidates(names, base)
+        if #matches == 0 then return end
+        local fill = #matches == 1 and matches[1] or common
+        if fill == "" then return end
+        composer:replace_token(start, dir .. fill)
+    end
+
+    local function handle(ev)
+        if help_view then
+            if help_view:handle(ev) == "close" then help_view = nil end
+            return
+        end
+        if session_view then
+            local r = session_view:handle(ev)
+            if r then
+                session_view = nil
+                if r.action == "select" then
+                    switch_to(r.id)
+                elseif r.action == "new" then
+                    switch_new()
+                end
+            end
+            return
+        end
+        if todo_view then
+            if todo_view:handle(ev) == "close" then todo_view = nil end
+            return
+        end
+        if diff_view then
+            if diff_view:handle(ev) == "close" then diff_view = nil end
+            return
+        end
+
+        local k = ev.key
+
+        if k == "ctrl" then
+            if ev.char == "c" then
+                if busy then
+                    cancel()
+                elseif not composer:is_empty() then
+                    composer:clear()
+                else
+                    quitting = true
+                end
+            elseif ev.char == "d" then
+                if not busy then
+                    if composer:is_empty() then quitting = true else composer:delete() end
+                end
+            elseif ev.char == "l" then
+                screen:invalidate()
+            elseif ev.char == "o" then
+                transcript:toggle_last_tool()
+            elseif ev.char == "g" then
+                open_diff()
+            elseif ev.char == "t" then
+                diff_view = nil
+                todo_view = TodoView.new(todo_items, { width = w, height = h })
+            end
+            return
+        end
+
+        if k == "enter" then
+            submit()
+        elseif k == "newline" then
+            composer:insert("\n")
+        elseif k == "tab" then
+            complete_path()
+        elseif k == "backspace" then
+            composer:backspace()
+        elseif k == "delete" then
+            composer:delete()
+        elseif k == "left" then
+            composer:left()
+        elseif k == "right" then
+            composer:right()
+        elseif k == "up" then
+            if #composer.lines == 1 then composer:history_prev() else composer:up() end
+        elseif k == "down" then
+            if #composer.lines == 1 then composer:history_next() else composer:down() end
+        elseif k == "home" then
+            composer:home()
+        elseif k == "end" then
+            composer:end_()
+        elseif k == "pgup" then
+            local _, th = M.layout(h, composer)
+            transcript:scroll_up(math.max(1, th - 1))
+        elseif k == "pgdown" then
+            local _, th = M.layout(h, composer)
+            transcript:scroll_down(math.max(1, th - 1))
+        elseif k == "char" and ev.text == "?" then
+            help_view = HelpView.new({ width = w, height = h })
+        elseif k == "paste" or k == "char" then
+            composer:insert(ev.text)
+        end
+    end
+
+    draw = function()
+        screen:clear()
+        if help_view then
+            help_view:render(screen, w, h)
+            screen.cursor.visible = false
+        elseif session_view then
+            session_view:render(screen, w, h)
+            screen.cursor.visible = false
+        elseif todo_view then
+            todo_view:render(screen, w, h)
+            screen.cursor.visible = false
+        elseif diff_view then
+            diff_view:render(screen, w, h)
+            screen.cursor.visible = false
+        else
+            local composer_y, transcript_h = M.layout(h, composer)
+            local composer_h = h - composer_y
+
+            transcript:render(screen, 1, 1, w, transcript_h)
+            local cur_x, cur_y = composer:render(screen, 1, composer_y, w, "default", composer_h)
+            Status.render(screen, h, w, ctx, {
+                busy = busy,
+                mem = mem_count,
+                hits = memory_hits,
+                todos = todo_items,
+                spinner = busy and SPINNER[spinner_i + 1] or nil,
+                status = current_tool and ("tool:" .. current_tool) or nil,
+            })
+            screen.cursor.x = cur_x
+            screen.cursor.y = cur_y
+            screen.cursor.visible = not busy
+        end
+        Terminal.write(screen:render())
+    end
+
+    while not quitting do
+        local nw, nh = Terminal.size()
+        if nw ~= w or nh ~= h then
+            w, h = nw, nh
+            screen:resize(w, h)
+            if diff_view then diff_view:set_size(w, h) end
+            if todo_view then todo_view:set_size(w, h) end
+            if help_view then help_view:set_size(w, h) end
+            if session_view then session_view:set_size(w, h) end
+        end
+
+        local _, revents = Terminal.poll(15)
+        if revents and revents ~= 0 then
+            local s = Terminal.read_available(4096)
+            if s then
+                for _, ev in ipairs(input:feed(s)) do handle(ev) end
+            end
+        end
+
+        if active_req and multi then
+            local done = http.poll(multi, 5)
+            for _, req in ipairs(done) do
+                if req == active_req then
+                    active_req = nil
+                    local a, e = provider.finish_request(req)
+                    resume_agent(a, e)
+                    break
+                end
+            end
+        end
+
+        if memory then memory:tick() end
+        local now = os.time()
+        if now ~= last_stats then
+            last_stats = now
+            mem_count = memory and memory:stats().count or 0
+        end
+        if busy then spinner_i = (spinner_i + 1) % #SPINNER end
+
+        draw()
+    end
+end
+
+function M.layout(h, composer)
+    local max_composer = math.max(1, math.min(6, h - 2))
+    local composer_h = composer:height(max_composer)
+    local composer_y = h - composer_h
+    local transcript_h = math.max(1, composer_y - 1)
+    return composer_y, transcript_h
+end
+
+return M

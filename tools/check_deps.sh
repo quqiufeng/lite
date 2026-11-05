@@ -35,6 +35,12 @@ for c in gcc cmake pkg-config; do
     fi
 done
 
+if command -v tmux >/dev/null 2>&1; then
+    echo "[OK]   tmux     $(tmux -V 2>/dev/null || echo present)"
+else
+    echo "[WARN] tmux missing (tui.smoke skipped)"
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "== dependencies missing =="
     exit 1

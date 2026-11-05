@@ -1,4 +1,6 @@
--- 工具集：bash / read / write / edit（全部自动，限制在 workspace 内）。
+-- 工具集：bash / read / write / edit / todo（全部自动，限制在 workspace 内）。
+local Todos = require("core.todos")
+
 local M = {}
 M.__index = M
 
@@ -22,11 +24,85 @@ local function read_file(path)
     return s
 end
 
+local function split_lines(s)
+    local out = {}
+    if s == "" then return out end
+    local p = 1
+    while true do
+        local q = s:find("\n", p, true)
+        if not q then
+            out[#out + 1] = s:sub(p)
+            break
+        end
+        out[#out + 1] = s:sub(p, q - 1)
+        p = q + 1
+        if p > #s then break end
+    end
+    return out
+end
+
+-- 为一次 edit 生成单 hunk unified diff（带 3 行上下文）。
+local function make_edit_diff(root, abs, before, i, old, new)
+    local rel = abs
+    if root and root ~= "" and abs:sub(1, #root + 1) == root .. "/" then
+        rel = abs:sub(#root + 2)
+    end
+
+    local before_match = before:sub(1, i - 1)
+    local _, nl = before_match:gsub("\n", "")
+    local start_line = nl + 1
+    local line_start = (before_match:find("\n[^\n]*$") or 0) + 1
+
+    local j = i + #old - 1
+    local nl_end = before:find("\n", j, true)
+    local line_end = nl_end or #before
+
+    local prefix = before:sub(line_start, i - 1)
+    local suffix = before:sub(j + 1, line_end)
+    local old_block = before:sub(line_start, line_end)
+    local new_block = prefix .. (new or "") .. suffix
+
+    local old_lines = split_lines(old_block)
+    local new_lines = split_lines(new_block)
+    if new_block == "" then new_lines = {} end
+
+    local all = split_lines(before)
+    local ctx_before = {}
+    for k = math.max(1, start_line - 3), start_line - 1 do
+        if all[k] then ctx_before[#ctx_before + 1] = all[k] end
+    end
+
+    local after_start = start_line + #old_lines
+    local ctx_after = {}
+    for k = after_start, math.min(#all, after_start + 2) do
+        if all[k] then ctx_after[#ctx_after + 1] = all[k] end
+    end
+
+    local old_start = start_line - #ctx_before
+    local old_count = #ctx_before + #old_lines + #ctx_after
+    local new_count = #ctx_before + #new_lines + #ctx_after
+
+    local out = {
+        "diff --git a/" .. rel .. " b/" .. rel,
+        "--- a/" .. rel,
+        "+++ b/" .. rel,
+        string.format("@@ -%d,%d +%d,%d @@", old_start, old_count, old_start, new_count),
+    }
+    for _, line in ipairs(ctx_before) do out[#out + 1] = " " .. line end
+    for _, line in ipairs(old_lines) do out[#out + 1] = "-" .. line end
+    for _, line in ipairs(new_lines) do out[#out + 1] = "+" .. line end
+    for _, line in ipairs(ctx_after) do out[#out + 1] = " " .. line end
+
+    return table.concat(out, "\n")
+end
+
 function M.new(opts)
     opts = opts or {}
     return setmetatable({
         cwd = opts.cwd or os.getenv("PWD") or ".",
         memory = opts.memory,
+        ctx = opts.ctx,
+        todos = Todos.new(opts.ctx, opts.memory),
     }, M)
 end
 
@@ -146,6 +222,33 @@ function M:schemas()
                 },
             },
         },
+        {
+            type = "function",
+            ["function"] = {
+                name = "todo",
+                description = "Replace the task list for multi-step work. Provide the full list.",
+                parameters = {
+                    type = "object",
+                    properties = {
+                        items = {
+                            type = "array",
+                            items = {
+                                type = "object",
+                                properties = {
+                                    content = { type = "string" },
+                                    status = {
+                                        type = "string",
+                                        enum = { "pending", "in_progress", "completed", "cancelled" },
+                                    },
+                                },
+                                required = { "content", "status" },
+                            },
+                        },
+                    },
+                    required = { "items" },
+                },
+            },
+        },
     }
 end
 
@@ -195,12 +298,17 @@ function M:edit(path, old, new)
     if not old or old == "" then return "error: empty old text" end
     local i = s:find(old, 1, true)
     if not i then return "error: old text not found in " .. abs end
-    s = s:sub(1, i - 1) .. (new or "") .. s:sub(i + #old)
+
+    local before = s
+    s = before:sub(1, i - 1) .. (new or "") .. before:sub(i + #old)
     local f, oerr = io.open(abs, "wb")
     if not f then return "error: " .. tostring(oerr) end
     f:write(s)
     f:close()
-    return "edited " .. abs
+
+    local root = normalize(self.cwd):gsub("/+$", "")
+    local diff = make_edit_diff(root, abs, before, i, old, new or "")
+    return "edited " .. abs .. "\n" .. diff
 end
 
 function M:execute(name, args)
@@ -228,6 +336,9 @@ function M:execute(name, args)
                 out[#out + 1] = string.format("[%s] %s", it.key, it.text)
             end
             return table.concat(out, "\n")
+        elseif name == "todo" then
+            if not self.todos then return "error: todo disabled" end
+            return self.todos:set(args.items)
         end
         return "error: unknown tool " .. tostring(name)
     end)

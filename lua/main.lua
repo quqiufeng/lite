@@ -1,11 +1,23 @@
 -- lite 入口：--check / --once / --recall；支持 --json 供 agent 驱动。
 local VERSION = "0.1.1"
 
+local function shq(s)
+    return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+end
+
 local function usage()
     io.write([[
 lite — DeepSeek 终端 coding agent
 
 用法:
+  lite --tui                   交互式终端 UI
+  lite serve --port 8765       启动 headless 服务端（TCP JSONL）
+  lite serve --port 8765 --wake 300 --task "检查 CI"   定时唤醒
+  lite attach --port 8765      连接服务端并显示 TUI
+  lite attach --port 8765 --tmux  在新 tmux 窗口 attach
+  lite --tui --snapshot out.txt   输出整屏快照（AI 验收）
+  lite state [--json]          输出会话/记忆/todo 状态
+  lite sessions [--json]       列出同 cwd 会话
   lite --check                 检查运行依赖
   lite --once "<prompt>"       无 UI 单轮/工具循环（流式输出）
   lite --recall "<query>"      查询当前目录的本地记忆
@@ -14,16 +26,18 @@ lite — DeepSeek 终端 coding agent
 
 选项:
   --json                       机器可读 JSONL 输出（AI agent 友好）
+  --thinking                   启用 DeepSeek thinking（reasoning_content）
+  --reasoning-effort LEVEL     high | medium | low
 
 环境:
   DEEPSEEK_API_KEY             必需
   DEEPSEEK_BASE_URL            默认 https://api.deepseek.com
-  DEEPSEEK_MODEL               默认 deepseek-chat
+  DEEPSEEK_MODEL               默认 deepseek-flash
   LITE_CWD                     默认当前目录
   LITE_MAX_TURNS               默认 16
   LITE_JSON=1                  等价于 --json
 
-状态: TUI 尚未实现；--once 是当前唯一执行入口。
+状态: --tui 为交互入口；--once 用于脚本/CI。
 ]])
 end
 
@@ -48,12 +62,168 @@ end
 
 local cmd = args[1]
 
+local function parse_flags(list)
+    local flags, pos = {}, {}
+    local i = 1
+    while i <= #list do
+        local a = list[i]
+        if a == "--port" then
+            flags.port = tonumber(list[i + 1])
+            i = i + 2
+        elseif a == "--host" then
+            flags.host = list[i + 1]
+            i = i + 2
+        elseif a == "--tmux" then
+            flags.tmux = true
+            i = i + 1
+        elseif a == "--wake" then
+            flags.wake = tonumber(list[i + 1])
+            i = i + 2
+        elseif a == "--wake-max" then
+            flags.wake_max = tonumber(list[i + 1])
+            i = i + 2
+        elseif a == "--task" then
+            flags.task = list[i + 1]
+            i = i + 2
+        elseif a == "--task-file" then
+            flags.task_file = list[i + 1]
+            i = i + 2
+        elseif a == "--snapshot" then
+            flags.snapshot = list[i + 1]
+            i = i + 2
+        elseif a == "--snapshot-text" then
+            flags.snapshot_text = list[i + 1]
+            i = i + 2
+        elseif a == "--snapshot-todo" then
+            flags.snapshot_todo = true
+            i = i + 1
+        elseif a == "--snapshot-diff" then
+            flags.snapshot_diff = true
+            i = i + 1
+        elseif a == "--width" then
+            flags.width = tonumber(list[i + 1])
+            i = i + 2
+        elseif a == "--height" then
+            flags.height = tonumber(list[i + 1])
+            i = i + 2
+        elseif a == "--session" then
+            flags.session = list[i + 1]
+            i = i + 2
+        elseif a == "--thinking" then
+            flags.thinking = true
+            i = i + 1
+        elseif a == "--reasoning-effort" then
+            flags.reasoning_effort = list[i + 1]
+            i = i + 2
+        else
+            pos[#pos + 1] = a
+            i = i + 1
+        end
+    end
+    return flags, pos
+end
+
 if cmd == "--version" then
     if json then emit({ type = "version", version = VERSION })
     else print("lite " .. VERSION) end
     os.exit(0)
 elseif cmd == "--help" or cmd == "-h" or cmd == nil then
     usage()
+    os.exit(0)
+elseif cmd == "serve" or cmd == "--serve" then
+    local flags = parse_flags(rest)
+    local config = require("core.config").load()
+    if flags.thinking then config.thinking = true end
+    if flags.reasoning_effort then config.reasoning_effort = flags.reasoning_effort end
+    if not config.api_key or config.api_key == "" then
+        io.stderr:write("lite: missing DEEPSEEK_API_KEY\n")
+        os.exit(2)
+    end
+    local port = flags.port or tonumber(os.getenv("LITE_SERVE_PORT")) or 8765
+    local ok, err = require("core.serve").run({
+        host = flags.host,
+        port = port,
+        config = config,
+        wake = flags.wake,
+        max_runs = flags.wake_max,
+        task = flags.task,
+        task_file = flags.task_file,
+    })
+    if not ok then
+        io.stderr:write("lite serve: " .. tostring(err) .. "\n")
+        os.exit(1)
+    end
+    os.exit(0)
+elseif cmd == "attach" or cmd == "--attach" then
+    local flags = parse_flags(rest)
+    local host = flags.host or "127.0.0.1"
+    local port = flags.port or tonumber(os.getenv("LITE_SERVE_PORT")) or 8765
+    if flags.tmux then
+        local root = os.getenv("LITE_ROOT") or "."
+        local cmdline = string.format(
+            "tmux new-window -n lite-attach '%s/tools/lite attach --port %d --host %s'",
+            root, port, host)
+        local rc = os.execute(cmdline)
+        os.exit(rc and 0 or 1)
+    end
+    local ok, err = require("tui.attach").run({ host = host, port = port })
+    if not ok then
+        io.stderr:write("lite attach: " .. tostring(err) .. "\n")
+        os.exit(1)
+    end
+    os.exit(0)
+elseif cmd == "state" or cmd == "--state" or cmd == "sessions" or cmd == "--sessions" then
+    local flags = parse_flags(rest)
+    local config = require("core.config").load()
+    local Memory = require("core.memory")
+    local memory, merr = Memory.new({
+        dir = config.memory_dir or config.cwd,
+        max_mb = config.memory_mb,
+        flush_sec = config.memory_flush,
+    })
+    if not memory then
+        io.stderr:write("lite: " .. tostring(merr) .. "\n")
+        os.exit(2)
+    end
+
+    local sessions = memory:list_sessions(config.cwd, 20)
+    local sid = flags.session or (sessions[1] and sessions[1].id)
+    local saved = sid and memory:get("/agent/session", sid .. "/todos") or nil
+    local todos = type(saved) == "table" and (saved.items or saved) or {}
+    local is_sessions = (cmd == "sessions" or cmd == "--sessions")
+
+    local out = {
+        type = is_sessions and "sessions" or "state",
+        cwd = config.cwd,
+        model = config.model,
+        sessions = sessions,
+    }
+    if not is_sessions then
+        out.session = sid
+        out.todos = todos
+        out.memory = memory:stats()
+        out.wake = memory:get("/agent/working", "wake")
+    end
+
+    if json then
+        emit(out)
+    else
+        print("cwd   " .. config.cwd)
+        print("model " .. config.model)
+        for _, s in ipairs(sessions) do
+            print(string.format("%s  turns=%s  %s", s.id,
+                tostring(s.turns or 0), tostring(s.title or "")))
+        end
+        if not is_sessions then
+            local st = out.memory or {}
+            print(string.format("memory count=%d used=%d max=%d",
+                st.count or 0, st.used or 0, st.max or 0))
+            for _, t in ipairs(todos) do
+                print(string.format("[%s] %s", tostring(t.status), tostring(t.content)))
+            end
+        end
+    end
+    memory:close()
     os.exit(0)
 elseif cmd == "--check" then
     local deps = require("core.deps")
@@ -92,6 +262,126 @@ elseif cmd == "--recall" then
     end
     memory:close()
     os.exit(0)
+elseif cmd == "--tui" then
+    local flags = parse_flags(rest)
+    local config = require("core.config").load()
+    if flags.thinking then config.thinking = true end
+    if flags.reasoning_effort then config.reasoning_effort = flags.reasoning_effort end
+    if not flags.snapshot and (not config.api_key or config.api_key == "") then
+        io.stderr:write("lite: missing DEEPSEEK_API_KEY\n")
+        os.exit(2)
+    end
+
+    local Context = require("context")
+    local Tools = require("core.tools")
+    local Session = require("core.session")
+    local Provider = require("core.provider")
+    local Agent = require("core.agent")
+    local Memory = require("core.memory")
+    local http = require("core.http")
+
+    local ctx = Context.new({
+        cwd = config.cwd,
+        model = config.model,
+        base_url = config.base_url,
+        api_key = config.api_key,
+        temperature = config.temperature,
+        max_turns = config.max_turns,
+        context_chars = config.context_chars,
+        context_turns = config.context_turns,
+        thinking = config.thinking,
+        reasoning_effort = config.reasoning_effort,
+    })
+    local memory, merr = Memory.new({
+        dir = config.memory_dir or config.cwd,
+        max_mb = config.memory_mb,
+        flush_sec = config.memory_flush,
+    })
+    if not memory then
+        io.stderr:write("lite: " .. tostring(merr) .. "\n")
+        os.exit(2)
+    end
+
+    local multi, mlerr = http.multi_new()
+    if not multi then
+        memory:close()
+        io.stderr:write("lite: " .. tostring(mlerr) .. "\n")
+        os.exit(2)
+    end
+    ctx.settings.multi = multi
+
+    local tools = Tools.new({ cwd = config.cwd, memory = memory, ctx = ctx })
+
+    local restored, restored_id, restored_turn = {}, nil, 0
+    for _, meta in ipairs(memory:list_sessions(config.cwd, 5)) do
+        local msgs, max_turn = memory:session_messages(meta.id, 50)
+        if #msgs > 0 then
+            restored = msgs
+            restored_id = meta.id
+            restored_turn = max_turn or meta.turns or 0
+            break
+        end
+    end
+    if not restored_id then
+        for _, s in ipairs(Session.for_cwd(config.cwd, 5)) do
+            local clean = Session.clean(s.messages)
+            if #clean > 0 then
+                restored = clean
+                restored_id = s.id
+                for _, m in ipairs(clean) do
+                    if m.role == "user" then restored_turn = restored_turn + 1 end
+                end
+                break
+            end
+        end
+    end
+    if restored_id then ctx.session.id = restored_id end
+    ctx.session.turn = restored_turn or 0
+    ctx.session.messages = restored
+    memory:ensure_session(ctx.session.id, config.cwd, config.model)
+    if tools.todos then tools.todos:load() end
+
+    local msg_count = memory:session_message_count(ctx.session.id)
+    local session = Session.new(ctx, { memory = memory, seq = math.max(#ctx.session.messages, msg_count) })
+    local agent = Agent.new(ctx, Provider, tools, session, memory)
+
+    if flags.snapshot then
+        local patch = ""
+        if flags.snapshot_diff then
+            local p = io.popen("cd " .. shq(config.cwd)
+                .. " && git --no-pager diff --no-color --no-ext-diff -U3 2>/dev/null", "r")
+            if p then patch = p:read("*a") or ""; p:close() end
+        end
+        local ok, err = require("tui.snapshot").write(flags.snapshot, ctx, {
+            messages = restored,
+            text = flags.snapshot_text,
+            todo = flags.snapshot_todo,
+            diff = flags.snapshot_diff,
+            diff_patch = patch,
+            width = flags.width,
+            height = flags.height,
+            mem = memory:stats().count or 0,
+        })
+        memory:close()
+        http.multi_free(multi)
+        if not ok then
+            io.stderr:write("lite snapshot: " .. tostring(err) .. "\n")
+            os.exit(1)
+        end
+        os.exit(0)
+    end
+
+    local ok, err = require("tui").run(ctx, agent, memory, {
+        multi = multi,
+        messages = restored,
+    })
+    memory:close()
+    http.multi_free(multi)
+    if not ok then
+        io.stderr:write("lite: " .. tostring(err) .. "\n")
+        os.exit(1)
+    end
+    os.exit(0)
 elseif cmd == "--once" then
     local prompt = rest[1]
     if not prompt or prompt == "" then
@@ -123,6 +413,8 @@ elseif cmd == "--once" then
         max_turns = config.max_turns,
         context_chars = config.context_chars,
         context_turns = config.context_turns,
+        thinking = config.thinking,
+        reasoning_effort = config.reasoning_effort,
     })
     local memory, merr = Memory.new({
         dir = config.memory_dir or config.cwd,
@@ -135,17 +427,22 @@ elseif cmd == "--once" then
         os.exit(2)
     end
 
-    local tools = Tools.new({ cwd = config.cwd, memory = memory })
-    local session = Session.new(ctx)
+    local tools = Tools.new({ cwd = config.cwd, memory = memory, ctx = ctx })
+    local session = Session.new(ctx, { memory = memory })
     local agent = Agent.new(ctx, Provider, tools, session, memory)
 
     if json then
+        ctx:on("reasoning", function(text) emit({ type = "reasoning", text = text }) end)
         ctx:on("delta", function(text) emit({ type = "delta", text = text }) end)
         ctx:on("tool_start", function(name, a) emit({ type = "tool_start", name = name, args = a }) end)
         ctx:on("tool_result", function(name, result) emit({ type = "tool_result", name = name, result = result }) end)
         ctx:on("assistant", function(m) emit({ type = "assistant", content = m.content or "" }) end)
         ctx:on("error", function(err) emit({ type = "error", error = tostring(err) }) end)
     else
+        ctx:on("reasoning", function(text)
+            io.write("\27[90m", text, "\27[0m")
+            io.flush()
+        end)
         ctx:on("delta", function(text)
             io.write(text)
             io.flush()

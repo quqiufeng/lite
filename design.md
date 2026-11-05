@@ -390,6 +390,7 @@ C.close(h)
 
 - 上下文窗口：system + 最近 2 轮 + 8k 字符预算；更早的轮次不留在 prompt，只留在 `mem.bin`。
 - 每次请求前：`memory:context(user_text, {limit=8,max_chars=2400})` 搜索并按预算组装，作为一条 `system` 消息插入到最近 `user` 之前（不写入会话）。
+- 同时 emit `memory` 事件（命中 items），TUI 状态栏显示 `mem:<总数> hit:<本轮命中>`。
 - 回答完成后：`memory:remember_turn(session_id, turn, user, answer, tools)`。
 - 工具新增：
   - `remember {key,content,tags}` → `/agent/knowledge/*`
@@ -405,7 +406,7 @@ C.close(h)
 
 ---
 
-## 8. TUI 技术方案（待实现）
+## 8. TUI 技术方案（已确定）
 
 ### 8.1 定位
 
@@ -474,6 +475,13 @@ curl_multi_init / add_handle / multi_perform / multi_info_read / remove_handle
 - TUI 主循环：poll stdin + curl_multi + 定时器（记忆 flush、状态刷新），合并重绘。
 - 支持流式中滚动、Ctrl+C 取消（`curl_multi_remove_handle`）。
 
+实现细节（`[verified]`）：
+
+- **不使用 Lua FFI 写回调**：`curl_multi` 请求用 libcurl 默认写回调写入 `tmpfile()`，每个 `poll` 后 `fflush + ftell + fread` 读取增量，再在普通 Lua 栈上调 `on_data`。这样避免 JIT 下从 C 回调进入 Lua 偶发 `PANIC ... (bad callback)`。
+- 单活动请求：`http.request` 拒绝并发请求；完成后 `finish_req` 关闭 tmpfile。
+- agent 用协程：`provider.stream_async` yield `{kind="http", req}`，TUI poll 完成后 resume。
+- `tool_start` / `tool_result` 触发立即重绘；状态栏显示 `tool:<name>`。工具执行仍是同步的，`bash` 运行期间 TUI 不刷新（后续可做异步工具）。
+
 ### 8.8 事件流
 
 ```
@@ -485,10 +493,10 @@ memory → 请求前 recall、回答后 remember；TUI 只显示命中数
 
 ### 8.9 测试与可观测
 
-- `screen.lua` 纯逻辑单测：宽字符、换行、滚动、diff、工具折叠。
-- `--tui --snapshot <path>`（或 `LITE_TUI=1` + 测试 harness）把虚拟屏幕输出为文本/HTML；AI 读文件即可验收。
-- 失败时保存 `artifacts/<timestamp>/<case>/screen.txt|html`、`events.jsonl`、`app.log`。
-- 真实终端行为（raw/ANSI）单独做 smoke；不阻塞单元测试。
+- 纯逻辑单测（`auto_unit.lua`）：宽字符、input、composer、transcript、status、整屏快照、diff 解析/布局/虚拟化。
+- `tools/tui_smoke.sh`：tmux 120x30 + 临时 git 仓库，验证初始界面/状态栏/diff split-unified；使用假 key，不访问网络。
+- 失败时保存 `artifacts/<timestamp>/tui.smoke/screen.txt`；`tools/test.sh` 已包含该步骤。
+- 真实终端（raw/ANSI/输入）由 `tui_smoke` 覆盖；后续可再加 `--snapshot` 文本/HTML 导出。
 
 ### 8.10 分阶段
 
@@ -505,3 +513,118 @@ memory → 请求前 recall、回答后 remember；TUI 只显示命中数
 - 工具审批 UI（当前全自动，后续按 Reasonix 风格加 ask 覆盖层）。
 - 多行提交键：Ctrl+J 还是 Shift+Enter（终端差异）。
 - 取消语义：Ctrl+C 一次取消当前请求，空输入时二次退出。
+
+### 8.12 diff 视图（已实现）
+
+参考实现（code search，`[static]`）：
+
+- Pi：`packages/coding-agent/src/modes/interactive/components/diff.ts:87 renderDiff`，unified + 词级 `renderIntraLineDiff` + Tab→空格。
+- opencode：`packages/tui/src/feature-plugins/system/diff-viewer.tsx`，`MIN_SPLIT_WIDTH=100`、`DiffRenderable view=split|unified`、虚拟化 `scrollbox`、文件树、hunk 跳转、单文件模式；TUI 基于 OpenTUI 原生渲染器。
+
+lite 实现（纯 ANSI，CPU 虚拟化）：
+
+```
+lua/tui/diff.lua         parse / pair / intraline（词级 LCS，1:1 才做，超限回退前后缀）
+lua/tui/diff_layout.lua  unified/split 逻辑行 + wrap 高度 + 前缀和；只渲染可视行
+lua/tui/diff_view.lua    全屏 pager：滚动 / hunk / split 切换 / 单文件
+lua/tui/loop.lua         Ctrl+G 执行 git diff；工具输出含 diff --git 时也可打开
+```
+
+- split 宽度阈值 100；窄屏强制 unified。
+- 大文件：只存逻辑行 + 每行高度前缀和；滚动二分定位首行，仅 wrap 可见窗口。
+- GPU：进程内不做；终端负责光栅化（kitty/alacritty/wezterm 等）。
+- `edit` 工具成功后返回单 hunk unified diff（3 行上下文）；TUI 中 <=40 行自动展开，`Ctrl+G` 可进 pager。
+
+### 8.13 serve / attach（已实现）
+
+参考：opencode / Reasonix 都有 serve / attach 前端（第 1/2 节 `[static]`）。lite 用最小 TCP JSON Lines 实现：
+
+- `lite serve --port 8765 [--host 127.0.0.1]`：headless 运行 ctx/tools/agent/memory。
+  - 事件广播：`user / delta / assistant / tool_start / tool_result / error / status / turn_start / turn_end / memory / state`。
+  - 新客户端：`hello` → `replay`（最多 500 条）→ `state`；之后实时广播。
+  - 命令：`submit / cancel / state / ping / diff`；submit 忙时排队。
+  - 每轮结束 `memory:sync()` 并广播最新 `state`（mem 计数）。
+- `lite attach --port 8765`：复用 `tui/*`，本地不跑 agent；把 submit/cancel/diff 发给服务端并渲染远程事件。
+  - `--tmux`：用 `tmux new-window` 新开 attach 窗口。
+  - `Ctrl+G` 请求服务端 cwd 的 `git diff`。
+- 安全：默认只绑 `127.0.0.1`，无鉴权，不要暴露公网。
+- 测试：`tools/serve_smoke.sh`（TCP probe + tmux attach + diff 转发）。
+
+### 8.14 prompt 与记忆召回（已实现）
+
+参考实现（code search，`[static]`）：
+
+- Pi：`packages/coding-agent/src/core/system-prompt.ts:128 buildSystemPromptSections`，preamble + `<tools>/<rules>/<project_context>/<cwd>`；`renderProjectContext:79` 注入项目指令。
+- Reasonix：`internal/session/control/prefix.go:11 SystemPrompt` + `ToolSchemas:22` 作为缓存前缀；`internal/runtime/agent/context_manager.go:93 prepareOnce` 做上下文维护；`internal/contract/tool/recall.go:5 RecallRequest` 用 query/positions 召回折叠上下文。
+
+lite 实现：
+
+- `lua/core/prompt.lua`：结构化 sections（`preamble/tools/rules/memory/project_context/cwd`）。
+  - 项目指令自动加载 `AGENTS.md` / `CLAUDE.md` / `.lite/instructions.md`；`LITE_INSTRUCTIONS_FILE` 覆盖，`/dev/null` 禁用，默认截断 4000 字符。
+  - 工具列表从 `tools:schemas()` 生成，避免与 schema 脱节。
+- 记忆召回：ASCII 词 + 中文 bigram；短追问拼接上一轮 user；`<retrieved_memory>` 块标注“可能过期、按需使用”，并提示 `recall`。
+- 稳定前缀：system + tool schema 固定；memory 块动态插入最近 user 之前，旧轮次只从 memory 召回。
+- Agent 的 `window_messages(reserve)` 会扣除 memory 块预算，避免 prompt 超限。
+- TUI/serve 共用同一套 prompt/recall；`mem:N hit:H` 可见。
+
+### 8.15 todo list（已实现）
+
+- `context.lua`：`session.todos`；`core/todos.lua` 负责 normalize/校验（`pending / in_progress / completed / cancelled`，最多 50 条）。
+- `todo` 工具：一次提交完整列表；更新 `ctx.session.todos`，emit `todos`，并持久化到 `/agent/working/todos`（TTL long）。
+- Prompt：`<todos>` 块注入最近 user 之前；规则要求多步任务维护 todo。
+- TUI：状态栏 `todo:done/total`，`Ctrl+T` 全屏列表；serve 广播 `todos`，attach 同步显示。
+- 测试：normalize/持久化/tool/prompt 注入/状态栏/TodoView；tmux TUI 与 serve/attach 冒烟均断言 `todo:1/2` 和列表内容。
+
+### 8.16 定时唤醒（已实现）
+
+- `lua/core/scheduler.lua`：`every / task / max_runs / can / submit`；状态持久化到 `/agent/working/wake`（runs / last_run / last_answer）。
+- `serve --wake <秒> --task <prompt>`（或 `--task-file` / `.lite/wake.md`）；仅当 `not busy and #queue == 0` 时触发。
+- 唤醒 prompt 包含任务与上次结果，要求无人值守完成；每轮结束把 assistant 返回值写回 scheduler。
+- 广播 `wake` 事件给 attach；状态包含 `wake.runs/every/next_run/task`。
+- 安全：无人值守 + bash 自动执行风险高，应先补工具审批/沙箱后再长期运行。
+
+### 8.17 TUI 核心补全（已实现）
+
+对照 Pi `packages/tui/src/components/*`（markdown/editor/select-list/scroll-view/help）与 opencode `feature-plugins`（diff/which-key）：
+
+- **Markdown**：`lua/tui/markdown.lua`；标题/列表/引用/代码块/行内 code/bold/italic/link；transcript 的 assistant 块走 Markdown，按宽度 wrap 并保留 segment 样式。
+- **Help / which-key**：`lua/tui/help_view.lua`，`?` 打开；TUI/attach 均支持。
+- **Tab 补全**：`lua/tui/complete.lua` + composer `replace_token`；按当前 token 列目录、唯一命中直接补全，多命中补公共前缀。
+- **会话恢复**：`Session.recent_ids` + `Session.new({id=...})`；TUI 启动时找同 cwd 的最近 JSONL，恢复 agent messages 与 transcript。
+- 测试：Markdown/help/complete/session 单测；tmux 实际验证恢复、Markdown、help、`src/ma` → `src/main.lua`。
+- 尚未做：鼠标/选择复制、终端图片协议、全文搜索浮层、Session picker。
+
+### 8.18 会话存储：KV cache（不引入 SQLite）
+
+opencode 用 SQLite（`[static]`：`packages/core/src/session/sql.ts` 的 `session/message/part/todo/session_message/session_input`，`projector.ts:193` 事件投影）。lite 使用自建 KV cache：
+
+- 结构：`/agent/session/<id>/meta`、`/agent/index/cwd/<hash>/<id>`、`/agent/session/<id>/msg/<seq>`（完整消息）、`/agent/session/<id>/turn/<n>`（摘要）、`/agent/session/<id>/todos`（session 级 todo）。
+- 引擎：hash + sorted array/skiplist + tag/vector；`mem.bin` `MAP_SHARED` mmap，`mem.idx` 只读 mmap；`cache_get/prefix` 返回指针，C 层零拷贝，Lua 解码 JSON 时才复制。
+- `Session:append` 双写 JSONL + KV `/msg/<seq>`；`/session` 优先读 msg 精确重建（含 tool_calls/tool result），turn 摘要兜底。
+- `list_sessions(cwd)` 走 cwd 索引前缀搜索；选择后重建 messages + `max_turn`，JSONL 仅兜底。
+- `remember_turn` 更新 meta（updated/title/turns）与 cwd 索引；meta 永久，消息/turn/todo 用 long TTL。
+- todo 按 session_id 隔离，切换会话时重新载入。
+- 验证：178 单测 + tmux「仅 KV、无 JSONL」自动恢复与 `/session` 切换。
+
+### 8.19 session input / replay（已实现）
+
+- 对齐 opencode `session_input`：待处理 prompt 存 `/agent/session/<id>/input/<seq>`（text/ts），`core/inputs.lua` 提供 add/load/remove。
+- `serve` 启动时从 KV 恢复队列（push 回放 user 事件），`start_next` 取走后删除；重启不丢排队 prompt。
+- `serve` 启动时把恢复的 messages 以 `user/assistant/tool_result` 事件写入 replay；attach 连接即看到历史。
+- `state` 增加 `queued` 计数。
+- 验证：180 单测 + serve smoke（hello/replay/state/ping/diff + todo）。
+
+### 8.20 上下文 digest 与 AI 自我迭代
+
+- 对齐 opencode `session_context_epoch`（简化）：`window_messages` 返回被裁掉的 dropped messages；`request_messages` 把它们压成 `<session_context>` digest 存 `/agent/session/<id>/context`，并按 digest 预算二次裁剪；细节仍由 `recall` 提供。
+- AI 友好：`--once --json` 结构化事件、`--check/--recall/state/sessions --json`、`--tui --snapshot` 整屏快照、`artifacts/`、tmux 快照、`mem.bin` 跨迭代记忆、`AGENTS.md`/`design.md` + code search 规范。
+- 自我迭代循环：读 AGENTS/design → code search 参考 → 改代码 → `build.sh/test.sh` → `--once`/`--tui --snapshot`/`state --json` 观察 → 记忆写入下一轮。
+- 验证：186 单测 + CLI（snapshot/state/sessions）+ TUI/serve 冒烟。
+
+### 8.21 thinking / reasoning（已实现）
+
+- Provider 请求：`thinking = {type="enabled"}` + `reasoning_effort`；开关来自 `LITE_THINKING` / `DEEPSEEK_THINKING`、`LITE_REASONING_EFFORT` / `DEEPSEEK_REASONING_EFFORT`，TUI/serve 支持 `--thinking` / `--reasoning-effort`。
+- SSE：`delta.reasoning_content` → `reasoning` 事件；`content` 仍可能为 null，已守卫。
+- Agent：`ctx:emit("reasoning", text)`；不把 reasoning 写回 messages（避免污染后续请求）。
+- TUI：灰色 `…` 思考块，assistant 内容开始时自动结束；serve/attach 广播并显示；`--once --json` 输出 `{"type":"reasoning"}`。
+- 验证：190 单测；真实 API 收到 72 条 reasoning 事件；tmux 显示 `… Simple: 9.9 > 9.11...`。

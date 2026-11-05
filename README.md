@@ -2,7 +2,7 @@
 
 一个**精简的 native coding agent**：基于 [Pi](https://github.com/badlogic/pi-mono) 的极简 harness 思路，并借鉴 [Reasonix](https://github.com/esengine/reasonix) 的 DeepSeek 原生与缓存优先设计，用 **LuaJIT + libcurl + C** 重新实现，不依赖 Node/Python 运行时。
 
-当前是 **无 UI 阶段**：`--once` 跑通 provider、工具循环与本地记忆；TUI 后续加。
+当前包含无 UI `--once`、本地 TUI、diff pager、TODO 列表、serve/attach 与本地 KV 记忆。
 
 ---
 
@@ -36,14 +36,18 @@ TUI 完成后，“看见”会进一步包含对话界面与截图，形成完�
 
 ## 特性
 
-- **DeepSeek 流式对话**：OpenAI 兼容 `/chat/completions` + SSE。
-- **工具循环**：`bash / read / write / edit`，自动执行，文件工具限制在 workspace。
+- **DeepSeek 流式对话**：OpenAI 兼容 `/chat/completions` + SSE；支持 `thinking` / `reasoning_effort`，TUI 用灰色 `…` 块显示思考过程。
+- **工具循环**：`bash / read / write / edit / todo`，自动执行，文件工具限制在 workspace；TUI 即时显示 `tool:<name>` 与结果。`edit` 成功返回 unified diff，小 diff 自动展开，`Ctrl+G` 可全屏查看。
 - **本地上下文记忆**：
   - 每个项目目录生成 `mem.bin` + `mem.idx`；
   - C 引擎 mmap 零拷贝载入，约 30 秒落盘一次；
   - 前缀 / 范围 / 正则 / 模糊 / 标签搜索；
   - 旧轮次不进 prompt，需要时用 `recall` 查回。
 - **有界上下文**：system + 最近 2 轮 + 相关记忆块（默认 8k 字符预算）。
+- **TUI + diff**：`--tui` 交互；assistant Markdown/代码块渲染、`Tab` 文件路径补全、`?` 帮助、启动时自动恢复同 cwd 最近会话；`/session` 选择/新建会话；`Ctrl+G` 打开 `git diff`，支持 split/unified、hunk 跳转、单文件、大 diff 虚拟滚动。
+- **Todo list**：`todo` 工具维护多步任务；状态栏 `todo:done/total`，`Ctrl+T` 打开列表；持久化到本地记忆并随 serve/attach 广播。
+- **serve / attach**：`lite serve --port 8765` 启动 headless 服务端；`lite attach --port 8765` 在任意终端或 tmux tab 实时显示并交互，所有客户端共享同一会话与事件流。待处理 prompt 持久化在 KV，重启可恢复；attach 连接时回放会话历史。
+- **定时唤醒**：`serve --wake 300 --task "检查 CI"`（或 `--task-file` / `.lite/wake.md`）；空闲时自动提交，记录上次结果并随 attach 广播。无人值守仍需先补工具审批/沙箱。
 - **纯 native**：LuaJIT + C KV cache；无 Node / WebView / Electron。
 
 ---
@@ -56,6 +60,25 @@ TUI 完成后，“看见”会进一步包含对话界面与截图，形成完�
 
 export DEEPSEEK_API_KEY="sk-..."
 
+# 交互式 TUI（Ctrl+G 查看 git diff）
+./tools/run.sh --tui
+
+# 启用 thinking 模式
+./tools/run.sh --tui --thinking --reasoning-effort high
+
+# headless 服务端 + 任意终端/tmux tab attach
+./tools/run.sh serve --port 8765
+./tools/run.sh attach --port 8765
+./tools/run.sh attach --port 8765 --tmux   # 新 tmux window
+
+# 无人值守：每 300 秒唤醒执行任务
+./tools/run.sh serve --port 8765 --wake 300 --task "检查 CI 并修复"
+
+# AI 自观察：整屏快照 / 机器可读状态
+./tools/run.sh --tui --snapshot /tmp/lite-screen.txt --snapshot-text "hello"
+./tools/run.sh state --json
+./tools/run.sh sessions --json
+
 # 无 UI 执行一轮（流式输出 + 工具循环）
 ./tools/run.sh --once "看一下当前目录，解释这个项目"
 
@@ -65,7 +88,7 @@ export DEEPSEEK_API_KEY="sk-..."
 # AI agent 驱动：JSONL 事件（delta / tool / assistant / done）
 ./tools/run.sh --once --json "解释这个项目"
 
-# 依赖 / 单元测试
+# 依赖 / 单元 / CLI / TUI(tmux) 冒烟
 ./tools/check_deps.sh
 ./tools/test.sh
 ```
@@ -76,7 +99,7 @@ export DEEPSEEK_API_KEY="sk-..."
 return {
   api_key = "sk-...",
   base_url = "https://api.deepseek.com",
-  model = "deepseek-chat",
+  model = "deepseek-flash",
   max_turns = 16,
 }
 ```
@@ -93,7 +116,17 @@ return {
 
 - 命名空间：`/agent/knowledge/*`、`/agent/working/*`、`/agent/session/<id>/turn/<n>`。
 - 启动时载入 `mem.bin`；运行中按 `LITE_MEMORY_FLUSH`（默认 30s）`sync`，退出强制落盘。
-- 每次请求前按当前输入搜索相关记忆，组装成小块 `system` 消息；最近 2 轮之外的消息只从记忆召回。
+- 每次请求前按当前输入搜索相关记忆，组装成小块 `<retrieved_memory>` system 消息；最近 2 轮之外的消息只从记忆召回。
+- 召回 query：ASCII 词 + 中文 bigram；短追问会拼接上一轮 user，改善“继续/那个”的指代。
+- 窗口裁剪时把旧消息压成 `<session_context>` digest，存 `/agent/session/<id>/context`；细节仍用 `recall`。
+- system prompt 参考 Pi 分段：`<tools> / <rules> / <memory> / <project_context> / <cwd>`；自动加载 `AGENTS.md` / `CLAUDE.md` / `.lite/instructions.md`（默认截断 4000 字符）。
+- 会话存储也在 KV：`/agent/session/<id>/meta`、`/agent/index/cwd/<hash>/<id>`、`/agent/session/<id>/msg/<seq>`、`/agent/session/<id>/turn/<n>`。
+- `Session:append` 会把完整消息（含 tool_calls/tool result）镜像到 KV 的 `/msg/<seq>`；`/session` 优先用它精确重建，turn 摘要仅兜底。
+- todo 按 `session_id` 存在 `/agent/session/<id>/todos`。
+- `mem.bin` 用 `MAP_SHARED` mmap，`mem.idx` 只读 mmap；`cache_get/prefix` 返回指针，C 层零拷贝，Lua 解码 JSON 时才复制。
+- 轮次按 `session_id` 存；请求召回只注入当前 session 的轮次，facts/working 全局。
+- `/session` 优先从 KV 列同 cwd 会话并重建 messages；JSONL 仅作兼容/兜底，不引入 SQLite。
+- TUI 状态栏显示 `mem:<总条数>`；本轮召回命中显示为 `hit:<n>`。
 - 模型也可主动调用：
   - `remember {key,content,tags}` 写入长期事实；
   - `recall {query,limit}` 查询旧上下文。
@@ -111,7 +144,11 @@ lua/core/provider.lua   DeepSeek SSE + tool_calls
 lua/core/tools.lua      bash/read/write/edit + remember/recall
 lua/core/agent.lua      messages → model → tools → messages
 lua/core/memory.lua     命名空间/TTL/召回/上下文组装
+lua/core/prompt.lua     system prompt 分段 + 记忆块 + recall query
 lua/core/session.lua    JSONL 会话
+lua/core/net.lua        TCP + poll（serve/attach）
+lua/core/serve.lua      headless serve + JSONL 事件广播
+lua/tui/attach.lua      连接 serve 的远程 TUI
 lua/ffi/cache.lua       KV cache FFI
 src/cache/*.c           C KV cache（mmap / hash / sorted / tag / vector / hnsw）
 src/storage/mmap.c      db_pool_t
@@ -128,14 +165,23 @@ build/liblite_cache.so  C 共享库
 |---|---|---|
 | `DEEPSEEK_API_KEY` | — | 必需 |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | API 地址 |
-| `DEEPSEEK_MODEL` | `deepseek-chat` | 模型 |
+| `DEEPSEEK_MODEL` | `deepseek-flash` | 模型 |
 | `LITE_CWD` | 当前目录 | workspace |
 | `LITE_MAX_TURNS` | 16 | 单次 agent 循环上限 |
 | `LITE_MEMORY_MB` | 100 | mem.bin 容量 |
 | `LITE_MEMORY_FLUSH` | 30 | 自动落盘间隔（秒） |
 | `LITE_CONTEXT_CHARS` | 8000 | prompt 字符预算 |
 | `LITE_CONTEXT_TURNS` | 2 | 保留最近轮数 |
+| `LITE_INSTRUCTIONS_FILE` | 自动探测 | 项目指令文件；`/dev/null` 禁用 |
+| `LITE_INSTRUCTIONS_CHARS` | 4000 | 指令文件截断上限 |
+| `LITE_THINKING` | — | `1` 启用 thinking |
+| `LITE_REASONING_EFFORT` | — | `high` / `medium` / `low` |
 | `LITE_JSON` | — | 设为 `1` 等价 `--json` |
+| `LITE_SERVE_PORT` | `8765` | serve/attach 默认端口 |
+| `LITE_WAKE_SEC` | — | 定时唤醒间隔（秒） |
+| `LITE_WAKE_TASK` | — | 唤醒任务 prompt |
+| `LITE_WAKE_TASK_FILE` | `.lite/wake.md` | 唤醒任务文件 |
+| `LITE_WAKE_MAX` | `0` | 最大唤醒次数（0 不限） |
 
 ---
 
@@ -153,8 +199,9 @@ build/liblite_cache.so  C 共享库
 - [x] P0 基础设施 / 依赖 / 工具链
 - [x] P1 无 UI Agent（provider / tools / agent loop / `--once`）
 - [x] P1.5 上下文记忆（C KV cache + FFI + Lua + agent 注入）
-- [ ] P2 TUI（对话 / 输入 / 流式 / 滚动）
-- [ ] P3 自动化客户端 / 工具审批
+- [x] P2 TUI（对话 / 输入 / 流式 / 滚动 / diff pager）
+- [x] P3 serve / attach（TCP JSONL 自动化）
+- [ ] P3 工具审批 / 沙箱
 
 ## 参考
 

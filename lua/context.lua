@@ -8,10 +8,11 @@ function M.new(opts)
         session = {
             id = opts.id or os.date("%Y%m%d-%H%M%S"),
             cwd = opts.cwd or os.getenv("PWD") or ".",
-            model = opts.model or "deepseek-chat",
+            model = opts.model or "deepseek-flash",
             messages = {},
             turn = 0,
             busy = false,
+            todos = {},
         },
         view = {
             status = "idle",   -- idle | thinking | tool | error
@@ -21,11 +22,13 @@ function M.new(opts)
         settings = {
             api_key = opts.api_key,
             base_url = opts.base_url or "https://api.deepseek.com",
-            model = opts.model or "deepseek-chat",
+            model = opts.model or "deepseek-flash",
             temperature = opts.temperature or 0,
             max_turns = opts.max_turns or 16,
             context_chars = opts.context_chars or 8000,
             context_turns = opts.context_turns or 2,
+            thinking = opts.thinking,
+            reasoning_effort = opts.reasoning_effort,
         },
         ui = { dirty = true },
         listeners = {},

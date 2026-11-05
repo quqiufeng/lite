@@ -8,6 +8,7 @@ function M.new_parser()
     return {
         buf = "",
         content = {},
+        reasoning = {},
         tool_calls = {},
         tool_max = 0,
         finish = nil,
@@ -38,11 +39,16 @@ function M.feed(p, chunk)
             if ok and type(obj) == "table" and obj.choices and obj.choices[1] then
                 local ch = obj.choices[1]
                 local d = ch.delta or {}
-                if d.content and d.content ~= "" then
+                if type(d.reasoning_content) == "string" and d.reasoning_content ~= "" then
+                    p.reasoning[#p.reasoning + 1] = d.reasoning_content
+                    events[#events + 1] = { type = "reasoning", text = d.reasoning_content }
+                end
+                -- 思考阶段 content 可能为 JSON null（cjson 解成 lightuserdata）。
+                if type(d.content) == "string" and d.content ~= "" then
                     p.content[#p.content + 1] = d.content
                     events[#events + 1] = { type = "content", text = d.content }
                 end
-                if d.tool_calls then
+                if type(d.tool_calls) == "table" then
                     for _, tc in ipairs(d.tool_calls) do
                         local idx = (tonumber(tc.index) or p.tool_max) + 1
                         if idx > p.tool_max then p.tool_max = idx end
@@ -55,14 +61,14 @@ function M.feed(p, chunk)
                             }
                             p.tool_calls[idx] = acc
                         end
-                        if tc.id then acc.id = tc.id end
-                        if tc.type then acc.type = tc.type end
+                        if type(tc.id) == "string" then acc.id = tc.id end
+                        if type(tc.type) == "string" then acc.type = tc.type end
                         local fn = tc["function"]
-                        if fn then
-                            if fn.name then
+                        if type(fn) == "table" then
+                            if type(fn.name) == "string" then
                                 acc["function"].name = acc["function"].name .. fn.name
                             end
-                            if fn.arguments then
+                            if type(fn.arguments) == "string" then
                                 acc["function"].arguments =
                                     acc["function"].arguments .. fn.arguments
                             end
@@ -88,21 +94,25 @@ function M.finish(p)
     return msg
 end
 
-function M.stream(messages, tools, opts, on_delta)
+local function build_request(messages, tools, opts)
     if not opts.api_key or opts.api_key == "" then
-        return nil, "missing DEEPSEEK_API_KEY"
+        return nil, nil, nil, "missing DEEPSEEK_API_KEY"
     end
 
     local body = {
-        model = opts.model or "deepseek-chat",
+        model = opts.model or "deepseek-flash",
         messages = messages,
         stream = true,
         temperature = opts.temperature or 0,
     }
     if tools and #tools > 0 then body.tools = tools end
+    if opts.thinking then body.thinking = { type = "enabled" } end
+    if opts.reasoning_effort and opts.reasoning_effort ~= "" then
+        body.reasoning_effort = opts.reasoning_effort
+    end
 
     local ok, payload = pcall(cjson.encode, body)
-    if not ok then return nil, "encode request failed: " .. tostring(payload) end
+    if not ok then return nil, nil, nil, "encode request failed: " .. tostring(payload) end
 
     local base = (opts.base_url or "https://api.deepseek.com"):gsub("/+$", "")
     local headers = {
@@ -110,15 +120,29 @@ function M.stream(messages, tools, opts, on_delta)
         "Authorization: Bearer " .. opts.api_key,
         "Accept: text/event-stream",
     }
+    return base .. "/chat/completions", headers, payload
+end
+
+local function feed_parser(parser, chunk, on_delta, on_reasoning)
+    local events = M.feed(parser, chunk)
+    for _, ev in ipairs(events) do
+        if ev.type == "content" and on_delta then
+            on_delta(ev.text)
+        elseif ev.type == "reasoning" and on_reasoning then
+            on_reasoning(ev.text)
+        end
+    end
+end
+
+-- 阻塞请求（--once / 单测）。
+function M.stream(messages, tools, opts, on_delta, on_reasoning)
+    local url, headers, payload, err = build_request(messages, tools, opts)
+    if not url then return nil, err end
 
     local parser = M.new_parser()
-    local rc, status, raw = http.post_stream(base .. "/chat/completions",
-        headers, payload, function(chunk)
-            local events = M.feed(parser, chunk)
-            for _, ev in ipairs(events) do
-                if ev.type == "content" and on_delta then on_delta(ev.text) end
-            end
-        end)
+    local rc, status, raw = http.post_stream(url, headers, payload, function(chunk)
+        feed_parser(parser, chunk, on_delta, on_reasoning)
+    end)
 
     if rc ~= 0 then
         return nil, "http error: " .. tostring(raw)
@@ -127,6 +151,38 @@ function M.stream(messages, tools, opts, on_delta)
         return nil, string.format("HTTP %d: %s", status, tostring(raw):sub(1, 800))
     end
     return M.finish(parser)
+end
+
+-- 非阻塞请求（TUI）：返回 req，完成后用 finish_request(req) 取结果。
+function M.start(multi, messages, tools, opts, on_delta, on_reasoning)
+    if not multi then return nil, "missing multi handle" end
+    local url, headers, payload, err = build_request(messages, tools, opts)
+    if not url then return nil, err end
+
+    local parser = M.new_parser()
+    local req, rerr = http.request(multi, url, headers, payload, function(chunk)
+        feed_parser(parser, chunk, on_delta, on_reasoning)
+    end)
+    if not req then return nil, rerr end
+    req.parser = parser
+    return req
+end
+
+function M.finish_request(req)
+    if req.rc ~= 0 then
+        return nil, "http error: " .. tostring(req.err or req.rc)
+    end
+    if req.status ~= 200 then
+        return nil, string.format("HTTP %d: %s", req.status, tostring(req.body or ""):sub(1, 800))
+    end
+    return M.finish(req.parser)
+end
+
+-- 协程入口：yield 一次 {kind="http", req=...}，由驱动方 poll 后 resume 结果。
+function M.stream_async(messages, tools, opts, on_delta, on_reasoning)
+    local req, err = M.start(opts.multi, messages, tools, opts, on_delta, on_reasoning)
+    if not req then return nil, err end
+    return coroutine.yield({ kind = "http", req = req })
 end
 
 return M
