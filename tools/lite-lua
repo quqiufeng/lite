@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# 带 LUA_PATH / LUA_CPATH 的 LuaJIT 包装。
+set -euo pipefail
+
+SELF="$(readlink -f "$0")"
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+LUA="$ROOT/third_party/luajit/src/luajit"
+
+if [ ! -x "$LUA" ]; then
+    LUA="$(command -v luajit || true)"
+fi
+if [ -z "$LUA" ]; then
+    echo "lite: bundled luajit not found" >&2
+    exit 1
+fi
+
+export LITE_ROOT="$ROOT"
+export LUA_PATH="$ROOT/lua/?.lua;$ROOT/lua/?/init.lua;$ROOT/automation/?.lua;;${LUA_PATH:-}"
+export LUA_CPATH="$ROOT/third_party/cjson/lua/5.1/?.so;;${LUA_CPATH:-}"
+
+exec "$LUA" "$@"

@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SELF="$(readlink -f "$0")"
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+exec "$ROOT/tools/run.sh" "$@"
