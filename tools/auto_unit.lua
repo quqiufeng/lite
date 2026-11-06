@@ -750,6 +750,21 @@ io.write(ok and "READY\n" or "NOTREADY\n")
                 end
             end
 
+            -- ort_link.sh 默认 CPU 优先：OCR 只需 CPU，GPU 版会挂 CUDA EP
+            do
+                local f = io.open(root .. "/tools/ort_link.sh", "r")
+                local txt = f and f:read("*a") or ""
+                if f then f:close() end
+                check(txt:find("LITE_ORT_PREFER", 1, true) ~= nil,
+                    "ort_link.sh exposes CPU/GPU preference")
+                check(txt:find("providers_cuda", 1, true) ~= nil
+                    and txt:find("ort_variant", 1, true) ~= nil,
+                    "ort_link.sh classifies CPU vs GPU variant")
+                check(txt:find("libonnxruntime.so.1.%%*", 1, true) ~= nil
+                    or txt:find("libonnxruntime.so.1.", 1, true) ~= nil,
+                    "ort_link.sh handles pip layout (no .so.1 symlink)")
+            end
+
             -- CUDA provider 走软链接，不打包；实体文件会膨胀 tarball
             do
                 local pkg = io.open(root .. "/tools/package.sh", "r")

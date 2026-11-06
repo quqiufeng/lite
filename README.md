@@ -251,6 +251,9 @@ C ABI 固定为 `char *lite_helper(const char *input)` + 可选 `lite_helper_fre
   - **onnxruntime 核心库不打包**（25MB，占 dist 一半）：目标机执行
     `./tools/ort_link.sh link` 接入系统里**版本匹配**的那份；`status` 查看、`unlink` 撤销。
     版本要求记在 `lib/ORT_VERSION`。确实要随包分发：`LITE_DIST_WITH_ORT=1 ./tools/package.sh`
+  - **OCR 只需要 CPU 版 ORT**：CPU 优先（`LITE_ORT_PREFER` 可改）。CPU/GPU 发布的核心库
+    内容几乎相同，差别是同目录有没有 `providers_cuda.so` —— 有它，OCR 每次初始化都去挂
+    CUDA EP，小图反而更慢还多一层 cudnn 依赖。pip 的 `onnxruntime`（非 `-gpu`）即 CPU 版
   - CUDA provider 同样**不打包**（329MB）：`./tools/cuda_provider.sh link` 按需接入
   - 默认留 CPU：单张小图 CUDA 反而更慢（实测 2.3s vs 0.75s，初始化开销占主导），批量/大图才值得
 - pkg-config / gcc / cmake / OpenMP（编译 C KV cache + image）
