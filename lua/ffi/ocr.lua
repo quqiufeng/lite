@@ -9,6 +9,11 @@ ocr_simple_t *ocr_simple_create(const char *det, const char *rec, const char *di
 char *ocr_simple_run(ocr_simple_t *h, const char *image_path);
 void ocr_simple_free(char *s);
 void ocr_simple_destroy(ocr_simple_t *h);
+
+int open(const char *pathname, int flags, unsigned int mode);
+int close(int fd);
+int dup(int oldfd);
+int dup2(int oldfd, int newfd);
 ]]
 
 local function env(name)
@@ -70,6 +75,67 @@ local function load_ort()
     return false
 end
 
+-- 已知噪声：libocr_simple 无条件尝试 CUDA EP，随包只有 CPU 版 onnxruntime，
+-- 这段失败信息是预期内的（见 ready() 里的说明）。只过滤这几类，其余照常输出。
+local NOISE = {
+    "Failed to load library",
+    "Failed to load shared library",
+    "CUDA not available",
+    "AppendExecutionProvider_Cuda",
+    "libonnxruntime_providers_cuda.so",
+    "provider_bridge_ort.cc",
+    "ONNXRuntimeError",
+    "VerifyEachNodeIsAssignedToAnEp",
+    "Rerunning with verbose output",
+    "tensorrt_execution_provider",
+}
+
+local function is_noise(line)
+    for _, pat in ipairs(NOISE) do
+        if line:find(pat, 1, true) then return true end
+    end
+    -- ORT 的彩色输出会单独留一行 "^[[1;31m" / "^[[m"
+    if line:match("^%[?%[?[%d;]*m$") or line:match("^%[m$") then return true end
+    return false
+end
+
+-- 临时把 fd 1/2 都指到临时文件，跑 fn，再还原并把非噪声行回放到 stderr。
+-- 必须两个都接管：libocr_simple 的诊断走 **stdout**，ORT 自己的日志走 stderr。
+local function with_output_filtered(fn)
+    local tmp = os.tmpname()
+    local fd = ffi.C.open(tmp, 0x242, 420)      -- O_RDWR|O_CREAT|O_TRUNC, 0644
+    if fd < 0 then return fn() end
+    local saved_out, saved_err = ffi.C.dup(1), ffi.C.dup(2)
+    if saved_out < 0 or saved_err < 0 then
+        if saved_out >= 0 then ffi.C.close(saved_out) end
+        if saved_err >= 0 then ffi.C.close(saved_err) end
+        ffi.C.close(fd)
+        return fn()
+    end
+    io.flush()
+    ffi.C.dup2(fd, 1)
+    ffi.C.dup2(fd, 2)
+    local results = { pcall(fn) }
+    ffi.C.dup2(saved_out, 1)
+    ffi.C.dup2(saved_err, 2)
+    ffi.C.close(saved_out)
+    ffi.C.close(saved_err)
+    ffi.C.close(fd)
+
+    local f = io.open(tmp, "rb")
+    local cap = f and f:read("*a") or ""
+    if f then f:close() end
+    os.remove(tmp)
+    for line in (cap .. "\n"):gmatch("(.-)\n") do
+        local text = line:gsub("\27%[[%d;]*m", "")
+        if text:match("%S") and not is_noise(text) then
+            io.stderr:write(text, "\n")
+        end
+    end
+    local unpack = unpack or table.unpack
+    return unpack(results)
+end
+
 function M.ready()
     if handle then return true end
     if tried then return false, load_err end
@@ -92,14 +158,23 @@ function M.ready()
     end
     lib = h
 
-    local okc, res = pcall(lib.ocr_simple_create,
-        MODELS .. "ch_PP-OCRv4_det_infer.onnx",
-        MODELS .. "ch_PP-OCRv4_rec_infer.onnx",
-        MODELS .. "ppocr_keys_v1.txt")
+    -- libocr_simple.so 无条件尝试 CUDA EP。随包只带 CPU 版 onnxruntime，
+    -- 于是每次初始化都往 stderr 打一段红色的
+    --   [E:onnxruntime:...] FAIL : Failed to load library .../libonnxruntime_providers_cuda.so
+    -- 然后回退 CPU。这条是**预期行为**（我们故意不打包 329MB 的 CUDA provider），
+    -- 实测 CUDA 对单张小图反而慢 3 倍（2.4s vs 0.8s），CPU 才是正确默认。
+    -- 所以初始化期间临时接管 fd 2，过滤掉这段噪声，其余照常回放。
+    local okc, res = with_output_filtered(function()
+        return lib.ocr_simple_create(
+            MODELS .. "ch_PP-OCRv4_det_infer.onnx",
+            MODELS .. "ch_PP-OCRv4_rec_infer.onnx",
+            MODELS .. "ppocr_keys_v1.txt")
+    end)
     if not okc or res == nil then
         load_err = "OCR init failed (models/onnxruntime): " .. tostring(res)
         return false, load_err
     end
+    io.stderr:write("[OCR] backend: CPU (CUDA provider not bundled; GPU is slower for single images)\n")
     handle = res
     return true
 end

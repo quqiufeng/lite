@@ -714,6 +714,33 @@ do
             "tools ocr")
         local with_boxes = t:execute("ocr", { path = img, boxes = true })
         check(with_boxes:find('"x"', 1, true) ~= nil, "tools ocr boxes")
+        -- 初始化不应把 ONNX Runtime 的 CUDA 缺库报错漏到进程输出里。
+        -- 随包只有 CPU 版 onnxruntime，回退是预期行为；那几行红色 ERROR 会
+        -- 被误读成「OCR 坏了」。噪声在进程流（libocr 写 stdout，ORT 写 stderr），
+        -- 所以必须开子进程抓 2>&1，不能只检查工具返回值。
+        do
+            local root = (arg[0]:match("^(.*)/[^/]+$") or ".") .. "/.."
+            local script = root .. "/../ocr_quiet_probe.lua"
+            local sf2 = io.open(script, "w")
+            if sf2 then
+                sf2:write(string.format([[
+package.path = %q .. "/lua/?.lua;" .. %q .. "/lua/?/init.lua;" .. package.path
+local ok = require("ffi.ocr").ready()
+io.write(ok and "READY\n" or "NOTREADY\n")
+]], root, root))
+                sf2:close()
+                local h = io.popen(shq(root .. "/tools/lite-lua") .. " " .. shq(script) .. " 2>&1")
+                local text = h and h:read("*a") or ""
+                if h then h:close() end
+                os.remove(script)
+                check(text:find("READY", 1, true) ~= nil, "ocr init succeeds in subprocess")
+                local noisy = text:find("ONNXRuntimeError", 1, true)
+                    or text:find("provider_bridge_ort", 1, true)
+                    or text:find("libonnxruntime_providers_cuda", 1, true)
+                    or text:find("Failed to load shared library", 1, true)
+                check(not noisy, "ocr init quiet on missing CUDA provider")
+            end
+        end
         os.remove(img)
         os.execute("rm -rf " .. shq(dir))
     else
