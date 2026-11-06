@@ -258,6 +258,10 @@ CLI JSON → `tui_smoke.sh` → `serve_smoke.sh`。失败产物落 `artifacts/`�
 
 - C 导出 `int lite_<feature>_...` + `const char *lite_<feature>_error(void)`；失败返回非 0。
 - `.so` 设 `$ORIGIN` RPATH；`package.sh` 复制非 libc 依赖到 `dist/lib/`。
+- **大块系统库用软链接，不打包**：`tar -h` 会解引用软链，把实体塞进 tarball。
+  已有先例：CUDA provider（329MB）用 `tools/cuda_provider.sh link` 接系统里版本匹配的那份，
+  `package.sh` 显式跳过 `*providers_cuda*`；`check_deps.sh` 报 `ocr-cuda` 状态。
+  链接前校验版本、链接后**实测**（`CUDA enabled`）才保留，否则自动回滚。
 - 热重载：清 `package.loaded[...]` 重新 require（TUI `/reload`）。C `.so` 不卸载，改 C 要重启。
 
 **`native`：让模型自己造工具**
