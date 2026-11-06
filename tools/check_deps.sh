@@ -65,8 +65,11 @@ OCR_MODELS="${LITE_OCR_MODELS:-$ROOT/models/ocr/}"
 [ -f "$OCR_MODELS/ch_PP-OCRv4_det_infer.onnx" ] || OCR_MODELS="$ROOT/third_party/ocr/models/ocr/"
 if [ -f "$OCR_LIB" ] && [ -f "$OCR_MODELS/ch_PP-OCRv4_det_infer.onnx" ]; then
     echo "[OK]   OCR      PP-OCRv4 (optional)"
+elif [ -f "$OCR_LIB" ]; then
+    # lib 在、模型不在：OCR 是可选项，dist 默认不带模型，这不算失败
+    echo "[INFO] OCR      lib 就绪，未装模型（可选：拷 models 或设 LITE_OCR_MODELS）"
 else
-    echo "[WARN] OCR      missing lib/models (ocr tool disabled)"
+    echo "[WARN] OCR      missing lib (ocr tool disabled)"
 fi
 
 # 回归：lite 不得通过 LD_LIBRARY_PATH 注入自带 .so。

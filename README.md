@@ -244,6 +244,10 @@ C ABI 固定为 `char *lite_helper(const char *input)` + 可选 `lite_helper_fre
 - libpng / libjpeg / libwebp（系统；打包时 `.so` 进 `dist/lib/`）
 - libX11 / libxdo（系统；X11 截图与窗口控制）
 - OCR：PP-OCRv4 `third_party/ocr/`（lib + models + onnxruntime 1.26，随包进 `dist/lib`/`dist/models`）
+  - **默认不带 OCR 模型**（14.8MB，占解包六成）：OCR 是可选项，需要时把
+    `third_party/ocr/models/ocr/` 拷到目标机，或设 `LITE_OCR_MODELS` 指向既有副本。
+    要随包分发：`LITE_DIST_WITH_OCR=1 ./tools/package.sh`。
+    dist 包因此从 27M 降到 **3.3M**
   - **onnxruntime 核心库不打包**（25MB，占 dist 一半）：目标机执行
     `./tools/ort_link.sh link` 接入系统里**版本匹配**的那份；`status` 查看、`unlink` 撤销。
     版本要求记在 `lib/ORT_VERSION`。确实要随包分发：`LITE_DIST_WITH_ORT=1 ./tools/package.sh`

@@ -70,13 +70,15 @@ candidate_dirs() {
     done
 }
 
+# 探测只验证「动态库可加载」，不要求模型存在：
+# dist 默认不带 OCR 模型，若这里要求 ready()，链接 ORT 会被误判失败。
 probe() {
     cd "$ROOT"
     LITE_ROOT="$ROOT" ./tools/lite-lua -e '
 local ok, m = pcall(require, "ffi.ocr")
 if not ok then io.write("LOADFAIL\n"); os.exit(0) end
-local ready, err = m.ready()
-io.write(ready and "READY\n" or ("NOTREADY " .. tostring(err) .. "\n"))
+local good, err = m.loadable()
+io.write(good and "READY\n" or ("NOTREADY " .. tostring(err) .. "\n"))
 ' 2>&1 | tail -3 >"/tmp/lite_ort_probe.$$" || true
     local out; out="$(cat "/tmp/lite_ort_probe.$$" 2>/dev/null || true)"
     rm -f "/tmp/lite_ort_probe.$$"
@@ -109,9 +111,17 @@ status() {
         fi
     done
     if probe >/dev/null 2>&1; then
-        echo "[OK]   OCR 可用"
+        echo "[OK]   OCR 动态库可加载"
     else
-        echo "[WARN] OCR 当前不可用（缺 onnxruntime 或版本不匹配）"
+        echo "[WARN] OCR 动态库不可加载（缺 onnxruntime 或版本不匹配）"
+    fi
+    # 模型是另一回事：可选，不会随 dist 分发
+    local models="${LITE_OCR_MODELS:-$ROOT/models/ocr/}"
+    if [ -f "$models/ch_PP-OCRv4_det_infer.onnx" ] \
+        && [ -f "$models/ch_PP-OCRv4_rec_infer.onnx" ]; then
+        echo "[OK]   模型齐备  $models"
+    else
+        echo "[INFO] 未安装模型（可选）：拷到 $models 或设 LITE_OCR_MODELS"
     fi
 }
 

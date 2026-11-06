@@ -765,6 +765,9 @@ io.write(ok and "READY\n" or "NOTREADY\n")
                     "package.sh has escape hatch for bundling ORT")
                 check(script:find("ORT_VERSION", 1, true) ~= nil,
                     "package.sh records required ORT version")
+                -- OCR 模型 14.8MB、可选能力，默认也不随包
+                check(script:find("LITE_DIST_WITH_OCR", 1, true) ~= nil,
+                    "package.sh has escape hatch for bundling OCR models")
             end
         end
         os.remove(img)
@@ -773,6 +776,38 @@ io.write(ok and "READY\n" or "NOTREADY\n")
         if sf then sf:close() end
         print("SKIP tools ocr (OCR/onnxruntime/model unavailable)")
     end
+end
+
+-- OCR 可选性：模型缺失时报错必须可操作，不能是 cdata NULL；
+-- 且其余工具不受影响（dist 默认不带模型）
+do
+    local dir = os.tmpname()
+    os.remove(dir)
+    os.execute("mkdir -p " .. shq(dir))
+    local root = (arg[0]:match("^(.*)/[^/]+$") or ".") .. "/.."
+    local script = dir .. "/probe.lua"
+    local f = assert(io.open(script, "w"))
+    f:write(string.format([[
+package.path = %q .. "/lua/?.lua;" .. %q .. "/lua/?/init.lua;" .. package.path
+local OCR = require("ffi.ocr")
+local ok, err = OCR.ready()
+if ok then io.write("READY\n") else io.write("ERR " .. tostring(err) .. "\n") end
+]], root, root))
+    f:close()
+
+    local h = io.popen("env LITE_OCR_MODELS=/nonexistent/missing LITE_ROOT="
+        .. shq(root) .. " " .. shq(root .. "/tools/lite-lua") .. " " .. shq(script)
+        .. " 2>&1")
+    local text = h and h:read("*a") or ""
+    if h then h:close() end
+    os.remove(script)
+    os.execute("rm -rf " .. shq(dir))
+
+    check(text:find("ERR", 1, true) ~= nil, "ocr missing models reports error")
+    check(text:find("optional", 1, true) ~= nil,
+        "ocr missing models hint says optional")
+    check(text:find("cdata", 1, true) == nil,
+        "ocr missing models does not leak cdata NULL")
 end
 
 -- X11 capture (only with a live display)

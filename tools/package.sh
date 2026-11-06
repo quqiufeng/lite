@@ -72,8 +72,19 @@ if [ "${#EXTERNAL_LIBS[@]}" -gt 0 ]; then
     echo "package: 跳过仓库外的系统库（用 tools/cuda_provider.sh 在目标机按需接入）:"
     for i in "${EXTERNAL_LIBS[@]}"; do echo "  - $i"; done
 fi
+# OCR 模型 14.8MB（det 4.5 + rec 10.3），占解包体积六成。OCR 是可选能力，
+# 默认不随包：目标机需要时把模型目录拷过去，或设 LITE_OCR_MODELS 指向既有副本。
+# 要随包分发：LITE_DIST_WITH_OCR=1 ./tools/package.sh
 if [ -d "$ROOT/third_party/ocr/models/ocr" ]; then
-    ln -sfn "../../../third_party/ocr/models/ocr" "$DIST/models/ocr"
+    if [ "${LITE_DIST_WITH_OCR:-0}" = "1" ]; then
+        ln -sfn "../../../third_party/ocr/models/ocr" "$DIST/models/ocr"
+    else
+        rmdir "$DIST/models" 2>/dev/null || true
+        echo "package: 跳过 OCR 模型（14.8MB，可选能力）"
+        echo "         需要时: cp -r third_party/ocr/models/ocr \$DEST/models/"
+        echo "                 或 LITE_OCR_MODELS=/path/to/models/ocr"
+        echo "         随包分发: LITE_DIST_WITH_OCR=1 ./tools/package.sh"
+    fi
 fi
 
 if [ -f "$ROOT/build/liblite_image.so" ]; then

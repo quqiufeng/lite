@@ -139,6 +139,21 @@ local function with_output_filtered(fn)
     return unpack(results)
 end
 
+-- 只验证「动态库能不能加载」：ORT 已链接、libocr_simple 的版本符号能解析。
+-- 不碰模型文件 —— 否则 dist 不带模型时，ort_link.sh 会把链接误判为失败。
+-- 返回 true / false, err。
+function M.loadable()
+    if lib then return true end
+    if not LIB then return false, "libocr_simple.so not found (set LITE_OCR_LIB)" end
+    load_ort()
+    local ok, h = pcall(ffi.load, LIB)
+    if not ok then
+        return false, "OCR library not available: " .. tostring(h)
+    end
+    lib = h
+    return true
+end
+
 function M.ready()
     if handle then return true end
     if tried then return false, load_err end
@@ -149,7 +164,24 @@ function M.ready()
         return false, load_err
     end
     if not MODELS then
-        load_err = "PP-OCRv4 models not found (set LITE_OCR_MODELS)"
+        load_err = "PP-OCRv4 models not found "
+            .. "(ocr is optional; set LITE_OCR_MODELS to the models dir)"
+        return false, load_err
+    end
+    -- 三个文件缺一不可。逐个检查，别等到 create 返回 NULL 才给个看不懂的
+    -- "cdata<struct ocr_simple_t *>: NULL"。
+    local missing = {}
+    for _, name in ipairs({ "ch_PP-OCRv4_det_infer.onnx",
+                            "ch_PP-OCRv4_rec_infer.onnx",
+                            "ppocr_keys_v1.txt" }) do
+        local f = io.open(MODELS .. name, "rb")
+        if f then f:close() else missing[#missing + 1] = name end
+    end
+    if #missing > 0 then
+        load_err = string.format(
+            "PP-OCRv4 models incomplete in %s (missing: %s). "
+            .. "ocr is optional — copy the models there or set LITE_OCR_MODELS.",
+            MODELS, table.concat(missing, ", "))
         return false, load_err
     end
 
