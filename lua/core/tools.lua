@@ -226,7 +226,8 @@ end
 
 function M:resolve(p)
     if not p or p == "" then return nil, "empty path" end
-    local root = normalize(self.cwd):gsub("/+$", "")
+    -- normalize 会丢掉 "."，相对 cwd（如 "."）会变成 "/"；优先用 realpath 结果。
+    local root = (self.real_root or normalize(self.cwd)):gsub("/+$", "")
     local abs = p
     if p:sub(1, 1) ~= "/" then abs = root .. "/" .. p end
     abs = normalize(abs)
@@ -660,8 +661,13 @@ function M:_native_image_modules()
 end
 
 function M:resize(path, width, height, output, force)
+    -- 输入允许白名单临时目录里的图片（与 read 一致）：截图通常先落在
+    -- artifacts/ 或 $TMPDIR，需要缩到合适尺寸再喂给模型。
     local abs, err = self:resolve(path)
-    if not abs then return "error: " .. err end
+    if not abs then
+        abs = self:_resolve_external_image(path)
+        if not abs then return "error: " .. err end
+    end
     if is_dir(abs) then return "error: cannot resize a directory: " .. abs end
     if not file_size(abs) then return "error: cannot stat file: " .. abs end
 
@@ -680,8 +686,16 @@ function M:resize(path, width, height, output, force)
     else
         local dir, base, ext = abs:match("^(.*)/([^/]+)%.([%w]+)$")
         if not dir then return "error: cannot derive output path; pass output" end
-        out_abs = string.format("%s/%s-%sx%s.%s", dir, base,
+        local derived = string.format("%s/%s-%sx%s.%s", dir, base,
             w and tostring(w) or "auto", h and tostring(h) or "auto", ext)
+        -- 外部输入（如 /tmp 截图）不能把产物写回外部，统一落到 workspace 的 artifacts/
+        out_abs, err = self:resolve(derived)
+        if not out_abs then
+            local root = self.real_root or (realpath(self.cwd) or normalize(self.cwd)):gsub("/+$", "")
+            out_abs = string.format("%s/artifacts/resized/%s-%sx%s.%s", root, base,
+                w and tostring(w) or "auto", h and tostring(h) or "auto", ext)
+            os.execute("mkdir -p " .. shq(root .. "/artifacts/resized") .. " 2>/dev/null")
+        end
     end
     if out_abs == abs then
         return "error: output path equals input; choose a different output"

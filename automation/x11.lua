@@ -204,10 +204,25 @@ function Win:capture(path)
     return true, path
 end
 
+-- 截图默认落到 workspace 下的 artifacts/selfsee/，而不是 /tmp。
+-- 落在 workspace 内，read/resize 才能直接消费（形成"看自己"闭环）；
+-- 目录不存在时自动创建（liblite_capture 只写文件，不建目录）。
+local function default_shot_path()
+    local cwd = os.getenv("PWD") or "."
+    return cwd .. "/artifacts/selfsee/screen.png"
+end
+
+local function ensure_parent(path)
+    local dir = path:match("^(.*)/[^/]+$")
+    if not dir or dir == "" then return end
+    os.execute("mkdir -p " .. "'" .. dir:gsub("'", "'\\''") .. "' 2>/dev/null")
+end
+
 -- 全屏截图（lite 自带 X11 + PNG）
 function M.capture_screen(path)
     M.ensure_display()
-    path = path or "/tmp/opencode/screen.png"
+    path = path or default_shot_path()
+    ensure_parent(path)
     local lib, err = capture_lib()
     if not lib then return false, err end
     local sw, sh = display():display_size()

@@ -596,6 +596,16 @@ do
         local ah = #apng >= 24 and (apng:byte(21) * 16777216 + apng:byte(22) * 65536 + apng:byte(23) * 256 + apng:byte(24)) or 0
         check(aw == 2 and ah == 1, "tools resize aspect size")
 
+        -- 外部输入（白名单临时目录）可读；产物必须落在 workspace 内
+        local outside = dir .. "-ext.png"
+        local ef = assert(io.open(outside, "wb"))
+        ef:write(unhex(png_hex))
+        ef:close()
+        local ext = t:execute("resize", { path = outside, width = 2 })
+        check(ext:find("resized", 1, true) ~= nil, "tools resize external input")
+        check(ext:find(dir, 1, true) ~= nil, "tools resize external output in workspace")
+        os.remove(outside)
+
         local jpg = t:execute("resize", { path = "in.png", width = 2, height = 1, force = true, output = "out.jpg" })
         check(jpg:find("resized", 1, true) ~= nil, "tools resize jpeg encode")
         local jf = io.open(dir .. "/out.jpg", "rb")
