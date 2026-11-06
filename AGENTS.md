@@ -91,7 +91,7 @@ cd "$(pwd)"
 # 全屏
 ./tools/lite-lua -e 'package.path="./lua/?.lua;./lua/?/init.lua;./automation/?.lua;"..package.path
   local ok, p = require("x11").capture_screen(); print(ok, p)'
-#   -> <cwd>/artifacts/selfsee/screen.png  (2560x1440，约 1.9MB)
+#   -> /tmp/lite-shot/screen.png  (2560x1440，约 1.9MB)
 
 # 单窗口（先定位再截）
 ./tools/lite-lua -e 'package.path="./lua/?.lua;./lua/?/init.lua;./automation/?.lua;"..package.path
@@ -101,15 +101,17 @@ cd "$(pwd)"
 # 缩放（2560 宽原图 token 太贵；1280 起通常够读 UI）
 ./tools/lite-lua -e 'package.path="./lua/?.lua;./lua/?/init.lua;"..package.path
   print(require("core.tools").new({cwd=os.getenv("PWD")}):resize(
-    "artifacts/selfsee/screen.png", 1280, 0, "artifacts/selfsee/s1280.png"))'
+    "/tmp/lite-shot/screen.png", 1280, 0))'
 ```
 
 要点：
 
-- 截图默认落 **workspace 内**的 `artifacts/selfsee/`（目录自动创建）。
-  落 workspace 是关键——`read`/`resize` 才能直接消费。
-- `resize` 的**输入**允许 `$TMPDIR:/tmp:/var/tmp`（与 `read` 一致，`LITE_READ_DIRS` 可扩展），
-  **输出**永远落 workspace；外部输入且未指定 `output` 时落 `artifacts/resized/`。
+- 截图默认落 **`$TMPDIR/lite-shot/`**（通常是 `/tmp/lite-shot/`），目录自动创建。
+  截图是过程产物，不写进 workspace——不然仓库里攒一堆 png，还容易误读成上一轮的图。
+  `LITE_SHOT_DIR` 可覆盖。
+- `resize` 的**输入与输出**都允许 `$TMPDIR:/tmp:/var/tmp`（与 `read` 的图片白名单一致，
+  `LITE_READ_DIRS` 可扩展），所以 `/tmp` 里截图 → 就在 `/tmp` 缩放，不用搬回仓库。
+  workspace 外但不在白名单里的路径仍然拒绝。
 - 鼠标键盘注入：`automation/xdo.lua`（libxdo + XTest FFI），**不要**起 `xdotool`/`wmctrl`。
   常用：`click_abs(x,y)` / `click_current()` / `key(win,"ctrl+l")` / `type(win,"text")`。
 - 点击屏幕坐标以**全屏像素**为准；读 1280 宽缩略图时，坐标要乘回实际宽度比。

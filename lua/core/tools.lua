@@ -660,9 +660,23 @@ function M:_native_image_modules()
     return mods
 end
 
+-- 输出路径许可：workspace 内任意位置，或白名单临时目录（与 read 的图片白名单一致）。
+-- 截图默认落在 $TMPDIR，缩放产物也要能留在同一处，否则 /tmp 的图每次都得
+-- 搬回仓库才能缩，既多余又污染工作区。
+function M:_resolve_output(p)
+    local abs = self:resolve(p)
+    if abs then return abs end
+    if not p or p:sub(1, 1) ~= "/" then return nil end
+    local real = realpath(p) or normalize(p)
+    for _, root in ipairs(read_roots()) do
+        if real == root or real:sub(1, #root + 1) == root .. "/" then return real end
+    end
+    return nil
+end
+
 function M:resize(path, width, height, output, force)
-    -- 输入允许白名单临时目录里的图片（与 read 一致）：截图通常先落在
-    -- artifacts/ 或 $TMPDIR，需要缩到合适尺寸再喂给模型。
+    -- 输入允许白名单临时目录里的图片（与 read 一致）：截图先落在
+    -- $TMPDIR/lite-shot/，需要缩到合适尺寸再喂给模型。
     local abs, err = self:resolve(path)
     if not abs then
         abs = self:_resolve_external_image(path)
@@ -681,16 +695,16 @@ function M:resize(path, width, height, output, force)
 
     local out_abs
     if output and output ~= "" then
-        out_abs, err = self:resolve(output)
-        if not out_abs then return "error: " .. err end
+        out_abs = self:_resolve_output(output)
+        if not out_abs then return "error: output must be inside workspace or a temp dir: " .. output end
     else
         local dir, base, ext = abs:match("^(.*)/([^/]+)%.([%w]+)$")
         if not dir then return "error: cannot derive output path; pass output" end
-        local derived = string.format("%s/%s-%sx%s.%s", dir, base,
+        out_abs = string.format("%s/%s-%sx%s.%s", dir, base,
             w and tostring(w) or "auto", h and tostring(h) or "auto", ext)
-        -- 外部输入（如 /tmp 截图）不能把产物写回外部，统一落到 workspace 的 artifacts/
-        out_abs, err = self:resolve(derived)
+        out_abs = self:_resolve_output(out_abs)
         if not out_abs then
+            -- 理论上不可达（派生路径与输入同目录，输入已通过白名单校验）
             local root = self.real_root or (realpath(self.cwd) or normalize(self.cwd)):gsub("/+$", "")
             out_abs = string.format("%s/artifacts/resized/%s-%sx%s.%s", root, base,
                 w and tostring(w) or "auto", h and tostring(h) or "auto", ext)

@@ -596,15 +596,21 @@ do
         local ah = #apng >= 24 and (apng:byte(21) * 16777216 + apng:byte(22) * 65536 + apng:byte(23) * 256 + apng:byte(24)) or 0
         check(aw == 2 and ah == 1, "tools resize aspect size")
 
-        -- 外部输入（白名单临时目录）可读；产物必须落在 workspace 内
+        -- 临时目录（截图默认落点）可读可写：输入在 /tmp，产物也留在同处，不搬回仓库
         local outside = dir .. "-ext.png"
         local ef = assert(io.open(outside, "wb"))
         ef:write(unhex(png_hex))
         ef:close()
         local ext = t:execute("resize", { path = outside, width = 2 })
-        check(ext:find("resized", 1, true) ~= nil, "tools resize external input")
-        check(ext:find(dir, 1, true) ~= nil, "tools resize external output in workspace")
+        check(ext:find("resized", 1, true) ~= nil, "tools resize temp input")
+        check(ext:find(dir .. "-ext-2xauto.png", 1, true) ~= nil,
+            "tools resize temp output stays in temp")
         os.remove(outside)
+        os.remove(dir .. "-ext-2xauto.png")
+
+        -- 白名单外的路径仍然拒绝（workspace 与 /tmp 之外）
+        local denied = t:execute("resize", { path = "in.png", width = 2, output = "/etc/lite-x.png" })
+        check(denied:find("error:", 1, true) ~= nil, "tools resize rejects outside path")
 
         local jpg = t:execute("resize", { path = "in.png", width = 2, height = 1, force = true, output = "out.jpg" })
         check(jpg:find("resized", 1, true) ~= nil, "tools resize jpeg encode")

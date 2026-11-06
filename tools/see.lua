@@ -46,7 +46,10 @@ end
 local cwd = os.getenv("PWD") or "."
 
 local function out_dir()
-    local d = cwd .. "/artifacts/selfsee"
+    local d = os.getenv("LITE_SHOT_DIR")
+    if not d or d == "" then
+        d = (os.getenv("TMPDIR") or "/tmp"):gsub("/+$", "") .. "/lite-shot"
+    end
     os.execute("mkdir -p '" .. d:gsub("'", "'\\''") .. "' 2>/dev/null")
     return d
 end

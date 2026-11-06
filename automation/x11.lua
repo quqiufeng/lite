@@ -136,12 +136,16 @@ function M.window_class(class, opts)
     return M.window(nil, opts)
 end
 
--- 截图默认落到 workspace 下的 artifacts/selfsee/，而不是 /tmp。
--- 落在 workspace 内，read/resize 才能直接消费（形成"看自己"闭环）；
--- 目录不存在时自动创建（liblite_capture 只写文件，不建目录）。
+-- 截图默认落到临时目录，不写进 workspace：
+-- 截图是过程产物，不该污染仓库（artifacts/ 里留着上一轮的图很容易误读）。
+-- read/resize 都对 $TMPDIR:/tmp:/var/tmp 放行图片，所以闭环不受影响。
+-- 可用 LITE_SHOT_DIR 覆盖（测试和 CI 用得上）。
 local function default_shot_path()
-    local cwd = os.getenv("PWD") or "."
-    return cwd .. "/artifacts/selfsee/screen.png"
+    local dir = os.getenv("LITE_SHOT_DIR")
+    if not dir or dir == "" then
+        dir = (os.getenv("TMPDIR") or "/tmp"):gsub("/+$", "") .. "/lite-shot"
+    end
+    return dir .. "/screen.png"
 end
 
 local function ensure_parent(path)
