@@ -763,6 +763,16 @@ io.write(ok and "READY\n" or "NOTREADY\n")
                 check(txt:find("libonnxruntime.so.1.%%*", 1, true) ~= nil
                     or txt:find("libonnxruntime.so.1.", 1, true) ~= nil,
                     "ort_link.sh handles pip layout (no .so.1 symlink)")
+                -- 「有 GPU 用 GPU、没有用 CPU」：auto 策略 + GPU 可用性探测
+                check(txt:find("auto", 1, true) ~= nil
+                    and txt:find("resolve_prefer", 1, true) ~= nil,
+                    "ort_link.sh supports auto preference")
+                check(txt:find("gpu_usable", 1, true) ~= nil
+                    and txt:find("nvidia-smi", 1, true) ~= nil,
+                    "ort_link.sh probes GPU usability")
+                -- 选 CPU 时必须摘掉 provider，否则运行时仍会挂 CUDA EP
+                check(txt:find("rm -f \"$PROVIDER\"", 1, true) ~= nil,
+                    "ort_link.sh detaches CUDA provider for cpu mode")
             end
 
             -- CUDA provider 走软链接，不打包；实体文件会膨胀 tarball

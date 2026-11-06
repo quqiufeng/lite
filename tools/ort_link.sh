@@ -10,11 +10,15 @@
 #   1. 先探测 libocr_simple.so 需要哪个版本
 #   2. 只在系统里找**版本一致**的那份
 #   3. 链接后实测一次 OCR，确认真的能用才留下，否则回滚
-# 选哪一份：**默认 CPU 优先**。核心库 libonnxruntime.so.1 在 CPU/GPU 两种发布里
-# 内容基本一致，真正的差别是同目录有没有 providers_cuda.so —— 有它，OCR 每次
-# 初始化都会去挂 CUDA EP（小图反而慢，还多一层 cudnn/cublas 依赖）。
-# 所以候选里凡是「同目录没有 providers_cuda」的都算 CPU 形态，排前面。
-# 需要 GPU：LITE_ORT_PREFER=gpu ./tools/ort_link.sh link
+# 选哪一份：LITE_ORT_PREFER=auto|gpu|cpu（默认 auto）
+#   auto —— 机器能跑 GPU 就用 GPU 版，否则 CPU 版
+#           "能跑" 判定：nvidia-smi 可用 + 有**版本匹配**的 providers_cuda
+#           + cudnn/cublas 能解析（GPU provider 依赖它们）
+#   cpu  —— 强制 CPU（单张小图 CPU 更快，实测 0.75s vs 2.3s）
+#   gpu  —— 强制 GPU（找不到就报错，不静默降级）
+#
+# 体积参考：CPU 版核心库 22MB、零 CUDA 依赖；GPU 版核心库 26MB +
+# providers_cuda 329MB + 依赖 cublas/cudart/cudnn。
 #
 # 用法:
 #   ./tools/ort_link.sh status     # 默认
@@ -32,6 +36,7 @@ fi
 OCRSO="$LIBDIR/libocr_simple.so"
 CORE="$LIBDIR/libonnxruntime.so.1"
 SHARED="$LIBDIR/libonnxruntime_providers_shared.so"
+PROVIDER="$LIBDIR/libonnxruntime_providers_cuda.so"
 
 # 探测 ORT 版本，按可靠度依次：
 #   1) LITE_ORT_VERSION 显式指定
@@ -93,9 +98,33 @@ core_file() {
     return 1
 }
 
-# 候选 lib 目录：默认 **CPU 变体优先**（LITE_ORT_PREFER=gpu 可改）
+# GPU 能不能真的跑起来：驱动 + 版本匹配的 providers_cuda + cudnn/cublas 可解析
+gpu_usable() {
+    local ver="$1"
+    command -v nvidia-smi >/dev/null 2>&1 || return 1
+    nvidia-smi -L >/dev/null 2>&1 || return 1
+
+    # 必须有版本匹配的 provider（ORT 对 provider 做版本校验）
+    local found="" p
+    for p in $(candidate_dirs gpu); do
+        local src; src="$(core_file "$p")"
+        [ -n "$src" ] || continue
+        [ "$(file_version "$src" || true)" = "$ver" ] || continue
+        [ -f "$p/libonnxruntime_providers_cuda.so" ] || continue
+        found="$p"; break
+    done
+    [ -n "$found" ] || return 1
+
+    # provider 依赖 cublas/cudart/cudnn，缺了也是白搭
+    local missing
+    missing="$(ldd "$found/libonnxruntime_providers_cuda.so" 2>/dev/null | grep -c 'not found')"
+    [ "${missing:-0}" = "0" ] || return 1
+    return 0
+}
+
+# 候选 lib 目录。$1 可显式指定 auto|gpu|cpu，缺省读 LITE_ORT_PREFER（默认 auto）
 candidate_dirs() {
-    local prefer="${LITE_ORT_PREFER:-cpu}"
+    local prefer="${1:-${LITE_ORT_PREFER:-auto}}"
     local cpu=() gpu=()
 
     add() {
@@ -120,10 +149,23 @@ candidate_dirs() {
         add "$d"
     done
 
-    if [ "$prefer" = gpu ]; then
-        printf '%s\n' "${gpu[@]}" "${cpu[@]}" 2>/dev/null
+    case "$prefer" in
+        cpu) printf '%s\n' "${cpu[@]}" "${gpu[@]}" 2>/dev/null ;;
+        *)   printf '%s\n' "${gpu[@]}" "${cpu[@]}" 2>/dev/null ;;
+    esac
+}
+
+# auto 的落点：GPU 可用就 gpu，否则 cpu
+resolve_prefer() {
+    local want="${LITE_ORT_PREFER:-auto}"
+    case "$want" in
+        cpu|gpu) echo "$want"; return 0 ;;
+    esac
+    local ver; ver="$(want_version || true)"
+    if [ -n "$ver" ] && gpu_usable "$ver"; then
+        echo gpu
     else
-        printf '%s\n' "${cpu[@]}" "${gpu[@]}" 2>/dev/null
+        echo cpu
     fi
 }
 
@@ -151,7 +193,13 @@ status() {
     local v; v="$(want_version || true)"
     echo "== lite onnxruntime（OCR）=="
     echo "需要版本: ${v:-未知}"
-    echo "优先变体: ${LITE_ORT_PREFER:-cpu}（ocr 只需 CPU；GPU 版会多带 cuda/cudnn）"
+    echo "选择策略: LITE_ORT_PREFER=${LITE_ORT_PREFER:-auto} -> $(resolve_prefer)"
+    local vnow; vnow="$(want_version || true)"
+    if [ -n "$vnow" ] && gpu_usable "$vnow"; then
+        echo "GPU 可用: 是（nvidia-smi + 版本匹配 provider + cudnn/cublas 齐全）"
+    else
+        echo "GPU 可用: 否（缺驱动 / 版本匹配的 providers_cuda / cudnn·cublas 之一）"
+    fi
     if [ -f "$CORE" ]; then
         local d; d="$(dirname "$(readlink -f "$CORE" 2>/dev/null || echo "$CORE")")"
         case "$(ort_variant "$d")" in
@@ -200,6 +248,9 @@ link_libs() {
     local v; v="$(want_version || true)"
     [ -z "$v" ] && { echo "error: 无法探测 ORT 版本（先放一份 libonnxruntime.so.1）" >&2; exit 1; }
 
+    local prefer; prefer="$(resolve_prefer)"
+    echo "选择策略: LITE_ORT_PREFER=${LITE_ORT_PREFER:-auto} -> $prefer" >&2
+
     local explicit="${1:-}" dir="" ok=""
     while IFS= read -r dir; do
         [ -n "$dir" ] || continue
@@ -211,9 +262,13 @@ link_libs() {
             continue
         fi
         ok="$dir"; break
-    done < <(if [ -n "$explicit" ]; then echo "$explicit"; else candidate_dirs; fi)
+    done < <(if [ -n "$explicit" ]; then echo "$explicit"; else candidate_dirs "$prefer"; fi)
 
     [ -z "$ok" ] && {
+        if [ "$prefer" = gpu ]; then
+            echo "LITE_ORT_PREFER=gpu 但没找到可用的 GPU 版 onnxruntime" >&2
+            echo "（需要版本匹配的 providers_cuda + cudnn/cublas；可改用 auto/cpu）" >&2
+        fi
         echo "未找到版本 $v 的系统 onnxruntime" >&2
         echo "可用 LITE_ORT_DIR=/path/to/lib ./tools/ort_link.sh link 显式指定" >&2
         exit 1
@@ -227,17 +282,34 @@ link_libs() {
         && ln -sfn "$ok/libonnxruntime_providers_shared.so" "$SHARED"
     echo "linked: $CORE -> $src  ($variant)"
 
+    # 变体决定是否接 CUDA provider：只换核心库不接 provider，运行时依旧是 CPU
+    case "$variant" in
+        gpu)
+            rm -f "$PROVIDER"
+            if [ -f "$ok/libonnxruntime_providers_cuda.so" ]; then
+                ln -sfn "$ok/libonnxruntime_providers_cuda.so" "$PROVIDER"
+                echo "linked: $PROVIDER -> $ok/libonnxruntime_providers_cuda.so"
+            else
+                echo "warn: $ok 没有 providers_cuda，运行时会退化为 CPU" >&2
+            fi
+            ;;
+        *)
+            # 选 CPU 就要彻底摘掉 provider，否则仍会尝试挂 CUDA EP
+            rm -f "$PROVIDER"
+            ;;
+    esac
+
     if probe; then
         echo "[OK] 实测 OCR 可用"
     else
-        rm -f "$CORE" "$SHARED"
+        rm -f "$CORE" "$SHARED" "$PROVIDER"
         echo "[FAIL] 实测 OCR 加载失败，已回滚（版本/ABI 可能不匹配）" >&2
         exit 1
     fi
 }
 
 unlink_libs() {
-    for f in "$CORE" "$SHARED"; do
+    for f in "$CORE" "$SHARED" "$PROVIDER"; do
         if [ -L "$f" ]; then rm -f "$f"; echo "unlinked: $f"; fi
     done
 }

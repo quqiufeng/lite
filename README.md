@@ -251,9 +251,14 @@ C ABI 固定为 `char *lite_helper(const char *input)` + 可选 `lite_helper_fre
   - **onnxruntime 核心库不打包**（25MB，占 dist 一半）：目标机执行
     `./tools/ort_link.sh link` 接入系统里**版本匹配**的那份；`status` 查看、`unlink` 撤销。
     版本要求记在 `lib/ORT_VERSION`。确实要随包分发：`LITE_DIST_WITH_ORT=1 ./tools/package.sh`
-  - **OCR 只需要 CPU 版 ORT**：CPU 优先（`LITE_ORT_PREFER` 可改）。CPU/GPU 发布的核心库
-    内容几乎相同，差别是同目录有没有 `providers_cuda.so` —— 有它，OCR 每次初始化都去挂
-    CUDA EP，小图反而更慢还多一层 cudnn 依赖。pip 的 `onnxruntime`（非 `-gpu`）即 CPU 版
+  - **自动选 CPU/GPU**：`LITE_ORT_PREFER=auto|gpu|cpu`（默认 `auto` = 有 GPU 用 GPU、
+    没有用 CPU）。GPU 的判定是「nvidia-smi 可用 + 有版本匹配的 providers_cuda +
+    cudnn/cublas 能解析」三者齐全；缺一项就回落 CPU。`link` 会连带接/摘
+    `providers_cuda.so`，保证形态和策略一致
+  - 体积对比：CPU 版核心库 22MB、**零 CUDA 依赖**；GPU 版核心库 26MB **+ provider 329MB**
+    + cudnn/cublas。CPU 版并不比 GPU 版核心库小多少，省的是那 329MB
+  - 单张小图实测 CPU 更快（0.80s vs 2.41s，GPU 每次进程都要建 CUDA 上下文）；
+    OCR 想快就 `LITE_ORT_PREFER=cpu`
   - CUDA provider 同样**不打包**（329MB）：`./tools/cuda_provider.sh link` 按需接入
   - 默认留 CPU：单张小图 CUDA 反而更慢（实测 2.3s vs 0.75s，初始化开销占主导），批量/大图才值得
 - pkg-config / gcc / cmake / OpenMP（编译 C KV cache + image）

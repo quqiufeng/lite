@@ -262,8 +262,9 @@ CLI JSON → `tui_smoke.sh` → `serve_smoke.sh`。失败产物落 `artifacts/`�
   两条先例：
   - `libonnxruntime.so.1`（22~25MB）→ `tools/ort_link.sh link`，
     版本要求写在 `lib/ORT_VERSION`；`LITE_DIST_WITH_ORT=1` 可强制随包。
-    **OCR 只需 CPU 版**，`ort_link.sh` 默认 CPU 优先（`LITE_ORT_PREFER=gpu` 可改）；
-    判定依据是「同目录有无 providers_cuda」，不是文件名
+    `LITE_ORT_PREFER=auto|gpu|cpu`（默认 auto = 有 GPU 用 GPU、没有用 CPU）；
+    变体判定依据是「同目录有无 providers_cuda」，不是文件名。`link` 会连带接/摘
+    provider，避免「核心库换了但没接 provider，运行时仍是 CPU」这种半吊子状态
   - OCR 模型（14.8MB，解包体积六成）→ 默认不打包，`LITE_DIST_WITH_OCR=1` 强制随包。
     OCR 是可选能力：模型缺失时 `ocr` 工具返回可操作提示，其余功能不受影响
   - dist 结果：27M → **3.3M**
