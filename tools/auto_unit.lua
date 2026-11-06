@@ -482,6 +482,22 @@ do
             if it.key:find("/agent/session/s2/", 1, true) then leaked = true end
         end
         check(not leaked, "memory session scope")
+
+        -- 工作记忆：会话级隔离；目录级 /agent/working（wake 等运行态）不进 recall
+        mem:remember_working("wtask", "s1 的临时任务 zebra", nil, "s1")
+        mem:put("/agent/working", "wake", { runs = 9, last_answer = "zebra wake" }, 0)
+        local w1 = mem:recall("zebra", 10, { session_id = "s1" })
+        local w2 = mem:recall("zebra", 10, { session_id = "s2" })
+        local function has(items, sub)
+            for _, it in ipairs(items) do
+                if it.key:find(sub, 1, true) then return true end
+            end
+            return false
+        end
+        check(has(w1, "/agent/session/s1/working/wtask"), "working session scoped")
+        check(not has(w2, "/agent/session/s1/working/"), "working no cross session")
+        check(not has(w1, "/agent/working/"), "working runtime state not injected")
+        check(not has(w2, "/agent/working/"), "working runtime state not injected (s2)")
         check(#mem:recall("alpha", 10, { session_id = "s2" }) >= 1,
             "memory session include")
         local sm, max_turn = mem:session_messages("s2", 10)

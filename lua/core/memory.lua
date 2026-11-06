@@ -233,12 +233,17 @@ function M:remember_fact(key, content, tags, ttl)
     }, ttl or TTL.permanent)
 end
 
-function M:remember_working(key, content, ttl)
-    return self:put("/agent/working", key, {
-        t = "working",
-        c = content,
-        ts = os.time(),
-    }, ttl or TTL.working)
+-- 工作记忆按会话隔离：给了 session_id 就落到 /agent/session/<sid>/working/<key>，
+-- 否则退回目录级的 /agent/working/<key>（跨会话共享）。
+-- 目录级的 /agent/working 是给调度器（wake）这类运行态用的，不进 recall。
+function M:remember_working(key, content, ttl, session_id)
+    local value = { t = "working", c = content, ts = os.time() }
+    if session_id then
+        return self:put("/agent/session",
+            string.format("%s/working/%s", tostring(session_id), tostring(key)),
+            value, ttl or TTL.working)
+    end
+    return self:put("/agent/working", key, value, ttl or TTL.working)
 end
 
 function M:remember_turn(session_id, turn, user, assistant, tools)
@@ -389,7 +394,11 @@ function M:recall(query, limit, opts)
     end
 
     local seen, out = {}, {}
+    local working_prefix = "/agent/working/"
     local function add(r)
+        -- 目录级 /agent/working（wake 调度状态、todos 兜底）属于运行态：
+        -- 既不该跨会话注入，也不该被 tag 检索带进来。
+        if r.key:sub(1, #working_prefix) == working_prefix then return end
         if want_session and r.key:sub(1, #session_prefix) == session_prefix then
             if r.key:sub(1, #want_session) ~= want_session then return end
         end
@@ -409,7 +418,10 @@ function M:recall(query, limit, opts)
         end
     end
 
-    local prefixes = { "/agent/knowledge/", "/agent/working/" }
+    -- 只召回长期事实与会话内内容。
+    -- 目录级 /agent/working（wake 调度状态、todos 兜底）属于运行态，不注入 prompt；
+    -- 会话级工作记忆在 /agent/session/<id>/working/，由下面的 session 前缀覆盖。
+    local prefixes = { "/agent/knowledge/" }
     prefixes[#prefixes + 1] = want_session or session_prefix
     for _, p in ipairs(prefixes) do
         for _, r in ipairs(self:search_prefix(p, { max_results = limit * 8 })) do

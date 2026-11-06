@@ -118,7 +118,7 @@ return {
 └── mem.idx        # 索引（hash/sorted/tag/vector）
 ```
 
-- 命名空间：`/agent/knowledge/*`、`/agent/working/*`、`/agent/session/<id>/turn/<n>`。
+- 命名空间：`/agent/knowledge/*`（本目录的长期事实，跨会话共享）、`/agent/session/<id>/*`（会话内容，含 `working/*`）、`/agent/working/*`（目录级运行态，如 wake，不注入 prompt）。
 - 启动时载入 `mem.bin`；运行中按 `LITE_MEMORY_FLUSH`（默认 30s）`sync`，退出强制落盘。
 - 每次请求前按当前输入搜索相关记忆，组装成小块 `<retrieved_memory>` system 消息；最近 2 轮之外的消息只从记忆召回。
 - 召回 query：ASCII 词 + 中文 bigram；短追问会拼接上一轮 user，改善“继续/那个”的指代。
