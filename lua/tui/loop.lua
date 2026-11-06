@@ -220,6 +220,20 @@ function M.run(ctx, agent, memory, opts)
         end
         if draw then draw() end
     end)
+    -- 可复用前缀命中率掉到阈值以下才提示。cache% 被新增工具输出稀释是常态，
+    -- 真正值得排查的是"上一轮那截里没命中多少" —— 那说明前缀位移了
+    -- （system/tools 变了、历史被改、或者压缩把前缀动了）。
+    ctx:on("prefix_drop", function(d)
+        if not d then return end
+        transcript:add("info", string.format(
+            "prompt prefix reuse dropped to %d%% (%d of %d tokens from the previous"
+                .. " prompt were reused; prev %d -> now %d tokens)."
+                .. " Something before the tail changed — check for per-turn"
+                .. " system/tool churn or a compaction.",
+            math.floor((d.ratio or 0) * 100 + 0.5), d.hit or 0, d.denom or 0,
+            d.prev_prompt or 0, d.prompt or 0))
+        if draw then draw() end
+    end)
     ctx:on("todos", function(items)
         todo_items = items or {}
         if todo_view then todo_view:set_items(todo_items) end
@@ -560,6 +574,7 @@ function M.run(ctx, agent, memory, opts)
                 mem = mem_count,
                 hits = memory_hits,
                 cache = ctx.cache_ratio and ctx:cache_ratio() or nil,
+                reuse = ctx.prefix_ratio and ctx:prefix_ratio() or nil,
                 ctxeng = agent and agent._compact_probe or nil,
                 todos = todo_items,
                 queue = #queue,

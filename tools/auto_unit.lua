@@ -417,6 +417,66 @@ do
     check(ctx.session.usage.cache_miss == 9750, "usage miss derived from prompt")
 end
 
+-- 可复用前缀命中率：hit / min(上一轮 prompt, 本轮 prompt)
+-- 这是"前缀有没有位移"的口径；cache_ratio 会被新增的工具输出稀释。
+do
+    local Ctx = require("context")
+
+    local function fresh()
+        local seen = {}
+        local ctx = Ctx.new({ api_key = "x" })
+        ctx:on("prefix_drop", function(d) seen[#seen + 1] = d end)
+        return ctx, seen
+    end
+
+    local ctx, drops = fresh()
+    -- 首轮没有"上一轮"，无法判断可复用前缀
+    ctx:add_usage({ prompt = 10000, cache_hit = 0, cache_miss = 10000 })
+    check(ctx.session.usage.prefix_denom == 0, "prefix denom 0 on first request")
+    check(ctx:prefix_ratio() == nil, "prefix_ratio nil on single request")
+    check(#drops == 0, "no prefix warning on first request")
+
+    -- 第二轮：前缀 10000 全命中，新增 3000 按 miss 计价。
+    -- cache_ratio 只有 71%，但前缀其实完全复用。
+    ctx:add_usage({ prompt = 13000, cache_hit = 10000, cache_miss = 3000 })
+    local one = ctx.session.usage.prefix_denom
+    check(one == 10000, "prefix denom = min(prev, now)")
+    check(ctx.session.usage.prefix_hit == 10000, "prefix hit capped by denom")
+    check(ctx:prefix_ratio() == 1, "prefix_ratio perfect reuse")
+    local cr = ctx:cache_ratio()
+    check(cr and math.abs(cr - (10000 / 23000)) < 1e-9, "cache_ratio diluted by new tokens")
+    check(#drops == 0, "no prefix warning when prefix reused")
+
+    -- 上一轮比本轮长（压缩/裁剪）：分母取本轮
+    local ctx2 = fresh()
+    ctx2:add_usage({ prompt = 40000, cache_hit = 0, cache_miss = 40000 })
+    ctx2:add_usage({ prompt = 8000, cache_hit = 7900, cache_miss = 100 })
+    check(ctx2.session.usage.prefix_denom == 8000, "prefix denom = now when now smaller")
+    check(ctx2:prefix_ratio() == 7900 / 8000, "prefix_ratio uses now as denom")
+
+    -- 前缀真坏了：只有 20% 命中，且超过告警门槛 → 每个 turn 只报一次
+    local ctx3, drops = fresh()
+    ctx3.session.turn = 5
+    ctx3:add_usage({ prompt = 20000, cache_hit = 0, cache_miss = 20000 })
+    ctx3:add_usage({ prompt = 20000, cache_hit = 4000, cache_miss = 16000 })
+    check(#drops == 1, "prefix drop warned once")
+    local d = drops[1]
+    check(d and math.abs(d.ratio - 0.2) < 1e-9, "prefix drop ratio")
+    check(d and d.prev_prompt == 20000 and d.prompt == 20000, "prefix drop prompts recorded")
+    ctx3:add_usage({ prompt = 20000, cache_hit = 4000, cache_miss = 16000 })
+    check(#drops == 1, "prefix drop warned at most once per turn")
+    ctx3.session.turn = 6
+    ctx3:add_usage({ prompt = 20000, cache_hit = 4000, cache_miss = 16000 })
+    check(#drops == 2, "prefix drop warns again on the next turn")
+
+    -- 短会话（低于 PREFIX_WARN_MIN_PROMPT）不告警，避免启动时噪音
+    local ctx4, drops = fresh()
+    ctx4:add_usage({ prompt = 500, cache_hit = 0, cache_miss = 500 })
+    ctx4:add_usage({ prompt = 500, cache_hit = 0, cache_miss = 500 })
+    check(ctx4:prefix_ratio() == 0, "prefix_ratio 0 when nothing reused")
+    check(#drops == 0, "no prefix warning for short prompts")
+end
+
 -- utf8 sanitize / debug log
 do
     local T = require("core.text")
@@ -2105,6 +2165,23 @@ do
     check(txt:find("hit:2", 1, true) ~= nil, "tui status memory hits")
     check(txt:find("todo:1/2", 1, true) ~= nil, "tui status todos")
     check(txt:find("queue:3", 1, true) ~= nil, "tui status queue")
+end
+
+-- tui status prefix reuse
+do
+    local Status = require("tui.status")
+    local S = require("tui.screen")
+    local Context = require("context")
+    local ctx = Context.new({ cwd = "/tmp", model = "m" })
+    local s = S.new(80, 1)
+    Status.render(s, 1, 80, ctx, { mem = 0, cache = 0.5, reuse = 0.97 })
+    local txt = s:snapshot_text()
+    check(txt:find("cache:50%", 1, true) ~= nil, "tui status cache pct")
+    check(txt:find("reuse:97%", 1, true) ~= nil, "tui status prefix reuse pct")
+
+    local s2 = S.new(80, 1)
+    Status.render(s2, 1, 80, ctx, { mem = 0, cache = 0.5 })
+    check(s2:snapshot_text():find("reuse:", 1, true) == nil, "tui status no reuse before 2nd turn")
 end
 
 -- tui todo view

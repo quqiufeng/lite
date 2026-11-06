@@ -33,6 +33,15 @@ function M.render(screen, y, w, ctx, info)
         if pct < 0 then pct = 0 end
         cache = string.format(" cache:%d%%", pct)
     end
+    -- 可复用前缀命中率：hit / min(上一轮 prompt, 本轮 prompt)。
+    -- cache% 会被"相对上一轮新增的工具输出"稀释（一次大结果就能把 96% 拉到 50%），
+    -- 这个不会。两个一起看：cache 低但 reuse 高 = 正常，两个都低 = 前缀真坏了。
+    if type(info.reuse) == "number" then
+        local pct = math.floor(info.reuse * 100 + 0.5)
+        if pct > 100 then pct = 100 end
+        if pct < 0 then pct = 0 end
+        cache = cache .. string.format(" reuse:%d%%", pct)
+    end
     local todo = ""
     local todos = info.todos
     if todos and #todos > 0 then

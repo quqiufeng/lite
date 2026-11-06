@@ -974,18 +974,41 @@ tok_per_char = 0.3452（实测 0.3563）
 | budget 9000 三次 18KB 工具输出 | `hard ceiling` → `prompt 8195 → 1231`（历史清空） | `budget raised` + 无硬上限，`prompt 4400 → 9611` 正常增长 |
 | TUI budget 9000 三次 6KB 工具输出 | 同上退化 | `compact: prompt 13092 → 8392 chars（6281 折成 1581 字符摘要）`，状态栏 `cache:57% ctx:66%` |
 
-**④ 顺带修正一个度量口径**
+**④ 顺带修正一个度量口径（已落地）**
 
 `cache_ratio`（命中/总 prompt）会被"每轮新增的工具输出"稀释：一次 9KB 工具结果
 ≈ 2.6k tokens，全部按 miss 计价，命中率自然掉到 50%。真正该看的是
 **"可复用前缀里命中了多少"**，即 `hit / min(上一轮 prompt, 本轮 prompt)`。
-当前实现只暴露前者；后者更适合做告警阈值（见待办）。
 
-回归测试：`tools/auto_unit.lua` 从 390 增至 410 项。新增覆盖：预算地板（抬起 + 上报 +
+落地：
+
+- `context.lua`：`add_usage` 里同时算第二种口径，累积到 `usage.prefix_hit/prefix_denom`，
+  并写进 `usage.last.reuse`（单轮）/ `prefix_ratio()`（会话级）。分母取上一轮与本轮
+  prompt 的较小值 —— 只有这一段是"两轮都存在、本该被缓存"的部分；`hit` 超过分母时夹住，
+  避免 provider 乱报导致 >100%。
+- 告警：`reuse < 0.5` 且分母 ≥ 1500 tokens 时发 `prefix_drop` 事件（一轮最多一次，
+  否则一次 agent 循环里每条请求都会刷）。1500 的地板是为了让短 prompt 不误报 ——
+  几百 token 的请求本来就没有可复用前缀。
+- 状态栏：`cache:79% reuse:94%` 并排显示。读法：cache 低而 reuse 高 = 正常（新增内容
+  按 miss 计价）；两个都低 = 前缀真坏了（system/tools 抖动、压缩动了前缀）。
+- `--once --json`：`usage` 事件带 `reuse`（单轮）+ `prefix_ratio`（会话），
+  `prefix_drop` 单独一个事件类型。
+
+实测（`[verified]`，真实 API，一次含工具调用的请求链 3.9k prompt）：
+
+```
+cache_ratio 0.799   reuse 0.936   requests 2
+```
+
+同一份 usage 下两种口径差 14 个点，正是"第二轮新增的 252 miss tokens"造成的稀释。
+
+回归测试：`tools/auto_unit.lua` 从 390 增至 424 项。新增覆盖：预算地板（抬起 + 上报 +
 不再触发硬上限 + 历史保留）、硬上限保留 digest 与 system、`tok_per_char` 首观测/平滑/
-离谱值丢弃、`estimate_tokens` 用校准、状态栏 `ctx:%` 阈值。
+离谱值丢弃、`estimate_tokens` 用校准、状态栏 `ctx:%` 阈值、前缀命中率（无上一轮时为 nil /
+夹住 >100% / 告警阈值 / 一轮一次 / 短 prompt 不告警 / 状态栏 `reuse:%` 与两轮前不显示）。
 变异验证：硬上限只留 `msgs[1]` → FAIL；去掉预算地板 → 4 项 FAIL；
-去掉平滑 → FAIL；去掉离谱值保护 → FAIL；`estimate_tokens` 忽略校准 → FAIL。
+去掉平滑 → FAIL；去掉离谱值保护 → FAIL；`estimate_tokens` 忽略校准 → FAIL；
+分母改成 `max()` → FAIL；去掉 `prefix_warned_turn` → FAIL。
 
 ### 8.33 仍然待办（P2 剩余）
 
@@ -994,8 +1017,10 @@ tok_per_char = 0.3452（实测 0.3563）
 2. 提前压缩（Pi `backgroundTokens=32768`）：后台在触发线之下就开始写摘要，
    到线时已经写好。需要后台任务，serve/wake 里做更自然。
 3. `cache_shape` 诊断：hash(system + tools) 变了就打 notice，直接解释 miss 原因。
-4. 观测：把 `cache_ratio` 与 `ctx%` 的逐轮曲线记进 KV，`lite state` 能看趋势；
-   并改用"可复用前缀命中率"作为告警口径（见 §8.32 ④）。
+4. ~~观测：把 `cache_ratio` 与 `ctx%` 的逐轮曲线记进 KV，`lite state` 能看趋势；
+   并改用"可复用前缀命中率"作为告警口径（见 §8.32 ④）。~~
+   **命中率口径部分已实现**（`reuse`/`prefix_ratio`/`prefix_drop` 告警/状态栏 `reuse:%`，
+   见 §8.32 ④）；**逐轮曲线落 KV、`lite state` 看趋势仍未做**。
 5. ~~单条消息本身超预算时（一个 18KB 工具结果 > 可分配预算），只能放着不管，
    等它自然触发硬上限。~~ **已实现**：`Compact:msg_cap()` = 触发线的 1/4，
    并有绝对地板 2000 字符（`msg_ratio=0.25` / `msg_min=2000`）。只截

@@ -488,6 +488,16 @@ elseif cmd == "--once" then
                 dropped = info.dropped, est_tokens = info.est_tokens,
             })
         end)
+        ctx:on("prefix_drop", function(d)
+            emit({
+                type = "prefix_drop",
+                ratio = d.ratio,
+                hit = d.hit,
+                denom = d.denom,
+                prompt = d.prompt,
+                prev_prompt = d.prev_prompt,
+            })
+        end)
         ctx:on("usage", function(u, total)
             emit({
                 type = "usage",
@@ -498,6 +508,11 @@ elseif cmd == "--once" then
                 requests = total and total.requests,
                 cache_ratio = total and ((total.cache_hit + total.cache_miss) > 0
                     and (total.cache_hit / (total.cache_hit + total.cache_miss)) or nil),
+                -- 第二种口径：hit / min(上一轮 prompt, 本轮 prompt)。
+                -- cache_ratio 会被每轮新增的工具输出稀释，这个不会。
+                reuse = u.reuse,
+                prefix_ratio = total and total.prefix_denom and total.prefix_denom > 0
+                    and (total.prefix_hit / total.prefix_denom) or nil,
             })
         end)
     else

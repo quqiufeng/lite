@@ -21,6 +21,11 @@ function M.new(opts)
                 completion = 0,
                 cache_hit = 0,
                 cache_miss = 0,
+                -- 可复用前缀命中率：hit / min(上一轮 prompt, 本轮 prompt)。
+                -- 和 cache_hit/cache_miss 分开累积，避免被"每轮新增的工具输出"稀释。
+                prefix_hit = 0,
+                prefix_denom = 0,
+                prefix_warned_turn = -1,
                 last = nil,
             },
         },
@@ -105,8 +110,18 @@ function M:fail(err)
     self:emit("error", self.view.error)
 end
 
+-- 前缀命中率低于这个值就值得提示：说明每轮 prompt 的前缀在位移。
+M.PREFIX_WARN_RATIO = 0.5
+-- 前缀太短（首轮 / 短会话）时比值没有意义，低于这个 prompt token 数不告警。
+M.PREFIX_WARN_MIN_PROMPT = 1500
+
 -- 累积一次请求的 usage。DeepSeek 一次 agent 循环会发多个请求（每个工具轮一次），
 -- 所以按请求累加，命中率 = cache_hit / (cache_hit + cache_miss)。
+--
+-- 同时算第二种口径：可复用前缀命中率 = hit / min(上一轮 prompt, 本轮 prompt)。
+-- 前者会被"相对上一轮新增的部分"稀释 —— 一次 9KB 工具结果 ≈2.6k tokens 全部
+-- 按 miss 计价，命中率自然掉到 50%，但前缀其实没坏。后者只看"上一轮那截里
+-- 命中了多少"，掉下去才真的说明 system/tools/历史前缀被动过。
 function M:add_usage(u)
     if type(u) ~= "table" then return end
     local s = self.session.usage
@@ -115,6 +130,22 @@ function M:add_usage(u)
     local hit = tonumber(u.cache_hit) or 0
     local miss = tonumber(u.cache_miss) or (prompt - hit)
     if miss < 0 then miss = 0 end
+    local prev_prompt = s.last and s.last.prompt or nil
+
+    -- hint 只能是"上一轮和本轮都存在的部分"，所以分母取两者的较小值。
+    local denom = 0
+    if prev_prompt and prev_prompt > 0 and prompt > 0 then
+        denom = prev_prompt < prompt and prev_prompt or prompt
+    end
+    local reuse
+    local got = 0
+    if denom > 0 then
+        got = hit < denom and hit or denom
+        s.prefix_hit = (s.prefix_hit or 0) + got
+        s.prefix_denom = (s.prefix_denom or 0) + denom
+        reuse = got / denom
+    end
+
     s.requests = s.requests + 1
     s.prompt = s.prompt + prompt
     s.completion = s.completion + (tonumber(u.completion) or 0)
@@ -125,17 +156,46 @@ function M:add_usage(u)
         completion = tonumber(u.completion) or 0,
         cache_hit = hit,
         cache_miss = miss,
+        reuse = reuse,
+        reuse_denom = denom,
+        prev_prompt = prev_prompt,
     }
     self:emit("usage", s.last, s)
+
+    -- 每个 turn 最多提示一次：一轮 agent 循环里会有多个请求，
+    -- 前缀坏了的话每条都会低于阈值，重复提示只会刷屏。
+    if reuse and denom >= M.PREFIX_WARN_MIN_PROMPT
+        and reuse < M.PREFIX_WARN_RATIO
+        and s.prefix_warned_turn ~= self.session.turn then
+        s.prefix_warned_turn = self.session.turn
+        self:emit("prefix_drop", {
+            ratio = reuse,
+            prompt = prompt,
+            prev_prompt = prev_prompt,
+            denom = denom,
+            hit = got,
+        })
+    end
 end
 
 -- 会话级缓存命中率（0~1）；没有任何请求时返回 nil。
+-- 注意：这个值包含"新增内容"的 miss，工具输出多的时候会掉，属于正常现象；
+-- 判断前缀是否稳定请用 prefix_ratio()。
 function M:cache_ratio()
     local s = self.session and self.session.usage
     if not s then return nil end
     local total = (s.cache_hit or 0) + (s.cache_miss or 0)
     if total <= 0 then return nil end
     return s.cache_hit / total
+end
+
+-- 会话级"可复用前缀命中率"（0~1）；没有两轮以上的请求时返回 nil。
+function M:prefix_ratio()
+    local s = self.session and self.session.usage
+    if not s then return nil end
+    local denom = s.prefix_denom or 0
+    if denom <= 0 then return nil end
+    return (s.prefix_hit or 0) / denom
 end
 
 function M:begin_turn()
