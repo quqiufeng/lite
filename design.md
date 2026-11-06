@@ -814,3 +814,190 @@ opencode 用 SQLite（`[static]`：`packages/core/src/session/sql.ts` 的 `sessi
 - Agent：工具结果后追加 **user** 消息 `[{type=text},{type=image_url,url=data:...;base64,...}]`；图片只能放 user，避免 DeepSeek 400。
 - 图片 base64 不写 KV（1MB value 限制），JSONL/工具结果保留路径；TUI/serve 发 `image` 事件。
 - 验证：真实 API 读取红色 PNG，只回复 `red`；240 单测。
+
+### 8.29 省 token：向 Pi / Reasonix / opencode 对齐
+
+三家参考实现（`/opt/pi-mono`、`/opt/reasonix`、`/opt/opencode`）的减 token 手段高度一致，分四层：
+
+| 层 | 作用点 | 省的是 |
+|---|---|---|
+| ① 单次工具输出硬上限 | 进 prompt 前 | 单步突增 |
+| ② 追加式 prompt（前缀稳定） | 请求组装 | DeepSeek 命中价 ≈ miss 的 1/10 |
+| ③ 低频压缩（cache-reset 点） | 超阈值时一次 | 长期线性增长 |
+| ④ 用真实 usage 校准估算 | 全局 | 估算漂移导致误压或爆窗 |
+
+关键事实（`[verified]`，走 agents 的 code search 通道读源码）：
+
+- **Pi** `core/compaction/compaction.ts`：`reserveTokens=16384`、`keepRecentTokens=20000`、`backgroundTokens=32768`；
+  触发即 `tokens > window - reserve`；`findCutPoint` 从最新往前累加、切点避开 tool result；
+  后台在 `blocking - 32768` 就提前写摘要；送摘要的对话逐条截到 2000 字符。
+- **Reasonix** `runtime/agent/compact.go`：压缩是"低频 cache-reset 点"，产物 = 稳定前缀（system + 首条 user，≤1500 tokens 且 ≤15% 窗口）+ 一段结构化 digest（Standing facts / Goal / Decisions / Files / Commands / Errors / Pending）+ 近期原文尾巴（`clamp(window×10%, 32K, 96K)`，边界回退避开 tool result）；
+  `keepUserTurns` 给用户原话单独预算（窗口 5%，下限 1024）；`foldEconomics` 收益 < 100 tokens 不调 summarizer；`tokPerChar` 用上轮 usage 反推 chars→tokens。
+- **opencode** `core/session/compaction.ts`：`RESERVE_MIN=16000`/`RESERVE_SHARE=0.15` 的余量是为了"整段照发、复用缓存"，而不是更早压缩；`PRECOMPUTE_LEAD=60000`；`TRANSCRIPT_LEVELS` 渐进降级（整段 → 截 tool output → 抹 output + 截 input → 只留 user → 省略，从最老的 exchange 开始降级，最新的永不丢）。
+
+lite 的差距与本轮已落地（P0）：
+
+| # | 原状 | 现在 |
+|---|---|---|
+| 1 | `provider.lua` 不解析 `usage`，命中率不可观测 | 请求带 `stream_options.include_usage`；usage chunk 的 `choices` 是空数组，**必须在 choices 判断之前处理**；`context:add_usage` 累积，TUI 状态栏 `cache:N%`，`--once --json` 发 `usage` 事件 |
+| 2 | `tools.lua` 只留头部（30KB） | `truncate_mid` 头 2/3 + 尾 1/3 + marker；bash 独立 32KB 档；TUI 异步 bash 的 proc 输出原本**完全不过限**，现在也裁 |
+| 3 | `context_chars` 默认 8000（≈2k tokens） | 64000 |
+| 4 | `context_turns` 文档写 2、config 默认 16 | 文档订正为 16（代码行为未变，是否降到 2 待定） |
+
+实测（`[verified]`，真实 API）：新进程首轮 `hit 2688 / prompt 4206`（63.9%，system + tool schema 是固定前缀，DeepSeek 按前缀跨进程命中）；同轮工具返回后第二次请求 `hit 3840 / prompt 4395`（87.4%），累积 75.9%，**真正新增的 miss 只有 555 tokens**。说明 append-only 前缀本身是生效的。
+
+### 8.30 P1：低频压缩（已落地）
+
+`lua/core/compact.lua` + `agent.lua` 的接入点。核心判断抄 Reasonix：
+**压缩是低频 cache-reset 点，不是每轮裁剪**。
+
+三段结构：
+
+| 段 | 内容 | 约束 |
+|---|---|---|
+| 稳定前缀 | system + 首条 user turn | 首条钉住上限 `min(budget×5%, 6000)`，且硬性 ≤ budget/8（这段每次请求都付费） |
+| digest | 一段结构化摘要 | 固定小标题、禁止编造、硬性字数上限 `clamp(budget×10%, 800, 6000)` |
+| 近期尾巴 | 最近原文 | `budget×10%`，夹在 `[min(8000, avail/3), 24000]`，且 ≤ trigger/2；边界回退避开 `role=="tool"`；`context_turns` 是尾巴的 user 轮数**上限** |
+
+关键实现决定（每条都对应一个踩过的坑）：
+
+- **`avail = budget - 固定前缀`**：system prompt 有 4.7k 字符，若把它算进可分配预算，尾巴和用户原话会把窗口挤爆。子预算全部基于 `avail`。
+- **地板值必须按预算夹住**：`tail_min=8000` 这种绝对地板在 9k 预算下会吃掉整个窗口，压完还超阈值 → 每轮都压。Reasonix 同一处注释：*Smaller synthetic windows drop the 32K floor so the tail cannot alone exceed the window.*
+- **最新一条无条件进尾巴**：丢掉最新消息等于丢掉"刚才发生了什么"，任何摘要都补不回来。
+- **`min_recent_keep` 的溢出要封顶**：允许尾巴略超预算，但溢出量 ≤ budget/2，否则两条 6KB 工具结果就能吃光窗口。
+- **迟滞（rearm）**：`rearm = 折叠后规模 + max(2×min_fold, budget×10%)`。没有它，折叠后基座仍贴着触发线 → 下一条消息又触发 → 每轮压一次。**rearm 必须把固定前缀算进去**，否则迟滞失效（这是变异测试 M1 抓到的）。
+- **检查点验收**：摘要 > 2×cap 就拒绝；折叠后规模 >= 折叠前也拒绝。宁可这次不压，也不要留一个"看起来压过了"的假结果。
+- **摘要请求不带 tools / 不带 thinking**：摘要用不到工具定义，带上只是白付 schema token，而且它本来就不和主对话共享缓存前缀。
+- **上一次 digest 要显式合并**：lite 的 digest 存 KV（不在 transcript 里），不会被自动卷进折叠区。不合并就会每压一次丢一段历史（对应 opencode 的 `[previous compaction][transcript]` 拼法）。
+- **无 KV 时的内存兜底**：状态一丢 baseline 归零，下次请求会把整段历史重新摘一遍 —— 每次请求多花一次摘要调用。
+- **尾巴逐级缩小重试**（opencode `SHRINK_STEPS` 思路）：`1 → 0.5 → 0.25`，把"没东西可折"和"失败"区分开，并在 reason 里报出试过的倍数。
+- **硬上限只做物理兜底**（`budget×2`）：触发它说明压缩救不回来，此时丢最老消息并在块里写明可用 `recall` 找回。这是边界，不是策略。
+
+`window_messages` 已删除（它每轮从最老整段切，前缀整体位移，缓存全废）。
+
+实测（`[verified]`，真实 API）：
+
+- 合成 91 条消息、budget 20000：折叠区 34197 字符 → 视图 91 条/44k 字符降到 14 条/12222 字符；摘要 5 秒；基线 79；再调一次不重复压。
+- 带 KV：`baseline=53` 落盘，重建 agent 后能读回并继续保持低频。
+- TUI 真实终端（budget 9000，三次 6KB 工具输出）：`compact: prompt 13434 -> 7059 chars (folded 7306 into a 931-char digest; baseline 6, 0 user turns kept, 0 dropped)`。
+- 摘要质量：模型在有 `Pending & next step` 时明确写 "Unknown — no user turn is present in this segment"，说明"禁止编造"生效。
+
+回归测试：`tools/auto_unit.lua` 385 项。六个变异全部被抓：
+去掉无条件保留最新条 / 去掉摘要长度验收 / 去掉摘要长度提示词 / rearm 漏固定前缀 /
+去掉 tail 的 tool 对齐 / 去掉地板值夹取。
+
+### 8.31 缓存杀手：动态块插在会话中间（已修）
+
+P1 落地后仍观察到命中率只有 38~48%。排查发现**不是压缩的问题，也不是 DeepSeek 的问题**，
+而是 prompt 组装把每轮都变的块插在了会话中间。
+
+根因：`request_messages` 把召回块（`<retrieved_memory>`）和 todo 块插在「最后一条 user 之前」。
+工具循环里"最后一条 user"始终是本轮开头那个问题，于是每一轮都把它插到 system 后面 ——
+后面所有消息整体位移，前缀缓存从插入点往后全部失效，只剩 `system + tools` 那段（约 4k tokens）
+还能命中。这正好解释了实测中反复出现的 `hit = 4096`。
+
+两处修正：
+
+1. **每个用户轮只注入一次**（`iter == 1`）：同一轮后续工具请求复用同一前缀，不再重复注入。
+   模型早就见过这些内容，重复注入既打断缓存又白花 token。
+2. **块追加到最末尾**，不再插在中间：末尾放 system 消息 DeepSeek 接受（已验证）。
+
+受控对比（真实 API，同一底座消息，只改块的位置）：
+
+| 位置 | 首轮命中 | 下一轮命中 |
+|---|---|---|
+| 插在最后一条 user 之前 | 95% | **71%** |
+| 追加到最末尾 | 95% | **97%** |
+
+端到端（同一 prompt、同样 7 次请求、budget 64000）：
+
+| | hit | miss（计费） | 命中率 |
+|---|---|---|---|
+| 改前 | 34304 | 37126 | 48.0% |
+| 改后 | 55296 | **10529** | **84.0%** |
+
+**计费 miss tokens 减少 72%**。DeepSeek 命中价约为 miss 的 1/10，折算后相当于这条链路的
+有效成本降到原来的 ~35%。
+
+这条比压缩的收益大得多，而且它一直是隐性成本：只要走工具循环就会踩到。
+
+回归测试（`tools/auto_unit.lua`）：
+- `agent memory block goes last, not mid-conversation`
+- `prefix stability: messages never shift between tool rounds`
+- `prefix stability: recall block not re-injected in tool rounds`
+
+变异验证：把块改回插在 user 之前 → 3 项 FAIL；每轮重新注入 → 1 项 FAIL。
+
+### 8.32 P2：硬上限、预算地板与 token 校准（已落地）
+
+P1 的压缩在小预算下有两条退化路径，加上一条估算漂移，这轮一起修掉。
+
+**① 硬上限会连 digest 一起丢掉（真 bug）**
+
+`hard_window` 原来只保留 `msgs[1]` 再加一条"历史被丢弃"的提示。但 `view_messages()`
+的输出是 `[system, 摘要块, ...历史]`，摘要块在 `msgs[2]` —— 于是压缩失败走硬上限时，
+**上一次好不容易压出来的摘要被一起扔掉**。实测 budget 9000 时 `prompt 8195 → 1231`：
+历史清空、摘要也没了，模型只能从头再来，比不压缩更差。
+
+修法：先量出前导固定段（system + 紧随其后的 digest 块），只丢中间的历史，并在提示里
+写明丢了几条、可用 `recall` 找回。返回 `(msgs, trimmed, dropped)`，事件里带丢弃条数。
+
+**② 预算小于固定前缀时必然退化**
+
+压缩的可分配预算 = 预算 − 固定前缀。system prompt 本身就有 4~5k 字符，预算设成 9000
+时只剩 4k 可分配，连"折叠区 + 尾巴"的最小值都不够 → 每次都是 `nothing to fold` →
+一路滑到硬上限。这不是用户的错，是配置不自洽。
+
+修法：`compactor()` 里把预算抬到固定前缀的 3 倍（够放摘要 + 尾巴 + 可折叠区），并发一条
+`reason="budget raised"` 的事件说明实际生效值。默认 64000 不受影响（4.7k×3 = 14.1k）。
+
+**③ 字符预算是估算，会漂**
+
+没有本地 tokenizer，纯按"3.5 字符/token"估会在中英混排、含图片占位、含 JSON 参数时偏很多。
+Reasonix 的 `tokPerChar` 做法：用上一轮真实 `usage.prompt_tokens` 反推真实比例。
+
+落地 `Compact.tok_per_char(prev, chars, tokens)`：首次观测直接用，之后指数平滑（0.7/0.3），
+离谱值（≤0 或 >2）直接丢弃。`agent:tok_per_char()` / `agent:estimate_tokens()` 暴露给
+状态栏和探针。实测校准精度：
+
+```
+估算 6360 tokens  vs  真实 prompt_tokens 6495   （误差 2%）
+tok_per_char = 0.3452（实测 0.3563）
+```
+
+状态栏新增 `ctx:N%`（占触发线的百分比，≥60% 才显示，避免噪声）。
+
+实测（`[verified]`，真实 API）：
+
+| 场景 | 改前 | 改后 |
+|---|---|---|
+| budget 9000 三次 18KB 工具输出 | `hard ceiling` → `prompt 8195 → 1231`（历史清空） | `budget raised` + 无硬上限，`prompt 4400 → 9611` 正常增长 |
+| TUI budget 9000 三次 6KB 工具输出 | 同上退化 | `compact: prompt 13092 → 8392 chars（6281 折成 1581 字符摘要）`，状态栏 `cache:57% ctx:66%` |
+
+**④ 顺带修正一个度量口径**
+
+`cache_ratio`（命中/总 prompt）会被"每轮新增的工具输出"稀释：一次 9KB 工具结果
+≈ 2.6k tokens，全部按 miss 计价，命中率自然掉到 50%。真正该看的是
+**"可复用前缀里命中了多少"**，即 `hit / min(上一轮 prompt, 本轮 prompt)`。
+当前实现只暴露前者；后者更适合做告警阈值（见待办）。
+
+回归测试：`tools/auto_unit.lua` 从 390 增至 410 项。新增覆盖：预算地板（抬起 + 上报 +
+不再触发硬上限 + 历史保留）、硬上限保留 digest 与 system、`tok_per_char` 首观测/平滑/
+离谱值丢弃、`estimate_tokens` 用校准、状态栏 `ctx:%` 阈值。
+变异验证：硬上限只留 `msgs[1]` → FAIL；去掉预算地板 → 4 项 FAIL；
+去掉平滑 → FAIL；去掉离谱值保护 → FAIL；`estimate_tokens` 忽略校准 → FAIL。
+
+### 8.33 仍然待办（P2 剩余）
+
+1. 渐进降级（opencode `TRANSCRIPT_LEVELS`）：只有"折叠"和"丢最老"两档，
+   缺中间档（截 tool output → 抹 output + 截 input → 只留 user 文本）。
+2. 提前压缩（Pi `backgroundTokens=32768`）：后台在触发线之下就开始写摘要，
+   到线时已经写好。需要后台任务，serve/wake 里做更自然。
+3. `cache_shape` 诊断：hash(system + tools) 变了就打 notice，直接解释 miss 原因。
+4. 观测：把 `cache_ratio` 与 `ctx%` 的逐轮曲线记进 KV，`lite state` 能看趋势；
+   并改用"可复用前缀命中率"作为告警口径（见 §8.32 ④）。
+5. 单条消息本身超预算时（一个 18KB 工具结果 > 可分配预算），现在只能放着不管，
+   等它自然触发硬上限。可考虑对**超预算的单条 tool 结果**按预算再截一刀。
+6. 触发线仍是字符口径。有了 `tok_per_char` 校准后，可以改成 token 口径
+   （例如 `LITE_CONTEXT_TOKENS`），和模型真实窗口直接对齐 ——
+   参考实现（Pi 16k reserve / Reasonix 90% / opencode 85%）都是按 token 算的。

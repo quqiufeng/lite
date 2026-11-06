@@ -138,6 +138,7 @@ cd "$(pwd)"
 | `core/agent.lua` | 循环：messages → model → tool_calls → messages |
 | `core/provider.lua` | DeepSeek SSE + tool_calls + 重试 + 图片消息 |
 | `core/tools.lua` | 10 个内置工具的实现与 schema |
+| `core/compact.lua` | 低频上下文压缩：三段式计划、结构化 digest、验收与迟滞 |
 | `core/memory.lua` | KV 记忆：命名空间/TTL/召回/上下文组装 |
 | `core/prompt.lua` | system prompt 分段、记忆块、recall query |
 | `core/session.lua` | JSONL 镜像 + `from_memory()` 恢复 |
@@ -238,7 +239,7 @@ MUST NOT：
 ./tools/package.sh / ./tools/release.sh     # 打包 / 构建+打包+安装
 ```
 
-测试分层（`test.sh` 串联）：`check_deps.sh` → `auto_unit.lua`（当前 295 项）→
+测试分层（`test.sh` 串联）：`check_deps.sh` → `auto_unit.lua`（当前 410 项）→
 CLI JSON → `tui_smoke.sh` → `serve_smoke.sh`。失败产物落 `artifacts/`。
 
 **写回归时先验证它抓得住 bug**：在修复前的 commit 上跑一遍，确认会 FAIL。

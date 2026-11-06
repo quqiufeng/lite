@@ -37,7 +37,7 @@ TUI 完成后，“看见”会进一步包含对话界面与截图，形成完�
 ## 特性
 
 - **DeepSeek 流式对话**：OpenAI 兼容 `/chat/completions` + SSE；支持 `thinking` / `reasoning_effort`，TUI 用灰色 `…` 块显示思考过程。
-- **工具循环**：`bash / read / ocr / write / edit / resize / native / todo`，文件工具限制在 workspace；TUI 即时显示 `tool:<name>` 与结果。`bash` 异步执行，长命令不冻结 TUI，`Ctrl+C` 可取消；`read` 支持文本/目录/图片（JPEG/PNG/GIF/WebP，图片以 user `image_url` 传入；图片还可从 `$TMPDIR`/`/tmp`/`/var/tmp` 只读打开，文本仍限 workspace）；`ocr` 走系统 PP-OCRv4（中文/英文，可选）；`resize` 走内置 `liblite_image.so`（LuaJIT FFI，PNG/JPEG/WebP 解码+缩放+编码）；`edit` 成功返回 unified diff。
+- **工具循环**：`bash / read / ocr / write / edit / resize / native / todo`，文件工具限制在 workspace；TUI 即时显示 `tool:<name>` 与结果。`bash` 异步执行，长命令不冻结 TUI，`Ctrl+C` 可取消；`read` 支持文本/目录/图片（JPEG/PNG/GIF/WebP，图片以 user `image_url` 传入；图片还可从 `$TMPDIR`/`/tmp`/`/var/tmp` 只读打开，文本仍限 workspace）；`ocr` 走系统 PP-OCRv4（中文/英文，可选）；`resize` 走内置 `liblite_image.so`（LuaJIT FFI，PNG/JPEG/WebP 解码+缩放+编码）；`edit` 成功返回 unified diff。工具输出统一 **head+tail 双端裁剪**（bash 32KB，其余 30KB）：只留头部会砍掉编译报错/测试失败摘要，模型只能重跑一遍，那是"省 token 反而更贵"。
 - **工具审批**：`--approval ask|deny`；危险工具弹出 once / always / reject，always 按 session 记忆；serve/attach 通过协议审批。
 - **本地上下文记忆**：
   - 每个项目目录生成 `mem.bin` + `mem.idx`；
@@ -45,7 +45,9 @@ TUI 完成后，“看见”会进一步包含对话界面与截图，形成完�
   - 前缀 / 范围 / 正则 / 模糊 / 标签搜索；
   - 旧轮次不进 prompt，需要时用 `recall` 查回；
   - `mem.bin` 头部损坏（magic/version 不符）不阻塞启动：自动改名为 `mem.bin.corrupt-<ts>` 后以空库继续，`mem.idx` 一并备份。
-- **有界上下文**：system + 最近 2 轮 + 相关记忆块（默认 8k 字符预算）。
+- **有界上下文 + 低频压缩**：prompt 一直 append-only，只在跨过预算阈值（`LITE_CONTEXT_CHARS`，默认 64k 字符）时压一次。压缩把旧内容折成**三段结构**——稳定前缀（system + 首条 user，≤8% 预算）、一段结构化 digest（固定小标题、禁止编造、硬性字数上限）、近期原文尾巴（预算的 10%，边界避开 tool result）——然后记 baseline 继续追加。用户自己的话有独立预算、逐字保留、不进摘要（约束被摘要丢掉就再也找不回来，而它约束的代码还在工作区里）。折叠收益不足或摘要超标时**拒绝**这次检查点，并带迟滞（rearm）避免"每轮都压"——重复压会打断缓存前缀，比不压更贵。`--json` 输出 `{"type":"compact"}` 事件，TUI 里显示 `compact: prompt N -> M chars`。
+- **用量与缓存可观测**：解析流末尾的 `usage`（`prompt_cache_hit/miss_tokens`），按会话累积；TUI 状态栏 `cache:N%` 显示前缀缓存命中率，`--once --json` 输出 `{"type":"usage"}` 事件。命中率是判断"prompt 前缀是否稳定"的唯一硬指标。
+- **上下文压力可见**：状态栏 `ctx:N%` 显示当前 prompt 占压缩触发线的比例（≥60% 才出现），数字来自真实 `usage` 校准的 chars→tokens 比例（实测误差 2%），不是纯字符猜测。预算小于固定前缀的 3 倍时会自动抬高并提示，避免"预算比 system prompt 还小"导致压缩永远失败、只能丢历史。
 - **TUI + diff**：`--tui` 交互；assistant Markdown/代码块渲染、`Tab` 文件路径补全、鼠标滚轮/`PgUp`/`PgDn` 上翻历史、`?` 帮助、`Esc×2` 终止当前回复、忙时继续输入排队（`queue:N` / `⏳` 待发送）、`quit` + Enter 退出、启动时自动恢复同 cwd 最近会话；`/session` 选择/新建会话；`Ctrl+G` 打开 `git diff`，支持 split/unified、hunk 跳转、单文件、大 diff 虚拟滚动。
 - **Todo list**：`todo` 工具维护多步任务；状态栏 `todo:done/total`，`Ctrl+T` 打开列表；持久化到本地记忆并随 serve/attach 广播。
 - **serve / attach**：`lite serve --port 8765` 启动 headless 服务端；`lite attach --port 8765` 在任意终端或 tmux tab 实时显示并交互，所有客户端共享同一会话与事件流。待处理 prompt 持久化在 KV，重启可恢复；attach 连接时回放会话历史；SIGINT/SIGTERM 优雅退出。
@@ -120,9 +122,9 @@ return {
 
 - 命名空间：`/agent/knowledge/*`（本目录的长期事实，跨会话共享）、`/agent/session/<id>/*`（会话内容，含 `working/*`）、`/agent/working/*`（目录级运行态，如 wake，不注入 prompt）。
 - 启动时载入 `mem.bin`；运行中按 `LITE_MEMORY_FLUSH`（默认 30s）`sync`，退出强制落盘。
-- 每次请求前按当前输入搜索相关记忆，组装成小块 `<retrieved_memory>` system 消息；最近 2 轮之外的消息只从记忆召回。
+- 每个用户轮开始时按当前输入搜索相关记忆，组装成小块 `<retrieved_memory>` system 消息，**追加到请求最末尾**（只影响请求，不写会话）：块内容每轮都变，插在会话中间会让后续消息整体位移、前缀缓存全部失效（实测命中 97% → 71%），且同一轮的后续工具请求不再重复注入。
 - 召回 query：ASCII 词 + 中文 bigram；短追问会拼接上一轮 user，改善“继续/那个”的指代。
-- 窗口裁剪时把旧消息压成 `<session_context>` digest，存 `/agent/session/<id>/context`；细节仍用 `recall`。
+- 超预算时把旧消息压成 `<session_context>` 块，状态存 `/agent/session/<id>/compact`（`baseline` / `digest` / `block` / `rearm_chars`）；细节仍用 `recall` 找回。压缩只在跨阈值时发生，压完 `baseline` 推进、prompt 继续 append-only —— 这是缓存能命中的前提。
 - system prompt 参考 Pi 分段：`<tools> / <rules> / <memory> / <project_context> / <cwd>`；自动加载 `AGENTS.md` / `CLAUDE.md` / `.lite/instructions.md`（默认截断 4000 字符）。
 - 会话存储也在 KV：`/agent/session/<id>/meta`、`/agent/index/cwd/<hash>/<id>`、`/agent/session/<id>/msg/<seq>`、`/agent/session/<id>/turn/<n>`。
 - `Session:append` 会把完整消息（含 tool_calls/tool result）镜像到 KV 的 `/msg/<seq>`；`/session` 优先用它精确重建，turn 摘要仅兜底。
@@ -132,7 +134,7 @@ return {
 - 轮次按 `session_id` 存；请求召回只注入当前 session 的轮次，facts/working 全局。
 - `/session` 与启动恢复**只读当前目录 `mem.bin`** 里的会话；`~/.local/share/lite/sessions/*.jsonl`
   仅作消息镜像备份，不参与恢复（删掉 `mem.bin` 就等于清空该目录的记忆）。
-- TUI 状态栏显示 `mem:<总条数>`；本轮召回命中显示为 `hit:<n>`。
+- TUI 状态栏显示 `mem:<总条数>`；本轮召回命中显示为 `hit:<n>`；前缀缓存命中率为 `cache:<n>%`。
 - 模型也可主动调用：
   - `remember {key,content,tags}` 写入长期事实；
   - `recall {query,limit}` 查询旧上下文。
@@ -148,7 +150,8 @@ lua/main.lua            --check / --once / --recall / --help
 lua/context.lua         session/view/settings/ui + 事件
 lua/core/provider.lua   DeepSeek SSE + tool_calls
 lua/core/tools.lua      bash/read/write/edit/resize/native + remember/recall
-lua/core/agent.lua      messages → model → tools → messages
+lua/core/agent.lua      messages → model → tools → messages（压缩接入点）
+lua/core/compact.lua    低频压缩：三段式计划 / 摘要提示词 / 验收与迟滞
 lua/core/memory.lua     命名空间/TTL/召回/上下文组装
 lua/core/prompt.lua     system prompt 分段 + 记忆块 + recall query
 lua/core/session.lua    JSONL 会话
@@ -212,8 +215,8 @@ C ABI 固定为 `char *lite_helper(const char *input)` + 可选 `lite_helper_fre
 | `LITE_MAX_TURNS` | 128 | 单次 agent 循环上限 |
 | `LITE_MEMORY_MB` | 100 | mem.bin 容量 |
 | `LITE_MEMORY_FLUSH` | 30 | 自动落盘间隔（秒） |
-| `LITE_CONTEXT_CHARS` | 8000 | prompt 字符预算 |
-| `LITE_CONTEXT_TURNS` | 2 | 保留最近轮数 |
+| `LITE_CONTEXT_CHARS` | 64000 | prompt 字符预算 |
+| `LITE_CONTEXT_TURNS` | 16 | 保留最近轮数 |
 | `LITE_INSTRUCTIONS_FILE` | 自动探测 | 项目指令文件；`/dev/null` 禁用 |
 | `LITE_INSTRUCTIONS_CHARS` | 4000 | 指令文件截断上限 |
 | `LITE_THINKING` | — | `1` 启用 thinking |
