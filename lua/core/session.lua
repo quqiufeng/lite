@@ -129,6 +129,20 @@ function M.for_cwd(cwd, limit, dir)
     return out
 end
 
+-- 启动/切换会话时恢复上下文：只认当前目录 mem.bin（KV）里的会话。
+-- 全局 JSONL 仅作镜像备份，不参与恢复——否则删掉目录下的 mem.bin 后
+-- 旧对话仍会从 ~/.local/share/lite/sessions 里被拉回来，违背「记忆跟着目录走」。
+function M.from_memory(memory, cwd, limit)
+    if not memory or type(memory.list_sessions) ~= "function" then return nil end
+    for _, meta in ipairs(memory:list_sessions(cwd, limit or 5)) do
+        local msgs, max_turn = memory:session_messages(meta.id, 50)
+        if msgs and #msgs > 0 then
+            return { id = meta.id, messages = msgs, turn = max_turn or meta.turns or 0 }
+        end
+    end
+    return nil
+end
+
 function M.new(ctx, opts)
     opts = opts or {}
     local base = opts.dir or default_dir()

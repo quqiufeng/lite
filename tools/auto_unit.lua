@@ -1540,6 +1540,31 @@ do
     os.execute("rm -rf " .. shq(dir))
 end
 
+-- Session.from_memory: 恢复只认 mem.bin；KV 空时即使全局 JSONL 有同名会话也不返回
+do
+    local dir = os.tmpname()
+    os.remove(dir)
+    os.execute("mkdir -p " .. shq(dir))
+    local Context = require("context")
+    local Session = require("core.session")
+    local Memory = require("core.memory")
+    local ctx = Context.new({ cwd = "/tmp/kvonly", id = "kv1" })
+
+    -- 只写 JSONL，不写 KV
+    local s = Session.new(ctx, { dir = dir, id = "kv1" })
+    s:append({ role = "system", content = "<cwd>\n/tmp/kvonly\n</cwd>" })
+    s:append({ role = "user", content = "jsonl only" })
+
+    local mem = Memory.new({ dir = dir, max_mb = 32 })
+    check(mem ~= nil, "from_memory: memory open")
+    if mem then
+        check(Session.from_memory(mem, "/tmp/kvonly", 5) == nil,
+            "from_memory: ignores jsonl only")
+        mem:close()
+    end
+    os.execute("rm -rf " .. shq(dir))
+end
+
 -- session for_cwd: 父目录不得命中子目录的会话（子串匹配的老 bug）
 do
     local dir = os.tmpname()

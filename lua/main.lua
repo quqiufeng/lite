@@ -350,28 +350,13 @@ elseif cmd == "--tui" then
         sandbox_net = config.sandbox_net,
     })
 
+    -- 只从当前目录的 mem.bin 恢复；全局 JSONL 不参与（见 Session.from_memory）。
+    local prev = Session.from_memory(memory, config.cwd, 5)
     local restored, restored_id, restored_turn = {}, nil, 0
-    for _, meta in ipairs(memory:list_sessions(config.cwd, 5)) do
-        local msgs, max_turn = memory:session_messages(meta.id, 50)
-        if #msgs > 0 then
-            restored = msgs
-            restored_id = meta.id
-            restored_turn = max_turn or meta.turns or 0
-            break
-        end
-    end
-    if not restored_id then
-        for _, s in ipairs(Session.for_cwd(config.cwd, 5)) do
-            local clean = Session.clean(s.messages)
-            if #clean > 0 then
-                restored = clean
-                restored_id = s.id
-                for _, m in ipairs(clean) do
-                    if m.role == "user" then restored_turn = restored_turn + 1 end
-                end
-                break
-            end
-        end
+    if prev then
+        restored = prev.messages
+        restored_id = prev.id
+        restored_turn = prev.turn
     end
     if restored_id then ctx.session.id = restored_id end
     ctx.session.turn = restored_turn or 0
@@ -482,6 +467,9 @@ elseif cmd == "--once" then
         sandbox = config.sandbox,
         sandbox_net = config.sandbox_net,
     })
+    -- 与 TUI 路径一致：先登记会话 meta，否则 --once 写进 KV 的 msg/*
+    -- 没有 /meta 索引，list_sessions 找不到，下次打开就等于没记录。
+    memory:ensure_session(ctx.session.id, config.cwd, config.model)
     local session = Session.new(ctx, { memory = memory })
     local agent = Agent.new(ctx, Provider, tools, session, memory)
 

@@ -603,7 +603,8 @@ lite 实现：
 - **Markdown**：`lua/tui/markdown.lua`；标题/列表/引用/代码块/行内 code/bold/italic/link；transcript 的 assistant 块走 Markdown，按宽度 wrap 并保留 segment 样式。
 - **Help / which-key**：`lua/tui/help_view.lua`，`?` 打开；TUI/attach 均支持。
 - **Tab 补全**：`lua/tui/complete.lua` + composer `replace_token`；按当前 token 列目录、唯一命中直接补全，多命中补公共前缀。
-- **会话恢复**：`Session.recent_ids` + `Session.new({id=...})`；TUI 启动时找同 cwd 的最近 JSONL，恢复 agent messages 与 transcript。
+- **会话恢复**：`Session.from_memory(memory, cwd, 5)` —— 只从当前目录 `mem.bin` 的 KV
+  （`/agent/index/cwd/<hash>/<id>` + `/msg/<seq>`）取最近会话；全局 JSONL 不参与。
 - 测试：Markdown/help/complete/session 单测；tmux 实际验证恢复、Markdown、help、`src/ma` → `src/main.lua`。
 - 尚未做：鼠标/选择复制、终端图片协议、全文搜索浮层、Session picker。
 

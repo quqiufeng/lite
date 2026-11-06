@@ -89,20 +89,15 @@ function M.run(ctx, agent, memory, opts)
             transcript:add("info", "无法切换：当前正在执行")
             return
         end
+        -- 内容只取当前目录 mem.bin 里的 KV；JSONL 仅作镜像，不参与恢复。
         local mem_msgs, max_turn = {}, 0
         if memory then mem_msgs, max_turn = memory:session_messages(id, 50) end
 
         local s = Session.new(ctx, { id = id, memory = memory })
-        local file_msgs = Session.clean(s:load())
-        local msgs = #mem_msgs > 0 and mem_msgs or file_msgs
+        local msgs = mem_msgs
         local total = memory and memory:session_message_count(id) or 0
-        s.seq = math.max(#file_msgs, total)
+        s.seq = math.max(#mem_msgs, total)
         local turn = max_turn or 0
-        if #mem_msgs == 0 then
-            for _, m in ipairs(msgs) do
-                if m.role == "user" then turn = turn + 1 end
-            end
-        end
 
         ctx.session.id = id
         ctx.session.messages = msgs
@@ -115,8 +110,7 @@ function M.run(ctx, agent, memory, opts)
             agent.tools.todos:load()
             ctx:emit("todos", ctx.session.todos)
         end
-        local source = #mem_msgs > 0 and ("memory " .. #mem_msgs) or ("jsonl " .. #file_msgs)
-        populate(msgs, string.format("session %s · %s", id, source))
+        populate(msgs, string.format("session %s · memory %d", id, #mem_msgs))
     end
 
     local function switch_new()
@@ -154,11 +148,7 @@ function M.run(ctx, agent, memory, opts)
                         sessions[#sessions + 1] = { id = meta.id, preview = meta.title or "" }
                     end
                 end
-                if #sessions == 0 then
-                    for _, s in ipairs(Session.for_cwd(ctx.session.cwd, 10)) do
-                        sessions[#sessions + 1] = { id = s.id, preview = s.preview }
-                    end
-                end
+                -- 不列全局 JSONL 里的会话：记忆只跟当前目录的 mem.bin 走。
                 session_view = SessionView.new(sessions, {
                     current = ctx.session.id,
                     width = w,

@@ -130,7 +130,8 @@ return {
 - `mem.bin` 用 `MAP_SHARED` mmap，`mem.idx` 只读 mmap；`cache_get/prefix` 返回指针，C 层零拷贝，Lua 解码 JSON 时才复制。
 - `mem.lock`：TUI/serve 写进程持独占锁，防止多写覆盖；`--recall/state/sessions` 只读不加锁，可在运行中诊断。
 - 轮次按 `session_id` 存；请求召回只注入当前 session 的轮次，facts/working 全局。
-- `/session` 优先从 KV 列同 cwd 会话并重建 messages；JSONL 仅作兼容/兜底，不引入 SQLite。
+- `/session` 与启动恢复**只读当前目录 `mem.bin`** 里的会话；`~/.local/share/lite/sessions/*.jsonl`
+  仅作消息镜像备份，不参与恢复（删掉 `mem.bin` 就等于清空该目录的记忆）。
 - TUI 状态栏显示 `mem:<总条数>`；本轮召回命中显示为 `hit:<n>`。
 - 模型也可主动调用：
   - `remember {key,content,tags}` 写入长期事实；
