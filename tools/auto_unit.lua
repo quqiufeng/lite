@@ -739,6 +739,32 @@ io.write(ok and "READY\n" or "NOTREADY\n")
                     or text:find("libonnxruntime_providers_cuda", 1, true)
                     or text:find("Failed to load shared library", 1, true)
                 check(not noisy, "ocr init quiet on missing CUDA provider")
+
+                -- backend 行必须与实测一致：链接了 CUDA provider 就不能还报 CPU
+                if text:find("CUDA enabled", 1, true) then
+                    check(text:find("backend: CUDA", 1, true) ~= nil,
+                        "ocr backend line says CUDA when CUDA enabled")
+                else
+                    check(text:find("backend: CPU", 1, true) ~= nil,
+                        "ocr backend line says CPU when CUDA unavailable")
+                end
+            end
+
+            -- CUDA provider 走软链接，不打包；实体文件会膨胀 tarball
+            do
+                local pkg = io.open(root .. "/tools/package.sh", "r")
+                local script = pkg and pkg:read("*a") or ""
+                if pkg then pkg:close() end
+                check(script:find("providers_cuda", 1, true) ~= nil
+                    and script:find("continue", 1, true) ~= nil,
+                    "package.sh skips CUDA provider")
+                -- onnxruntime 核心库 25MB，占包一半；默认不打包，靠 ort_link.sh 接
+                check(script:find("libonnxruntime.so.1", 1, true) ~= nil,
+                    "package.sh is aware of onnxruntime core lib")
+                check(script:find("LITE_DIST_WITH_ORT", 1, true) ~= nil,
+                    "package.sh has escape hatch for bundling ORT")
+                check(script:find("ORT_VERSION", 1, true) ~= nil,
+                    "package.sh records required ORT version")
             end
         end
         os.remove(img)

@@ -101,6 +101,8 @@ end
 
 -- 临时把 fd 1/2 都指到临时文件，跑 fn，再还原并把非噪声行回放到 stderr。
 -- 必须两个都接管：libocr_simple 的诊断走 **stdout**，ORT 自己的日志走 stderr。
+local last_capture = ""
+
 local function with_output_filtered(fn)
     local tmp = os.tmpname()
     local fd = ffi.C.open(tmp, 0x242, 420)      -- O_RDWR|O_CREAT|O_TRUNC, 0644
@@ -126,6 +128,7 @@ local function with_output_filtered(fn)
     local cap = f and f:read("*a") or ""
     if f then f:close() end
     os.remove(tmp)
+    last_capture = cap
     for line in (cap .. "\n"):gmatch("(.-)\n") do
         local text = line:gsub("\27%[[%d;]*m", "")
         if text:match("%S") and not is_noise(text) then
@@ -174,7 +177,15 @@ function M.ready()
         load_err = "OCR init failed (models/onnxruntime): " .. tostring(res)
         return false, load_err
     end
-    io.stderr:write("[OCR] backend: CPU (CUDA provider not bundled; GPU is slower for single images)\n")
+    -- 后端状态按实测日志决定（libocr_simple 会打 "CUDA enabled" 或
+    -- "CUDA not available, using CPU"）。不写死，否则 tools/cuda_provider.sh
+    -- 链接 CUDA 之后这行就是错的。
+    if last_capture:find("CUDA enabled", 1, true) then
+        io.stderr:write("[OCR] backend: CUDA\n")
+    else
+        io.stderr:write("[OCR] backend: CPU "
+            .. "(CUDA provider not linked; single images are faster on CPU)\n")
+    end
     handle = res
     return true
 end

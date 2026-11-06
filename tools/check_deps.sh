@@ -85,6 +85,15 @@ if not ready then io.stderr:write(tostring(err) .. "\n"); os.exit(1) end
     fi
 fi
 
+# onnxruntime 核心库：不打包（25MB），靠 ort_link.sh 接系统库
+ORT_CORE="$ROOT/third_party/ocr/lib/libonnxruntime.so.1"
+[ -f "$ORT_CORE" ] || ORT_CORE="$ROOT/lib/libonnxruntime.so.1"
+if [ -f "$ORT_CORE" ]; then
+    echo "[OK]   ocr-core $(du -h "$ORT_CORE" | cut -f1)  $(readlink -f "$ORT_CORE")"
+else
+    echo "[INFO] ocr-core missing (./tools/ort_link.sh link 接入系统 onnxruntime)"
+fi
+
 # CUDA provider：不打包，靠软链接接入系统里版本匹配的那份
 CUDA_LINK="$ROOT/third_party/ocr/lib/libonnxruntime_providers_cuda.so"
 if [ -L "$CUDA_LINK" ]; then

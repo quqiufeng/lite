@@ -259,9 +259,13 @@ CLI JSON → `tui_smoke.sh` → `serve_smoke.sh`。失败产物落 `artifacts/`�
 - C 导出 `int lite_<feature>_...` + `const char *lite_<feature>_error(void)`；失败返回非 0。
 - `.so` 设 `$ORIGIN` RPATH；`package.sh` 复制非 libc 依赖到 `dist/lib/`。
 - **大块系统库用软链接，不打包**：`tar -h` 会解引用软链，把实体塞进 tarball。
-  已有先例：CUDA provider（329MB）用 `tools/cuda_provider.sh link` 接系统里版本匹配的那份，
-  `package.sh` 显式跳过 `*providers_cuda*`；`check_deps.sh` 报 `ocr-cuda` 状态。
-  链接前校验版本、链接后**实测**（`CUDA enabled`）才保留，否则自动回滚。
+  两条先例：
+  - `libonnxruntime.so.1`（25MB，占 dist 一半）→ `tools/ort_link.sh link`，
+    版本要求写在 `lib/ORT_VERSION`；`LITE_DIST_WITH_ORT=1` 可强制随包
+  - CUDA provider（329MB）→ `tools/cuda_provider.sh link`
+  - `package.sh` 的规则是**指向仓库外的软链一律跳过**（按 realpath 判断，不靠文件名），
+    外加 16MB 单文件闸门（`LITE_DIST_MAX_FILE_MB`）防回归
+  - 两个 link 脚本都是「校验版本 → 链接 → **实测能用**才保留，否则回滚」
 - 热重载：清 `package.loaded[...]` 重新 require（TUI `/reload`）。C `.so` 不卸载，改 C 要重启。
 
 **`native`：让模型自己造工具**

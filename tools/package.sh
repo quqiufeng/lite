@@ -22,18 +22,55 @@ if [ -f "$ROOT/build/liblite_capture.so" ]; then
     cp "$ROOT/build/liblite_capture.so" "$DIST/lib/"
 fi
 
+# 随包的 ocr 库：只收「仓库内实体文件」。
+# 任何指向仓库外的软链（典型：CUDA provider 329MB 接的是系统
+# onnxruntime-gpu）都不打包 —— 下面的 `tar -h` 会解引用软链，把系统库
+# 实体塞进 tarball。目标机需要 GPU 时用 tools/cuda_provider.sh link 自己接。
+#
+# 判断依据是 realpath 是否在 $ROOT 内，而不是文件名：这样以后接任何大块
+# 系统库（TRT provider、cudnn…）都自动不会进包，不用逐条加黑名单。
+EXTERNAL_LIBS=()
 if [ -d "$ROOT/third_party/ocr/lib" ]; then
     for src in "$ROOT/third_party/ocr/lib/"*.so*; do
         [ -e "$src" ] || continue
         bn="$(basename "$src")"
-        # CUDA provider 是 329MB 的系统库软链，绝不打包：
-        # 下面的 tar -h 会解引用软链，把 329MB 实体塞进 tarball。
-        # 目标机需要 GPU 时用 tools/cuda_provider.sh link 自己接。
         case "$bn" in
-            *providers_cuda*) continue ;;
+            *providers_cuda*) continue ;;   # 双保险：即便有人放成实体文件也不收
+            # onnxruntime 核心库 25MB，占整个包一半。目标机一般已装
+            # （onnxruntime-gpu 的 pip 包 / 系统包），用 tools/ort_link.sh 接。
+            # 确实要随包分发时设 LITE_DIST_WITH_ORT=1。
+            libonnxruntime.so.1)
+                [ "${LITE_DIST_WITH_ORT:-0}" = "1" ] || { SKIP_ORT=1; continue; }
+                ;;
+        esac
+        real="$(readlink -f "$src" 2>/dev/null || echo "$src")"
+        case "$real" in
+            "$ROOT"/*) ;;
+            *)
+                EXTERNAL_LIBS+=("$bn -> $real")
+                continue
+                ;;
         esac
         ln -sfn "../../../third_party/ocr/lib/$bn" "$DIST/lib/$bn"
     done
+fi
+# 记下目标机需要哪个 ORT 版本，供 tools/ort_link.sh 精确匹配
+ORT_VER=""
+if [ -f "$ROOT/third_party/ocr/lib/libonnxruntime.so.1" ]; then
+    ORT_VER="$(strings "$ROOT/third_party/ocr/lib/libonnxruntime.so.1" 2>/dev/null \
+        | grep -oE '^1\.[0-9]+\.[0-9]+$' | sort -u | tail -1)"
+fi
+if [ -n "$ORT_VER" ]; then
+    printf '%s\n' "$ORT_VER" >"$DIST/lib/ORT_VERSION"
+fi
+if [ "${SKIP_ORT:-0}" = "1" ]; then
+    echo "package: 跳过 libonnxruntime.so.1（25MB，宿主机提供）"
+    echo "         目标机执行 ./tools/ort_link.sh link 接入系统 onnxruntime"
+    echo "         要随包分发则 LITE_DIST_WITH_ORT=1 ./tools/package.sh"
+fi
+if [ "${#EXTERNAL_LIBS[@]}" -gt 0 ]; then
+    echo "package: 跳过仓库外的系统库（用 tools/cuda_provider.sh 在目标机按需接入）:"
+    for i in "${EXTERNAL_LIBS[@]}"; do echo "  - $i"; done
 fi
 if [ -d "$ROOT/third_party/ocr/models/ocr" ]; then
     ln -sfn "../../../third_party/ocr/models/ocr" "$DIST/models/ocr"
@@ -55,7 +92,8 @@ if [ -f "$ROOT/build/liblite_image.so" ]; then
     rm -f "$LDD_TMP"
 fi
 
-for f in lite-lua lite run.sh check_deps.sh build.sh test.sh install.sh package.sh release.sh launch.sh; do
+for f in lite-lua lite run.sh check_deps.sh build.sh test.sh install.sh package.sh release.sh launch.sh \
+         ort_link.sh cuda_provider.sh see.lua; do
     [ -f "$ROOT/tools/$f" ] && cp "$ROOT/tools/$f" "$DIST/tools/"
 done
 cp "$ROOT/tools/auto_unit.lua" "$DIST/tools/"
@@ -67,11 +105,24 @@ cp "$ROOT/third_party/cjson/lua/5.1/cjson.so" "$DIST/third_party/cjson/lua/5.1/"
 chmod +x "$DIST/tools/lite-lua" "$DIST/tools/lite" "$DIST/tools/run.sh" \
     "$DIST/tools/check_deps.sh" "$DIST/tools/build.sh" "$DIST/tools/test.sh" \
     "$DIST/tools/install.sh" "$DIST/tools/package.sh" "$DIST/tools/release.sh" \
-    "$DIST/tools/launch.sh"
+    "$DIST/tools/launch.sh" "$DIST/tools/ort_link.sh" "$DIST/tools/cuda_provider.sh"
 
 if command -v strip >/dev/null 2>&1; then
     strip --strip-unneeded "$DIST/third_party/luajit/src/luajit" 2>/dev/null || true
 fi
 
+# 自检：tar -h 会解引用软链，万一混进系统库，包会瞬间膨胀。
+# 这里给一个大文件闸门，超了就报错而不是静默产出胖包。
+DIST_MAX_FILE_MB="${LITE_DIST_MAX_FILE_MB:-16}"
+big="$(find "$DIST" -type f -size +"${DIST_MAX_FILE_MB}"M -printf '%s %p\n' 2>/dev/null | sort -rn | head -5)"
+if [ -n "$big" ]; then
+    echo "package: 以下文件超过 ${DIST_MAX_FILE_MB}MB，疑似误打包系统库：" >&2
+    echo "$big" | while read -r sz f; do
+        printf '  %6sMB  %s\n' "$((sz / 1024 / 1024))" "${f#"$DIST"/}" >&2
+    done
+    echo "  确认要打包就设 LITE_DIST_MAX_FILE_MB=<更大的值>" >&2
+    exit 1
+fi
+
 tar -czhf "$ROOT/dist/lite-linux-x64.tar.gz" -C "$ROOT/dist" lite-linux-x64
-echo "package: $ROOT/dist/lite-linux-x64.tar.gz"
+echo "package: $ROOT/dist/lite-linux-x64.tar.gz ($(du -h "$ROOT/dist/lite-linux-x64.tar.gz" | cut -f1))"

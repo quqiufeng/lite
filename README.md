@@ -244,8 +244,10 @@ C ABI 固定为 `char *lite_helper(const char *input)` + 可选 `lite_helper_fre
 - libpng / libjpeg / libwebp（系统；打包时 `.so` 进 `dist/lib/`）
 - libX11 / libxdo（系统；X11 截图与窗口控制）
 - OCR：PP-OCRv4 `third_party/ocr/`（lib + models + onnxruntime 1.26，随包进 `dist/lib`/`dist/models`）
-  - CUDA provider **不打包**（329MB）：需要 GPU 时用 `./tools/cuda_provider.sh link`
-    把系统里**版本匹配**的那份软链进 `third_party/ocr/lib/`；`status` 查看、`unlink` 退回 CPU
+  - **onnxruntime 核心库不打包**（25MB，占 dist 一半）：目标机执行
+    `./tools/ort_link.sh link` 接入系统里**版本匹配**的那份；`status` 查看、`unlink` 撤销。
+    版本要求记在 `lib/ORT_VERSION`。确实要随包分发：`LITE_DIST_WITH_ORT=1 ./tools/package.sh`
+  - CUDA provider 同样**不打包**（329MB）：`./tools/cuda_provider.sh link` 按需接入
   - 默认留 CPU：单张小图 CUDA 反而更慢（实测 2.3s vs 0.75s，初始化开销占主导），批量/大图才值得
 - pkg-config / gcc / cmake / OpenMP（编译 C KV cache + image）
 
