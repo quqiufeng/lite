@@ -50,13 +50,13 @@ fi
 mkdir -p "$PREFIX/bin" 2>/dev/null || true
 
 if [ "$(id -u)" -eq 0 ] || [ -w "$PREFIX/bin" ]; then
-    PREFIX="$PREFIX" "$ROOT/tools/install.sh"
+    PREFIX="$PREFIX" LITE_SKIP_PACKAGE=1 "$ROOT/tools/install.sh"
 else
     if ! command -v sudo >/dev/null 2>&1; then
         echo "release: $PREFIX/bin is not writable and sudo is missing" >&2
         exit 1
     fi
-    sudo env PREFIX="$PREFIX" "$ROOT/tools/install.sh"
+    sudo env PREFIX="$PREFIX" LITE_SKIP_PACKAGE=1 "$ROOT/tools/install.sh"
 fi
 
 echo "installed: $PREFIX/bin/lite"

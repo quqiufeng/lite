@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# 可选安装：~/.local/share/lite + ~/.local/bin/lite。
+# 安装：<prefix>/share/lite + <prefix>/bin/lite。
+#
+# 原则：装进去的必须由当前源码树现打，绝不复用旧 dist。
+# 旧实现是「dist 存在就直接 cp」，改了 lua 却装上几天前的包，
+# 现象是改的代码"不生效"，排查极浪费时间。package 只要 0.6s，不值得省。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -7,7 +11,23 @@ DIST="$ROOT/dist/lite-linux-x64"
 APP="${PREFIX:-$HOME/.local}/share/lite"
 BIN="${PREFIX:-$HOME/.local}/bin"
 
-if [ ! -x "$DIST/tools/lite" ]; then
+if [ "${LITE_SKIP_PACKAGE:-0}" = "1" ]; then
+    # 逃生阀：release.sh 刚打完包，或明确知道自己要复用现成产物时用。
+    [ -x "$DIST/tools/lite" ] || {
+        echo "install: LITE_SKIP_PACKAGE=1 but dist is missing" >&2
+        exit 1
+    }
+    echo "install: reusing existing dist (LITE_SKIP_PACKAGE=1)"
+else
+    # 原生库若比 C 源码旧，先重建；否则 dist 里的 .so 仍是老二进制。
+    if [ -f "$ROOT/CMakeLists.txt" ] && [ -d "$ROOT/src" ]; then
+        newest="$(ls -t "$ROOT"/build/*.so 2>/dev/null | head -1 || true)"
+        if [ -z "$newest" ] || [ -n "$(find "$ROOT/src" "$ROOT/CMakeLists.txt" \
+                -newer "$newest" -print -quit 2>/dev/null)" ]; then
+            echo "install: C sources newer than build/*.so -> rebuilding"
+            "$ROOT/tools/build.sh"
+        fi
+    fi
     "$ROOT/tools/package.sh"
 fi
 
@@ -21,3 +41,4 @@ ln -sf "$APP/tools/lite-lua" "$BIN/lite-lua"
 
 echo "installed: $BIN/lite"
 echo "config:    ~/.config/lite/config.lua (not touched)"
+echo "note:      已在运行的 lite 仍用旧代码，需退出重启才生效"
