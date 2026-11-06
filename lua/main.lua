@@ -10,7 +10,8 @@ local function usage()
 lite — DeepSeek 终端 coding agent
 
 用法:
-  lite --tui                   交互式终端 UI
+  lite                         交互式终端 UI（默认，等价于 --tui）
+  lite --tui                   同上，显式写法
   lite serve --port 8765       启动 headless 服务端（TCP JSONL）
   lite serve --port 8765 --wake 300 --task "检查 CI"   定时唤醒
   lite attach --port 8765      连接服务端并显示 TUI
@@ -41,7 +42,7 @@ lite — DeepSeek 终端 coding agent
   LITE_MAX_TURNS               默认 256
   LITE_JSON=1                  等价于 --json
 
-状态: --tui 为交互入口；--once 用于脚本/CI。
+状态: 无参数启动即交互入口（与 --tui 等价）；--once 用于脚本/CI。
 ]])
 end
 
@@ -49,12 +50,12 @@ local args = {}
 for i = 1, #arg do args[#args + 1] = arg[i] end
 
 local json = os.getenv("LITE_JSON") == "1"
-local rest = {}
-for i = 2, #args do
+local clean = {}
+for i = 1, #args do
     if args[i] == "--json" then
         json = true
     else
-        rest[#rest + 1] = args[i]
+        clean[#clean + 1] = args[i]
     end
 end
 
@@ -64,7 +65,24 @@ local function emit(obj)
     io.flush()
 end
 
-local cmd = args[1]
+-- 子命令识别：`lite` 不带参数就是交互 TUI；`lite --snapshot out.txt` 这种只给
+-- TUI 选项、没写子命令的写法也当 TUI 处理（选项原样转发）。`--help/-h` 仍打用法。
+local SUBCOMMANDS = {
+    ["--version"] = true, ["--help"] = true, ["-h"] = true,
+    serve = true, ["--serve"] = true, attach = true, ["--attach"] = true,
+    state = true, ["--state"] = true, sessions = true, ["--sessions"] = true,
+    ["--check"] = true, ["--recall"] = true, ["--tui"] = true, ["--once"] = true,
+}
+
+local cmd = clean[1]
+local rest = {}
+if cmd == nil then
+    cmd = "--tui"
+elseif cmd:sub(1, 1) == "-" and not SUBCOMMANDS[cmd] then
+    rest[1] = cmd
+    cmd = "--tui"
+end
+for i = 2, #clean do rest[#rest + 1] = clean[i] end
 
 local function parse_flags(list)
     local flags, pos = {}, {}
@@ -143,7 +161,7 @@ if cmd == "--version" then
     if json then emit({ type = "version", version = VERSION })
     else print("lite " .. VERSION) end
     os.exit(0)
-elseif cmd == "--help" or cmd == "-h" or cmd == nil then
+elseif cmd == "--help" or cmd == "-h" then
     usage()
     os.exit(0)
 elseif cmd == "serve" or cmd == "--serve" then
@@ -285,7 +303,11 @@ elseif cmd == "--recall" then
     memory:close()
     os.exit(0)
 elseif cmd == "--tui" then
-    local flags = parse_flags(rest)
+    local flags, pos = parse_flags(rest)
+    -- 无子命令时未知选项会落到这里（见上面 SUBCOMMANDS 那段），别静默吞掉
+    if #pos > 0 then
+        io.stderr:write("lite: ignoring unexpected argument: " .. tostring(pos[1]) .. "\n")
+    end
     local config = require("core.config").load()
     if flags.thinking then config.thinking = true end
     if flags.reasoning_effort then config.reasoning_effort = flags.reasoning_effort end
