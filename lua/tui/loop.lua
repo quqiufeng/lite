@@ -234,6 +234,14 @@ function M.run(ctx, agent, memory, opts)
             d.prev_prompt or 0, d.prompt or 0))
         if draw then draw() end
     end)
+    ctx:on("turn_limit", function(info)
+        if not info then return end
+        transcript:add("info", string.format(
+            "tool loop stopped: %s. Asking the model to wrap up with a summary"
+                .. " (no tools this time).",
+            tostring(info.reason or "")))
+        if draw then draw() end
+    end)
     ctx:on("todos", function(items)
         todo_items = items or {}
         if todo_view then todo_view:set_items(todo_items) end

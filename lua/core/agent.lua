@@ -365,8 +365,64 @@ local function decode_args(s)
     return nil
 end
 
+-- 同一批工具调用连续重复这么多次，就认为模型卡住了（同一命令反复跑，结果不变）。
+-- 手写循环在 128 轮里烧掉几十万 token 是常态，越早熔断越好。
+M.REPEAT_LIMIT = 4
+
+local STOP_NOTE = table.concat({
+    "<session_context>",
+    "工具循环已停止：%s。现在没有可用工具，不要再请求工具调用。",
+    "请立刻用中文收口，不要再解释这条指令：",
+    "1) 已完成什么（写出具体文件/命令/结论，别写过程）；",
+    "2) 还有什么没做；",
+    "3) 下一步建议（可执行的一两句）。",
+    "</session_context>",
+}, "\n")
+
+-- 循环被迫结束时，再要一次"不带工具"的收尾。
+--
+-- 直接 return nil, "max turns reached" 会把前面几十轮做完的事情全丢掉 ——
+-- 用户只看到一句报错，得自己翻会话才知道跑到哪了。收尾请求不带 tools
+-- （模型没有工具可调，只能说话），把结论落地成一条普通 assistant 消息。
+-- 这额外一次请求是全新前缀，但只发生一次，值得。
+function M:_finalize(stream, why)
+    local ctx = self.ctx
+    local msgs = self:view_messages()
+    -- 用 user 而不是在末尾插 system：有些网关对"system 必须在最前面"较真，
+    -- 这个请求要是 400 了，前面几十轮的结果就彻底丢了。
+    msgs[#msgs + 1] = { role = "user", content = string.format(STOP_NOTE, why) }
+
+    ctx:emit("turn_limit", { reason = why, turns = ctx.settings.max_turns })
+    -- 工具轮结束时没有 end_turn（busy 还挂着），别再叠一个 turn_start。
+    if not ctx.session.busy then ctx:begin_turn() end
+    ctx:set_status("thinking")
+    local assistant, err = stream(msgs, nil, ctx.settings,
+        function(delta) ctx:emit("delta", delta) end,
+        function(delta) ctx:emit("reasoning", delta) end)
+    if not assistant then
+        ctx:end_turn()
+        return nil, err
+    end
+    local answer = assistant.content or ""
+    if answer:match("^%s*$") then
+        -- 模型有时仍然只回一个空串/又一次工具调用，至少别让用户看到空白。
+        answer = string.format("（工具循环已停止：%s。这一轮没能收口，请说\"继续\"让我接着做。）", why)
+        assistant.content = answer
+    end
+    ctx:add_message(assistant)
+    self.session:append(assistant)
+    ctx:emit("assistant", assistant)
+    if self.memory then
+        self.memory:remember_turn(ctx.session.id, ctx.session.turn, self._text or "", answer, {})
+        self.memory:tick()
+    end
+    ctx:end_turn()
+    return answer
+end
+
 function M:_loop(text, stream)
     local ctx = self.ctx
+    self._text = text
     self:ensure_system()
 
     local user = { role = "user", content = text }
@@ -374,6 +430,7 @@ function M:_loop(text, stream)
     self.session:append(user)
 
     local tool_notes = {}
+    local last_sig, repeat_n = nil, 0
 
     for iter = 1, ctx.settings.max_turns do
         ctx:begin_turn()
@@ -406,8 +463,10 @@ function M:_loop(text, stream)
             return answer
         end
 
+        local sig = {}
         for _, tc in ipairs(calls) do
             local fn = tc["function"] or {}
+            sig[#sig + 1] = tostring(fn.name) .. "\0" .. tostring(fn.arguments)
             local name = fn.name or ""
             local args = decode_args(fn.arguments)
             local result
@@ -479,12 +538,22 @@ function M:_loop(text, stream)
         end
         if self.memory then self.memory:tick() end
         ctx:set_status("thinking")
+
+        -- 卡住检测：同一批工具调用连续第 REPEAT_LIMIT 次，结果也不会变，
+        -- 继续跑只是空烧 token。
+        local cur = table.concat(sig, "\1")
+        if cur == last_sig then
+            repeat_n = repeat_n + 1
+        else
+            last_sig, repeat_n = cur, 1
+        end
+        if repeat_n >= M.REPEAT_LIMIT then
+            local why = string.format("the same tool calls repeated %d times in a row", repeat_n)
+            return self:_finalize(stream, why)
+        end
     end
 
-    local err = string.format("max turns reached (%d; raise with --max-turns or LITE_MAX_TURNS)", ctx.settings.max_turns)
-    ctx:fail(err)
-    ctx:end_turn()
-    return nil, err
+    return self:_finalize(stream, string.format("used all %d tool-loop turns", ctx.settings.max_turns))
 end
 
 -- 阻塞入口：--once / 单测。

@@ -44,7 +44,7 @@ do
         DEEPSEEK_MODEL = "deepseek-flash-x",
     })
     check(cfg.model == "deepseek-flash-x", "config env override")
-    check(cfg.max_turns == 128, "config default max_turns")
+    check(cfg.max_turns == 256, "config default max_turns")
     check(cfg.max_retries == 2, "config max retries")
     check(cfg.approval == "auto", "config approval")
 
@@ -535,6 +535,105 @@ do
     check(ctx.session.messages[4].role == "tool", "agent tool result")
     check(ctx.session.messages[4].content == "tool-ok:echo hi", "agent tool content")
     check(calls == 2, "agent loop count")
+end
+
+-- 循环被迫结束：收尾请求（不带 tools）+ 重复调用熔断
+do
+    local Context = require("context")
+    local Agent = require("core.agent")
+
+    -- 1) max_turns 用尽：最后一次请求不要 tools，且结论落地
+    local ctx = Context.new({ cwd = "/tmp", max_turns = 3 })
+    local reqs, events, results = {}, {}, {}
+    local provider = {
+        stream = function(msgs, tools)
+            reqs[#reqs + 1] = { tools = tools, n = #msgs, last = msgs[#msgs] }
+            if tools then
+                return {
+                    role = "assistant", content = "",
+                    tool_calls = { {
+                        id = "c" .. #reqs, type = "function",
+                        ["function"] = { name = "bash", arguments = '{"command":"ls"}' },
+                    } },
+                }
+            end
+            return { role = "assistant", content = "总结：已看目录，下一步装依赖。" }
+        end,
+    }
+    local tools = {
+        schemas = function() return { { type = "function" } } end,
+        execute = function(_, name, args) return "ok:" .. tostring(args.command) end,
+    }
+    local session = { append = function(_, m) results[#results + 1] = m end, save = function() end }
+    ctx:on("turn_limit", function(info) events[#events + 1] = info end)
+    local agent = Agent.new(ctx, provider, tools, session)
+    local text, err = agent:run("hi")
+
+    check(err == nil, "turn limit no error")
+    check(text == "总结：已看目录，下一步装依赖。", "turn limit keeps conclusions")
+    check(#reqs == 4, "turn limit one extra request")
+    check(reqs[1].tools ~= nil and reqs[3].tools ~= nil, "turn limit tool requests have tools")
+    check(reqs[4].tools == nil, "turn limit finalize without tools")
+    check(reqs[4].last.role == "user" or reqs[4].last.role == "system", "turn limit finalize appends note")
+    check(type(reqs[4].last.content) == "string"
+        and reqs[4].last.content:find("used all 3 tool-loop turns", 1, true) ~= nil,
+        "turn limit note explains why")
+    check(#events == 1 and events[1].turns == 3, "turn limit event")
+    check(events[1] and events[1].reason:find("used all 3", 1, true) ~= nil, "turn limit reason")
+    local last = ctx.session.messages[#ctx.session.messages]
+    check(last.role == "assistant" and last.content == text, "turn limit answer is a session message")
+
+    -- 2) 同一批工具调用连续重复 → 熔断，不等 max_turns
+    local ctx2 = Context.new({ cwd = "/tmp", max_turns = 128 })
+    local n2, ev2, final2 = 0, {}, nil
+    local provider2 = {
+        stream = function(msgs, tools)
+            n2 = n2 + 1
+            if tools then
+                return {
+                    role = "assistant", content = "",
+                    tool_calls = { {
+                        id = "x" .. n2, type = "function",
+                        ["function"] = { name = "bash", arguments = '{"command":"sleep 1"}' },
+                    } },
+                }
+            end
+            final2 = "卡住了，我停下来汇报。"
+            return { role = "assistant", content = final2 }
+        end,
+    }
+    ctx2:on("turn_limit", function(info) ev2[#ev2 + 1] = info end)
+    local agent2 = Agent.new(ctx2, provider2, tools, { append = function() end, save = function() end })
+    local t2, e2 = agent2:run("go")
+    check(e2 == nil and t2 == final2, "repeat breaker keeps conclusions")
+    check(Agent.REPEAT_LIMIT == 4 and n2 == 5, "repeat breaker stops early")
+    check(#ev2 == 1 and ev2[1].reason:find("repeated", 1, true) ~= nil, "repeat breaker reason")
+
+    -- 3) 不同的工具调用不算卡住
+    local ctx3 = Context.new({ cwd = "/tmp", max_turns = 6 })
+    local n3, ev3 = 0, 0
+    local provider3 = {
+        stream = function(msgs, tools)
+            n3 = n3 + 1
+            if tools then
+                return {
+                    role = "assistant", content = "",
+                    tool_calls = { {
+                        id = "y" .. n3, type = "function",
+                        ["function"] = { name = "bash", arguments = '{"command":"echo ' .. n3 .. '"}' },
+                    } },
+                }
+            end
+            return { role = "assistant", content = "done" }
+        end,
+    }
+    ctx3:on("turn_limit", function(info)
+        ev3 = ev3 + 1
+        if info.reason:find("repeated", 1, true) then check(false, "distinct calls must not trip breaker") end
+    end)
+    local agent3 = Agent.new(ctx3, provider3, tools, { append = function() end, save = function() end })
+    agent3:run("go")
+    check(n3 == 7 and ev3 == 1, "distinct calls run to turn limit")
 end
 
 -- context_turns：作为近期尾巴的 user 轮数上限

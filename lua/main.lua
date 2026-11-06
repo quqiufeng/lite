@@ -30,7 +30,7 @@ lite — DeepSeek 终端 coding agent
   --reasoning-effort LEVEL     high | medium | low
   --sandbox                    bash 使用 bwrap 沙箱（需安装 bubblewrap）
   --approval auto|ask|deny     工具审批策略（默认 auto）
-  --max-turns N                单次任务工具循环上限（默认 128）
+  --max-turns N                单次任务工具循环上限（默认 256）
   --debug-log PATH             写 JSONL 调试日志（provider/HTTP）
 
 环境:
@@ -38,7 +38,7 @@ lite — DeepSeek 终端 coding agent
   DEEPSEEK_BASE_URL            默认 https://api.deepseek.com
   DEEPSEEK_MODEL               默认 deepseek-flash
   LITE_CWD                     默认当前目录
-  LITE_MAX_TURNS               默认 128
+  LITE_MAX_TURNS               默认 256
   LITE_JSON=1                  等价于 --json
 
 状态: --tui 为交互入口；--once 用于脚本/CI。
@@ -486,6 +486,13 @@ elseif cmd == "--once" then
                 baseline = info.baseline, stats = info.stats,
                 used = info.used, line = info.line,
                 dropped = info.dropped, est_tokens = info.est_tokens,
+            })
+        end)
+        ctx:on("turn_limit", function(info)
+            emit({
+                type = "turn_limit",
+                reason = info.reason,
+                turns = info.turns,
             })
         end)
         ctx:on("prefix_drop", function(d)
