@@ -31,34 +31,88 @@ coding 只是它的功能之一。对外说明见 `README.md`，设计取舍与�
 
 ## 1 自观察闭环：看见自己
 
-三条命令，均已实测。**截图 → 缩放 → 读图** 是核心闭环，不依赖 `import`/`scrot`/`xdotool`。
+**机器上同时跑几十个进程、十几个窗口，第一步永远是准确定位。** 直接截全屏经常截到
+遮挡在上面的别的应用，看到的东西和想看的不是一回事。
+
+### 1.1 一条命令：定位 → 激活 → 截图 → 缩放
+
+```bash
+./tools/lite-lua tools/see.lua --list                      # 先摊开所有窗口
+./tools/lite-lua tools/see.lua --class wechat --width 1280 # 按 WM_CLASS
+./tools/lite-lua tools/see.lua --pid 2032                  # 按 _NET_WM_PID
+./tools/lite-lua tools/see.lua --class pcmanfm-qt --name lite --exact
+./tools/lite-lua tools/see.lua --active                    # 当前焦点窗口
+./tools/lite-lua tools/see.lua --full                      # 全屏（不定位）
+```
+
+最后一行输出图片绝对路径，直接喂给 `read`。`--list` 的字段：
+
+```
+id           name                  class            pid     view  z
+67108867     抖音精选电脑版…        Google-chrome    54498   true  7  <-ACTIVE
+```
+
+`view=false` 是隐藏/最小化；`z` 是堆叠顺序（越大越靠前）。
+
+### 1.2 为什么不能"直接截全屏"
+
+`liblite_capture` 抓的是**屏幕像素**。窗口 A 被 B 遮挡时，截 A 的区域得到的是 B。
+所以 `Win:capture()` 会先 `activate()` 再**确认真的拿到焦点**，拿不到就直接报错，
+不产出错图：
+
+```
+window 65011728 did not become active (active=67108867);
+refusing to capture an occluded area
+```
+
+激活走 `_NET_ACTIVE_WINDOW` ClientMessage（自己发 XSendEvent），**不用**
+`xdo_activate_window` —— 后者会顺带读 `_NET_WM_DESKTOP` 切工作区，桌面/面板类窗口
+没有该属性，会把 `XGetWindowProperty[_NET_WM_DESKTOP] failed (code=1)` 打到 stderr。
+
+### 1.3 定位失败怎么读
+
+多匹配时 `resolve()` **返回候选列表而不是静默挑一个**：
+
+```
+定位失败：2 个候选
+  23068678    pcmanfm-desktop0   class=pcmanfm-qt pid=2068
+  23068781    lite               class=pcmanfm-qt pid=2068
+补一个条件（--pid / --class / --name --exact）或 --pick N
+```
+
+注意 `pcmanfm-qt` 同时是桌面和文件管理器；`--name lite` 会同时命中窗口标题和
+终端标题 —— 所以要么 `--exact`，要么加 `--pid`。
+
+### 1.4 手工等价操作
 
 ```bash
 cd "$(pwd)"
 
-# ① 截全屏（X11 FFI → liblite_capture）
+# 全屏
 ./tools/lite-lua -e 'package.path="./lua/?.lua;./lua/?/init.lua;./automation/?.lua;"..package.path
-  local ok, p = require("x11").capture_screen()
-  print(ok, p)'
+  local ok, p = require("x11").capture_screen(); print(ok, p)'
 #   -> <cwd>/artifacts/selfsee/screen.png  (2560x1440，约 1.9MB)
 
-# ② 缩到合适尺寸（2560 宽原图 token 太贵；1280 起通常够读 UI）
+# 单窗口（先定位再截）
+./tools/lite-lua -e 'package.path="./lua/?.lua;./lua/?/init.lua;./automation/?.lua;"..package.path
+  local w = assert(require("x11").resolve({class="wechat", viewable=true}))
+  print(w:capture())'
+
+# 缩放（2560 宽原图 token 太贵；1280 起通常够读 UI）
 ./tools/lite-lua -e 'package.path="./lua/?.lua;./lua/?/init.lua;"..package.path
   print(require("core.tools").new({cwd=os.getenv("PWD")}):resize(
     "artifacts/selfsee/screen.png", 1280, 0, "artifacts/selfsee/s1280.png"))'
-#   -> 1.9MB 降到 ~650KB
-
-# ③ 用 read 工具看（图片会作为 image_url 进入对话）
 ```
 
 要点：
 
-- `capture_screen()` 无参时默认落到 **workspace 内**的 `artifacts/selfsee/`，目录自动创建。
+- 截图默认落 **workspace 内**的 `artifacts/selfsee/`（目录自动创建）。
   落 workspace 是关键——`read`/`resize` 才能直接消费。
 - `resize` 的**输入**允许 `$TMPDIR:/tmp:/var/tmp`（与 `read` 一致，`LITE_READ_DIRS` 可扩展），
-  **输出**永远落在 workspace 内；外部输入且未指定 `output` 时落到 `artifacts/resized/`。
-- 单窗口截图：`x11.window(title)` 拿到 `Win` 对象后 `:capture(path)`。
-- 键盘鼠标注入：`automation/xdo.lua`（libxdo FFI），**不要**起 `xdotool`/`wmctrl`。
+  **输出**永远落 workspace；外部输入且未指定 `output` 时落 `artifacts/resized/`。
+- 鼠标键盘注入：`automation/xdo.lua`（libxdo + XTest FFI），**不要**起 `xdotool`/`wmctrl`。
+  常用：`click_abs(x,y)` / `click_current()` / `key(win,"ctrl+l")` / `type(win,"text")`。
+- 点击屏幕坐标以**全屏像素**为准；读 1280 宽缩略图时，坐标要乘回实际宽度比。
 
 其他内省通道：
 

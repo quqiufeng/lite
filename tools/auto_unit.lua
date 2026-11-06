@@ -730,6 +730,28 @@ do
             if f then f:close() end
             check(head == "\137PNG\13\10\26\10", "x11 capture png")
             os.remove(img)
+
+            -- 窗口定位：字段齐全 + 多匹配不静默挑一个
+            local wins = x11.windows()
+            check(#wins > 0, "x11 windows non-empty")
+            local has_meta = false
+            for _, w in ipairs(wins) do
+                if w.class ~= nil or w.pid ~= nil then has_meta = true end
+            end
+            check(has_meta, "x11 windows carry class/pid")
+
+            local act = x11.resolve({ active = true })
+            check(act ~= nil, "x11 resolve active")
+            if act then
+                check(act.viewable == true, "x11 resolved window viewable")
+            end
+            local none, cand = x11.resolve({ class = "__no_such_class__" })
+            check(none == nil and #cand == 0, "x11 resolve unknown class empty")
+            -- 用一个必然多匹配的查询：所有可 view 的窗口
+            local multi, list = x11.resolve({ viewable = true })
+            if #wins > 1 then
+                check(multi == nil and #list >= 1, "x11 resolve ambiguous returns candidates")
+            end
         else
             print("SKIP x11 capture (module unavailable)")
         end
