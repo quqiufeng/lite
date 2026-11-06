@@ -3,6 +3,7 @@
 #include "cache_index.h"
 #include "metrics.h"
 #include <string.h>
+#include <errno.h>
 #include <stdio.h>
 #include <time.h>
 #include <fcntl.h>
@@ -253,6 +254,51 @@ static int ensure_dir(const char* path) {
     return mkdir(path, 0755);
 }
 
+// 检查已有 cache 文件的头部是否可读。
+// 返回 1=头部合法，0=存在但头部损坏（magic/version 不符），-1=文件不存在或为空。
+// 只读前 8 字节，不 mmap，用于在 pool_init_with_header 硬失败之前决定是否备份。
+static int cache_file_header_status(const char* path) {
+    struct stat st;
+    if (stat(path, &st) != 0) return -1;
+    if (st.st_size <= 0) return -1;
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    char head[8];
+    ssize_t n = read(fd, head, sizeof(head));
+    close(fd);
+    if (n < (ssize_t)sizeof(head)) return 0;
+    if (memcmp(head, CACHE_MAGIC, 4) != 0) return 0;
+    if (*(uint32_t*)(head + 4) != CACHE_VERSION) return 0;
+    return 1;
+}
+
+// 把损坏的 cache 文件改名备份，保留现场供人工恢复。
+// 失败也不阻塞启动：内存中的数据本已不可用，新文件会覆盖旧内容。
+static int cache_backup_corrupt(const char* dir, const char* name) {
+    char src[512], dst[640];
+    snprintf(src, sizeof(src), "%s/%s", dir, name);
+
+    struct stat st;
+    if (stat(src, &st) != 0 || st.st_size <= 0) return 0; // 不存在或空文件，无需备份
+
+    time_t now = time(NULL);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    snprintf(dst, sizeof(dst), "%s/%s.corrupt-%04d%02d%02d-%02d%02d%02d",
+             dir, name,
+             tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+             tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+
+    if (rename(src, dst) != 0) {
+        fprintf(stderr, "[CACHE] WARNING: %s is corrupted and could not be backed up: %s\n",
+                src, strerror(errno));
+        return -1;
+    }
+    fprintf(stderr, "[CACHE] WARNING: %s was corrupted; backed up to %s\n", src, dst);
+    return 1;
+}
+
 cache_t* cache_open(const char* db_dir, size_t max_memory) {
     if (!db_dir) return NULL;
     
@@ -272,6 +318,19 @@ cache_t* cache_open(const char* db_dir, size_t max_memory) {
     char path[512];
     snprintf(path, sizeof(path), "%s/mem.bin", db_dir);
     
+    // 头部自愈：pool_init_with_header 遇到 magic/version 不符会直接失败，
+    // 导致整个 lite 起不来（--tui 也一样）。这里先探测一次，损坏则备份后重建空库，
+    // 保证「记忆文件坏了不阻塞启动」，同时保留现场。
+    if (cache_file_header_status(path) == 0) {
+        // 返回 1=已备份，0=无需备份，-1=备份失败；只有 -1 才放弃启动
+        if (cache_backup_corrupt(db_dir, "mem.bin") < 0) {
+            free(cache);
+            return NULL;
+        }
+        // 索引与数据必须成对：数据已被移走，旧索引留着只会误导后续加载
+        cache_backup_corrupt(db_dir, "mem.idx");
+    }
+
     // 打开/创建 pool（使用自定义 magic）
     size_t pool_used = 0;
     if (pool_init_with_header(&cache->pool, path, 1024 * 1024, 

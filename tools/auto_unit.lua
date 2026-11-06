@@ -512,6 +512,36 @@ do
         check(rc:find("asyncio", 1, true) ~= nil, "tools recall")
         mem3:close()
     end
+
+    -- 头部损坏自愈：mem.bin 的 magic 被写坏时，backup 后以空库启动，而不是硬失败。
+    do
+        local dir = dir .. "-corrupt"
+        os.execute("mkdir -p " .. shq(dir))
+        local mem = Memory.new({ dir = dir, max_mb = 32 })
+        check(mem ~= nil, "corrupt: seed open")
+        if mem then
+            mem:remember_fact("keep", "should be backed up", { "t" })
+            mem:close()
+        end
+        local f = assert(io.open(dir .. "/mem.bin", "r+b"))
+        f:seek("set", 0)
+        f:write("XXXX")
+        f:close()
+
+        local healed = Memory.new({ dir = dir, max_mb = 32 })
+        check(healed ~= nil, "corrupt: mem.bin header self-heals on open")
+        if healed then
+            check(healed:get("/agent/knowledge", "keep") == nil, "corrupt: starts empty")
+            healed:remember_fact("after", "works again", { "t" })
+            check(healed:get("/agent/knowledge", "after") ~= nil, "corrupt: writable after heal")
+            healed:close()
+        end
+        check(os.execute("ls " .. shq(dir) .. " | grep -q 'mem.bin.corrupt-'") == 0
+            or os.execute("ls " .. shq(dir) .. " | grep -q 'mem.bin.corrupt-'") == true,
+            "corrupt: backup file kept")
+        os.execute("rm -rf " .. shq(dir))
+    end
+
     os.execute("rm -rf " .. shq(dir))
 end
 

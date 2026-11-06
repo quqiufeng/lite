@@ -43,7 +43,8 @@ TUI 完成后，“看见”会进一步包含对话界面与截图，形成完�
   - 每个项目目录生成 `mem.bin` + `mem.idx`；
   - C 引擎 mmap 零拷贝载入，约 30 秒落盘一次；
   - 前缀 / 范围 / 正则 / 模糊 / 标签搜索；
-  - 旧轮次不进 prompt，需要时用 `recall` 查回。
+  - 旧轮次不进 prompt，需要时用 `recall` 查回；
+  - `mem.bin` 头部损坏（magic/version 不符）不阻塞启动：自动改名为 `mem.bin.corrupt-<ts>` 后以空库继续，`mem.idx` 一并备份。
 - **有界上下文**：system + 最近 2 轮 + 相关记忆块（默认 8k 字符预算）。
 - **TUI + diff**：`--tui` 交互；assistant Markdown/代码块渲染、`Tab` 文件路径补全、鼠标滚轮/`PgUp`/`PgDn` 上翻历史、`?` 帮助、`Esc×2` 终止当前回复、忙时继续输入排队（`queue:N` / `⏳` 待发送）、`quit` + Enter 退出、启动时自动恢复同 cwd 最近会话；`/session` 选择/新建会话；`Ctrl+G` 打开 `git diff`，支持 split/unified、hunk 跳转、单文件、大 diff 虚拟滚动。
 - **Todo list**：`todo` 工具维护多步任务；状态栏 `todo:done/total`，`Ctrl+T` 打开列表；持久化到本地记忆并随 serve/attach 广播。
