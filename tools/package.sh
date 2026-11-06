@@ -51,7 +51,11 @@ if [ -d "$ROOT/third_party/ocr/lib" ]; then
                 continue
                 ;;
         esac
-        ln -sfn "../../../third_party/ocr/lib/$bn" "$DIST/lib/$bn"
+        # 直接拷实体（libocr_simple 76KB）。不能用相对软链：
+        # "../../../third_party/ocr/lib/xxx" 从 dist/lite-linux-x64/lib 往上
+        # 三级正好回到源码树根，链会解析到 $ROOT 而不是 dist 内部 ——
+        # 单拷 dist 出去就断链，install.sh 的 `cp -rL` 也依赖源树在。
+        cp -f "$real" "$DIST/lib/$bn"
     done
 fi
 # 记下目标机需要哪个 ORT 版本，供 tools/ort_link.sh 精确匹配
