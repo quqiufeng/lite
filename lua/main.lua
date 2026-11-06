@@ -480,6 +480,26 @@ elseif cmd == "--once" then
         ctx:on("tool_result", function(name, result) emit({ type = "tool_result", name = name, result = result }) end)
         ctx:on("assistant", function(m) emit({ type = "assistant", content = m.content or "" }) end)
         ctx:on("error", function(err) emit({ type = "error", error = tostring(err) }) end)
+        ctx:on("compact", function(info)
+            emit({
+                type = "compact", ok = info.ok, reason = info.reason,
+                baseline = info.baseline, stats = info.stats,
+                used = info.used, line = info.line,
+                dropped = info.dropped, est_tokens = info.est_tokens,
+            })
+        end)
+        ctx:on("usage", function(u, total)
+            emit({
+                type = "usage",
+                prompt = u.prompt,
+                completion = u.completion,
+                cache_hit = u.cache_hit,
+                cache_miss = u.cache_miss,
+                requests = total and total.requests,
+                cache_ratio = total and ((total.cache_hit + total.cache_miss) > 0
+                    and (total.cache_hit / (total.cache_hit + total.cache_miss)) or nil),
+            })
+        end)
     else
         ctx:on("reasoning", function(text)
             io.write("\27[90m", text, "\27[0m")

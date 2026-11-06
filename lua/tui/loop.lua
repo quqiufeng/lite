@@ -204,6 +204,22 @@ function M.run(ctx, agent, memory, opts)
         memory_hits = #(items or {})
         if draw then draw() end
     end)
+    -- 压缩是低频但重要的事件：它一次性改变了 prompt 前缀。
+    -- 不提示的话，用户只会看到命中率突然掉一段而不知道为什么。
+    ctx:on("compact", function(info)
+        if not info then return end
+        if info.ok and info.stats then
+            transcript:add("info", string.format(
+                "compact: prompt %d -> %d chars (folded %d into a %d-char digest;"
+                    .. " baseline %d, %d user turns kept, %d dropped)",
+                info.stats.before_chars or 0, info.stats.after_chars or 0,
+                info.stats.region_chars or 0, info.stats.digest_chars or 0,
+                info.baseline or 0, info.stats.kept_user or 0, info.stats.dropped_user or 0))
+        else
+            transcript:add("info", "compact skipped: " .. tostring(info.reason or "?"))
+        end
+        if draw then draw() end
+    end)
     ctx:on("todos", function(items)
         todo_items = items or {}
         if todo_view then todo_view:set_items(todo_items) end
@@ -453,6 +469,9 @@ function M.run(ctx, agent, memory, opts)
                 if active_proc then
                     local out = active_proc:cancel()
                     active_proc = nil
+                    if agent.tools and agent.tools.limit_output then
+                        out = agent.tools.limit_output(out, agent.tools.BASH_MAX_OUT)
+                    end
                     resume_agent(out)
                 elseif busy then
                     cancel()
@@ -540,6 +559,8 @@ function M.run(ctx, agent, memory, opts)
                 busy = busy,
                 mem = mem_count,
                 hits = memory_hits,
+                cache = ctx.cache_ratio and ctx:cache_ratio() or nil,
+                ctxeng = agent and agent._compact_probe or nil,
                 todos = todo_items,
                 queue = #queue,
                 spinner = busy and SPINNER[spinner_i + 1] or nil,
@@ -591,6 +612,10 @@ function M.run(ctx, agent, memory, opts)
                 active_proc = nil
                 if code and code ~= 0 then
                     out = out .. "\n[exit " .. tostring(code) .. "]"
+                end
+                -- 异步 bash 的输出原本完全不过限，这里补上 head+tail 双端裁剪。
+                if agent.tools and agent.tools.limit_output then
+                    out = agent.tools.limit_output(out, agent.tools.BASH_MAX_OUT)
                 end
                 resume_agent(out)
             end

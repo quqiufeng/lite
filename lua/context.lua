@@ -4,7 +4,7 @@ M.__index = M
 
 function M.new(opts)
     opts = opts or {}
-    return setmetatable({
+    local self = setmetatable({
         session = {
             id = opts.id or os.date("%Y%m%d-%H%M%S"),
             cwd = opts.cwd or os.getenv("PWD") or ".",
@@ -13,6 +13,16 @@ function M.new(opts)
             turn = 0,
             busy = false,
             todos = {},
+            -- usage 累积：DeepSeek 的 prompt_cache_hit_tokens 是判断"前缀是否稳定"的
+            -- 唯一硬指标。命中率低说明每轮 prompt 前缀都在变，缓存全废。
+            usage = {
+                requests = 0,
+                prompt = 0,
+                completion = 0,
+                cache_hit = 0,
+                cache_miss = 0,
+                last = nil,
+            },
         },
         view = {
             status = "idle",   -- idle | thinking | tool | error
@@ -25,7 +35,7 @@ function M.new(opts)
             model = opts.model or "deepseek-flash",
             temperature = opts.temperature or 0,
             max_turns = opts.max_turns or 16,
-            context_chars = opts.context_chars or 8000,
+            context_chars = opts.context_chars or 64000,
             context_turns = opts.context_turns or 2,
             thinking = opts.thinking,
             reasoning_effort = opts.reasoning_effort,
@@ -36,6 +46,9 @@ function M.new(opts)
         ui = { dirty = true },
         listeners = {},
     }, M)
+    -- provider 拿到流末尾 usage 后回调；挂在 settings 上是因为 opts 就是 ctx.settings。
+    self.settings.on_usage = function(u) self:add_usage(u) end
+    return self
 end
 
 function M:on(evt, fn)
@@ -90,6 +103,39 @@ function M:fail(err)
     self.view.error = tostring(err)
     self:set_status("error")
     self:emit("error", self.view.error)
+end
+
+-- 累积一次请求的 usage。DeepSeek 一次 agent 循环会发多个请求（每个工具轮一次），
+-- 所以按请求累加，命中率 = cache_hit / (cache_hit + cache_miss)。
+function M:add_usage(u)
+    if type(u) ~= "table" then return end
+    local s = self.session.usage
+    if not s then return end
+    local prompt = tonumber(u.prompt) or 0
+    local hit = tonumber(u.cache_hit) or 0
+    local miss = tonumber(u.cache_miss) or (prompt - hit)
+    if miss < 0 then miss = 0 end
+    s.requests = s.requests + 1
+    s.prompt = s.prompt + prompt
+    s.completion = s.completion + (tonumber(u.completion) or 0)
+    s.cache_hit = s.cache_hit + hit
+    s.cache_miss = s.cache_miss + miss
+    s.last = {
+        prompt = prompt,
+        completion = tonumber(u.completion) or 0,
+        cache_hit = hit,
+        cache_miss = miss,
+    }
+    self:emit("usage", s.last, s)
+end
+
+-- 会话级缓存命中率（0~1）；没有任何请求时返回 nil。
+function M:cache_ratio()
+    local s = self.session and self.session.usage
+    if not s then return nil end
+    local total = (s.cache_hit or 0) + (s.cache_miss or 0)
+    if total <= 0 then return nil end
+    return s.cache_hit / total
 end
 
 function M:begin_turn()

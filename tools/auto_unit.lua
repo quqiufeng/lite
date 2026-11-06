@@ -359,6 +359,62 @@ do
     check(P.retryable("HTTP 500: boom"), "provider retry 500")
     check(not P.retryable("HTTP 401: auth"), "provider no retry 401")
     check(P.retryable("http error: timeout"), "provider retry network")
+
+    -- usage：DeepSeek 把用量放在流末尾的独立 chunk 里，那条 choices 是空数组。
+    -- 旧实现只处理 choices[1]，整条 usage 被丢掉 → 命中率无从观测。
+    local pu = P.new_parser()
+    local usage_events = 0
+    local seen
+    for _, c in ipairs({
+        chunk({ choices = { { delta = { content = "hi" } } } }),
+        chunk({ choices = { { delta = {}, finish_reason = "stop" } } }),
+        chunk({ choices = {}, usage = {
+            prompt_tokens = 12000, completion_tokens = 30, total_tokens = 12030,
+            prompt_cache_hit_tokens = 11000, prompt_cache_miss_tokens = 1000,
+        } }),
+    }) do
+        for _, ev in ipairs(P.feed(pu, c)) do
+            if ev.type == "usage" then
+                usage_events = usage_events + 1
+                seen = ev.usage
+            end
+        end
+    end
+    check(usage_events == 1, "provider usage event once")
+    check(seen and seen.prompt == 12000, "provider usage prompt")
+    check(seen and seen.cache_hit == 11000, "provider usage cache hit")
+    check(seen and seen.cache_miss == 1000, "provider usage cache miss")
+    check(P.finish(pu).content == "hi", "provider usage chunk does not break content")
+
+    -- OpenAI 风格的 prompt_tokens_details.cached_tokens 也要认
+    local pu2 = P.new_parser()
+    for _, ev in ipairs(P.feed(pu2, chunk({ choices = {}, usage = {
+        prompt_tokens = 5000, completion_tokens = 1,
+        prompt_tokens_details = { cached_tokens = 4000 },
+    } }))) do
+        if ev.type == "usage" then seen = ev.usage end
+    end
+    check(seen and seen.cache_hit == 4000 and seen.cache_miss == 1000,
+        "provider usage openai style")
+end
+
+-- usage 累积与命中率
+do
+    local Ctx = require("context")
+    local ctx = Ctx.new({ api_key = "x" })
+    check(ctx:cache_ratio() == nil, "cache_ratio nil when unused")
+    check(type(ctx.settings.on_usage) == "function", "on_usage wired")
+    ctx:add_usage({ prompt = 12000, completion = 30, cache_hit = 11000, cache_miss = 1000 })
+    ctx:add_usage({ prompt = 8000, completion = 10, cache_hit = 0, cache_miss = 8000 })
+    local s = ctx.session.usage
+    check(s.requests == 2, "usage requests accumulated")
+    check(s.prompt == 20000 and s.completion == 40, "usage tokens accumulated")
+    check(s.cache_hit == 11000 and s.cache_miss == 9000, "usage cache accumulated")
+    local r = ctx:cache_ratio()
+    check(r and math.abs(r - 0.55) < 1e-9, "cache_ratio value")
+    -- 缺 cache_miss 字段时按 prompt-hit 推
+    ctx:add_usage({ prompt = 1000, cache_hit = 250 })
+    check(ctx.session.usage.cache_miss == 9750, "usage miss derived from prompt")
 end
 
 -- utf8 sanitize / debug log
@@ -421,31 +477,150 @@ do
     check(calls == 2, "agent loop count")
 end
 
--- context window：只留最近轮次 + recall 提示
+-- context_turns：作为近期尾巴的 user 轮数上限
 do
     local Context = require("context")
     local Agent = require("core.agent")
-    local ctx = Context.new({ cwd = "/tmp", context_chars = 400, context_turns = 2 })
+    local Compact = require("core.compact")
+    local ctx = Context.new({ cwd = "/tmp", context_chars = 20000, context_turns = 4 })
     ctx.session.messages = { { role = "system", content = "sys" } }
-    for i = 1, 10 do
+    for i = 1, 12 do
         ctx.session.messages[#ctx.session.messages + 1] = {
-            role = "user", content = "question " .. i .. " " .. string.rep("x", 100),
+            role = "user", content = "question " .. i .. " " .. string.rep("x", 400),
         }
         ctx.session.messages[#ctx.session.messages + 1] = {
-            role = "assistant", content = "answer " .. i .. " " .. string.rep("y", 100),
+            role = "assistant", content = "answer " .. i .. " " .. string.rep("y", 400),
         }
     end
     local agent = Agent.new(ctx, {}, {}, {})
-    local msgs, trimmed = agent:window_messages()
-    check(trimmed == true, "window trimmed")
-    check(msgs[1].role == "system" and msgs[1].content == "sys", "window keeps system")
-    local users, note = 0, false
-    for _, m in ipairs(msgs) do
-        if m.role == "user" then users = users + 1 end
-        if m.role == "system" and tostring(m.content):find("recall", 1, true) then note = true end
+    local c = agent:compactor()
+    check(c.tail_turn_cap == 4, "context_turns wired into tail turn cap")
+
+    local p = c:plan(ctx.session.messages)
+    local users = 0
+    for i = p.start, #ctx.session.messages do
+        if ctx.session.messages[i].role == "user" then users = users + 1 end
     end
-    check(users <= 2, "window turns bound")
-    check(note, "window recall hint")
+    check(users <= 4, "tail respects context_turns turn cap")
+    check(users >= 1, "tail keeps at least one turn")
+
+    -- 尾巴受字符预算约束
+    check(p.tail_chars <= c:tail_budget(p.avail) + 200, "tail respects char budget")
+
+    -- 尾巴绝不以孤立的 tool 结果开头
+    check(ctx.session.messages[p.start].role ~= "tool", "tail not orphan tool")
+end
+
+-- compact.lua 纯逻辑：尾巴对齐 / 用户原话预算 / 摘要输入裁剪
+do
+    local C = require("core.compact")
+    local function mk(n)
+        local m = { { role = "system", content = string.rep("s", 1500) }, { role = "user", content = "TASK" } }
+        for i = 1, n do
+            m[#m + 1] = { role = "user", content = "q" .. i .. " " .. string.rep("q", 200) }
+            m[#m + 1] = { role = "assistant", content = "", tool_calls = { { id = "c" .. i,
+                type = "function", ["function"] = { name = "bash", arguments = '{"command":"ls"}' } } } }
+            m[#m + 1] = { role = "tool", tool_call_id = "c" .. i, content = string.rep("x", 1200) }
+            m[#m + 1] = { role = "tool", tool_call_id = "c" .. i, content = string.rep("y", 1200) }
+        end
+        return m
+    end
+    local msgs = mk(30)
+
+    -- 扫预算：尾巴永远不以 tool 开头
+    local bad = 0
+    for budget = 8000, 200000, 997 do
+        local c = C.new({ budget_chars = budget })
+        local p = c:plan(msgs)
+        if p.ok and msgs[p.start].role == "tool" then bad = bad + 1 end
+    end
+    check(bad == 0, "compact tail never starts with tool result")
+
+    local c = C.new({ budget_chars = 40000 })
+    local p = c:plan(msgs)
+    check(#p.kept_user > 0, "compact hoists user turns")
+    local kept_chars = 0
+    for _, m in ipairs(p.kept_user) do kept_chars = kept_chars + C.msg_chars(m) end
+    check(kept_chars <= c:keep_user_budget(p.avail), "compact user turns within budget")
+
+    -- 逐字保留的用户消息不能重复进摘要输入
+    local text = c:serialize(p.region, p.keep)
+    local dup = false
+    for _, m in ipairs(p.kept_user) do
+        if text:find(m.content, 1, true) then dup = true end
+    end
+    check(not dup, "compact does not duplicate hoisted user turns")
+
+    -- 送摘要的 tool 结果要截断
+    local longest = 0
+    for line in text:gmatch("[^\n]+") do
+        if line:find("^%[Tool result%]") then longest = math.max(longest, #line) end
+    end
+    check(longest <= c.summarize_tool_chars + 200, "compact clips tool results for summary")
+
+    -- 地板值必须按预算夹住（小预算不能被绝对地板吃光）
+    local tiny = C.new({ budget_chars = 2000 })
+    check(tiny:keep_user_budget() <= 500, "keep_user budget clamped by window")
+    check(tiny:tail_budget() <= math.floor(2000 / 2), "tail budget clamped by window")
+    check(tiny:pin_cap() <= math.floor(2000 / 8), "pin cap clamped by window")
+
+    -- 压缩后规模必须把**固定前缀**算进去，否则迟滞线低于实际大小，
+    -- 下一条消息就再次触发压缩（每轮压一次，缓存全毁）。
+    local seen_prompt
+    local ok_fold = c:fold(msgs, function(_, prompt)
+        seen_prompt = prompt
+        return "## Goal\nx"
+    end)
+    check(ok_fold.ok, "compact fold ok")
+    -- fold 必须真的把长度约束传下去，而不是只在 digest_prompt() 里存在
+    check(seen_prompt and seen_prompt:find("Hard limit", 1, true) ~= nil,
+        "compact fold passes length-constrained prompt")
+    check(seen_prompt and seen_prompt:find(tostring(c:digest_max_chars()), 1, true) ~= nil,
+        "compact fold prompt carries digest cap number")
+    local pinned_chars = 0
+    for i = 1, ok_fold.plan.head do pinned_chars = pinned_chars + C.msg_chars(msgs[i]) end
+    check(pinned_chars > 0, "compact plan has pinned prefix")
+    check(ok_fold.stats.after_chars >= pinned_chars,
+        "compact after_chars includes pinned prefix")
+    check(ok_fold.rearm_chars > ok_fold.stats.after_chars,
+        "compact rearm is above post-fold size")
+
+    -- 摘要失败要优雅降级，不能抛错
+    local r = c:fold(msgs, function() return nil, "boom" end)
+    check(not r.ok and tostring(r.reason):find("summarize failed", 1, true) ~= nil,
+        "compact degrades on summarize failure")
+
+    -- 摘要长度约束写进提示词（模型对具体数字敏感，对 "terse" 不敏感）
+    check(c:digest_max_chars() >= 800, "compact digest cap floor")
+    check(c:digest_prompt():find("Hard limit", 1, true) ~= nil,
+        "compact digest prompt has hard limit")
+
+    -- 摘要比折叠区小不了多少 => 拒绝检查点（净亏损，还多花一次调用）
+    local huge_digest = string.rep("z", c:digest_max_chars() * 3)
+    local rj = c:fold(msgs, function() return huge_digest end)
+    check(not rj.ok and rj.rejected == true, "compact rejects oversized digest")
+
+    -- 最新一条消息超大时，尾巴绝不能变成空的：丢掉它等于丢掉"刚才发生了什么"
+    local big = { { role = "system", content = "sys" }, { role = "user", content = "TASK" } }
+    for i = 1, 6 do
+        big[#big + 1] = { role = "user", content = "u" .. i }
+        big[#big + 1] = { role = "assistant", content = string.rep("A", 5000) }
+        big[#big + 1] = { role = "tool", tool_call_id = "c" .. i, content = string.rep("T", 5000) }
+    end
+    local pc = C.new({ budget_chars = 12000 })
+    local pb = pc:plan(big, { tail_scale = 1 })
+    check(pb.ok, "compact plans with oversized tail messages")
+    check(pb.start <= #big, "compact keeps the newest message in the tail")
+    check(pb.tail_chars > 0, "compact tail is never empty")
+
+    -- 尾巴"没东西可折"时逐级缩小尾巴重试，并把试过的倍数报出来
+    local short = { { role = "system", content = "s" }, { role = "user", content = "TASK" },
+                    { role = "assistant", content = string.rep("A", 300) },
+                    { role = "tool", tool_call_id = "c", content = string.rep("T", 300) } }
+    local rs = pc:fold(short, function() return "## Goal\nx" end)
+    check(not rs.ok, "compact refuses to fold a short session")
+    check(tostring(rs.reason):find("tail scales tried", 1, true) ~= nil,
+        "compact reports tail scales tried")
 end
 
 -- memory
@@ -989,7 +1164,11 @@ do
         if m.role == "system" and m.content == "MEMORY-BLOCK" then mem_idx = i end
         if m.role == "user" then user_idx = i end
     end
-    check(mem_idx ~= nil and user_idx ~= nil and mem_idx < user_idx, "agent memory order")
+    -- 召回块追加在末尾，不插在中间：插在中间会把后续消息整体位移，
+    -- 让 DeepSeek 的前缀缓存从插入点往后全部失效。
+    check(mem_idx ~= nil and user_idx ~= nil, "agent memory injected")
+    check(mem_idx > user_idx, "agent memory block goes last, not mid-conversation")
+    check(mem_idx == #captured, "agent memory block is the final message")
 end
 
 -- approval policy
@@ -1148,7 +1327,7 @@ do
     check(err == nil and text == "a" and got == "r1", "agent reasoning event")
 end
 
--- agent context digest
+-- agent 上下文压缩：三段式（pinned prefix + digest + 近期尾巴）
 do
     local dir = os.tmpname()
     os.remove(dir)
@@ -1158,7 +1337,86 @@ do
     local Memory = require("core.memory")
 
     local mem = assert(Memory.new({ dir = dir, max_mb = 16 }))
-    local ctx = Context.new({ cwd = "/tmp", context_chars = 300, context_turns = 1, max_turns = 1 })
+    local ctx = Context.new({ cwd = "/tmp", context_chars = 8000, max_turns = 1 })
+    -- 20 条 500 字的往返，折叠区必然超过 min_fold_chars
+    for i = 1, 20 do
+        ctx.session.messages[#ctx.session.messages + 1] = {
+            role = "user", content = "question " .. i .. " " .. string.rep("x", 480),
+        }
+        ctx.session.messages[#ctx.session.messages + 1] = {
+            role = "assistant", content = "answer " .. i .. " " .. string.rep("y", 480),
+        }
+    end
+
+    local calls, captured, saw_prompt, saw_tools = 0, nil, nil, nil
+    local provider = {
+        stream = function(msgs, tools)
+            calls = calls + 1
+            if calls == 1 then
+                -- 第一次是摘要调用：检查它拿到的提示词和 tools
+                saw_prompt = msgs[1].content
+                saw_tools = tools
+                return { role = "assistant", content = "## Goal\ntest-digest" }
+            end
+            captured = msgs
+            return { role = "assistant", content = "ok" }
+        end,
+    }
+    local toolset = { schemas = function() return {} end, execute = function() end }
+    local session = { append = function() end }
+    local agent = Agent.new(ctx, provider, toolset, session, mem)
+    local _, err = agent:run("latest question")
+    check(err == nil, "compact run")
+
+    -- 摘要用的是结构化小标题提示词，且**不带 tools**（省 schema token）
+    check(saw_prompt and saw_prompt:find("## Standing facts", 1, true) ~= nil,
+        "compact summary prompt is structured")
+    check(saw_prompt and saw_prompt:find("Do NOT invent", 1, true) ~= nil,
+        "compact summary prompt forbids invention")
+    check(type(saw_tools) == "table" and #saw_tools == 0, "compact summary sends no tools")
+
+    -- 状态落在 /compact，包含 baseline / digest / block
+    local st = mem:get("/agent/session", ctx.session.id .. "/compact")
+    check(type(st) == "table" and type(st.baseline) == "number",
+        "compact state stored")
+    check(st and st.digest == "## Goal\ntest-digest", "compact digest is model output")
+    check(st and st.baseline >= 2, "compact baseline advanced")
+
+    -- 注入的块紧跟 system，位置固定 => 前缀稳定、缓存可命中
+    check(captured and captured[1].role == "system", "compact keeps system first")
+    check(captured and type(captured[2].content) == "string"
+        and captured[2].content:find("<session_context>", 1, true) ~= nil,
+        "compact digest injected right after system")
+
+    -- 被折叠的旧消息不能再出现在 prompt 里
+    local leaked = false
+    for _, m in ipairs(captured or {}) do
+        if m.role == "user" and tostring(m.content):find("question 1 ", 1, true) then
+            leaked = true
+        end
+    end
+    check(not leaked, "compact does not resend folded messages")
+
+    -- 第二轮不该再压（低频！重复压会打断缓存前缀）
+    local before = calls
+    local reask = function()
+        calls = calls + 1
+        return { role = "assistant", content = "## Goal\nsecond" }
+    end
+    agent:request_messages("another question", reask)
+    check(calls == before, "compact is low frequency")
+
+    mem:close()
+    os.execute("rm -rf " .. shq(dir))
+end
+
+-- 预算地板：预算小于固定前缀的若干倍时自动抬高
+-- 否则可分配空间连"折叠区 + 尾巴"都不够，每次压缩都 "nothing to fold"，
+-- 一路滑到硬上限丢历史 —— 实测 budget 9000 时 prompt 8195 → 1231。
+do
+    local Context = require("context")
+    local Agent = require("core.agent")
+    local ctx = Context.new({ cwd = "/tmp", context_chars = 300, max_turns = 1 })
     for i = 1, 6 do
         ctx.session.messages[#ctx.session.messages + 1] = {
             role = "user", content = "question " .. i .. " " .. string.rep("x", 40),
@@ -1167,31 +1425,161 @@ do
             role = "assistant", content = "answer " .. i .. " " .. string.rep("y", 40),
         }
     end
-
-    local captured
     local provider = {
-        stream = function(msgs)
-            captured = msgs
-            return { role = "assistant", content = "ok" }
-        end,
+        stream = function() return { role = "assistant", content = "ok" } end,
     }
-    local tools = { schemas = function() return {} end, execute = function() end }
-    local session = { append = function() end }
-    local agent = Agent.new(ctx, provider, tools, session, mem)
-    local _, err = agent:run("latest question")
-    check(err == nil, "agent context run")
+    local toolset = { schemas = function() return {} end, execute = function() end }
+    local agent = Agent.new(ctx, provider, toolset, { append = function() end })
+    agent:ensure_system()
 
-    local found = false
-    for _, m in ipairs(captured or {}) do
-        if m.role == "system" and tostring(m.content):find("<session_context>", 1, true) then
-            found = true
+    local events = {}
+    ctx:on("compact", function(info) events[#events + 1] = info end)
+    local msgs = agent:request_messages("hi", provider.stream)
+
+    local fixed = agent:fixed_prefix_chars()
+    check(fixed > 0, "budget floor: fixed prefix measured")
+    check(agent:compactor().budget >= fixed * 3, "budget floor: budget raised above fixed prefix")
+
+    local raised = false
+    for _, e in ipairs(events) do
+        if e.reason == "budget raised" then raised = true end
+    end
+    check(raised, "budget floor: raise is reported")
+
+    -- 抬高后不该再触发硬上限丢历史
+    local hit_ceiling = false
+    for _, e in ipairs(events) do
+        if e.reason == "hard ceiling" then hit_ceiling = true end
+    end
+    check(not hit_ceiling, "budget floor: no hard ceiling after raise")
+    local users = 0
+    for _, m in ipairs(msgs) do if m.role == "user" then users = users + 1 end end
+    check(users >= 6, "budget floor: history preserved")
+end
+
+-- 硬上限兜底：压缩救不回来时才丢最老消息，但**必须保住已有 digest**
+do
+    local Context = require("context")
+    local Agent = require("core.agent")
+    local ctx = Context.new({ cwd = "/tmp", context_chars = 9000, max_turns = 1 })
+    local agent = Agent.new(ctx, { stream = function() end },
+        { schemas = function() return {} end }, { append = function() end })
+    agent:ensure_system()
+
+    local view = {
+        { role = "system", content = "SYSTEM-PROMPT" },
+        { role = "system", content = "<session_context>\n## Goal\nDIGEST-MARKER\n</session_context>" },
+    }
+    for i = 1, 20 do
+        view[#view + 1] = { role = "user", content = "q" .. i .. string.rep("x", 800) }
+        view[#view + 1] = { role = "assistant", content = string.rep("a", 800) }
+    end
+
+    local out, trimmed, dropped = agent:hard_window(view, 6000)
+    check(trimmed == true, "hard ceiling trims")
+    check(dropped and dropped > 0, "hard ceiling reports dropped count")
+    check(#out < #view, "hard ceiling shrinks prompt")
+
+    local has_sys, has_digest = false, false
+    for _, m in ipairs(out) do
+        if m.content == "SYSTEM-PROMPT" then has_sys = true end
+        if type(m.content) == "string" and m.content:find("DIGEST-MARKER", 1, true) then
+            has_digest = true
         end
     end
-    check(found, "agent context digest injected")
-    check(mem:get("/agent/session", ctx.session.id .. "/context") ~= nil,
-        "agent context digest stored")
-    mem:close()
-    os.execute("rm -rf " .. shq(dir))
+    check(has_sys, "hard ceiling keeps system prompt")
+    -- 丢掉 digest 等于白压一次，还让模型失去全部历史
+    check(has_digest, "hard ceiling keeps existing digest")
+    check(out[#out].role ~= "tool", "hard ceiling tail alignment")
+end
+
+-- chars→tokens 校准：用真实 usage 反推，不能纯靠经验值
+do
+    local C = require("core.compact")
+    check(math.abs(C.tok_per_char(nil, 0, 0) - C.DEFAULT_TOK_PER_CHAR) < 1e-9,
+        "tok_per_char falls back to default")
+    local r1 = C.tok_per_char(nil, 10000, 3000)
+    check(math.abs(r1 - 0.3) < 1e-9, "tok_per_char first observation")
+    local r2 = C.tok_per_char(r1, 10000, 4000)
+    check(r2 > r1 and r2 < 0.4, "tok_per_char smooths toward new observation")
+    -- 离谱比例（图片占位、协议开销抖动）要丢掉，不能污染估算
+    check(math.abs(C.tok_per_char(0.3, 10000, 999999) - 0.3) < 1e-9,
+        "tok_per_char rejects absurd ratio")
+end
+
+-- agent 侧的 token 估算与探针
+do
+    local Context = require("context")
+    local Agent = require("core.agent")
+    local Compact = require("core.compact")
+    local ctx = Context.new({ cwd = "/tmp", context_chars = 64000, max_turns = 1 })
+    local agent = Agent.new(ctx, { stream = function() end },
+        { schemas = function() return {} end }, { append = function() end })
+    agent:ensure_system()
+    check(agent:tok_per_char() == nil, "tok_per_char nil without usage")
+    -- 没有校准数据时用经验值
+    check(agent:estimate_tokens(3500) > 0, "estimate_tokens works without usage")
+
+    -- 喂一条真实 usage：15000 字符 → 5000 tokens
+    agent._last_request_chars = 15000
+    ctx:add_usage({ prompt = 5000, completion = 1, cache_hit = 0, cache_miss = 5000 })
+    local r = agent:tok_per_char()
+    check(r and math.abs(r - 5000 / 15000) < 1e-9, "tok_per_char from real usage")
+    check(agent:estimate_tokens(30000) == math.floor(30000 * r),
+        "estimate_tokens uses calibration")
+end
+
+-- 前缀稳定性：工具轮之间只允许"追加"，不允许位移
+-- 这是缓存命中率的硬约束；踩过的坑是召回块插在中间导致命中从 97% 掉到 31%。
+do
+    local Context = require("context")
+    local Agent = require("core.agent")
+    local ctx = Context.new({ cwd = "/tmp", context_chars = 64000, max_turns = 4 })
+
+    local snaps = {}
+    local provider = {
+        stream = function(msgs)
+            snaps[#snaps + 1] = msgs
+            if #snaps == 1 then
+                return { role = "assistant", content = "", tool_calls = { { id = "c1",
+                    type = "function", ["function"] = { name = "bash", arguments = '{"command":"ls"}' } } } }
+            end
+            return { role = "assistant", content = "done" }
+        end,
+    }
+    local toolset = {
+        schemas = function() return {} end,
+        execute = function() return "tool-output" end,
+    }
+    local memory = {
+        context = function() return "<retrieved_memory>轮次相关记忆</retrieved_memory>" end,
+        remember_turn = function() end,
+        tick = function() end,
+    }
+    local agent = Agent.new(ctx, provider, toolset, { append = function() end }, memory)
+    agent:run("do it")
+
+    check(#snaps >= 2, "prefix stability: two requests captured")
+    local a, b = snaps[1], snaps[2]
+    -- a 的最后一条是召回块，b 的前 #a-1 条必须与 a 逐条相同
+    local stable = #a - 1
+    local same = true
+    for i = 1, stable do
+        if a[i] ~= b[i] then
+            if a[i].role ~= b[i].role or a[i].content ~= b[i].content then same = false end
+        end
+    end
+    check(same, "prefix stability: messages never shift between tool rounds")
+
+    -- 召回块只能出现一次（首个请求），后续工具轮不再重复注入
+    local blocks_in_b = 0
+    for _, m in ipairs(b) do
+        if m.role == "system" and type(m.content) == "string"
+            and m.content:find("<retrieved_memory>", 1, true) then
+            blocks_in_b = blocks_in_b + 1
+        end
+    end
+    check(blocks_in_b == 0, "prefix stability: recall block not re-injected in tool rounds")
 end
 
 -- agent todos injection
@@ -1956,6 +2344,48 @@ do
     check(s2.runs == 1 and s2.last_answer == "done", "scheduler persisted")
     mem2:close()
     os.execute("rm -rf " .. shq(dir))
+end
+
+-- 工具输出裁剪：head+tail 双端保留
+do
+    local Tools = require("core.tools")
+    check(type(Tools.limit_output) == "function", "limit_output exported")
+    check(Tools.BASH_MAX_OUT >= 32 * 1024, "bash cap >= 32KB")
+
+    -- 未超限时逐字节原样返回
+    local small = "abc\ndef\n"
+    check(Tools.limit_output(small, 1024) == small, "limit_output passthrough")
+
+    -- 超限：头、尾、marker 都在；编译错误常出现在尾部
+    local body = string.rep("HEAD\n", 500) .. string.rep("MID\n", 20000)
+        .. "TAIL: error: undefined symbol foo\n"
+    local out = Tools.limit_output(body, Tools.BASH_MAX_OUT)
+    check(#out <= Tools.BASH_MAX_OUT + 200, "limit_output respects cap")
+    check(out:sub(1, 4) == "HEAD", "limit_output keeps head")
+    check(out:find("TAIL: error", 1, true) ~= nil, "limit_output keeps tail")
+    check(out:find("truncated", 1, true) ~= nil, "limit_output marks truncation")
+    check(#out < #body, "limit_output actually shrinks")
+end
+
+-- 状态栏缓存命中率
+do
+    local Status = require("tui.status")
+    local Ctx = require("context")
+    local ctx = Ctx.new({ api_key = "x" })
+    local captured
+    local screen = { line = function(_, _, text) captured = text end }
+    Status.render(screen, 24, 120, ctx, { mem = 1, cache = 0.8712 })
+    check(captured:find("cache:87%%") ~= nil, "status cache pct")
+    Status.render(screen, 24, 120, ctx, { mem = 1 })
+    check(captured:find("cache:", 1, true) == nil, "status hides unknown cache")
+
+    -- 上下文占用：只有接近触发线（>=60%）才显示，避免状态栏噪声
+    Status.render(screen, 24, 120, ctx, { mem = 1, ctxeng = { used = 40000, line = 54400 } })
+    check(captured:find("ctx:74%%") ~= nil, "status shows context pressure")
+    Status.render(screen, 24, 120, ctx, { mem = 1, ctxeng = { used = 5000, line = 54400 } })
+    check(captured:find("ctx:", 1, true) == nil, "status hides low context pressure")
+    Status.render(screen, 24, 120, ctx, { mem = 1, ctxeng = nil })
+    check(captured:find("ctx:", 1, true) == nil, "status hides ctxeng without probe")
 end
 
 -- entry

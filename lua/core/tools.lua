@@ -9,6 +9,9 @@ local M = {}
 M.__index = M
 
 local MAX_OUT = 30000
+-- bash 单独一档：编译/测试输出真正的信息常在**尾部**（报错、失败摘要），
+-- 只留头部会迫使模型重跑一遍，反而更贵。参考 Pi/Reasonix：头部+尾部双端保留。
+local BASH_MAX_OUT = 32768
 local IMAGE_MAX = 20 * 1024 * 1024
 local READ_MAX_LINES = 2000
 local READ_MAX_BYTES = 50 * 1024
@@ -22,11 +25,34 @@ local function shq(s)
     return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
 end
 
-local function truncate(s)
+-- head+tail 双端保留。只留头部会砍掉编译错误/测试失败摘要，模型必须重跑，
+-- 那是"省 token 反而更贵"的典型。marker 里给出原始字节数，让模型知道被截了。
+local function truncate_mid(s, cap)
     s = tostring(s or "")
-    if #s <= MAX_OUT then return s end
-    return s:sub(1, MAX_OUT) .. "\n... [truncated " .. (#s - MAX_OUT) .. " bytes]"
+    cap = cap or MAX_OUT
+    if #s <= cap then return s end
+    -- 先按 2/3 头、1/3 尾切，再生成 marker 并扣掉它占的长度。
+    local head = math.floor(cap * 2 / 3)
+    local tail = cap - head
+    local omitted = #s - head - tail
+    local marker = string.format(
+        "\n... [truncated %d bytes of %d; narrow the command, or use head/tail] ...\n",
+        omitted, #s)
+    head = math.max(0, head - math.floor(#marker / 2))
+    tail = math.max(0, cap - #marker - head)
+    return s:sub(1, head) .. marker .. s:sub(#s - tail + 1)
 end
+
+local function truncate(s)
+    return truncate_mid(s, MAX_OUT)
+end
+
+-- 供 TUI 的异步 bash 路径复用：那一路的 proc 输出原来完全不过限，
+-- 一条 `cat 5MB日志` 直接顶满窗口。
+function M.limit_output(s, cap)
+    return truncate_mid(s, cap or MAX_OUT)
+end
+M.BASH_MAX_OUT = BASH_MAX_OUT
 
 local function read_file(path)
     local f, err = io.open(path, "rb")
@@ -469,7 +495,7 @@ function M:bash(command)
     local out = p:read("*a") or ""
     local ok = p:close()
     if not ok then out = out .. "\n[exit nonzero]" end
-    return truncate(out)
+    return truncate_mid(out, BASH_MAX_OUT)
 end
 
 local function read_dir(abs, offset, limit)

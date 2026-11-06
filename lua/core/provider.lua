@@ -14,6 +14,33 @@ function M.new_parser()
         tool_max = 0,
         finish = nil,
         done = false,
+        usage = nil,
+    }
+end
+
+-- DeepSeek 在 stream_options.include_usage 下把用量放在**最后一个** chunk 里，
+-- 那个 chunk 的 choices 是空数组，所以必须先于 choices 判断处理，否则整条被丢掉。
+-- 三家参考实现都靠 usage 反推 chars→tokens 比例（Reasonix tokPerChar），没有本地
+-- tokenizer 时这是唯一可靠的校准来源。
+local function read_usage(obj)
+    local u = obj and obj.usage
+    if type(u) ~= "table" then return nil end
+    local prompt = tonumber(u.prompt_tokens) or 0
+    local details = u.prompt_tokens_details
+    local hit = tonumber(u.prompt_cache_hit_tokens)
+    if not hit and type(details) == "table" then
+        hit = tonumber(details.cached_tokens)
+    end
+    hit = hit or 0
+    if hit > prompt then hit = prompt end
+    local miss = tonumber(u.prompt_cache_miss_tokens)
+    if not miss then miss = prompt - hit end
+    return {
+        prompt = prompt,
+        completion = tonumber(u.completion_tokens) or 0,
+        total = tonumber(u.total_tokens) or prompt,
+        cache_hit = hit,
+        cache_miss = miss > 0 and miss or 0,
     }
 end
 
@@ -37,6 +64,13 @@ function M.feed(p, chunk)
         local payload = line:match("^data:%s*(.*)$")
         if payload and payload ~= "" then
             local ok, obj = pcall(cjson.decode, payload)
+            if ok and type(obj) == "table" then
+                local usage = read_usage(obj)
+                if usage then
+                    p.usage = usage
+                    events[#events + 1] = { type = "usage", usage = usage }
+                end
+            end
             if ok and type(obj) == "table" and obj.choices and obj.choices[1] then
                 local ch = obj.choices[1]
                 local d = ch.delta or {}
@@ -167,6 +201,8 @@ local function build_request(messages, tools, opts)
         temperature = opts.temperature or 0,
     }
     if tools and #tools > 0 then body.tools = tools end
+    -- 不带上 include_usage，DeepSeek 不会在流末尾返回 usage，命中率就无从观测。
+    body.stream_options = { include_usage = true }
     if opts.thinking then body.thinking = { type = "enabled" } end
     if opts.reasoning_effort and opts.reasoning_effort ~= "" then
         body.reasoning_effort = opts.reasoning_effort
@@ -207,13 +243,15 @@ local function build_request(messages, tools, opts)
     return base .. "/chat/completions", headers, payload
 end
 
-local function feed_parser(parser, chunk, on_delta, on_reasoning)
+local function feed_parser(parser, chunk, on_delta, on_reasoning, on_usage)
     local events = M.feed(parser, chunk)
     for _, ev in ipairs(events) do
         if ev.type == "content" and on_delta then
             on_delta(ev.text)
         elseif ev.type == "reasoning" and on_reasoning then
             on_reasoning(ev.text)
+        elseif ev.type == "usage" and on_usage then
+            on_usage(ev.usage)
         end
     end
 end
@@ -247,7 +285,7 @@ function M.stream(messages, tools, opts, on_delta, on_reasoning)
 
         local parser = M.new_parser()
         local rc, status, raw = http.post_stream(url, headers, payload, function(chunk)
-            feed_parser(parser, chunk, d, r)
+            feed_parser(parser, chunk, d, r, opts.on_usage)
         end)
 
         if opts.debug then
@@ -282,7 +320,7 @@ function M.start(multi, messages, tools, opts, on_delta, on_reasoning)
 
     local parser = M.new_parser()
     local req, rerr = http.request(multi, url, headers, payload, function(chunk)
-        feed_parser(parser, chunk, on_delta, on_reasoning)
+        feed_parser(parser, chunk, on_delta, on_reasoning, opts.on_usage)
     end)
     if not req then return nil, rerr end
     req.parser = parser

@@ -113,7 +113,7 @@ function M.load(env)
         memory_dir = getv("LITE_MEMORY_DIR") or file.memory_dir,
         memory_mb = tonumber(getv("LITE_MEMORY_MB") or file.memory_mb) or 100,
         memory_flush = tonumber(getv("LITE_MEMORY_FLUSH") or file.memory_flush) or 30,
-        context_chars = tonumber(getv("LITE_CONTEXT_CHARS") or file.context_chars) or 8000,
+        context_chars = tonumber(getv("LITE_CONTEXT_CHARS") or file.context_chars) or 64000,
         context_turns = tonumber(getv("LITE_CONTEXT_TURNS") or file.context_turns) or 16,
         thinking = (function()
             local v = getv("LITE_THINKING") or getv("DEEPSEEK_THINKING") or file.thinking

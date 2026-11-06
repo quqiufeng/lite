@@ -24,6 +24,15 @@ function M.render(screen, y, w, ctx, info)
     local left = string.format(" lite · %s · turn %d · %s ", model, turn, cwd)
     local mem = string.format(" mem:%d", info.mem or 0)
     if (info.hits or 0) > 0 then mem = mem .. string.format(" hit:%d", info.hits) end
+    -- 缓存命中率：唯一能说明"前缀是否稳定"的指标。低于 50% 说明每轮 prompt
+    -- 都在整体位移，等于按 miss 价重付整段历史。
+    local cache = ""
+    if type(info.cache) == "number" then
+        local pct = math.floor(info.cache * 100 + 0.5)
+        if pct > 100 then pct = 100 end
+        if pct < 0 then pct = 0 end
+        cache = string.format(" cache:%d%%", pct)
+    end
     local todo = ""
     local todos = info.todos
     if todos and #todos > 0 then
@@ -33,8 +42,19 @@ function M.render(screen, y, w, ctx, info)
         end
         todo = string.format(" todo:%d/%d", done, #todos)
     end
+    -- 估算的 prompt token 占预算的比例：判断"离压缩还远不远"最直接的数字。
+    -- 用真实 usage 校准过，不是纯字符估算。
+    local ctxpct = ""
+    local probe = info.ctxeng
+    if type(probe) == "table" and probe.line and probe.line > 0 and probe.used then
+        local p = math.floor(probe.used / probe.line * 100 + 0.5)
+        if p > 999 then p = 999 end
+        if p >= 60 then
+            ctxpct = string.format(" ctx:%d%%", p)
+        end
+    end
     local queued = (info.queue or 0) > 0 and string.format(" queue:%d", info.queue) or ""
-    local right = mem .. todo .. queued .. " · " .. status .. " "
+    local right = mem .. cache .. ctxpct .. todo .. queued .. " · " .. status .. " "
     local lw, rw = utf8.width_str(left), utf8.width_str(right)
     if lw + rw + 1 > w then
         local keep = math.max(1, w - rw - 2)
