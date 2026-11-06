@@ -996,8 +996,16 @@ tok_per_char = 0.3452（实测 0.3563）
 3. `cache_shape` 诊断：hash(system + tools) 变了就打 notice，直接解释 miss 原因。
 4. 观测：把 `cache_ratio` 与 `ctx%` 的逐轮曲线记进 KV，`lite state` 能看趋势；
    并改用"可复用前缀命中率"作为告警口径（见 §8.32 ④）。
-5. 单条消息本身超预算时（一个 18KB 工具结果 > 可分配预算），现在只能放着不管，
-   等它自然触发硬上限。可考虑对**超预算的单条 tool 结果**按预算再截一刀。
+5. ~~单条消息本身超预算时（一个 18KB 工具结果 > 可分配预算），只能放着不管，
+   等它自然触发硬上限。~~ **已实现**：`Compact:msg_cap()` = 触发线的 1/4，
+   并有绝对地板 2000 字符（`msg_ratio=0.25` / `msg_min=2000`）。只截
+   `role == "tool"` 的消息 —— assistant 的 `tool_calls` 是配对结构（截了会
+   400），user 原话是约束（截了就找不回来），system 与首条 user 钉住不动。
+   截中间：留头 2/3 + 尾 1/3（开头是命令在干什么，结尾是报错/结论），中间插
+   `... [N chars truncated: ... re-run the command narrower ...] ...`。
+   **clip 不落 KV**：cap 只由 budget 决定，`M:clips(msgs)` 是纯函数，
+   `view_messages` 每轮重算 → 同一条消息的裁剪结果稳定，前缀缓存照样命中；
+   原文始终留在 transcript/KV 里（`M.clip_message` 复制出新表，不改原消息）。
 6. 触发线仍是字符口径。有了 `tok_per_char` 校准后，可以改成 token 口径
    （例如 `LITE_CONTEXT_TOKENS`），和模型真实窗口直接对齐 ——
    参考实现（Pi 16k reserve / Reasonix 90% / opencode 85%）都是按 token 算的。

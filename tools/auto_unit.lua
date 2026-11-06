@@ -613,6 +613,39 @@ do
     check(pb.start <= #big, "compact keeps the newest message in the tail")
     check(pb.tail_chars > 0, "compact tail is never empty")
 
+    -- 单条 tool 结果本身就超预算：按 msg_cap 截一刀，且发出去的视图里
+    -- 那条消息确实短了，原文不动
+    local giant = string.rep("G", 18000)
+    local gm = { { role = "system", content = "sys" }, { role = "user", content = "TASK" },
+                 { role = "tool", tool_call_id = "g1", content = giant } }
+    local gc = C.new({ budget_chars = 64000 })
+    local gcap = gc:msg_cap()
+    check(gcap > 0 and gcap < #giant, "compact msg_cap is below a huge tool result")
+    local gp = gc:plan(gm, { tail_scale = 1 })
+    check(gp.clip and gp.clip[3] == gcap, "compact plan clips a huge tool result")
+    check(gp.clip_n == 1 and gp.clipped_chars == C.msg_chars(gm[3]) - gcap,
+        "compact plan reports clipped chars")
+    local gclips = gc:clips(gm)
+    check(gclips and gclips[3] == gcap, "compact clips() maps absolute index")
+    local gv = C.clip_message(gm[3], gclips[3])
+    check(#gv.content <= gcap, "compact clip_message shrinks the tool result")
+    check(gv.content:sub(1, 4) == "GGGG", "compact clip keeps the head")
+    check(#gm[3].content == #giant, "compact clip leaves the original intact")
+    check(gv.tool_call_id == "g1", "compact clip keeps tool_call_id")
+    -- 非 tool 消息永不被截：assistant 的 tool_calls 是配对的，user 原话是约束
+    local am = { { role = "system", content = "s" }, { role = "user", content = "TASK" },
+                 { role = "assistant", content = giant },
+                 { role = "user", content = giant } }
+    check(gc:clips(am) == nil, "compact never clips assistant/user messages")
+    -- 钉住的前缀不动
+    local pm = { { role = "system", content = "s" }, { role = "user", content = "TASK" },
+                 { role = "tool", tool_call_id = "p", content = giant } }
+    check(gc:clips(pm)[3] == gcap, "compact clips tool messages after the pinned head")
+    -- 截断标记要能指路（告诉模型重跑窄一点的命令）
+    local clipped = C._clip_mid(giant, gcap)
+    check(clipped:find("re-run the command narrower", 1, true) ~= nil,
+        "compact clip marker tells the model what to do")
+
     -- 尾巴"没东西可折"时逐级缩小尾巴重试，并把试过的倍数报出来
     local short = { { role = "system", content = "s" }, { role = "user", content = "TASK" },
                     { role = "assistant", content = string.rep("A", 300) },
@@ -1327,6 +1360,26 @@ do
     check(err == nil and text == "a" and got == "r1", "agent reasoning event")
 end
 
+-- system prompt 每轮只发一次：还没压过时 baseline=0，视图里第 1 条 system
+-- 曾被重复追加一遍（整段 system 付两份输入 token）
+do
+    local Context = require("context")
+    local Agent = require("core.agent")
+    local ctx = Context.new({ cwd = "/tmp", max_turns = 1 })
+    local got = nil
+    local provider = {
+        stream = function(msgs)
+            got = msgs
+            return { role = "assistant", content = "ok" }
+        end,
+    }
+    local toolset = { schemas = function() return {} end, execute = function() end }
+    local agent = Agent.new(ctx, provider, toolset, { append = function() end })
+    agent:run("hi")
+    check(got and #got == 2 and got[1].role == "system" and got[2].role == "user",
+        "system prompt is sent once")
+end
+
 -- agent 上下文压缩：三段式（pinned prefix + digest + 近期尾巴）
 do
     local dir = os.tmpname()
@@ -1396,6 +1449,36 @@ do
         end
     end
     check(not leaked, "compact does not resend folded messages")
+
+    -- 单条消息超预算：只截 tool 结果的视图，原文不动
+    -- 巨型 tool 结果整条塞进 prompt 会把窗口撑爆，压尾巴也救不回来
+    do
+        local Compactor = require("core.compact")
+        local inst = Compactor.new({ budget_chars = 8000 })
+        local huge = "line:1 ok\n" .. string.rep("z", 20000) .. "\nline:20000 boom\n"
+        local msgs = {
+            { role = "system", content = "sys" },
+            { role = "user", content = "run it" },
+            { role = "assistant", content = "", tool_calls = {
+                { id = "c1", type = "function",
+                    ["function"] = { name = "bash", arguments = "{}" } } } },
+            { role = "tool", tool_call_id = "c1", content = huge },
+            { role = "assistant", content = "done" },
+        }
+        local cap = inst:msg_cap()
+        local clips = inst:clips(msgs)
+        check(clips and clips[4] == cap, "compact clips oversized tool result")
+        local view = Compactor.clip_message(msgs[4], cap)
+        check(#view.content <= cap and #view.content > cap * 0.9,
+            "clipped tool result fits the cap")
+        check(view.content:find("line:1 ok", 1, true) ~= nil
+            and view.content:find("truncated", 1, true) ~= nil
+            and view.content:find("boom", 1, true) ~= nil,
+            "clip keeps head and tail")
+        check(#msgs[4].content == #huge and msgs[4].content == huge,
+            "clip leaves the original message untouched")
+        check(inst:clips({ msgs[1], msgs[2] }) == nil, "no clip without a tool result")
+    end
 
     -- 第二轮不该再压（低频！重复压会打断缓存前缀）
     local before = calls

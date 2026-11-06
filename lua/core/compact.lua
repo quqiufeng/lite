@@ -52,6 +52,13 @@ local DEFAULTS = {
     min_fold_chars = 2000,
     min_fold_savings_ratio = 0.15,
 
+    -- 单条消息的上限：触发线的这个比例（并夹一个绝对地板）。
+    -- 最新一条消息在尾巴里是**无条件保留**的，所以它自己一旦超过触发线，
+    -- 任何 tail_scale 都缩不下来 —— 折叠区"没东西可折"，压完还是超阈值。
+    -- 这种时候只能对这条 tool 结果按预算截一刀（见 plan 里的 clip）。
+    msg_ratio = 0.25,
+    msg_min = 2000,
+
     -- 至少保留这么多条原文，否则摘要在语义上没意义。
     min_recent_keep = 2,
     -- 尾巴里最多保留这么多条 user 轮次；由 `context_turns` 覆盖。
@@ -197,6 +204,66 @@ function M:trigger()
     return math.max(1, math.floor(self.budget * self.compact_ratio))
 end
 
+-- 单条消息的字符上限。一条消息吃掉的窗口不该超过触发线的 1/4：
+-- 再大就等于"这条消息自己就是一个会话"，尾巴里放不下第二条，
+-- 压缩也就无从下手（最坏情况：每轮都白花一次摘要调用，最后滑到硬上限）。
+function M:msg_cap()
+    local n = math.floor(self:trigger() * self.msg_ratio)
+    if n < self.msg_min then n = self.msg_min end
+    return n
+end
+
+-- 发出去时的视图裁剪表：绝对下标 → 目标字符数。纯函数（只看 msgs + budget），
+-- 所以 view_messages 每轮都能重算，不必把 clip 落进 KV。cap 只由 budget 决定，
+-- 每条消息的裁剪结果因此是稳定的 —— 前缀缓存照样命中。
+-- 只截 tool：assistant 的 tool_calls 是配对结构（截了会断），
+-- user 原话是约束（截了就找不回来）。钉住的前缀（system + 首条 user）不动。
+function M:clips(msgs)
+    msgs = msgs or {}
+    local head = self:pinned_len(msgs)
+    local cap = self:msg_cap()
+    local out
+    for i = head + 1, #msgs do
+        local m = msgs[i]
+        if type(m) == "table" and m.role == "tool" and msg_chars(m) > cap then
+            out = out or {}
+            out[i] = cap
+        end
+    end
+    return out
+end
+
+-- 复制一条消息并按 cap 截其 content。原文不动（transcript / KV 里还是全的）。
+function M.clip_message(m, cap)
+    if type(m) ~= "table" or not cap then return m end
+    local c = m.content
+    if type(c) ~= "string" then
+        if type(c) ~= "table" then return m end
+        local parts, changed = {}, false
+        for i, part in ipairs(c) do
+            parts[i] = part
+            if type(part) == "table" and part.type == "text"
+                and type(part.text) == "string" and #part.text > cap then
+                local p2 = {}
+                for k, v in pairs(part) do p2[k] = v end
+                p2.text = M._clip_mid(part.text, cap)
+                parts[i] = p2
+                changed = true
+            end
+        end
+        if not changed then return m end
+        local copy = {}
+        for k, v in pairs(m) do copy[k] = v end
+        copy.content = parts
+        return copy
+    end
+    if #c <= cap then return m end
+    local copy = {}
+    for k, v in pairs(m) do copy[k] = v end
+    copy.content = M._clip_mid(c, cap)
+    return copy
+end
+
 -- 近期原文尾巴预算。三个约束叠起来：
 --   1. budget 的 tail_ratio，夹在 [tail_min, tail_max]
 --   2. 不超过 budget/2（尾巴不能吃掉一半预算）
@@ -262,12 +329,22 @@ function M:pinned_len(msgs)
     return i
 end
 
+-- 计算"发出去时这条消息实际占多少字符"。cap 只对 tool 结果生效：
+-- 超预算的单条 tool 结果会被 _clip_mid 截到 cap，所以算尾巴时按截后算，
+-- 否则一条 30KB 的输出就把尾巴撑爆，fold 直接判成"没东西可折"。
+local function capped_chars(m, cap)
+    local c = msg_chars(m)
+    if cap and m.role == "tool" and c > cap then return cap + 80 end
+    return c
+end
+
 -- 尾巴起点：从最新往回累加，超预算就停；然后**向前回退**避开孤立的 tool result。
 -- 尾巴以 tool 消息开头是错的——它对应的 assistant tool_calls 被摘掉了，
 -- 很多 provider 会直接 400。
 -- turn_cap：尾巴里最多保留多少条 user 轮次（`context_turns` 的语义，是**上限**
 -- 不是下限：下限会让短会话永远压不动，长会话尾巴大得离谱）。
-function M:tail_start(msgs, head, budget, turn_cap)
+-- cap：单条 tool 结果的字符上限（见 msg_cap/_clip_mid）。
+function M:tail_start(msgs, head, budget, turn_cap, cap)
     local n = #msgs
     local start = n + 1
     local acc = 0
@@ -280,13 +357,13 @@ function M:tail_start(msgs, head, budget, turn_cap)
     -- 最新一条**无条件**保留。丢掉它等于丢掉"刚才发生了什么"，
     -- 那是任何摘要都补不回来的（多数场景下它就是用户当前的问题）。
     if n > head then
-        acc = msg_chars(msgs[n])
+        acc = capped_chars(msgs[n], cap)
         start = n
         if msgs[n].role == "user" and turn_cap and turn_cap > 0 then users = 1 end
     end
     for i = n - 1, head + 1, -1 do
         local m = msgs[i]
-        local c = msg_chars(m)
+        local c = capped_chars(m, cap)
         local within_min = (n - i + 1) <= self.min_recent_keep
         if acc + c > budget then
             if not within_min then break end
@@ -347,13 +424,35 @@ function M:plan(msgs, popts)
 
     local tail_budget = math.floor(self:tail_budget(avail) * tail_scale)
     if tail_budget < 200 then tail_budget = 200 end
-    local start = self:tail_start(msgs, head, tail_budget, self.tail_turn_cap)
+    -- cap 先算：tail_start 要按"截后"的字符数累加，否则一条 30KB 的
+    -- tool 结果会让尾巴一进来就超预算，plan 直接放弃折叠。
+    local cap = self:msg_cap()
+    local start = self:tail_start(msgs, head, tail_budget, self.tail_turn_cap, cap)
     plan.tail_scale = tail_scale
     plan.tail_budget = tail_budget
     plan.head = head
     plan.start = start
-    local tail_chars = 0
-    for i = start, n do tail_chars = tail_chars + msg_chars(msgs[i]) end
+
+    -- 尾巴里"单条就撑爆预算"的 tool 结果：按 msg_cap 截一刀。
+    -- 最新一条在尾巴里是无条件保留的，它超预算时 plan 只会一路给出
+    -- "nothing to fold"/"would not shrink"，而 fold 每轮都要先花一次
+    -- 摘要调用才被拒 —— 白花钱还什么都没省下。
+    -- 只截 tool：assistant 的 tool_calls 是配对结构（截了会断），
+    -- user 原话是约束（截了就找不回来了）。
+    local clip, tail_chars, clip_n, clip_saved = nil, 0, 0, 0
+    for i = start, n do
+        local raw = msg_chars(msgs[i])
+        if msgs[i].role == "tool" and raw > cap then
+            clip = clip or {}
+            clip[i] = cap
+            clip_n = clip_n + 1
+            clip_saved = clip_saved + (raw - cap)
+        end
+        tail_chars = tail_chars + capped_chars(msgs[i], cap)
+    end
+    plan.clip = clip
+    plan.clip_n = clip_n
+    plan.clipped_chars = clip_saved
     plan.tail_chars = tail_chars
 
     if start - 1 - head < 1 then
@@ -459,6 +558,27 @@ function M._clip(s, n)
     return s:sub(1, n) .. string.format("\n[... %d chars truncated]", #s - n)
 end
 
+-- 截中间：头 2/3 + 尾 1/3。这里动的是**留在尾巴里的原文**，两头都有用
+-- （开头是"这条命令在干什么"，结尾是错误/结论），所以不能像摘要那样只留头部。
+-- marker 要写明怎么办，否则模型只会看着半截输出瞎猜。
+function M._clip_mid(s, n)
+    s = tostring(s or "")
+    if #s <= n then return s end
+    local marker = string.format(
+        "\n... [%d chars truncated: this single result exceeded the context budget;"
+            .. " re-run the command narrower, or use head/tail] ...\n", #s - n)
+    local keep = n - #marker
+    if keep < 64 then
+        marker = "\n... [truncated to fit the context budget] ...\n"
+        keep = math.max(0, n - #marker)
+    end
+    local head = math.floor(keep * 2 / 3)
+    local tail = keep - head
+    local out = s:sub(1, head) .. marker
+    if tail > 0 then out = out .. s:sub(#s - tail + 1) end
+    return out
+end
+
 -- 渲染成注入 prompt 的 system 块。
 function M:render(digest, kept_user)
     local lines = {
@@ -562,6 +682,9 @@ function M:fold(msgs, summarize, opts)
         block = block,
         digest = digest,
         plan = plan,
+        -- 尾巴里需要截断的消息（绝对下标 → 目标字符数）。视图层照这个剪，
+        -- 原文不动：raw 消息还在 transcript 和 KV 里，只是发出去时装不下。
+        clip = plan.clip,
         rearm_chars = rearm,
         -- baseline = 折叠到第几条（含）。下次只有一个更大的 baseline 才值得再压。
         baseline = plan.start - 1,
@@ -573,6 +696,8 @@ function M:fold(msgs, summarize, opts)
             saved_chars = plan.region_chars - digest_chars,
             kept_user = #plan.kept_user,
             dropped_user = #plan.dropped_user,
+            clipped = plan.clip_n or 0,
+            clipped_chars = plan.clipped_chars or 0,
         },
     }
 end

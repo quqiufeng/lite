@@ -130,7 +130,22 @@ function M:view_messages()
     end
     local from = st and (st.baseline or 0) or 0
     if from < 0 then from = 0 end
-    for i = from + 1, #all do out[#out + 1] = all[i] end
+    -- 还没压过时 baseline=0，但第 1 条 system 上面已经单独放过了，
+    -- 不跳过就会把整段 system prompt 发两遍（多付一份输入 token）。
+    if from < 1 and all[1] and all[1].role == "system" then from = 1 end
+    -- 单条就超预算的 tool 结果：发出去时按 msg_cap 截一刀，原文不动
+    -- （transcript / KV 里仍是全的）。cap 只由 budget 决定，所以同一条
+    -- 消息每次算出来的裁剪结果一样 —— 前缀缓存照样命中。
+    local clips
+    if from < #all then clips = self:compactor():clips(all) end
+    for i = from + 1, #all do
+        local cap = clips and clips[i]
+        if cap then
+            out[#out + 1] = Compact.clip_message(all[i], cap)
+        else
+            out[#out + 1] = all[i]
+        end
+    end
     return out
 end
 
