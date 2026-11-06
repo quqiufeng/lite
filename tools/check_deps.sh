@@ -85,6 +85,20 @@ if not ready then io.stderr:write(tostring(err) .. "\n"); os.exit(1) end
     fi
 fi
 
+# CUDA provider：不打包，靠软链接接入系统里版本匹配的那份
+CUDA_LINK="$ROOT/third_party/ocr/lib/libonnxruntime_providers_cuda.so"
+if [ -L "$CUDA_LINK" ]; then
+    if [ -f "$(readlink -f "$CUDA_LINK" 2>/dev/null)" ]; then
+        echo "[OK]   ocr-cuda linked -> $(readlink "$CUDA_LINK")"
+    else
+        echo "[WARN] ocr-cuda dangling link（./tools/cuda_provider.sh unlink）"
+    fi
+elif [ -f "$CUDA_LINK" ]; then
+    echo "[WARN] ocr-cuda 实体文件 $(du -h "$CUDA_LINK" | cut -f1)，不应随包：改用 --link"
+else
+    echo "[INFO] ocr-cuda not linked (CPU only; 单图更快)"
+fi
+
 if command -v tmux >/dev/null 2>&1; then
     echo "[OK]   tmux     $(tmux -V 2>/dev/null || echo present)"
 else

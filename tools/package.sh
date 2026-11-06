@@ -26,6 +26,12 @@ if [ -d "$ROOT/third_party/ocr/lib" ]; then
     for src in "$ROOT/third_party/ocr/lib/"*.so*; do
         [ -e "$src" ] || continue
         bn="$(basename "$src")"
+        # CUDA provider 是 329MB 的系统库软链，绝不打包：
+        # 下面的 tar -h 会解引用软链，把 329MB 实体塞进 tarball。
+        # 目标机需要 GPU 时用 tools/cuda_provider.sh link 自己接。
+        case "$bn" in
+            *providers_cuda*) continue ;;
+        esac
         ln -sfn "../../../third_party/ocr/lib/$bn" "$DIST/lib/$bn"
     done
 fi
