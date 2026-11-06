@@ -514,8 +514,17 @@ C.close(h)
 
 ### 7.5 Agent 接入
 
-- 上下文窗口：system + 最近 2 轮 + 8k 字符预算；更早的轮次不留在 prompt，只留在 `mem.bin`。
-- 每次请求前：`memory:context(user_text, {limit=8,max_chars=2400})` 搜索并按预算组装，作为一条 `system` 消息插入到最近 `user` 之前（不写入会话）。
+> 以下描述以 P1 压缩（§8.30）与缓存修复（§8.31）之后的实现为准；
+> 早期"最近 2 轮 + 8k 字符"的说法已作废。
+
+- 上下文窗口：由 `lua/core/compact.lua` 的三段结构决定（固定前缀 / digest / 近期尾巴），
+  预算来自 `config.context_chars`（默认 64000），尾巴的 user 轮数上限来自
+  `config.context_turns`（默认 16，是**上限**不是固定值）。更早的轮次不留在 prompt，
+  只留在 `mem.bin`。
+- 每次请求前：`memory:context(recall_query, {limit=8, max_chars=2400})` 搜索并按预算组装，
+  **追加到消息列表最末尾**（末尾放 `system` 消息 DeepSeek 接受），不写入会话。
+- 注入只在每个用户轮的**第一次**请求发生（`inject_context`），工具循环的后续请求不重复注入
+  —— 重复注入会让前缀整体位移，下一轮命中率 71% vs 追加末尾 97%（§8.31 实测）。
 - 同时 emit `memory` 事件（命中 items），TUI 状态栏显示 `mem:<总数> hit:<本轮命中>`。
 - 回答完成后：`memory:remember_turn(session_id, turn, user, answer, tools)`。
 - 工具新增：
@@ -525,10 +534,11 @@ C.close(h)
 
 ### 7.6 验证
 
-- `./tools/test.sh`：43 项单测，含 KV 持久化、recall、agent 注入、remember/recall 工具、上下文窗口裁剪。
+- `./tools/test.sh`：461 项单测（`tools/auto_unit.lua`），含 KV 持久化、recall、agent 注入、
+  上下文窗口裁剪/压缩预算、缓存前缀稳定性、remember/recall 工具。
 - 打包：`dist/lite-linux-x64.tar.gz` 含 `build/liblite_cache.so`；包内 `core.memory` 可用。
 - 手动验证：在项目目录运行 `lite --recall "关键词"`，会使用该目录的 `mem.bin`。
-- 未做真实 DeepSeek 请求验证（需要 `DEEPSEEK_API_KEY`）。
+- 真实 DeepSeek 请求验证见 §8.30/§8.31（命中率、cache hit/miss 均为真实 API 实测）。
 
 ---
 

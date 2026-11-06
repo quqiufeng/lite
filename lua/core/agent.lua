@@ -289,14 +289,12 @@ function M:hard_window(msgs, budget)
     return out, true, dropped
 end
 
--- 把相关记忆插入到最近一条 user 之前（不写入会话）。
+-- 组装发出去的完整消息列表：视图 + 召回块 + todo 块。
 --
--- opts.inject_context：每个用户轮**只在第一次请求**注入召回块和 todo 块。
---
--- 这一条是缓存命中的关键。工具循环里"最后一条 user"始终是本轮开头那个问题，
--- 每轮都插一次就等于把块插到 system 后面、整段历史往后位移 —— DeepSeek 的
--- 前缀缓存从位移处全部失效，实测命中从 98% 掉到 30~40%（只剩 system+tools 那段）。
--- 同一轮的后续请求里模型早就见过这些内容，重复注入既打断缓存又白花 token。
+-- opts.inject_context：每个用户轮**只在第一次请求**注入这两个块，工具循环的后续请求不注入
+-- （模型早已见过，重复注入既打断前缀缓存又白花 token）。
+-- 两个块**追加到最末尾**而不是插在会话中间 —— 原因与实测见下面 "追加到最末尾" 那段注释
+-- 以及 design.md §8.31。
 function M:request_messages(text, stream, opts)
     opts = opts or {}
     local inject = opts.inject_context ~= false

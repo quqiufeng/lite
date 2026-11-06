@@ -133,7 +133,7 @@ cd "$(pwd)"
 
 | 文件 | 职责 |
 |---|---|
-| `main.lua` | 入口：`--check/--once/--recall/state/sessions/serve/attach/--tui` |
+| `main.lua` | 入口：无参=交互 TUI；`--tui/--check/--once/--recall/state/sessions/serve/attach` |
 | `context.lua` | 全应用状态切片（session/view/settings/ui）+ 事件总线 |
 | `core/agent.lua` | 循环：messages → model → tool_calls → messages |
 | `core/provider.lua` | DeepSeek SSE + tool_calls + 重试 + 图片消息 |
@@ -212,6 +212,7 @@ MUST：
 
 MUST NOT：
 
+- 不用 `python`/`sed -i` 改仓库文件：改代码用 `edit`/`write` 工具逐处替换（不是所有环境都有 python；shell 改文件还容易漏编码与转义）。
 - 不用 Chrome/WebView/CEF/Electron。
 - 不起 `xdotool/wmctrl/import`；窗口与截图走 `automation/*` 的 FFI。
 - 不用 `systemd --user` 启 UI；不用 `pkill -f`（用 `pkill -x`）。
@@ -226,7 +227,8 @@ MUST NOT：
 ```bash
 ./tools/build.sh                            # 依赖检查 + 编 C 模块
 ./tools/check_deps.sh                       # 只查依赖
-./tools/run.sh --tui                        # 交互 TUI
+./tools/run.sh                             # 交互 TUI（无参默认，等价 --tui）
+./tools/run.sh --tui                       # 同上，显式写法
 ./tools/run.sh --once "prompt"              # 无 UI 跑一轮
 ./tools/run.sh --once --json "prompt"       # JSONL 事件流
 ./tools/run.sh --recall "关键词"             # 查当前目录记忆
@@ -239,7 +241,7 @@ MUST NOT：
 ./tools/package.sh / ./tools/release.sh     # 打包 / 构建+打包+安装
 ```
 
-测试分层（`test.sh` 串联）：`check_deps.sh` → `auto_unit.lua`（当前 410 项）→
+测试分层（`test.sh` 串联）：`check_deps.sh` → `auto_unit.lua`（当前 461 项）→
 CLI JSON → `tui_smoke.sh` → `serve_smoke.sh`。失败产物落 `artifacts/`。
 
 **写回归时先验证它抓得住 bug**：在修复前的 commit 上跑一遍，确认会 FAIL。
