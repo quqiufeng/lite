@@ -108,7 +108,7 @@ function M.load(env)
         base_url = getv("DEEPSEEK_BASE_URL") or file.base_url or "https://api.deepseek.com",
         model = getv("DEEPSEEK_MODEL") or file.model or "deepseek-flash",
         cwd = getv("LITE_CWD") or file.cwd or cwd,
-        max_turns = tonumber(getv("LITE_MAX_TURNS") or file.max_turns) or 128,
+        max_turns = tonumber(getv("LITE_MAX_TURNS") or file.max_turns) or 256,
         temperature = tonumber(getv("LITE_TEMPERATURE") or file.temperature) or 0,
         memory_dir = getv("LITE_MEMORY_DIR") or file.memory_dir,
         memory_mb = tonumber(getv("LITE_MEMORY_MB") or file.memory_mb) or 100,

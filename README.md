@@ -106,7 +106,7 @@ return {
   api_key = "sk-...",
   base_url = "https://api.deepseek.com",
   model = "deepseek-flash",
-  max_turns = 128,
+  max_turns = 256,
 }
 ```
 
@@ -212,7 +212,7 @@ C ABI 固定为 `char *lite_helper(const char *input)` + 可选 `lite_helper_fre
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | API 地址 |
 | `DEEPSEEK_MODEL` | `deepseek-flash` | 模型 |
 | `LITE_CWD` | 当前目录 | workspace |
-| `LITE_MAX_TURNS` | 128 | 单次 agent 循环上限 |
+| `LITE_MAX_TURNS` | 256 | 单次 agent 循环上限 |
 | `LITE_MEMORY_MB` | 100 | mem.bin 容量 |
 | `LITE_MEMORY_FLUSH` | 30 | 自动落盘间隔（秒） |
 | `LITE_CONTEXT_CHARS` | 64000 | prompt 字符预算 |
