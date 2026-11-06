@@ -52,19 +52,63 @@ function M.clean(messages)
     return out
 end
 
+-- 去掉尾部多余的 "/"，根目录除外。
+local function norm_cwd(p)
+    p = tostring(p or "")
+    if p == "/" then return p end
+    return (p:gsub("/+$", ""))
+end
+
+-- 从 system prompt 里取 <cwd>...</cwd> 的精确值（prompt.lua 生成）。
+-- 旧会话没有这一段时返回 nil。
+local function system_cwd(content)
+    if type(content) ~= "string" then return nil end
+    local v = content:match("<cwd>%s*\n(.-)\n%s*</cwd>")
+    if not v then return nil end
+    return norm_cwd(v)
+end
+
+local function is_path_char(c)
+    return c ~= "" and c:match("[%w%-%._~/]") ~= nil
+end
+
+-- 旧会话（无 <cwd> 段）兜底：子串命中还要求两侧都是路径边界，
+-- 否则 /a/b 会误命中 /a/b/c 的会话（换到父目录时把子目录的对话带出来）。
+local function cwd_mentioned(content, cwd)
+    local text = tostring(content)
+    local i = 1
+    while true do
+        local a, b = text:find(cwd, i, true)
+        if not a then return false end
+        local before = a > 1 and text:sub(a - 1, a - 1) or ""
+        local after = text:sub(b + 1, b + 1)
+        if not is_path_char(before) and not is_path_char(after) then return true end
+        i = a + 1
+    end
+end
+
+-- 该会话是否属于 cwd：有 <cwd> 段就精确比对，没有才退回边界匹配。
+local function session_matches_cwd(msgs, cwd)
+    cwd = norm_cwd(cwd)
+    for _, m in ipairs(msgs) do
+        if m.role == "system" then
+            local marked = system_cwd(m.content)
+            if marked then return marked == cwd end
+        end
+    end
+    for _, m in ipairs(msgs) do
+        if m.role == "system" and cwd_mentioned(m.content, cwd) then return true end
+    end
+    return false
+end
+
 function M.for_cwd(cwd, limit, dir)
     limit = limit or 10
     local out = {}
     for _, id in ipairs(M.recent_ids(dir, limit * 4)) do
         local s = M.new({ session = { id = id } }, { dir = dir, id = id })
         local msgs = s:load()
-        local match = false
-        for _, m in ipairs(msgs) do
-            if m.role == "system" and tostring(m.content):find(cwd, 1, true) then
-                match = true
-                break
-            end
-        end
+        local match = session_matches_cwd(msgs, cwd)
         if match then
             local preview = ""
             for _, m in ipairs(msgs) do

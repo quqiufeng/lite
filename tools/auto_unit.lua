@@ -1540,6 +1540,31 @@ do
     os.execute("rm -rf " .. shq(dir))
 end
 
+-- session for_cwd: 父目录不得命中子目录的会话（子串匹配的老 bug）
+do
+    local dir = os.tmpname()
+    os.remove(dir)
+    os.execute("mkdir -p " .. shq(dir))
+    local Context = require("context")
+    local Session = require("core.session")
+
+    local ctx = Context.new({ cwd = "/tmp/proj", id = "p1" })
+    -- 有 <cwd> 段：精确比对
+    local a = Session.new(ctx, { dir = dir, id = "p1" })
+    a:append({ role = "system", content = "x\n<cwd>\n/tmp/proj\n</cwd>" })
+    a:append({ role = "user", content = "hi" })
+    -- 老会话没有 <cwd> 段：退回边界匹配
+    local b = Session.new(ctx, { dir = dir, id = "p2" })
+    b:append({ role = "system", content = "workdir is /tmp/proj now" })
+    b:append({ role = "user", content = "yo" })
+
+    check(#Session.for_cwd("/tmp/proj", 5, dir) == 2, "session cwd exact")
+    check(#Session.for_cwd("/tmp/proj/", 5, dir) == 2, "session cwd trailing slash")
+    check(#Session.for_cwd("/tmp", 5, dir) == 0, "session cwd parent not matched")
+    check(#Session.for_cwd("/tmp/pro", 5, dir) == 0, "session cwd prefix not matched")
+    os.execute("rm -rf " .. shq(dir))
+end
+
 -- session messages / todos in KV
 do
     local dir = os.tmpname()
