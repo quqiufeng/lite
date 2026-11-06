@@ -55,8 +55,11 @@ mem.lock
 
 # keep vendored cjson shared object
 !third_party/cjson/lua/5.1/cjson.so
-!third_party/ocr/lib/*.so
-!third_party/ocr/lib/*.so.*
+# ocr: 只跟 libocr_simple.so（76KB，仓库自带）。
+# onnxruntime 是机器相关的大件（CPU 22MB / GPU 26MB / provider 329MB），
+# 不进仓库也不进 dist：自己部署，见 README「依赖」章节
+!third_party/ocr/lib/libocr_simple.so
+third_party/ocr/lib/libonnxruntime*
 
 # generated native helpers
 helper/*.so

@@ -259,7 +259,9 @@ CLI JSON → `tui_smoke.sh` → `serve_smoke.sh`。失败产物落 `artifacts/`�
 - C 导出 `int lite_<feature>_...` + `const char *lite_<feature>_error(void)`；失败返回非 0。
 - `.so` 设 `$ORIGIN` RPATH；`package.sh` 复制非 libc 依赖到 `dist/lib/`。
 - **大块系统库用软链接，不打包**：`tar -h` 会解引用软链，把实体塞进 tarball。
-  两条先例：
+  这些二进制**也不进 git**（`.gitignore` 里 `third_party/ocr/lib/libonnxruntime*`），
+  部署方式见 README「依赖」：`tools/ort_link.sh copy|models` 拷进 dist 目录。
+  三条先例：
   - `libonnxruntime.so.1`（22~25MB）→ `tools/ort_link.sh link`，
     版本要求写在 `lib/ORT_VERSION`；`LITE_DIST_WITH_ORT=1` 可强制随包。
     `LITE_ORT_PREFER=auto|gpu|cpu`（默认 auto = 有 GPU 用 GPU、没有用 CPU）；

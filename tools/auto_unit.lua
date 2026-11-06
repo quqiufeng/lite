@@ -773,6 +773,31 @@ io.write(ok and "READY\n" or "NOTREADY\n")
                 -- 选 CPU 时必须摘掉 provider，否则运行时仍会挂 CUDA EP
                 check(txt:find("rm -f \"$PROVIDER\"", 1, true) ~= nil,
                     "ort_link.sh detaches CUDA provider for cpu mode")
+                -- 「自己下载部署、拷到 dist」：copy 是真拷贝，models 是拷模型
+                check(txt:find("copy)", 1, true) ~= nil
+                    and txt:find("cp -f", 1, true) ~= nil,
+                    "ort_link.sh can copy (not just symlink) into lib/")
+                check(txt:find("install_models", 1, true) ~= nil
+                    and txt:find("ppocr_keys_v1.txt", 1, true) ~= nil,
+                    "ort_link.sh deploys OCR models")
+                check(txt:find("paddleocr.bj.bcebos.com", 1, true) ~= nil,
+                    "ort_link.sh tells where to download models")
+            end
+
+            -- README 依赖章节必须说清：默认不打包 + 自己下载部署 + 拷到 dist
+            do
+                local f = io.open(root .. "/README.md", "r")
+                local txt = f and f:read("*a") or ""
+                if f then f:close() end
+                check(txt:find("默认不打包", 1, true) ~= nil,
+                    "README says optional parts are not packaged")
+                check(txt:find("models/ocr/", 1, true) ~= nil,
+                    "README tells where to put OCR models")
+                check(txt:find("ort_link.sh copy", 1, true) ~= nil,
+                    "README tells how to deploy onnxruntime into dist")
+                check(txt:find("329 MB", 1, true) ~= nil
+                    or txt:find("329MB", 1, true) ~= nil,
+                    "README documents the 329MB CUDA provider cost")
             end
 
             -- CUDA provider 走软链接，不打包；实体文件会膨胀 tarball

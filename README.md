@@ -238,30 +238,105 @@ C ABI 固定为 `char *lite_helper(const char *input)` + 可选 `lite_helper_fre
 
 ## 依赖
 
-- LuaJIT（`third_party/luajit`，缺失时 `tools/build.sh` 构建）
-- cjson（`third_party/cjson`）
-- libcurl（系统）
-- libpng / libjpeg / libwebp（系统；打包时 `.so` 进 `dist/lib/`）
-- libX11 / libxdo（系统；X11 截图与窗口控制）
-- OCR：PP-OCRv4 `third_party/ocr/`（lib + models + onnxruntime 1.26，随包进 `dist/lib`/`dist/models`）
-  - **默认不带 OCR 模型**（14.8MB，占解包六成）：OCR 是可选项，需要时把
-    `third_party/ocr/models/ocr/` 拷到目标机，或设 `LITE_OCR_MODELS` 指向既有副本。
-    要随包分发：`LITE_DIST_WITH_OCR=1 ./tools/package.sh`。
-    dist 包因此从 27M 降到 **3.3M**
-  - **onnxruntime 核心库不打包**（25MB，占 dist 一半）：目标机执行
-    `./tools/ort_link.sh link` 接入系统里**版本匹配**的那份；`status` 查看、`unlink` 撤销。
-    版本要求记在 `lib/ORT_VERSION`。确实要随包分发：`LITE_DIST_WITH_ORT=1 ./tools/package.sh`
-  - **自动选 CPU/GPU**：`LITE_ORT_PREFER=auto|gpu|cpu`（默认 `auto` = 有 GPU 用 GPU、
-    没有用 CPU）。GPU 的判定是「nvidia-smi 可用 + 有版本匹配的 providers_cuda +
-    cudnn/cublas 能解析」三者齐全；缺一项就回落 CPU。`link` 会连带接/摘
-    `providers_cuda.so`，保证形态和策略一致
-  - 体积对比：CPU 版核心库 22MB、**零 CUDA 依赖**；GPU 版核心库 26MB **+ provider 329MB**
-    + cudnn/cublas。CPU 版并不比 GPU 版核心库小多少，省的是那 329MB
-  - 单张小图实测 CPU 更快（0.80s vs 2.41s，GPU 每次进程都要建 CUDA 上下文）；
-    OCR 想快就 `LITE_ORT_PREFER=cpu`
-  - CUDA provider 同样**不打包**（329MB）：`./tools/cuda_provider.sh link` 按需接入
-  - 默认留 CPU：单张小图 CUDA 反而更慢（实测 2.3s vs 0.75s，初始化开销占主导），批量/大图才值得
-- pkg-config / gcc / cmake / OpenMP（编译 C KV cache + image）
+### 随包自带（`dist/lite-linux-x64/`，解包即用）
+
+| 项 | 位置 | 说明 |
+|---|---|---|
+| LuaJIT | `third_party/luajit/` | 自带运行时 + `libluajit.a`，不依赖系统 lua |
+| cjson | `third_party/cjson/` | JSON |
+| `liblite_cache.so` | `build/` | C KV cache（mmap 零拷贝） |
+| `liblite_image.so` | `lib/` | PNG/JPEG/WebP 解码+缩放+编码 |
+| `liblite_capture.so` | `lib/` | X11 截图（`XGetImage` + libpng） |
+| `libjpeg / libpng16 / libwebp / libz` | `lib/` | 上面两个 `.so` 的非 libc 依赖 |
+
+### 需要系统提供
+
+| 项 | 说明 | 缺失后果 |
+|---|---|---|
+| `libcurl` | DeepSeek HTTP/SSE | 无法调用 API |
+| `libX11` / `libxdo` | 截图、窗口、鼠标键盘（`automation/*.lua` 走 FFI） | 无 `x11`/`xdo` 能力，其余照常 |
+| `libgomp`（OpenMP） | KV cache 并行 | 加载失败 |
+
+检查：`./tools/check_deps.sh`
+
+### 可选 · 默认不打包，自己部署
+
+这三样加起来占了原始包体的 **90%+**，所以 `tools/package.sh` 默认都不带。
+需要 OCR 时按下面的方式自己下载部署 —— **拷贝到 dist 目录即可**，不需要重新打包。
+
+| 组件 | 体积 | 默认 | 拷到哪里 |
+|---|---|---|---|
+| PP-OCRv4 模型（det + rec + 字典） | 14.8 MB | ❌ | `dist/lite-linux-x64/models/ocr/` |
+| `libonnxruntime.so.1`（CPU 版） | 22 MB | ❌ | `dist/lite-linux-x64/lib/` |
+| `libonnxruntime.so.1`（GPU 版） | 26 MB | ❌ | 同上 |
+| `libonnxruntime_providers_cuda.so` | **329 MB** | ❌ | 同上（仅 GPU 需要） |
+
+> 为什么 CPU / GPU 的核心库都这么大：`.text` 段 17.4 MB 是 MLAS 的算子 kernel
+> 矩阵（每个算子 × 每种 dtype × 每代 CPU 指令集各一份），跟 CUDA 无关，两种版本
+> 都带。GPU 版只多 3.2 MB；真正的大头是 329 MB 的 `providers_cuda.so`。
+
+#### 部署步骤（解包后执行）
+
+```bash
+cd dist/lite-linux-x64
+
+# 1) OCR 模型：从 clone 的源码树拷过来（或自己下载，见下）
+./tools/ort_link.sh models /path/to/lite/third_party/ocr/models/ocr
+#   -> models/ocr/{ch_PP-OCRv4_det_infer.onnx, ch_PP-OCRv4_rec_infer.onnx, ppocr_keys_v1.txt}
+
+# 2) onnxruntime：从系统里拷一份（版本必须匹配，见 lib/ORT_VERSION）
+LITE_ORT_PREFER=cpu ./tools/ort_link.sh copy
+#   或指定目录
+./tools/ort_link.sh copy /path/to/onnxruntime-linux-x64-1.26.0/lib
+
+# 3) 验收
+./tools/ort_link.sh status     # 动态库可加载 + 模型齐备
+./tools/lite-lua -e 'package.path="./lua/?.lua;./lua/?/init.lua;"..package.path
+  print(require("ffi.ocr").ready())'
+```
+
+`copy` 是**真拷贝**（拷完源目录可删，dist 可整体搬走）；`link` 只建软链（省空间，
+但源目录不能删）。两者都会实测一次 OCR，失败自动回滚。
+
+#### 从零下载
+
+```bash
+# onnxruntime CPU 版（推荐，22MB，零 CUDA 依赖）
+python3 -m pip install onnxruntime==$(cat lib/ORT_VERSION) --target /tmp/ort
+./tools/ort_link.sh copy /tmp/ort/onnxruntime/capi
+
+# 或官方预编译包
+curl -LO https://github.com/microsoft/onnxruntime/releases/download/v1.26.0/onnxruntime-linux-x64-1.26.0.tgz
+tar xf onnxruntime-linux-x64-1.26.0.tgz
+./tools/ort_link.sh copy onnxruntime-linux-x64-1.26.0/lib
+```
+
+PP-OCRv4 模型：从 PaddleOCR 官方下载 det/rec 推理模型与 `ppocr_keys_v1.txt`，
+转成 onnx 后按上面的文件名放进 `models/ocr/`。最省事的是直接从另一份 lite
+源码树 `cp -r third_party/ocr/models/ocr dist/lite-linux-x64/models/`。
+
+#### CPU vs GPU
+
+`LITE_ORT_PREFER=auto|gpu|cpu`（默认 `auto` = 有 GPU 用 GPU，没有用 CPU）。
+GPU 判定要三项全齐：`nvidia-smi` 可用 + 版本匹配的 `providers_cuda` +
+`cudnn`/`cublas` 能解析。
+
+**实测单张小图 CPU 更快**（0.80s vs 2.41s，GPU 每次进程都要建 CUDA 上下文），
+所以 OCR 想快就用 `LITE_ORT_PREFER=cpu`。
+
+#### 想随包分发
+
+```bash
+LITE_DIST_WITH_OCR=1 LITE_DIST_WITH_ORT=1 ./tools/package.sh
+# 包体 3.3M -> 27M；GPU provider 永不打包（tar -h 会解引用软链）
+```
+
+`package.sh` 有 16MB 单文件闸门（`LITE_DIST_MAX_FILE_MB`），误打包系统库会直接报错。
+
+### 构建期依赖
+
+pkg-config / gcc / cmake / OpenMP（编译 C KV cache + image）、`libpng`/`libjpeg`/`libwebp`
+开发包（pkg-config 可见）。
 
 ---
 

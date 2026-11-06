@@ -22,7 +22,9 @@
 #
 # 用法:
 #   ./tools/ort_link.sh status     # 默认
-#   ./tools/ort_link.sh link [dir] # dir 可显式指定 onnxruntime 的 lib 目录
+#   ./tools/ort_link.sh link [dir] # 软链系统里那份（省空间，源目录不能删）
+#   ./tools/ort_link.sh copy [dir] # 真拷进 lib/（可移动/分发；CPU 22MB，GPU +329MB）
+#   ./tools/ort_link.sh models [dir] # 拷 OCR 模型到 models/ocr/（默认从源码树拷）
 #   ./tools/ort_link.sh unlink
 set -euo pipefail
 
@@ -244,14 +246,9 @@ status() {
     fi
 }
 
-link_libs() {
-    local v; v="$(want_version || true)"
-    [ -z "$v" ] && { echo "error: 无法探测 ORT 版本（先放一份 libonnxruntime.so.1）" >&2; exit 1; }
-
-    local prefer; prefer="$(resolve_prefer)"
-    echo "选择策略: LITE_ORT_PREFER=${LITE_ORT_PREFER:-auto} -> $prefer" >&2
-
-    local explicit="${1:-}" dir="" ok=""
+# 找一份版本匹配的 onnxruntime 目录；$1 可显式指定目录
+pick_dir() {
+    local v="$1" explicit="${2:-}" prefer="$3" dir="" 
     while IFS= read -r dir; do
         [ -n "$dir" ] || continue
         local src; src="$(core_file "$dir")"
@@ -261,34 +258,75 @@ link_libs() {
             echo "skip (版本 ${dv:-?} ≠ $v): $dir" >&2
             continue
         fi
-        ok="$dir"; break
+        echo "$dir"; return 0
     done < <(if [ -n "$explicit" ]; then echo "$explicit"; else candidate_dirs "$prefer"; fi)
+    return 1
+}
 
-    [ -z "$ok" ] && {
-        if [ "$prefer" = gpu ]; then
-            echo "LITE_ORT_PREFER=gpu 但没找到可用的 GPU 版 onnxruntime" >&2
-            echo "（需要版本匹配的 providers_cuda + cudnn/cublas；可改用 auto/cpu）" >&2
-        fi
-        echo "未找到版本 $v 的系统 onnxruntime" >&2
-        echo "可用 LITE_ORT_DIR=/path/to/lib ./tools/ort_link.sh link 显式指定" >&2
+# deploy_missing: install 失败提示
+_no_ort_helper() {
+    local v="$1" prefer="$2"
+    if [ "$prefer" = gpu ]; then
+        echo "LITE_ORT_PREFER=gpu 但没找到可用的 GPU 版 onnxruntime" >&2
+        echo "（需要版本匹配的 providers_cuda + cudnn/cublas；可改用 auto/cpu）" >&2
+    fi
+    echo "未找到版本 $v 的 onnxruntime（CPU/GPU 都可以）" >&2
+    echo "" >&2
+    echo "自己下载部署（任选其一）:" >&2
+    echo "  1) pip 安装 CPU 版（推荐，22MB，零 CUDA 依赖）:" >&2
+    echo "       python3 -m pip install onnxruntime==$v --target /tmp/ort" >&2
+    echo "       ./tools/ort_link.sh copy /tmp/ort/onnxruntime/capi" >&2
+    echo "  2) 下载官方预编译包，解压后指定 lib 目录:" >&2
+    echo "       curl -LO https://github.com/microsoft/onnxruntime/releases/download/v$v/onnxruntime-linux-x64-$v.tgz" >&2
+    echo "       tar xf onnxruntime-linux-x64-$v.tgz" >&2
+    echo "       ./tools/ort_link.sh copy onnxruntime-linux-x64-$v/lib" >&2
+    echo "  3) 已经装在别处: LITE_ORT_DIR=/path/to/lib ./tools/ort_link.sh copy" >&2
+    echo "" >&2
+    echo "copy 会把 .so 实际拷进 $(basename "$LIBDIR")/（不依赖源路径）；" >&2
+    echo "link 只做软链（省空间，但源目录不能删）。" >&2
+}
+
+# mode=link 建软链（原行为）；mode=copy 真拷贝（便于分发/移动）
+install_ort() {
+    local mode="$1" explicit="${2:-}"
+    local v; v="$(want_version || true)"
+    [ -z "$v" ] && { echo "error: 无法探测 ORT 版本（先放一份 libonnxruntime.so.1）" >&2; exit 1; }
+
+    local prefer; prefer="$(resolve_prefer)"
+    echo "选择策略: LITE_ORT_PREFER=${LITE_ORT_PREFER:-auto} -> $prefer" >&2
+
+    local ok; ok="$(pick_dir "$v" "$explicit" "$prefer")" || {
+        _no_ort_helper "$v" "$prefer"
         exit 1
     }
 
     local variant; variant="$(ort_variant "$ok")"
     local src; src="$(core_file "$ok")"
-    rm -f "$CORE" "$SHARED"
-    ln -sfn "$src" "$CORE"
-    [ -f "$ok/libonnxruntime_providers_shared.so" ] \
-        && ln -sfn "$ok/libonnxruntime_providers_shared.so" "$SHARED"
-    echo "linked: $CORE -> $src  ($variant)"
+    rm -f "$CORE" "$SHARED" "$PROVIDER"
+
+    if [ "$mode" = copy ]; then
+        cp -f "$src" "$CORE"
+        [ -f "$ok/libonnxruntime_providers_shared.so" ] \
+            && cp -f "$ok/libonnxruntime_providers_shared.so" "$SHARED"
+        echo "copied: $CORE <- $src  ($variant)"
+    else
+        ln -sfn "$src" "$CORE"
+        [ -f "$ok/libonnxruntime_providers_shared.so" ] \
+            && ln -sfn "$ok/libonnxruntime_providers_shared.so" "$SHARED"
+        echo "linked: $CORE -> $src  ($variant)"
+    fi
 
     # 变体决定是否接 CUDA provider：只换核心库不接 provider，运行时依旧是 CPU
     case "$variant" in
         gpu)
-            rm -f "$PROVIDER"
             if [ -f "$ok/libonnxruntime_providers_cuda.so" ]; then
-                ln -sfn "$ok/libonnxruntime_providers_cuda.so" "$PROVIDER"
-                echo "linked: $PROVIDER -> $ok/libonnxruntime_providers_cuda.so"
+                if [ "$mode" = copy ]; then
+                    cp -f "$ok/libonnxruntime_providers_cuda.so" "$PROVIDER"
+                    echo "copied: $PROVIDER <- $ok/libonnxruntime_providers_cuda.so (329MB)"
+                else
+                    ln -sfn "$ok/libonnxruntime_providers_cuda.so" "$PROVIDER"
+                    echo "linked: $PROVIDER -> $ok/libonnxruntime_providers_cuda.so"
+                fi
             else
                 echo "warn: $ok 没有 providers_cuda，运行时会退化为 CPU" >&2
             fi
@@ -308,6 +346,41 @@ link_libs() {
     fi
 }
 
+# OCR 模型（PP-OCRv4）同样不随包：从源码树或下载目录拷到 models/ocr/
+install_models() {
+    local src="${1:-}"
+    local dst="$ROOT/models/ocr"
+
+    if [ -z "$src" ]; then
+        # 默认从源码树里的那份拷（dist 场景常见：先解包，再从 clone 拷）
+        for cand in "$ROOT/third_party/ocr/models/ocr" "$HOME/lite/third_party/ocr/models/ocr"; do
+            if [ -f "$cand/ch_PP-OCRv4_det_infer.onnx" ]; then src="$cand"; break; fi
+        done
+    fi
+    if [ -z "$src" ] || [ ! -f "$src/ch_PP-OCRv4_det_infer.onnx" ]; then
+        echo "未找到 PP-OCRv4 模型" >&2
+        echo "" >&2
+        echo "自己下载部署:" >&2
+        echo "  官方模型（det/rec + 字典）:" >&2
+        echo "    https://paddleocr.bj.bcebos.com/PP-OCRv4/chinese/ch_PP-OCRv4_det_infer.tar" >&2
+        echo "    https://paddleocr.bj.bcebos.com/PP-OCRv4/chinese/ch_PP-OCRv4_rec_infer.tar" >&2
+        echo "    https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/main/ppocr/utils/ppocr_keys_v1.txt" >&2
+        echo "  解压/改名后应为（.tar 里是 inference.pdmodel 时需先转 onnx）:" >&2
+        echo "    $dst/ch_PP-OCRv4_det_infer.onnx" >&2
+        echo "    $dst/ch_PP-OCRv4_rec_infer.onnx" >&2
+        echo "    $dst/ppocr_keys_v1.txt" >&2
+        echo "" >&2
+        echo "有现成目录则: ./tools/ort_link.sh models /path/to/models/ocr" >&2
+        exit 1
+    fi
+
+    mkdir -p "$dst"
+    cp -f "$src/ch_PP-OCRv4_det_infer.onnx" "$src/ch_PP-OCRv4_rec_infer.onnx" \
+          "$src/ppocr_keys_v1.txt" "$dst/" 2>/dev/null
+    echo "copied models -> $dst"
+    ls -lh "$dst"
+}
+
 unlink_libs() {
     for f in "$CORE" "$SHARED" "$PROVIDER"; do
         if [ -L "$f" ]; then rm -f "$f"; echo "unlinked: $f"; fi
@@ -316,7 +389,9 @@ unlink_libs() {
 
 case "${1:-status}" in
     status) status ;;
-    link)   shift || true; link_libs "${1:-}" ;;
+    link)   shift || true; install_ort link "${1:-}" ;;
+    copy)   shift || true; install_ort copy "${1:-}" ;;
+    models) shift || true; install_models "${1:-}" ;;
     unlink) unlink_libs ;;
-    *) echo "用法: $0 [status|link [dir]|unlink]" >&2; exit 2 ;;
+    *) echo "用法: $0 [status|link [dir]|copy [dir]|models [dir]|unlink]" >&2; exit 2 ;;
 esac
