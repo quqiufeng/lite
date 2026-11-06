@@ -96,21 +96,37 @@ function M.windows()
     return display():windows()
 end
 
--- 按标题子串查找；opts = { class=, pick= }
+-- 精确解析窗口。query = { id, name, class, instance, pid, active, viewable, exact }
+-- 唯一命中返回 Win；否则返回 nil, 候选列表（调用方自己决定，不静默选一个）。
+function M.resolve(query)
+    M.ensure_display()
+    local w, cand = display():resolve(query or {})
+    if not w then
+        -- 候选也补上 Win 方法，方便调用方直接 :activate()/:capture()
+        local out = {}
+        for _, c in ipairs(cand or {}) do
+            out[#out + 1] = M.wrap(c.id, c.name, c):refresh()
+        end
+        return nil, out
+    end
+    return M.wrap(w.id, w.name, w):refresh(), nil
+end
+
+-- 按标题查找；opts = { class=, exact=, pick= }
+-- 多个匹配时默认**报错**（返回 nil + 候选），要显式 pick 才取第 N 个。
 function M.window(title, opts)
     opts = opts or {}
-    local wins = opts.class and display():find_class(opts.class)
-        or display():find(title)
-    if opts.exact then
-        local exact = {}
-        for _, w in ipairs(wins) do
-            if w.name == title then exact[#exact + 1] = w end
-        end
-        wins = exact
+    if opts.class then
+        return M.resolve({ class = opts.class, exact = opts.exact, pick = opts.pick })
     end
-    if #wins == 0 then return nil end
-    local w = wins[opts.pick or #wins]
-    return M.wrap(w.id, w.name):refresh()
+    local w, cand = M.resolve({ name = title, exact = opts.exact })
+    if w then return w end
+    if #cand == 0 then return nil, cand end
+    if opts.pick then
+        local hit = cand[opts.pick] or cand[#cand]
+        return M.wrap(hit.id, hit.name):refresh(), #cand
+    end
+    return nil, cand
 end
 
 -- 按 WM_CLASS 查找（如 "com.quqiufeng.nativereader"）。
@@ -120,12 +136,34 @@ function M.window_class(class, opts)
     return M.window(nil, opts)
 end
 
+-- 截图默认落到 workspace 下的 artifacts/selfsee/，而不是 /tmp。
+-- 落在 workspace 内，read/resize 才能直接消费（形成"看自己"闭环）；
+-- 目录不存在时自动创建（liblite_capture 只写文件，不建目录）。
+local function default_shot_path()
+    local cwd = os.getenv("PWD") or "."
+    return cwd .. "/artifacts/selfsee/screen.png"
+end
+
+local function ensure_parent(path)
+    local dir = path:match("^(.*)/[^/]+$")
+    if not dir or dir == "" then return end
+    os.execute("mkdir -p " .. "'" .. dir:gsub("'", "'\\''") .. "' 2>/dev/null")
+end
+
 local Win = {}
 Win.__index = Win
 M.Win = Win
 
-function M.wrap(id, name)
-    return setmetatable({ id = tonumber(id), name = name }, Win)
+function M.wrap(id, name, raw)
+    local self = setmetatable({ id = tonumber(id), name = name }, Win)
+    if type(raw) == "table" then
+        self.class = raw.class
+        self.instance = raw.instance
+        self.pid = raw.pid
+        self.viewable = raw.viewable
+        self.z = raw.z
+    end
+    return self
 end
 
 function Win:refresh()
@@ -190,10 +228,20 @@ function Win:type(text, delay)
 end
 
 -- 截图窗口区域（lite 自带 X11 + PNG）
+-- 注意：lite_capture 抓的是**屏幕像素**，窗口被遮挡会截到别的应用。
+-- 因此先激活并确认它真的拿到焦点；拿不到就明确报错，不产出错图。
 function Win:capture(path)
     self:activate()
+    ffi.C.usleep(120000)
     self:refresh()
-    path = path or "/tmp/opencode/native_reader.png"
+    local active = display():active()
+    if active ~= nil and active ~= self.id then
+        return false, string.format(
+            "window %s did not become active (active=%s); refusing to capture an occluded area",
+            tostring(self.id), tostring(active))
+    end
+    path = path or (default_shot_path():gsub("%.png$", "-window.png"))
+    ensure_parent(path)
     local lib, err = capture_lib()
     if not lib then return false, err end
     local rc = lib.lite_capture(self.x, self.y, self.w, self.h, path)
@@ -202,20 +250,6 @@ function Win:capture(path)
         return false, msg ~= nil and ffi.string(msg) or "capture failed"
     end
     return true, path
-end
-
--- 截图默认落到 workspace 下的 artifacts/selfsee/，而不是 /tmp。
--- 落在 workspace 内，read/resize 才能直接消费（形成"看自己"闭环）；
--- 目录不存在时自动创建（liblite_capture 只写文件，不建目录）。
-local function default_shot_path()
-    local cwd = os.getenv("PWD") or "."
-    return cwd .. "/artifacts/selfsee/screen.png"
-end
-
-local function ensure_parent(path)
-    local dir = path:match("^(.*)/[^/]+$")
-    if not dir or dir == "" then return end
-    os.execute("mkdir -p " .. "'" .. dir:gsub("'", "'\\''") .. "' 2>/dev/null")
 end
 
 -- 全屏截图（lite 自带 X11 + PNG）
