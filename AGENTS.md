@@ -1,300 +1,273 @@
 # AGENTS.md — lite
 
-LuaJIT + libcurl + cjson + C KV cache 的 native coding agent。细节见 `design.md`、`README.md`。
+lite 是一个 **AI-native agent harness**：带记忆、能力对模型完全开放、可自我迭代、能看见自己。
+coding 只是它的功能之一。对外说明见 `README.md`，设计取舍与参考实现剖析见 `design.md`。
 
-## 0 开发前
+> 本文件的目的：读一遍就知道**我是谁、我的手在哪、怎么验证**。
+> 不确定的事实去跑，别猜；没跑过的标 `[static]`，跑过才标 `[verified]`。
 
-新功能或架构决策动手前，**先查参考实现**，不要凭记忆猜。只借鉴思路，不复制源码。
+---
 
-| 参考 | 源码目录 | code search 缓存 | KV namespace |
+## 0 我是谁
+
+不是「一个只拥有 10 个工具的聊天壳」。三层结构：
+
+| 层 | 是什么 | 在哪 |
+|---|---|---|
+| 模型 | DeepSeek（多模态，能直接读图） | `lua/core/provider.lua` |
+| harness | 循环 + 工具 + 记忆 + TUI/serve | `lua/`（约 8.7k 行） |
+| 机器 | 宿主 shell、编译器、FFI、X11、GPU | 通过 `bash` 直接可达 |
+
+**能力来源不是工具清单**，是 `bash` + 编译器 + FFI + `native`。
+10 个内置工具是常用快捷键，不是边界。缺什么就现场造（见 §5）。
+
+**已知的真实边界**（别自我设限，但也别吹）：
+
+- 回合制：用户不说话就不存在；`serve --wake` 能定时唤醒，但那是预设脚本在跑。
+- 上下文有界：prompt 只带 system + 最近若干轮 + 召回块，旧内容靠 `recall`。
+- 同目录只允许一个写实例（`mem.lock` flock），第二个会直接报错。
+
+---
+
+## 1 自观察闭环：看见自己
+
+三条命令，均已实测。**截图 → 缩放 → 读图** 是核心闭环，不依赖 `import`/`scrot`/`xdotool`。
+
+```bash
+cd "$(pwd)"
+
+# ① 截全屏（X11 FFI → liblite_capture）
+./tools/lite-lua -e 'package.path="./lua/?.lua;./lua/?/init.lua;./automation/?.lua;"..package.path
+  local ok, p = require("x11").capture_screen()
+  print(ok, p)'
+#   -> <cwd>/artifacts/selfsee/screen.png  (2560x1440，约 1.9MB)
+
+# ② 缩到合适尺寸（2560 宽原图 token 太贵；1280 起通常够读 UI）
+./tools/lite-lua -e 'package.path="./lua/?.lua;./lua/?/init.lua;"..package.path
+  print(require("core.tools").new({cwd=os.getenv("PWD")}):resize(
+    "artifacts/selfsee/screen.png", 1280, 0, "artifacts/selfsee/s1280.png"))'
+#   -> 1.9MB 降到 ~650KB
+
+# ③ 用 read 工具看（图片会作为 image_url 进入对话）
+```
+
+要点：
+
+- `capture_screen()` 无参时默认落到 **workspace 内**的 `artifacts/selfsee/`，目录自动创建。
+  落 workspace 是关键——`read`/`resize` 才能直接消费。
+- `resize` 的**输入**允许 `$TMPDIR:/tmp:/var/tmp`（与 `read` 一致，`LITE_READ_DIRS` 可扩展），
+  **输出**永远落在 workspace 内；外部输入且未指定 `output` 时落到 `artifacts/resized/`。
+- 单窗口截图：`x11.window(title)` 拿到 `Win` 对象后 `:capture(path)`。
+- 键盘鼠标注入：`automation/xdo.lua`（libxdo FFI），**不要**起 `xdotool`/`wmctrl`。
+
+其他内省通道：
+
+| 手段 | 拿到什么 |
+|---|---|
+| `--tui --snapshot <file>` | 整屏**文本**快照（无像素，便宜） |
+| `state --json` / `sessions --json` | 会话列表、记忆计数、todo |
+| `LITE_DEBUG_LOG=<file>` | request/response JSONL（provider 层原始 body） |
+| `tmux capture-pane` | TUI 在 tmux 里时的文本快照（测试用） |
+
+---
+
+## 2 代码地图
+
+### Lua 层（`lua/`）
+
+| 文件 | 职责 |
+|---|---|
+| `main.lua` | 入口：`--check/--once/--recall/state/sessions/serve/attach/--tui` |
+| `context.lua` | 全应用状态切片（session/view/settings/ui）+ 事件总线 |
+| `core/agent.lua` | 循环：messages → model → tool_calls → messages |
+| `core/provider.lua` | DeepSeek SSE + tool_calls + 重试 + 图片消息 |
+| `core/tools.lua` | 10 个内置工具的实现与 schema |
+| `core/memory.lua` | KV 记忆：命名空间/TTL/召回/上下文组装 |
+| `core/prompt.lua` | system prompt 分段、记忆块、recall query |
+| `core/session.lua` | JSONL 镜像 + `from_memory()` 恢复 |
+| `core/approval.lua` | 审批 auto/ask/deny + session 级 allow |
+| `core/sandbox.lua` | bwrap bash 沙箱 |
+| `core/todos.lua` / `core/inputs.lua` | todo 列表 / 待发 prompt 队列 |
+| `core/serve.lua` `core/net.lua` `core/scheduler.lua` | headless 服务 / TCP / 定时唤醒 |
+| `core/http.lua` `core/proc.lua` `core/text.lua` `core/debug.lua` `core/config.lua` `core/deps.lua` `core/reload.lua` `core/signal.lua` | 基础设施 |
+| `core/automation.lua` | 外部自动化 Unix socket（模板，非主路径） |
+| `ffi/cache.lua` | KV cache FFI |
+| `ffi/image.lua` / `ffi/magick.lua` | 图像缩放双后端（内置优先，ImageMagick 兜底） |
+| `ffi/ocr.lua` | PP-OCRv4（中英混排，可选） |
+| `tui/loop.lua` | TUI 主循环：输入、命令、会话切换 |
+| `tui/screen.lua` `terminal.lua` `utf8.lua` | 虚拟屏幕 + 终端适配 |
+| `tui/transcript.lua` `markdown.lua` `composer.lua` `input.lua` | 渲染与输入 |
+| `tui/diff.lua` `diff_layout.lua` `diff_view.lua` | Ctrl+G diff pager（split/unified） |
+| `tui/status.lua` `todo_view.lua` `session_view.lua` `help_view.lua` `approval_view.lua` `complete.lua` | 状态栏与浮层 |
+| `tui/attach.lua` | attach 远程 serve |
+| `tui/snapshot.lua` | `--snapshot` 整屏文本 |
+
+### C 层（`src/` → `build/lib*.so`）
+
+| 目录 | 产物 | 职责 |
+|---|---|---|
+| `src/cache/` | `liblite_cache.so` | KV：hash/sorted/skiplist/namespace/tag/vector/hnsw + 索引持久化 |
+| `src/storage/mmap.c` | 同上 | `db_pool_t` mmap 池 |
+| `src/image/image.c` | `liblite_image.so` | PNG/JPEG/WebP 解码 + 缩放 + 编码 |
+| `src/x11/capture.c` | `liblite_capture.so` | `XGetImage` + libpng 截图 |
+
+### 其他
+
+```
+automation/x11.lua xdo.lua   libX11/libxdo FFI：窗口、鼠标键盘、截图
+helper/                      动态 native helper（模型现场生成，见 §5）
+tools/                       build/run/test/package/release + 冒烟脚本
+third_party/                 luajit / cjson / ocr（随包）
+```
+
+---
+
+## 3 记忆语义
+
+**每个目录一份 `mem.bin`**（+ `mem.idx`）。删掉 = 清空该目录记忆；换目录 = 全新。
+全局 `~/.local/share/lite/sessions/*.jsonl` 只是镜像，**不参与恢复**。
+
+| 命名空间 | 作用域 | 进 prompt | 说明 |
 |---|---|---|---|
-| Pi (TS) | `/opt/pi-mono` | `/opt/code_caches/pi-mono_cache` | `/code/pi-mono` |
-| Reasonix (Go) | `/opt/reasonix` | `/opt/code_caches/reasonix_cache` | `/code/reasonix` |
-| opencode (TS) | `/opt/opencode` | `/opt/code_caches/opencode_cache` | `/code/opencode` |
+| `/agent/knowledge/*` | 本目录，跨会话 | ✓ | 长期事实（`remember` 写入） |
+| `/agent/session/<id>/msg/*` | 单会话 | ✓ 仅本会话 | 完整消息 |
+| `/agent/session/<id>/turn/*` | 单会话 | ✓ | 轮次摘要 |
+| `/agent/session/<id>/working/*` | 单会话 | ✓ 仅本会话 | 会话内工作记忆 |
+| `/agent/session/<id>/todos` | 单会话 | ✓ | todo 列表 |
+| `/agent/working/*` | 本目录运行态 | ✗ | wake 调度状态等，**不注入** |
+| `/agent/index/cwd/<hash>/<id>` | 本目录 | — | 会话索引 |
 
-工具全在 `/opt/my_db`，下文命令都先 `cd /opt/my_db`。三套通道分工：
-`ai_code_search.sh`（向量语义搜索）、`tools/cache_query`（KV 精确符号，**不需向量**）、
-`tools/ctx.py`（批量 caller/callee，最省 context）。
+- 写实例持 `mem.lock` 独占锁；`--recall/state/sessions` 只读不加锁，可并发诊断。
+- `mem.bin` 头部（magic/version）损坏时自动备份为 `mem.bin.corrupt-<ts>` 并重建空库，不阻塞启动。
+- `mem.idx` 是可再生的；坏了会自动扫描 pool 重建。
 
-```bash
-cd /opt/my_db
+---
 
-# ① 前置检查（索引/向量/HNSW/KV 是否齐全）
-./ai_code_search.sh check /opt/code_caches/pi-mono_cache  pi-mono
-./ai_code_search.sh check /opt/code_caches/reasonix_cache reasonix
-./ai_code_search.sh check /opt/code_caches/opencode_cache opencode
-
-# ② 自然语言定位 file:line（默认 brief；要代码定义加 --rich）
-./ai_code_search.sh search /opt/code_caches/opencode_cache "permission approval ask deny" 5
-./ai_code_search.sh search /opt/code_caches/reasonix_cache "memory recall across sessions" 5 --rich
-
-# ③ 单符号的 caller/callee/调用链（KV，快）
-./tools/cache_query 'PermissionDecision' --repo /code/opencode --type context --brief
-./tools/cache_query 'control.turnOrchestrator::runTurnLoopWithPreparedTurn' \
-  --repo /code/reasonix --type context --depth 2 --brief   # Go 必须用 pkg::Func 全名
-
-# ④ 批量符号关系（agent 首选，只回吐名字）
-./tools/ctx.py /code/opencode PermissionDecision SessionStore --max 5
-
-# ⑤ 字段级数据流（谁创建/持有/改）
-./ai_code_search.sh dataflow /opt/code_caches/opencode_cache session
-
-# ⑥ 第三个项目单独再跑一遍（同一 query，逐个比，不要聚合）
-./ai_code_search.sh search /opt/code_caches/pi-mono_cache "session persistence" 5
-```
-
-> **逐个查，不要 `cross-search`**：聚合只给一锅混合排名，看不出「谁在哪个抽象层解决」；
-> 而且每个项目 60s 级、默认扫 20 个缓存会跑到十分钟以上。
-> 一次一个项目，各自 `search` → `cache_query` → 读源码，最后再横向列表对比。
-
-规则：
-
-- 结论标 `[static]`（搜索/调用图/数据流都是静态证据），**真正跑过**才标 `[verified]`。
-- 引用写 `file:symbol`，行号仅参考。
-- 符号命名：Go 是 `pkg::Func`，C++ 是 `Class::method`，TS 用导出名；裸名查不到。
-- 缓存缺失才重建（索引任务必须串行）：`./analyze_nodejs_repo.sh <src> /code/<name> --jobs 4`；
-  重建后补 `./tools/word_freq <cache>`，否则 TF-IDF 重排失效（`check` 会 WARN）。
-- 耗时参考（已优化后）：`cache_query` 1~2s、`search` 1.5~2s、`check` <1s。
-  载入成本拆开看（`/memory`：cache.bin 34GB、index.bin 179MB、6.5M 条）：
-  | 阶段 | 耗时 | 说明 |
-  |---|---|---|
-  | `cache_get` 单次 | **186 ns** | 真零拷贝：value 指针直接指向 mmap，不复制 |
-  | index.bin 反序列化 | 300ms | 快照要还原成哈希表+排序数组，不是零拷贝 |
-  | `cache_vector_index_rebuild` | 100s+ / 18GB | ← 历史真凶，见下 |
-  三个已修的坑（换机器或换库版本复现时先查这三条）：
-  1. `cache_open` 默认对整个 34GB pool 线性扫描重建 KV 向量索引。纯文本查询
-     （context/symbol）与 lite 记忆层用不到它 → `CACHE_SKIP_VECTOR_INDEX=1`。
-  2. `cache_close` 每次都重写 179MB index.bin（727ms）+ `msync` 整个 pool。
-     查询不改数据 → `CACHE_READONLY=1` 跳过写回（也防止把跳过的残缺索引写回去）。
-  3. 单查询走 TensorRT 会反序列化 ~600MB engine（3.9s / 4.1GB vs 1.4s / 1.3GB），
-     TRT 只在批量编码划算 → `ONNX_EMBEDDER_DISABLE_TRT=1`。
-  `tools/cache_query` 包装器已默认导出这三个变量；`batch_embedder` 与
-  `import_book` 等写入/批量路径**不要**设，否则失去向量索引与 TRT 加速。
-- 详细方法论见 `/opt/my_db/code_search_best_practices.md`，命令速查见 `/opt/my_db/coding.md`。
-
-### 0.1 范例：逐个项目探索同一功能
-
-以「工具审批」为例（lite 待做项）。**顺序：一个项目 → 定位 → 关系 → 读源码 → 下一个项目**，
-最后才横向列表。不要一开始就跨项目聚合，否则只会拿到一锅混合排名，看不出各自在哪个抽象层解决。
-
-#### ① Pi（TypeScript monorepo）
-
-```bash
-cd /opt/my_db
-# 第一轮：用「行为」描述，命中全是 UI 层，方向不对
-./ai_code_search.sh search /opt/code_caches/pi-mono_cache \
-  "tool approval permission confirm user prompt" 5
-#   -> promptConfirm / grantNotice / showExtensionConfirm（都是终端交互，不是策略）
-
-# 第二轮：换成「机制」描述，直接命中扩展点
-./ai_code_search.sh search /opt/code_caches/pi-mono_cache \
-  "beforeToolCall block tool execution deny result" 5
-#   [1] BeforeToolCallResult  0.92  packages/agent/src/types.ts:66
-#   [2] _beforeToolCall       0.87  packages/coding-agent/src/core/agent-session.ts:678
-#   [4] _installAgentToolHooks 0.75 packages/coding-agent/src/core/agent-session.ts:672
-```
-
-```bash
-./tools/cache_query '_beforeToolCall' --repo /code/pi-mono --type context --brief
-#   callers(2): _installAgentToolHooks, _executeNestedToolCall
-#   callees(2): emitToolCall, hasHandlers
-```
-
-读源码（`[static]`）：
-
-- `packages/agent/src/types.ts:66` `BeforeToolCallResult { block?, reason?, terminate? }`
-- `packages/agent/src/agent-loop.ts:738` 在 `beforeToolCall` 返回 `block` 时，**不执行工具**，
-  直接 `createErrorToolResult(reason ?? "Tool execution was blocked")` 作为 `kind: "immediate"` 结果返回；
-  `terminate` 透传到 tool result，整批结果都 terminate 才提前结束。
-- `packages/coding-agent/src/core/agent-session.ts:672` 把 `this.agent.beforeToolCall` 接到扩展 runner。
-- `packages/coding-agent/src/core/extensions/runner.ts:1256` `emitToolCall` 遍历所有 `tool_call`
-  handler，**命中第一个 `block:true` 就 return**（短路）；handler 可原地改 `event.input` 改参数。
-
-**结论**：Pi **没有内置规则引擎**，审批完全下放给扩展；核心只提供「可阻断的钩子 + 可改参数」。
-`_isAllowedTool`（`:1581`）是 `--tools`/`--exclude-tools` 白名单，不是审批。
-
-#### ② Reasonix（Go）
-
-```bash
-./ai_code_search.sh search /opt/code_caches/reasonix_cache \
-  "permission policy decide mode rules allow deny ask" 6
-#   [1] Policy::allowedOnlyByMode  1.00  internal/safety/permission/origin_ctx.go:34
-#   [2] TestPolicyModeAllow        1.00  permission_test.go:200   （单测，跳过）
-#   [5] Policy::Decide             0.89  internal/safety/permission/permission.go:148
-```
-
-```bash
-./tools/cache_query 'permission.Policy::Decide' --repo /code/reasonix --type context --depth 2 --brief
-#   callers(1): permission.Policy::allowedOnlyByMode
-```
-
-读源码（`[static]`）：
-
-- `permission.go:107` `Policy{Mode, Allow, Ask, Deny, SessionAllow, AllowDynamicBash, ReadOnly, AskOnOrigin}`
-- `permission.go:282` `DecideSubjects`：多 subject（如 move 的源+目标）逐个判定，
-  **任一 Deny 即 Deny，任一 Ask 则 Ask**，否则 Allow。
-- `permission.go:170` `DecideSubject` 优先级：
-  `ReadOnly 姿态 > bash 专项 > 浏览器凭据 > computer >`
-  **`deny > SessionAllow > ask > allow > readOnly→Allow > subjectRequiresHuman→Ask > Mode`**
-- 规则语法 `internal/contract/permrule`：`Tool` / `Tool(glob)` / `Tool=literal`（`=` 形式不允许通配）。
-- `verdict.go:72` `Gate.Check` = `Gate.Verdict`；`ask()` 里 `Approver.Approve` 返回
-  `(allow, remember, reason)`，`remember=true` 时**把 `ToolName` 整体追加进 `Policy.Allow`**
-  （即“always allow”是工具级，不是命令级）。
-- `permission.go:569` `Approver` 为 `nil` 时走 `unattendedAsk`：无人值守按“允许”以免打断自动流程，
-  但 `ReadOnly` / `AskOnOrigin` 姿态下改为拒绝。
-- bash 有额外两跳：`BashCommandIsReadOnly(args)` 可把非只读调用**升级成只读**（免审批）；
-  `gitReadPrograms` 可把“只读”的 git 命令**降级回非只读**（仓库自己配置会跑程序）。
-
-**结论**：Reasonix 把「规则求值」（纯函数 Policy）和「问人」（Approver 接口）彻底分离，
-规则粒度 = 工具 + subject glob，且明确写出优先级。
-
-#### ③ opencode（TypeScript monorepo）
-
-```bash
-./ai_code_search.sh search /opt/code_caches/opencode_cache \
-  "permission ruleset evaluate tool call allow deny ask" 6
-#   [2] PermissionDecision   0.78  app/src/session/requests/permission-machine.ts:5  （UI 状态机）
-#   [5] PermissionRuleset    0.78  client/src/promise/generated/types.ts:1088      （生成的类型）
-```
-
-前 6 名都在 UI / 生成代码里，策略本体得按文件定位：
-
-```bash
-grep -n "export" /opt/opencode/packages/core/src/permission.ts | head -30
-```
-
-读源码（`[static]`）：
-
-- `packages/core/src/permission.ts:94` 规则求值只有一个函数：
-  ```ts
-  evaluate(action, resource, ...rulesets) =
-    rulesets.flat().findLast(r => Wildcard.match(action, r.action)
-                               && Wildcard.match(resource, r.resource))
-    ?? { action, resource: "*", effect: "ask" }      // 默认 ask
-  ```
-  **`findLast` → 后写的规则覆盖先写的**；`Wildcard` 支持 `*`/`?`（`util/wildcard.ts`）。
-- `permission.ts:176` `denied()` 先用**配置规则**（agent + session）短路：任一 resource 为 `deny` 即拒，
-  **saved（“总是允许”）无法翻掉配置的 deny**。
-- `permission.ts:187` 合并顺序 `all = [...rules, ...savedRules()]`，saved 在后 → 可覆盖配置的 `ask`。
-- `permission.ts:256` `assert()`：`deny → BlockedError`；`allow → 直接过`；
-  `ask → 建 pending + 发 permission.asked + Deferred.await`。
-  拒绝分两种：带反馈 → `CorrectedError`（模型继续）；纯拒绝 → `DeclinedError` 用 `Effect.die` 打穿。
-- `permission.ts:306` `reply()`：`reject` 会**连带拒绝同 session 所有 pending**；
-  `always` 时 `saved.add({projectID, action, resources: save})` 落库（项目级持久），
-  然后重算 pending，把已变成 allow 的一并放行。
-- `permission.ts:63` `Unattended = Context.Reference<Ruleset>`：无人值守时 ask 转 deny
-  并附 `"...nobody is present to give it"`。
-- 调用侧 `packages/core/src/tool/plugin/shell.ts:127`：
-  ```ts
-  permission.assert({ action: name,
-                      resources: parsed.commands.map(c => c.resource),
-                      save:      parsed.commands.map(c => c.save), ... })
-  ```
-  `save` 是**前缀通配**（`shell/parse.ts:229`，取前几个词拼 `"git status *"`），
-  所以“总是允许”落到具体命令前缀，而不是整个 bash。
-
-**结论**：opencode 用 `(action, resource)` 二元组 + glob 规则表，默认 `ask`；
-持久化授权是**项目级**，粒度是命令前缀。
-
-#### 横向对比（三个都读完之后再列）
-
-| 维度 | Pi | Reasonix | opencode |
-|---|---|---|---|
-| 内置策略 | 无，全靠扩展 | `Policy` 纯函数 | `evaluate()` + ruleset |
-| 挂点 | `beforeToolCall` 钩子 | `Gate.Check/Verdict` | `Permission.assert/ask` |
-| 判定键 | 工具名 + args（自定义） | 工具名 + **subject** glob | **action + resource** glob |
-| 优先级 | 扩展自定义 | deny > sessionAllow > ask > allow > readOnly > Mode | 配置 deny 短路 → 其余 `findLast`（saved 覆盖 ask） |
-| 默认动作 | 无 → 执行 | writer 回落 `Mode`（默认 ask） | 无匹配 → `ask` |
-| 记住范围 | 扩展自定义 | 进程内 `SessionAllow`；`OnRemember` 落配置 | 项目级 DB，粒度=命令前缀 |
-| 拒绝语义 | 文本塞回 tool result | `Verdict.Reason` 喂模型 | 带反馈 `CorrectedError`；纯拒 `DeclinedError` 终止 |
-| 无人值守 | 不阻塞（钩子自己决定） | `Approver=nil` → 允许 | `Unattended` → deny |
-| 只读姿态 | 无 | `ReadOnly` 硬拒写；bash 可动态升级/降级只读 | 无独立姿态 |
-
-**对 lite 的启示**：`lua/core/approval.lua` 现在是 `decide(tool)` —— **只有工具名，没有参数**，
-「允许 bash」等于放行所有 bash 命令。三家一致的解法是**把审批键扩成「动作 + 目标」**：
-
-- 最小改动：`decide(tool, args)`，对 `bash` 取命令前缀作为 subject（对齐 opencode 的 `save`）
-- `allow[tool]` 改成 `allow[rule]`，规则写成 `bash(git status *)` 形式（对齐 Reasonix 的 permrule）
-- 保持「deny 优先 + 无匹配回落 mode」，不要引入 opencode 那种 `findLast` 覆盖语义
-
-## 1 铁律
+## 4 铁律
 
 MUST：
 
 - 改代码后跑 `./tools/test.sh`，通过才算完成。
 - 依赖变更同步 `tools/check_deps.sh` 和本文件；C ABI/FFI 变更同步 `lua/ffi/*` 与文档。
-- UI 改动用 `tmux capture-pane` 或快照验收。
-- Commit：`feat/fix/style/docs/chore(scope): ...`；仅用户明确要求时 commit/push。
+- UI 改动用 `tmux capture-pane` 或 `--tui --snapshot` 验收。
+- 结论标 `[static]` / `[verified]`；引用写 `file:symbol`，行号仅参考。
+- Commit：`feat/fix/style/docs/chore(scope): ...`；**仅用户明确要求时** commit/push。
 
 MUST NOT：
 
 - 不用 Chrome/WebView/CEF/Electron。
-- 不启动 `xdotool/wmctrl/import`；窗口控制用 LuaJIT FFI。
+- 不起 `xdotool/wmctrl/import`；窗口与截图走 `automation/*` 的 FFI。
 - 不用 `systemd --user` 启 UI；不用 `pkill -f`（用 `pkill -x`）。
 - 不把 API Key 写进仓库。
+- 不把 `$ROOT/lib` 注入 `LD_LIBRARY_PATH`（会把 1.26 的 onnxruntime 塞给所有子进程，
+  让依赖 1.20.1 的外部工具静默失败；回归项在 `check_deps.sh` 的 `ocr self-contained`）。
 
-## 2 依赖
+---
 
-LuaJIT/cjson、libcurl、OpenMP、libpng/libjpeg/libwebp + X11 + pkg-config、gcc/cmake/cc/c++、tmux（可选）。
-OCR：PP-OCRv4 + onnxruntime 1.26 放 `third_party/ocr/`；CUDA provider 不打包，系统有则用。
-
-`./tools/check_deps.sh`
-
-## 3 命令
+## 5 命令与测试
 
 ```bash
-./tools/build.sh
-./tools/run.sh --tui
-./tools/run.sh --once "prompt"
-./tools/run.sh serve --port 8765
-./tools/test.sh
-./tools/package.sh
-./tools/release.sh
+./tools/build.sh                            # 依赖检查 + 编 C 模块
+./tools/check_deps.sh                       # 只查依赖
+./tools/run.sh --tui                        # 交互 TUI
+./tools/run.sh --once "prompt"              # 无 UI 跑一轮
+./tools/run.sh --once --json "prompt"       # JSONL 事件流
+./tools/run.sh --recall "关键词"             # 查当前目录记忆
+./tools/run.sh --tui --snapshot out.txt     # 整屏文本快照
+./tools/run.sh state --json                 # 会话/记忆/todo
+./tools/run.sh sessions --json              # 同 cwd 会话列表
+./tools/run.sh serve --port 8765            # headless
+./tools/run.sh attach --port 8765           # 远程 TUI
+./tools/test.sh                             # check + unit + cli + tui + serve
+./tools/package.sh / ./tools/release.sh     # 打包 / 构建+打包+安装
 ```
 
-## 4 目录
+测试分层（`test.sh` 串联）：`check_deps.sh` → `auto_unit.lua`（当前 295 项）→
+CLI JSON → `tui_smoke.sh` → `serve_smoke.sh`。失败产物落 `artifacts/`。
 
-```
-lua/main.lua context.lua core/ tui/ ffi/
-src/cache src/image   C KV cache / image
-automation/           x11/xdo FFI
-helper/               动态 native helper
-tools/                build/run/test/package/release
-```
+**写回归时先验证它抓得住 bug**：在修复前的 commit 上跑一遍，确认会 FAIL。
 
-## 5 约定
+调用工具时的约定：
 
-- 模块 `M.new(ctx)` + `M:method()`；不反向 require `main.lua`，依赖用 ctx 注入。
-- FFI 薄封装；指针/内存成对释放；工具输出单次 ≤ 32KB。
-- 会话 JSONL + KV；旧上下文靠 memory/recall；审批 `auto|ask|deny`。
-- `LITE_SANDBOX=1` 用 bwrap；FFI/native 在进程内、不经过 bwrap，靠审批守边界。
-- `read` 文本/目录限 workspace；图片可读 `$TMPDIR:/tmp:/var/tmp`，`LITE_READ_DIRS` 可加白名单。
-- Prompt 在 `lua/core/prompt.lua`；自动加载 `AGENTS.md`/`CLAUDE.md`/`.lite/instructions.md`，`LITE_INSTRUCTIONS_FILE` 覆盖，`LITE_INSTRUCTIONS_CHARS` 截断。
+- 输出单次 ≤ 32KB；超了要自己收窄（`head`/`--limit`/分页）。
+- `read` 文本/目录限 workspace；图片可读 `$TMPDIR:/tmp:/var/tmp`（`LITE_READ_DIRS` 扩展）。
+- `bash` 可以异步长跑；TUI 里 `Ctrl+C` 取消。
+
+---
 
 ## 6 原生扩展
 
-LuaJIT 自带 FFI：系统有 `.so` 就直接 `ffi.cdef` + `ffi.load`，封装放 `lua/ffi/<feature>.lua`，工具在 `lua/core/tools.lua` 暴露；复杂 ABI/热路径才写 `src/<feature>/`。
+系统已有 `.so` 就直接 `ffi.cdef` + `ffi.load`，封装放 `lua/ffi/<feature>.lua`，
+工具在 `lua/core/tools.lua` 暴露；只有复杂 ABI 或热路径才写 `src/<feature>/`。
 
 - C 导出 `int lite_<feature>_...` + `const char *lite_<feature>_error(void)`；失败返回非 0。
-- `.so` 设 `$ORIGIN` RPATH；`package.sh` 复制 `.so` 及非 libc 依赖到 `dist/lib/`。
-- **禁止把 `$ROOT/lib` 注入 `LD_LIBRARY_PATH`**：该变量被 exec 的子进程（`bash` 工具、native helper、外部脚本）继承，随包的 `libonnxruntime.so.1` 会遮蔽系统同名库（缺 `VERS_1.20.1` 等版本符号），让依赖系统 onnxruntime 的 `ai_code_search.sh` 等工具**静默失败**。自带 `.so` 靠 `$ORIGIN`；无 RPATH 的第三方库（如 `libocr_simple.so`）由 FFI 层按绝对路径 `ffi.load(path, true)` 预加载。回归由 `check_deps.sh` 的 `ocr self-contained` 项守护。
-- `mem.bin` 头部（magic/version）损坏时 `cache_open` 会把它改名为 `mem.bin.corrupt-<ts>` 并重建空库，`mem.idx` 一并备份，保证不阻塞启动；回归项在 `auto_unit.lua` 的 `corrupt:` 用例。
-- 热重载：Lua 清 `package.loaded[...]` 重新 require；TUI `/reload`。C `.so` 不卸载，C 改动需重启。
+- `.so` 设 `$ORIGIN` RPATH；`package.sh` 复制非 libc 依赖到 `dist/lib/`。
+- 热重载：清 `package.loaded[...]` 重新 require（TUI `/reload`）。C `.so` 不卸载，改 C 要重启。
 
-## 7 native helper
+**`native`：让模型自己造工具**
 
-`native` 让模型写 C/C++、编译 `.so`、写 Lua wrapper + schema，立即成为工具。
+```text
+native(action="build", name="x", code=C_OR_CPP, lang="c", libs={"m"})
+  -> helper/x-<ts>.so + manifest
+native(action="run", name="x", input="...")
+native(action="wrap", name="x", lua=..., description=..., parameters={...})
+  -> helper/x.lua + x.tool.json，立即成为可调用工具 x(...)
+```
 
-- 发现：`<workspace>/helper` 优先，`$LITE_ROOT/helper` 兜底；`scope=local|global`。
-- ABI：`char *lite_helper(const char *input)`；可选 `void lite_helper_free(char *out)`；UTF-8 字符串（通常 JSON）。
-- `build` → `<name>-<ts>.so` + manifest；`run` 调最新；`wrap` 写 `<name>.lua` + `.tool.json`，`schemas()` 自动发现。
-- Wrapper 返回 `{ run = function(args, env) ... end }`；`env` 有 `cwd/helper_dir/scope/ffi/load(name)/call(name,input)`。
-- 新 build 用新路径，免重启；也可 `bash` 直接 `cc -shared -fPIC ...` 或用 `luajit -e` 加载。动态工具需审批。
+- ABI：`char *lite_helper(const char *input)` + 可选 `lite_helper_free`；UTF-8 字符串（通常 JSON）。
+- 发现顺序 `<workspace>/helper` → `$LITE_ROOT/helper`；`scope=local|global` 控制写哪一侧。
+- Wrapper 返回 `{ run = function(args, env) ... end }`，`env` 有
+  `cwd/helper_dir/scope/ffi/load(name)/call(name,input)`。
+- 新 build 用新路径，**免重启**即生效。native helper 在进程内、不经 bwrap，靠审批守边界。
 
-## 8 能力原则
+---
 
-不要把能力全硬编码进工具。给模型**手和眼睛**：bash、文件、编译器、系统 `.so`、FFI、进程/网络、X11/xdo、`native`；长尾能力让模型现场组合，harness 守审批/沙箱边界。
+## 7 参考实现（code search）
 
-## 9 测试
+**新功能或架构决策动手前，先查参考实现**，不要凭记忆猜；只借鉴思路，不复制源码。
 
-`check_deps.sh` / `auto_unit.lua` / `tui_smoke.sh` / `serve_smoke.sh`；视觉用 `tmux capture-pane`，失败存 `artifacts/`。
+| 参考 | 源码 | code search 缓存 | KV namespace |
+|---|---|---|---|
+| Pi (TS) | `/opt/pi-mono` | `/opt/code_caches/pi-mono_cache` | `/code/pi-mono` |
+| Reasonix (Go) | `/opt/reasonix` | `/opt/code_caches/reasonix_cache` | `/code/reasonix` |
+| opencode (TS) | `/opt/opencode` | `/opt/code_caches/opencode_cache` | `/code/opencode` |
+
+工具在 `/opt/my_db`。三套通道分工：`ai_code_search.sh`（向量语义搜索）、
+`tools/cache_query`（KV 精确符号，**不需向量**）、`tools/ctx.py`（批量 caller/callee，最省 context）。
+
+```bash
+cd /opt/my_db
+
+# 前置检查
+./ai_code_search.sh check /opt/code_caches/opencode_cache opencode
+
+# 语义定位 file:line（默认 brief；要代码定义加 --rich）
+./ai_code_search.sh search /opt/code_caches/opencode_cache "permission ruleset evaluate" 5
+
+# 单符号 caller/callee（KV，快）
+./tools/cache_query 'PermissionDecision' --repo /code/opencode --type context --brief
+./tools/cache_query 'control.turnOrchestrator::runTurnLoopWithPreparedTurn' \
+  --repo /code/reasonix --type context --depth 2 --brief    # Go 必须 pkg::Func 全名
+
+# 批量符号关系
+./tools/ctx.py /code/opencode PermissionDecision SessionStore --max 5
+
+# 字段级数据流
+./ai_code_search.sh dataflow /opt/code_caches/opencode_cache session
+```
+
+规则：
+
+- **逐个项目查，不要 `cross-search`**：聚合只给混合排名，看不出谁在哪个抽象层解决；
+  且每项目 60s 级、默认扫 20 个缓存要十分钟以上。
+- 命中顺序 ≠ 该读的顺序。扫前 5 条再用 `cache_query` 按符号补齐；top1 常是 UI/单测/生成代码。
+- 符号命名：Go `pkg::Func`、C++ `Class::method`、TS 用导出名；裸名查不到。
+- 耗时（已优化）：`cache_query` 1~2s、`search` 1.5~2s、`check` <1s。
+  三个环境开关只由 `tools/cache_query` 包装器导出，写入/批量路径**不要**设：
+  `CACHE_SKIP_VECTOR_INDEX`（跳过 34GB 线性重建）、`CACHE_READONLY`（不重写 179MB 索引）、
+  `ONNX_EMBEDDER_DISABLE_TRT`（单查询不吃 600MB engine）。
+- 缓存缺失才重建（串行）：`./analyze_nodejs_repo.sh <src> /code/<name> --jobs 4`，
+  之后补 `./tools/word_freq <cache>`，否则 TF-IDF 重排失效。
+
+**完整范例**（以「工具审批」为例，逐个项目走一遍：定位 → 关系 → 读源码 → 横向对比）
+见 `design.md` §5；方法论与报告模板见 `/opt/my_db/code_search_best_practices.md`。

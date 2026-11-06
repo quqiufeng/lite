@@ -337,6 +337,119 @@ done
 - Reasonix：`runTurnLoopWithPreparedTurn` callers `runTurnLoop`，callees `armAwaitResume/noticeUserGate/stopGoal/continueGoal/runOrchestratedTurn/...`。
 - Reasonix Go：索引 101,565 个 Go chunks；修复后 call graph 从 1,224 键（仅 JS）提升到 16,968 键，含 72,569 个函数、44,920 个函数体。
 
+### 5.8 范例：逐个项目探索同一功能（工具审批）
+
+顺序：**一个项目 → 定位 → 关系 → 读源码 → 下一个项目**，最后才横向列表。
+不要一开始就跨项目聚合，否则只拿到一锅混合排名，看不出各自在哪个抽象层解决。
+
+#### ① Pi
+
+```bash
+cd /opt/my_db
+# 第一轮：用「行为」描述，命中全是 UI 层，方向不对
+./ai_code_search.sh search /opt/code_caches/pi-mono_cache \
+  "tool approval permission confirm user prompt" 5
+#   -> promptConfirm / grantNotice / showExtensionConfirm（终端交互，不是策略）
+
+# 第二轮：换成「机制」描述，直接命中扩展点
+./ai_code_search.sh search /opt/code_caches/pi-mono_cache \
+  "beforeToolCall block tool execution deny result" 5
+#   [1] BeforeToolCallResult   0.92  packages/agent/src/types.ts:66
+#   [2] _beforeToolCall        0.87  packages/coding-agent/src/core/agent-session.ts:678
+
+./tools/cache_query '_beforeToolCall' --repo /code/pi-mono --type context --brief
+#   callers(2): _installAgentToolHooks, _executeNestedToolCall
+#   callees(2): emitToolCall, hasHandlers
+```
+
+- `types.ts:66` `BeforeToolCallResult { block?, reason?, terminate? }`
+- `agent-loop.ts:738` 返回 `block` 时**不执行工具**，直接
+  `createErrorToolResult(reason ?? "Tool execution was blocked")` 作为 `immediate` 结果返回
+- `extensions/runner.ts:1256` `emitToolCall` 遍历 handler，**命中第一个 `block:true` 就短路**；
+  handler 可原地改 `event.input` 改参数
+
+**结论**：Pi **没有内置规则引擎**，审批完全下放给扩展；核心只给「可阻断钩子 + 可改参数」。
+`_isAllowedTool`（`:1581`）是 `--tools` 白名单，不是审批。
+
+#### ② Reasonix
+
+```bash
+./ai_code_search.sh search /opt/code_caches/reasonix_cache \
+  "permission policy decide mode rules allow deny ask" 6
+#   [1] Policy::allowedOnlyByMode 1.00  internal/safety/permission/origin_ctx.go:34
+#   [2] TestPolicyModeAllow       1.00  permission_test.go:200   （单测，跳过）
+#   [5] Policy::Decide            0.89  internal/safety/permission/permission.go:148
+```
+
+- `permission.go:107` `Policy{Mode, Allow, Ask, Deny, SessionAllow, AllowDynamicBash, ReadOnly, AskOnOrigin}`
+- `:282` `DecideSubjects`：多 subject 逐个判定，**任一 Deny 即 Deny，任一 Ask 则 Ask**
+- `:170` `DecideSubject` 优先级：
+  `ReadOnly 姿态 > bash 专项 > 浏览器凭据 > computer >`
+  **`deny > SessionAllow > ask > allow > readOnly→Allow > subjectRequiresHuman→Ask > Mode`**
+- 规则语法 `internal/contract/permrule`：`Tool` / `Tool(glob)` / `Tool=literal`
+- `verdict.go:72` `Gate.Check` = `Gate.Verdict`；`remember=true` 时把 **ToolName 整体**
+  追加进 `Policy.Allow`（"always allow" 是工具级，不是命令级）
+- `:569` `Approver == nil` 时走 `unattendedAsk`：无人值守按允许，但 `ReadOnly`/`AskOnOrigin` 改拒
+- bash 两跳：`BashCommandIsReadOnly` 可把非只读**升级成只读**（免审批）；
+  `gitReadPrograms` 可把"只读"git 命令**降级回非只读**（仓库配置会跑程序）
+
+**结论**：规则求值（纯函数 Policy）与「问人」（Approver 接口）彻底分离，粒度 = 工具 + subject glob。
+
+#### ③ opencode
+
+```bash
+./ai_code_search.sh search /opt/code_caches/opencode_cache \
+  "permission ruleset evaluate tool call allow deny ask" 6
+#   [2] PermissionDecision 0.78  app/src/session/requests/permission-machine.ts:5 （UI 状态机）
+#   [5] PermissionRuleset  0.78  client/src/promise/generated/types.ts:1088     （生成类型）
+```
+
+前 6 名都在 UI / 生成代码里，策略本体按文件定位：
+`grep -n "export" /opt/opencode/packages/core/src/permission.ts`
+
+- `permission.ts:94` 求值只有一个函数：
+
+  ```ts
+  evaluate(action, resource, ...rulesets) =
+    rulesets.flat().findLast(r => Wildcard.match(action, r.action)
+                               && Wildcard.match(resource, r.resource))
+    ?? { action, resource: "*", effect: "ask" }      // 默认 ask
+  ```
+
+  **`findLast` → 后写的覆盖先写的**；`Wildcard` 支持 `*`/`?`（`util/wildcard.ts`）
+- `:176` `denied()` 先用配置规则短路：任一 resource 为 `deny` 即拒，saved 翻不掉
+- `:187` `all = [...rules, ...savedRules()]`，saved 在后 → 可覆盖配置的 `ask`
+- `:256` `assert()`：`deny → BlockedError`；`allow → 过`；`ask → pending + Deferred.await`。
+  带反馈拒绝 → `CorrectedError`（模型继续）；纯拒 → `DeclinedError` 用 `Effect.die` 打穿
+- `:306` `reply()`：`reject` 连带拒绝同 session 所有 pending；
+  `always` 时 `saved.add({projectID, action, resources: save})` 落库（项目级）
+- `:63` `Unattended`：无人值守时 ask 转 deny
+- `shell.ts:127` 调用侧传 `resources` 与 `save`；`save` 是**前缀通配**
+  （`shell/parse.ts:229` 取前几个词拼 `"git status *"`）
+
+**结论**：`(action, resource)` 二元组 + glob 规则表，默认 `ask`；持久化授权项目级、粒度是命令前缀。
+
+#### 横向对比
+
+| 维度 | Pi | Reasonix | opencode |
+|---|---|---|---|
+| 内置策略 | 无，全靠扩展 | `Policy` 纯函数 | `evaluate()` + ruleset |
+| 挂点 | `beforeToolCall` 钩子 | `Gate.Check/Verdict` | `Permission.assert/ask` |
+| 判定键 | 工具名 + args（自定义） | 工具名 + **subject** glob | **action + resource** glob |
+| 优先级 | 扩展自定义 | deny > sessionAllow > ask > allow > readOnly > Mode | 配置 deny 短路 → 其余 `findLast` |
+| 默认动作 | 无 → 执行 | writer 回落 `Mode`（默认 ask） | 无匹配 → `ask` |
+| 记住范围 | 扩展自定义 | 进程内 `SessionAllow` + 落配置 | 项目级 DB，粒度=命令前缀 |
+| 拒绝语义 | 文本塞回 tool result | `Verdict.Reason` 喂模型 | `CorrectedError` 继续 / `DeclinedError` 终止 |
+| 无人值守 | 不阻塞 | `Approver=nil` → 允许 | `Unattended` → deny |
+| 只读姿态 | 无 | `ReadOnly` 硬拒写；bash 可动态升降级 | 无独立姿态 |
+
+**对 lite 的启示**：`lua/core/approval.lua` 现在是 `decide(tool)`，**只有工具名没有参数**，
+「允许 bash」等于放行所有 bash 命令。三家一致的解法是**把审批键扩成「动作 + 目标」**：
+
+- `decide(tool, args)`，对 `bash` 取命令前缀作为 subject（对齐 opencode 的 `save`）
+- `allow[tool]` → `allow[rule]`，写成 `bash(git status *)`（对齐 Reasonix 的 permrule）
+- 保持「deny 优先 + 无匹配回落 mode」，不要引入 opencode 的 `findLast` 覆盖语义
+
 ---
 
 ## 6. 证据分级
