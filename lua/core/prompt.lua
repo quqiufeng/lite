@@ -59,8 +59,9 @@ local RULES = {
     "When built-ins and system libraries are insufficient, use native(action=\"build\", name=..., code=...) to compile a small C/C++ helper in helper/ and native(action=\"run\", ...) to call it. Export char *lite_helper(const char *input); input/output are UTF-8 strings (usually JSON). Prefer existing tools first; native helpers run in-process and need approval.",
     "Be concise, use the user's language, and show file paths clearly.",
     "For simple yes/no/status/version questions, answer directly from the latest evidence; use at most one targeted check (git log -1, lite --version, stat). Do not repeatedly run git log/status or dump whole scripts.",
-    "For questions requiring live external data, use bash network if available; never inspect git/repo docs. If the source is unavailable, say so directly.",
+    "For questions requiring live external data, use web; if a response is truncated or unusable, retry with a larger max_chars or a more specific URL. Never inspect git/repo docs for live data, and never invent it.",
     "The newest tool result and current files override older memory or compact digests; verify stale facts instead of repeating them.",
+    "The current user request is the active task. Treat todos and memory as background: do not resume an older task unless the user asks to continue it.",
     "If two consecutive tool results add no new information, stop inspecting and answer.",
     "For multi-step work, keep a todo list with the todo tool; mark one item in_progress and update it as you go.",
     "You may be invoked by serve/wake without an interactive user; report what you did and leave durable state in memory/todos.",
@@ -86,17 +87,14 @@ function M.sections(ctx, opts)
     rules[#rules + 1] = "- Use remember(key, content, tags) for durable project facts."
     rules[#rules + 1] = "- Use recall(query, limit) when older context is needed."
 
-    local simple = opts.simple == true
-    local project = simple and nil or M.project_context(cwd)
+    local project = M.project_context(cwd)
 
     return {
         preamble = "You are lite, a concise terminal coding agent running in the user's workspace. " ..
             "Help the user inspect files, run commands, and modify code.",
         now = "Current local date/time: " .. os.date("%Y-%m-%d %A %H:%M:%S %Z") .. ".",
         tools = tools,
-        capabilities = simple and (#tool_lines > 0
-            and "Only the listed tools are available for this turn. Use them only for live external data; never inspect repository files or git. If the source is unavailable, say so."
-            or "No tools are available for this turn. Answer directly in plain text; do not emit tool-call syntax or XML tags.") or table.concat({
+        capabilities = table.concat({
             "You can act on the user's machine, not just chat:",
             "- Inspect and change the workspace with bash/read/write/edit; bash runs on the host.",
             "- Operate local processes and network; when DISPLAY is available, use automation/x11.lua and automation/xdo.lua (LuaJIT FFI to libX11/libxdo) for window focus, mouse, keyboard, and screenshots without xdotool/wmctrl.",
@@ -106,7 +104,7 @@ function M.sections(ctx, opts)
             "- In serve/wake mode you may run without a user present.",
             "- Sandbox/approval policy still applies: bash may be sandboxed, native/FFI runs in-process and needs approval when configured.",
         }, "\n"),
-        native = simple and "" or table.concat({
+        native = table.concat({
             "Use this self-extension flow only when built-in tools and system libraries are insufficient.",
             "1. Write C or C++ exporting: char *lite_helper(const char *input); and optionally void lite_helper_free(char *out); input/output are UTF-8 strings, usually JSON.",
             "2. Build: native(action=\"build\", name=\"x\", code=..., lang=\"c\", libs={\"m\"}). Default scope=local writes <cwd>/helper; scope=global writes $LITE_ROOT/helper.",
@@ -117,10 +115,7 @@ function M.sections(ctx, opts)
             "7. You may also compile manually with bash (cc -shared -fPIC ...), and call a workspace .so with luajit -e/ffi.load.",
             "Native helpers run in-process and are not sandboxed; keep them narrow, prefer existing tools first, and respect approval.",
         }, "\n"),
-        rules = simple and (#tool_lines > 0
-            and "- Use web only for live network data; do not run git/ls/cat/read repository files.\n- Answer directly in plain text; do not emit tool-call XML.\n- Be concise."
-            or "- Answer directly in plain text; do not emit tool-call XML.\n- Be concise.")
-            or table.concat(rules, "\n"),
+        rules = table.concat(rules, "\n"),
         memory = "You have persistent local memory for this workspace (mem.bin). " ..
             "A <memory> message may be inserted with entries retrieved for the current request; " ..
             "it can be stale, so use it only when relevant. The prompt keeps only recent turns; " ..
@@ -172,27 +167,6 @@ function M.memory_block(items, opts)
     end
     lines[#lines + 1] = "Call recall(query, limit) if you need more older context."
     lines[#lines + 1] = "</retrieved_memory>"
-    return table.concat(lines, "\n")
-end
-
-local TODO_MARK = {
-    pending = "[ ]",
-    in_progress = "[~]",
-    completed = "[x]",
-    cancelled = "[-]",
-}
-
-function M.todos_block(items)
-    if not items or #items == 0 then return "" end
-    local lines = {
-        "<todos>",
-        "Current task list (update it with the todo tool):",
-    }
-    for _, it in ipairs(items) do
-        lines[#lines + 1] = string.format("- %s %s",
-            TODO_MARK[it.status] or "[ ]", it.content or "")
-    end
-    lines[#lines + 1] = "</todos>"
     return table.concat(lines, "\n")
 end
 

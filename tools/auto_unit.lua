@@ -131,6 +131,20 @@ do
     check(sp:find("<memory>", 1, true) ~= nil, "prompt memory policy")
     check(sp:find("<cwd>", 1, true) ~= nil and sp:find("/tmp", 1, true) ~= nil, "prompt cwd")
 
+    local idir = os.tmpname()
+    os.remove(idir)
+    os.execute("mkdir -p " .. shq(idir))
+    local ifile = assert(io.open(idir .. "/AGENTS.md", "w"))
+    ifile:write("PROJECT-MARKER\n")
+    ifile:close()
+    local ictx = Context.new({ cwd = idir, model = "m" })
+    local full_sp = Prompt.system_prompt(ictx, { tools = tools })
+    check(full_sp:find("PROJECT-MARKER", 1, true) ~= nil,
+        "prompt includes project instructions")
+    check(full_sp:find("current user request is the active task", 1, true) ~= nil,
+        "prompt gives the current request priority")
+    os.execute("rm -rf " .. shq(idir))
+
     local items = { { key = "/agent/knowledge/x", text = "LITE-42", score = 1 } }
     local block = Prompt.memory_block(items, { max_chars = 300 })
     check(block:find("LITE-42", 1, true) ~= nil, "prompt memory item")
@@ -143,14 +157,6 @@ do
     }
     local q = Prompt.recall_query("what", msgs)
     check(q:find("previous question", 1, true) ~= nil, "prompt recall query")
-
-    local tb = Prompt.todos_block({
-        { content = "a", status = "pending" },
-        { content = "b", status = "completed" },
-    })
-    check(tb:find("<todos>", 1, true) ~= nil
-        and tb:find("[x] b", 1, true) ~= nil
-        and tb:find("[ ] a", 1, true) ~= nil, "prompt todos block")
 end
 
 -- tools
@@ -555,17 +561,7 @@ do
     check(calls == 2, "agent loop count")
 end
 
--- 简单问题识别：短问题优先，不按天气等主题枚举
-do
-    local A = require("core.agent")
-    check(A.is_simple_question("明天杭州天气如何"), "simple question weather")
-    check(A.is_simple_question("你查一下杭州这三天的天气"), "simple question lookup")
-    check(A.is_simple_question("现在是什么版本 做了什么修改"), "simple question status")
-    check(not A.is_simple_question("修改 lua/tui/loop.lua 的鼠标逻辑"), "task with code not simple")
-    check(not A.is_simple_question("实现一个天气查询工具，改 tools.lua"), "task with verbs not simple")
-end
-
--- 旧会话 system prompt 必须刷新；简单状态问题限制工具轮
+-- 旧会话 system prompt 必须刷新；统一 loop 不按问题文本切工具
 do
     local Context = require("context")
     local Agent = require("core.agent")
@@ -583,44 +579,22 @@ do
         "system prompt refresh content")
     check(appends == 0, "system prompt refresh does not duplicate")
 
-    local ctx2 = Context.new({ cwd = "/tmp", max_turns = 10 })
-    local n2, final2, captured2 = 0, nil, nil
-    local provider = {
-        stream = function(msgs, ts)
-            captured2 = msgs
-            n2 = n2 + 1
-            final2 = "是最新版本"
-            return { role = "assistant", content = final2 }
-        end,
-    }
-    local flat = { schemas = function() return {} end, execute = function() return "same" end }
-    local a2 = Agent.new(ctx2, provider, flat, { append = function() end, save = function() end })
-    local ans, err = a2:run("当前是最新版本吗")
-    check(err == nil and ans == final2, "simple question answer")
-    check(n2 == 1, "simple question tool budget")
-    local no_repo_tools = true
-    for _, m in ipairs(captured2 or {}) do
-        if m.role == "system" and tostring(m.content):find("- bash:", 1, true) then
-            no_repo_tools = false
-        end
-    end
-    check(no_repo_tools, "simple question prompt has no repo tools")
-    check(#captured2 == 2 and captured2[1].role == "system" and captured2[2].role == "user",
-        "simple question is isolated system+user")
-
     local ctx3 = Context.new({ cwd = "/tmp", max_turns = 10 })
+    ctx3.session.todos = {
+        { content = "STALE-DOC-TASK", status = "in_progress" },
+    }
     local n3, final3 = 0, nil
     local captured3
     local provider3 = {
         stream = function(msgs, ts)
             captured3 = msgs
             n3 = n3 + 1
-            if n3 == 1 then
+            if n3 <= 2 then
                 check(ts and #ts == 1 and ts[1]["function"].name == "web", "weather web tool exposed")
                 return {
                     role = "assistant", content = "",
                     tool_calls = { { id = "w" .. n3, type = "function",
-                        ["function"] = { name = "web", arguments = '{"url":"https://wttr.in/Hangzhou?format=j1"}' } } },
+                        ["function"] = { name = "web", arguments = '{"url":"https://wttr.in/Hangzhou?format=j1","max_chars":' .. tostring(n3 * 10000) .. '}' } } },
                 }
             end
             final3 = "杭州明天有雨"
@@ -636,10 +610,16 @@ do
     local a3 = Agent.new(ctx3, provider3, web_tools, { append = function() end, save = function() end })
     local ans3, err3 = a3:run("明天杭州天气如何")
     check(err3 == nil and ans3 == final3, "weather question answer")
-    check(n3 == 2, "weather question uses web then answer")
-    local saw_tool = false
-    for _, m in ipairs(captured3 or {}) do if m.role == "tool" then saw_tool = true end end
+    check(n3 == 3, "weather question can retry web then answer")
+    local saw_tool, saw_stale_todo = false, false
+    for _, m in ipairs(captured3 or {}) do
+        if m.role == "tool" then saw_tool = true end
+        if type(m.content) == "string" and m.content:find("STALE-DOC-TASK", 1, true) then
+            saw_stale_todo = true
+        end
+    end
     check(saw_tool, "weather tool result returned to model")
+    check(not saw_stale_todo, "stale todo is not injected into the prompt")
 end
 
 -- 循环被迫结束：收尾请求（不带 tools）+ 重复调用熔断
@@ -774,7 +754,7 @@ do
         if info.reason:find("repeated", 1, true) then check(false, "distinct calls must not trip breaker") end
     end)
     local agent3 = Agent.new(ctx3, provider3, tools, { append = function() end, save = function() end })
-    agent3:run("go")
+    agent3:run("修改 lua/core/agent.lua 的代码")
     check(n3 == 7 and ev3 == 1, "distinct calls run to turn limit")
 end
 
@@ -1635,7 +1615,7 @@ do
         tick = function() end,
     }
     local agent = Agent.new(ctx, provider, tools, session, memory)
-    local text, err = agent:run("hi")
+    local text, err = agent:run("修改 lua/core/agent.lua 的代码")
     check(err == nil and text == "ok", "agent memory answer")
     check(remembered, "agent remember turn")
 
@@ -1865,7 +1845,7 @@ do
     local toolset = { schemas = function() return {} end, execute = function() end }
     local session = { append = function() end }
     local agent = Agent.new(ctx, provider, toolset, session, mem)
-    local _, err = agent:run("latest question")
+    local _, err = agent:run("修改 lua/core/agent.lua 的代码")
     check(err == nil, "compact run")
 
     -- 摘要用的是结构化小标题提示词，且**不带 tools**（省 schema token）
@@ -2087,7 +2067,7 @@ do
         tick = function() end,
     }
     local agent = Agent.new(ctx, provider, toolset, { append = function() end }, memory)
-    agent:run("do it")
+    agent:run("修改 lua/core/agent.lua 的代码")
 
     check(#snaps >= 2, "prefix stability: two requests captured")
     local a, b = snaps[1], snaps[2]
@@ -2129,17 +2109,15 @@ do
     local tools = { schemas = function() return {} end, execute = function() end }
     local session = { append = function() end }
     local agent = Agent.new(ctx, provider, tools, session)
-    agent:run("hi")
+    agent:run("修改 lua/core/agent.lua 的代码")
 
-    local found = false
+    local injected = false
     for _, m in ipairs(captured or {}) do
-        if m.role == "system"
-            and tostring(m.content):find("<todos>", 1, true)
-            and tostring(m.content):find("ship it", 1, true) then
-            found = true
+        if type(m.content) == "string" and m.content:find("ship it", 1, true) then
+            injected = true
         end
     end
-    check(found, "agent todos injected")
+    check(not injected, "agent todos are not injected into the prompt")
 end
 
 -- agent + real KV memory injection

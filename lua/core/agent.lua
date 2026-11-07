@@ -26,16 +26,15 @@ function M.new(ctx, provider, tools, session, memory)
     return self
 end
 
-function M:system_prompt(active_tools, simple)
+function M:system_prompt(active_tools)
     return self.prompt.system_prompt(self.ctx, {
         tools = active_tools or self.tools:schemas(),
-        simple = simple,
     })
 end
 
-function M:ensure_system(active_tools, simple)
+function M:ensure_system(active_tools)
     local msgs = self.ctx.session.messages
-    local prompt = self:system_prompt(active_tools, simple)
+    local prompt = self:system_prompt(active_tools)
     local changed = false
     if #msgs == 0 or msgs[1].role ~= "system" then
         local msg = { role = "system", content = prompt }
@@ -52,7 +51,6 @@ function M:ensure_system(active_tools, simple)
         self.ctx.settings.debug:log("system_prompt", {
             content = prompt,
             bytes = #prompt,
-            simple = simple == true,
             tools = active_tools and #active_tools or 0,
         })
     end
@@ -161,18 +159,8 @@ end
 
 -- 真正发给模型的视图：system + [摘要块] + baseline 之后的原文。
 -- 摘要块位置固定（紧跟 system），所以两轮之间前缀稳定，缓存能命中。
-function M:view_messages(simple)
+function M:view_messages()
     local all = self.ctx.session.messages
-    if simple then
-        -- 独立短问题：system + 当前 user 起的本轮消息（含刚执行的 tool 结果），
-        -- 不携带旧历史/compact/todo。
-        local start = #all
-        while start > 1 and all[start].role ~= "user" do start = start - 1 end
-        local out = {}
-        if all[1] and all[1].role == "system" then out[1] = all[1] end
-        for i = start, #all do out[#out + 1] = all[i] end
-        return out
-    end
     local st = self:compact_state()
     local out = {}
     if all[1] and all[1].role == "system" then out[1] = all[1] end
@@ -350,17 +338,15 @@ function M:hard_window(msgs, budget)
     return out, true, dropped
 end
 
--- 组装发出去的完整消息列表：视图 + 召回块 + todo 块。
+-- 组装发出去的完整消息列表：视图 + 召回块。
 --
--- opts.inject_context：每个用户轮**只在第一次请求**注入这两个块，工具循环的后续请求不注入
+-- opts.inject_context：每个用户轮**只在第一次请求**注入召回块，工具循环的后续请求不注入
 -- （模型早已见过，重复注入既打断前缀缓存又白花 token）。
--- 两个块**追加到最末尾**而不是插在会话中间 —— 原因与实测见下面 "追加到最末尾" 那段注释
--- 以及 design.md §8.31。
+-- 召回块**追加到最末尾**而不是插在会话中间 —— 原因与实测见下面 "追加到最末尾" 那段注释
+-- 以及 design.md §8.31。todo 是工具状态，不自动注入 prompt。
 function M:request_messages(text, stream, opts)
     opts = opts or {}
-    local simple = opts.simple == true
-    -- 短问题是独立 side question：不注入召回、todo、compact 或旧历史。
-    local inject = opts.inject_context ~= false and not simple
+    local inject = opts.inject_context ~= false
     local block = ""
     if inject and self.memory then
         local query = self.prompt.recall_query(text, self.ctx.session.messages)
@@ -373,14 +359,9 @@ function M:request_messages(text, stream, opts)
         self.ctx:emit("memory", items or {})
     end
 
-    local todo_block = inject and self.prompt.todos_block(self.ctx.session.todos) or ""
-    local reserve = #block + #todo_block + 200
-
-    -- 独立短问题不压、不带历史；否则走正常低频压缩。
-    if not simple then
-        self:maybe_compact(stream, reserve, opts.force_compact)
-    end
-    local msgs = self:view_messages(simple)
+    local reserve = #block + 200
+    self:maybe_compact(stream, reserve, opts.force_compact)
+    local msgs = self:view_messages()
 
     local c = self:compactor()
     local used = Compact.total(msgs) + reserve
@@ -395,7 +376,7 @@ function M:request_messages(text, stream, opts)
         end
     end
 
-    if block == "" and todo_block == "" then
+    if block == "" then
         -- 没有额外块时请求就是这个规模，直接记下来校准。
         self._last_request_chars = Compact.total(msgs)
         return msgs
@@ -403,18 +384,14 @@ function M:request_messages(text, stream, opts)
 
     -- 追加到**最末尾**，不要插在中间。
     --
-    -- 这些块每轮内容都不同（召回结果随 query 变、todo 随进度变）。插在会话中间
-    -- 会把后面所有消息整体位移，DeepSeek 的前缀缓存从插入点往后全部失效。
-    -- 实测（真实 API，同一底座）：插在最后一条 user 之前，下一轮命中 71%；
-    -- 追加到末尾，同一轮命中 97% —— 差的就是被位移的那段历史。
-    -- 末尾放 system 消息 DeepSeek 接受（已验证）。
+    -- 召回内容每轮不同（随 query 变）。插在会话中间会把后面所有消息整体位移，
+    -- DeepSeek 的前缀缓存从插入点往后全部失效。实测（真实 API，同一底座）：
+    -- 插在最后一条 user 之前，下一轮命中 71%；追加到末尾，同一轮命中 97% ——
+    -- 差的就是被位移的那段历史。末尾放 system 消息 DeepSeek 接受（已验证）。
     local out = {}
     for i = 1, #msgs do out[#out + 1] = msgs[i] end
     if block ~= "" then
         out[#out + 1] = { role = "system", content = block }
-    end
-    if todo_block ~= "" then
-        out[#out + 1] = { role = "system", content = todo_block }
     end
     -- 本次真正发出去的规模，供下一轮用真实 usage 反推 chars→tokens。
     self._last_request_chars = Compact.total(out)
@@ -448,6 +425,7 @@ local STOP_NOTE = table.concat({
     "<session_context>",
     "工具循环已停止：%s。现在没有可用工具，不要再请求工具调用。",
     "用户原问题：%s",
+    "先检查上下文中已有的 tool 结果；能用就用最新结果，只有确实没有可用数据时才说无法回答。",
     "直接回答这个问题，先给结论（是/否/状态/版本），不要复述历史：",
     "1) 结论；",
     "2) 只列必要的一两条证据；",
@@ -498,56 +476,11 @@ function M:_finalize(stream, why)
     return answer
 end
 
-M.SIMPLE_TURNS = 2
-
--- 状态/版本/是否类短问题：不要让模型把一次确认变成安装审计。
--- 只做粗粒度识别，明显是开发任务的句子不命中。
--- 通用判断：短问题、且没有代码/仓库上下文，就不要把工具循环开到底。
--- 不按“天气/新闻”等主题枚举；具体该查网络还是回答“不知道”由 prompt 约束。
-local TASK_VERBS = { "改", "修", "实现", "升级", "安装", "编译", "打包", "运行", "写", "删", "添加" }
-local CODEISH = {
-    "代码", "文件", "目录", "仓库", "git", "commit", "测试", "编译", "安装",
-    "报错", "错误", "bug", "log", "code", "函数", "模块", "接口", "日志", "修复",
-}
-local function is_simple_question(text)
-    text = tostring(text or ""):gsub("%s+", " "):sub(1, 200)
-    if #text > 80 or text:find("\n") then return false end
-    for _, v in ipairs(TASK_VERBS) do
-        if text:sub(1, #v) == v then return false end
-    end
-    for _, w in ipairs(CODEISH) do
-        if text:find(w, 1, true) then return false end
-    end
-    return text:find("?", 1, true) ~= nil or text:find("？", 1, true) ~= nil
-        or text:find("如何", 1, true) ~= nil or text:find("怎么", 1, true) ~= nil
-        or text:find("什么", 1, true) ~= nil or text:find("为什么", 1, true) ~= nil
-        or text:find("吗", 1, true) ~= nil or text:find("是否", 1, true) ~= nil
-        or text:find("几", 1, true) ~= nil or text:find("多少", 1, true) ~= nil
-        or text:find("最新", 1, true) ~= nil or text:find("版本", 1, true) ~= nil
-        or text:find("当前", 1, true) ~= nil
-        -- 短请求句：查一下/搜一下/看看/告诉我；代码/仓库词已在上面排除。
-        or text:find("查", 1, true) ~= nil
-        or text:find("搜", 1, true) ~= nil
-        or text:find("看看", 1, true) ~= nil
-        or text:find("告诉我", 1, true) ~= nil
-end
-
-M.is_simple_question = is_simple_question
-
 function M:_loop(text, stream)
     local ctx = self.ctx
     self._text = text
-    local simple_question = is_simple_question(text)
     local request_tools = self.tools:schemas()
-    if simple_question then
-        local only = {}
-        for _, schema in ipairs(request_tools) do
-            local fn = schema["function"] or {}
-            if fn.name == "web" then only[#only + 1] = schema end
-        end
-        request_tools = only
-    end
-    self:ensure_system(request_tools, simple_question)
+    self:ensure_system(request_tools)
 
     local user = { role = "user", content = text }
     ctx:add_message(user)
@@ -558,14 +491,12 @@ function M:_loop(text, stream)
     local result_counts, repeated_result = {}, 0
     local overflow_retried = false
     local max_turns = ctx.settings.max_turns
-    if simple_question then max_turns = 2 end
     local token_budget = tonumber(ctx.settings.token_budget) or 0
 
     local function request_stream(inject, force)
         local req = self:request_messages(text, stream, {
             inject_context = inject,
             force_compact = force,
-            simple = simple_question,
         })
         -- outputLimit：让 provider 知道本轮输入大概占了多少 token。
         ctx.settings.input_tokens = self:estimate_tokens(Compact.total(req))
@@ -602,7 +533,6 @@ function M:_loop(text, stream)
             if compacted then
                 retry_msgs = self:request_messages(text, stream, {
                     inject_context = (iter == 1),
-                    simple = simple_question,
                 })
             else
                 local c = self:compactor()
@@ -635,16 +565,8 @@ function M:_loop(text, stream)
         local calls = assistant.tool_calls
         if not calls or #calls == 0 then
             local answer = assistant.content or ""
-            if simple_question and (answer:find("DSML", 1, true)
-                or answer:find("<|", 1, true) or answer:find("<｜｜", 1, true)) then
-                -- 没有 tools 时模型有时会吐原始 tool-call XML；绝不能展示给用户。
-                answer = "（当前没有可用工具，无法获取实时信息。）"
-                assistant.content = answer
-            end
             if answer:match("^%s*$") then
-                answer = simple_question
-                    and "（这是一个简短问题，但我无法从当前上下文确认答案。）"
-                    or "（模型没有返回内容。）"
+                answer = "（模型没有返回内容。）"
                 assistant.content = answer
             end
             if self.memory then

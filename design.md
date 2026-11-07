@@ -712,9 +712,9 @@ lite 实现：
 
 - `context.lua`：`session.todos`；`core/todos.lua` 负责 normalize/校验（`pending / in_progress / completed / cancelled`，最多 50 条）。
 - `todo` 工具：一次提交完整列表；更新 `ctx.session.todos`，emit `todos`，并持久化到 `/agent/working/todos`（TTL long）。
-- Prompt：`<todos>` 块注入最近 user 之前；规则要求多步任务维护 todo。
+- Prompt：todo 是工具/主机状态，不自动注入；当前 user 请求优先，旧任务不能借 todo 劫持本轮。
 - TUI：状态栏 `todo:done/total`，`Ctrl+T` 全屏列表；serve 广播 `todos`，attach 同步显示。
-- 测试：normalize/持久化/tool/prompt 注入/状态栏/TodoView；tmux TUI 与 serve/attach 冒烟均断言 `todo:1/2` 和列表内容。
+- 测试：normalize/持久化/tool/状态栏/TodoView，以及旧 todo 不进入 prompt 的回归；tmux TUI 与 serve/attach 冒烟均断言 `todo:1/2` 和列表内容。
 
 ### 8.16 定时唤醒（已实现）
 
