@@ -290,7 +290,7 @@ function M:schemas()
             type = "function",
             ["function"] = {
                 name = "lua",
-                description = "Run a Lua snippet out-of-process (tools/lite-lua -e, 30s timeout). "
+                description = "Run a Lua snippet out-of-process (tools/lua.sh -e, 30s timeout). "
                     .. "The snippet sees `args` (JSON `input`, if given) and can return a value "
                     .. "(tables are JSON-encoded). LuaJIT FFI and bundled cjson are available. "
                     .. "Use it for one-off logic, FFI probing, or data munging without writing files.",
@@ -1287,7 +1287,7 @@ function M:native(action, name, code, lang, libs, input, lua_code, description, 
     return "error: action must be build, run, wrap, remove, or list"
 end
 
--- lua 工具：进程外跑一段 LuaJIT（tools/lite-lua -e），参数以 JSON 走环境变量。
+-- lua 工具：进程外跑一段 LuaJIT（tools/lua.sh -e），参数以 JSON 走环境变量。
 -- 刻意不做进程内 loadstring：死循环会卡住 agent，崩溃会带崩主进程。
 local LUA_TOOL_ADAPTER = [=[
 local okj, cjson = pcall(require, "cjson")
@@ -1310,11 +1310,11 @@ if res ~= nil then io.write(tostring(res)) end
 os.exit(0)
 ]=]
 
-local function lite_lua_bin(cwd)
+local function lua_plugin_bin(cwd)
     local cands = {}
     local root = lite_root_dir()
-    if root then cands[#cands + 1] = root .. "/tools/lite-lua" end
-    cands[#cands + 1] = (normalize(cwd or "."):gsub("/+$", "")) .. "/tools/lite-lua"
+    if root then cands[#cands + 1] = root .. "/tools/lua.sh" end
+    cands[#cands + 1] = (normalize(cwd or "."):gsub("/+$", "")) .. "/tools/lua.sh"
     for _, p in ipairs(cands) do
         local f = io.open(p, "r")
         if f then
@@ -1329,8 +1329,8 @@ function M:lua(args)
     args = args or {}
     local code = tostring(args.code or "")
     if code == "" then return "error: code is required" end
-    local bin = lite_lua_bin(self.cwd)
-    if not bin then return "error: tools/lite-lua not found (set LITE_ROOT)" end
+    local bin = lua_plugin_bin(self.cwd)
+    if not bin then return "error: tools/lua.sh not found (set LITE_ROOT)" end
     local req = { code = code }
     if args.input ~= nil then req.input = args.input end
     local ok, payload = pcall(cjson.encode, req)
@@ -1338,7 +1338,11 @@ function M:lua(args)
     local timeout = math.floor(tonumber(args.timeout) or 30)
     if timeout < 1 then timeout = 1 end
     if timeout > 120 then timeout = 120 end
-    local cmd = "timeout " .. tostring(timeout) .. " env LITE_LUA_ARGS=" .. shq(payload)
+    -- tools/lua.sh 会 cd 到 LITE_CWD：插件脚本按相对路径找模块/数据文件，
+    -- 而不是跟着 agent 进程的 cwd（TUI 里通常是仓库根）跑。
+    local root = self.real_root or self.cwd or "."
+    local cmd = "LITE_CWD=" .. shq(root) .. " timeout " .. tostring(timeout)
+        .. " env LITE_LUA_ARGS=" .. shq(payload)
         .. " " .. shq(bin) .. " -e " .. shq(LUA_TOOL_ADAPTER)
     -- LuaJIT 的 popen:close() 只返回 true，拿不到退出码，所以让 shell 回显 rc。
     local proc = io.popen("sh -c " .. shq(cmd .. '; echo "__lite_rc=$?"') .. " 2>&1")

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# 带 LUA_PATH / LUA_CPATH 的 LuaJIT 包装。
+# 仓库内部用的 LuaJIT 包装（run.sh / test.sh / check_deps.sh / 各 tools/*.lua）。
+# 只暴露项目自身的模块与 .so 路径，不带任何 workspace 状态；
+# 插件和外部脚本走 tools/lua.sh（那边才注入 cwd 与预加载）。
 set -euo pipefail
 
 SELF="$(readlink -f "$0")"
@@ -21,7 +23,17 @@ export LITE_ROOT="$ROOT"
 # 让依赖系统 onnxruntime 的工具静默失败。
 # 自带 .so 一律靠 $ORIGIN RUNPATH 定位同目录依赖；例外由 FFI 层按绝对路径
 # ffi.load 预加载（见 lua/ffi/ocr.lua 的 load_ort）。
-export LUA_PATH="$ROOT/lua/?.lua;$ROOT/lua/?/init.lua;$ROOT/automation/?.lua;;${LUA_PATH:-}"
-export LUA_CPATH="$ROOT/third_party/cjson/lua/5.1/?.so;;${LUA_CPATH:-}"
+#
+# LUA_PATH / LUA_CPATH：项目路径在前，`;;` 展开默认路径，外部传入的追加在最后
+# （tools/lua.sh 就是靠这一点把 workspace 条目挂上来的）。
+export LUA_PATH="$ROOT/lua/?.lua;$ROOT/lua/?/init.lua;$ROOT/automation/?.lua;$ROOT/helper/?.lua;;${LUA_PATH:-}"
+export LUA_CPATH="$ROOT/third_party/cjson/lua/5.1/?.so;$ROOT/build/?.so;$ROOT/lib/?.so;$ROOT/helper/?.so;;${LUA_CPATH:-}"
 
-exec "$LUA" "$@"
+# 预加载只做「把调用方给的绝对路径列表 dlopen 成 RTLD_GLOBAL」，
+# 列表本身由 tools/lua.sh 计算；这里没有 workspace 概念的副作用。
+PRELUDE='local f = require("ffi") local l = os.getenv("LITE_PRELOAD") if l and l ~= "" then for p in l:gmatch("[^:]+") do pcall(f.load, p, true) end end'
+case "${1:-}" in
+    -v|--version|-h|--help|-b) exec "$LUA" "$@" ;;
+esac
+
+exec "$LUA" -e "$PRELUDE" "$@"

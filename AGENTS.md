@@ -87,8 +87,10 @@ wrapper 返回 `{ run=function(args,env) ... end }`；重新 build 生成新 `.s
 （`.tool.json` 写法仍可用、优先）。schema 只在会话启动扫一次并记忆化，之后每轮
 `schemas()` 用快照 —— 运行时新建/删除 `.lua` 不影响工具列表（避免打掉前缀缓存），
 但可按名调用，重启后进列表。运行时要试新代码走 `lua` 工具（进程外
-`tools/lite-lua -e`，`args` 走 `LITE_LUA_ARGS` JSON，默认 30s 超时，审批同 `bash`），
-**这是唯一动态出口**；改 C `.so` 或插件要生效都得重启。
+`tools/lua.sh -e`，`args` 走 `LITE_LUA_ARGS` JSON，默认 30s 超时，审批同 `bash`），
+**这是唯一动态出口**；改 C `.so` 或插件要生效都得重启。入口分两个：`tools/lua.sh`
+给插件/脚本（`LITE_CWD`、workspace `?.lua`/`?.so`、预加载 `liblite_*.so`），
+`tools/lite-lua` 给仓库内部脚本（干净，不继承 workspace 状态）。
 
 ## 7 参考实现（新功能先查）
 

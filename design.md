@@ -1126,11 +1126,17 @@ UI 侧按 `AGENTS.md` §4 的铁律用 `tmux capture-pane` 或 `--tui --snapshot
 1. **会话开始**：`_scan_helper_schemas()` 扫一眼 `<workspace>/helper` → `$LITE_ROOT/helper`，
    把 `schema` / `run` / `hooks` 一次读进内存，`_helper_cache` 惰性记忆化。
    之后每轮 `schemas()` 直接返回快照，**不再 `ls` fork**。
-2. **运行时试新东西**：走 `lua` 工具 → `tools/lite-lua -e <adapter>`（进程外，参数走
+2. **运行时试新东西**：走 `lua` 工具 → `tools/lua.sh -e <adapter>`（进程外，参数走
    `LITE_LUA_ARGS` 的 JSON → 片段里的 `args`，`timeout` 默认 30s 可到 120s）。
    它**不进工具列表**，所以改代码不会打掉前缀缓存；审批同 `bash`。
 3. **改了 C `.so` 或 `helper/*.lua`**：重启（`/reload` 只重载 `core.tools` /
    `core.prompt` / `ffi.*`，**保留 helper 快照**）。
+
+**两个入口** —— `tools/lua.sh` 给插件/脚本用：`cd` 到 `LITE_CWD`（默认 `$PWD`），把
+workspace 的 `?.lua` / `?.so` 前置进 `package.path`/`cpath`，并扫 `build`/`lib`/`helper`
+下的 `liblite_*.so` 塞进 `LITE_PRELOAD` 预加载；`tools/lite-lua` 只给仓库内部
+（`run.sh`/`test.sh`/`check_deps.sh`）用：只认仓库自己的 `lua/`、`automation/`、`helper/`
+和 cjson，不继承任何 workspace 状态 —— 否则在别人仓库里跑 lite 会把对方的 `.so` 拉进来。
 
 **为什么不做热插拔** —— schema 是 system prompt 之后的第一段，任何动态插入/
 删除都会让 DeepSeek 前缀缓存整段失效（§8.31 同一个坑）。而"改完立刻生效"的需求，
@@ -1145,8 +1151,10 @@ UI 侧按 `AGENTS.md` §4 的铁律用 `tmux capture-pane` 或 `--tui --snapshot
 
 **验收** —— `tools/auto_unit.lua` 的 helper 快照块（`.tool.json` / 内嵌 schema 均被发现、
 删文件后快照仍在、新增文件被忽略但可按名调用、新 session 重新扫描、坏插件报错）与
-`lua` 工具块（返回值 / `args` / 中文 / table→JSON / 运行错 / 语法错 / 超时）。
+`lua` 工具块（返回值 / `args` / 中文 / table→JSON / 运行错 / 语法错 / 超时）与
+`tools/lua.sh` 块（可执行 / 从 cwd 解析 workspace 模块 / 尊重 `LITE_CWD` / 预加载
+bundled `.so` / `tools/lite-lua` 保持干净）。
 
-**当前回归** —— `./tools/test.sh`：单元 571 项 + `cli.json` / `tui.smoke` /
+**当前回归** —— `./tools/test.sh`：单元 579 项 + `cli.json` / `tui.smoke` /
 `serve.probe` / `serve.smoke` 全通过（`[verified]` 2026-11-07）。§8.30 / §8.33 里的
 "385 项"/"424 项"是各自落地时的历史数字，不再逐节回填。

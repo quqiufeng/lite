@@ -1688,6 +1688,11 @@ do
     local dir = os.tmpname()
     os.remove(dir)
     os.execute("mkdir -p " .. shq(dir))
+    local function put(path, data)
+        local f = assert(io.open(path, "wb"))
+        f:write(data)
+        f:close()
+    end
     local Tools = require("core.tools")
     local t = Tools.new({ cwd = dir })
 
@@ -1709,6 +1714,49 @@ do
     check(t:execute("lua", { code = "return require('core.tools') ~= nil" }) == "true",
         "lua tool sees lua/ package path")
     check(t:execute("lua", {}):find("code", 1, true) ~= nil, "lua tool requires code")
+
+    -- 插件脚本要在自己的 workspace 里找模块/当前目录，而不是 agent 进程的 cwd
+    put(dir .. "/wsmod.lua", "return { v = 5 }")
+    check(t:execute("lua", { code = 'return require("wsmod").v' }) == "5",
+        "lua tool resolves workspace module")
+    put(dir .. "/marker.txt", "hi")
+    check(t:execute("lua", {
+        code = 'local f = io.open("marker.txt"); if f then f:close(); return "found" end return "missing"',
+    }) == "found", "lua tool runs in workspace cwd")
+
+    -- 项目自带 .so：裸名 ffi.load 要能从任意 cwd 命中（LITE_PRELOAD 预加载）
+    local lroot = os.getenv("LITE_ROOT") or ""
+    local img = io.open(lroot .. "/build/liblite_image.so", "rb")
+    if img then
+        img:close()
+        check(t:execute("lua", {
+            code = 'local ffi = require("ffi"); local ok = pcall(ffi.load, "liblite_image.so"); return ok and "ok" or "fail"',
+        }) == "ok", "lua tool bare ffi.load of bundled so")
+    end
+
+    -- tools/lua.sh：插件/脚本专用入口，把 LITE_CWD（缺省 $PWD）当搜索根
+    local lua_sh = lroot .. "/tools/lua.sh"
+    local fsh = lroot ~= "" and io.open(lua_sh) or nil
+    check(fsh ~= nil, "tools/lua.sh exists")
+    if fsh then fsh:close() end
+    local function shrun(cmd)
+        local h = io.popen(cmd .. " 2>&1")
+        local text = h and h:read("*a") or ""
+        if h then h:close() end
+        return (text:gsub("%s+$", ""))
+    end
+    check(shrun("cd " .. shq(dir) .. " && " .. shq(lua_sh) .. " -e " .. shq('print(require("wsmod").v)')) == "5",
+        "lua.sh resolves workspace module from cwd")
+    check(shrun("cd / && LITE_CWD=" .. shq(dir) .. " " .. shq(lua_sh)
+        .. " -e " .. shq('local f = io.open("marker.txt"); if f then f:close(); print("found") else print("missing") end'))
+        == "found", "lua.sh honours LITE_CWD")
+    check(shrun("cd " .. shq(lroot) .. " && " .. shq(lua_sh) .. " -e "
+        .. shq('print((os.getenv("LITE_PRELOAD") or "") == "" and "clean" or "dirty")'))
+        == "dirty", "lua.sh preloads bundled so")
+    -- 仓库内部调用（run.sh/test.sh/check_deps.sh）保持精简，不带 workspace 路径与预加载
+    check(shrun(shq(lroot .. "/tools/lite-lua") .. " -e "
+        .. shq('print((os.getenv("LITE_PRELOAD") or "") == "" and "clean" or "dirty")')) == "clean",
+        "lite-lua stays clean without plugin flag")
 
     os.execute("rm -rf " .. shq(dir))
 end

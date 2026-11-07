@@ -229,7 +229,7 @@ lua({ code = "return #(args.text:gmatch('%S+'))", input = { text = "a b c" } })
 -- -> "3"
 ```
 
-它在子进程里跑 `tools/lite-lua -e`，`args` 走 JSON，默认 30s 超时（最多 120s），审批同 `bash`；死循环只撞超时，不会卡住 agent。这也意味着**改 C `.so` 或 `helper/*.lua` 都要重启**（`/reload` 只重载 Lua 层模块，不重扫插件快照）。
+它在子进程里跑 `tools/lua.sh -e`，`args` 走 JSON，默认 30s 超时（最多 120s），审批同 `bash`；死循环只撞超时，不会卡住 agent。`tools/lua.sh` 是**插件/脚本专用入口**（仓库内部脚本仍用精简的 `tools/lite-lua`）：它把 `LITE_CWD`（缺省 `$PWD`，agent 里就是 workspace）当搜索根并 `cd` 过去，`LUA_PATH`/`LUA_CPATH` 额外含 `./?.lua`、`./helper/?.so` 等条目，所以片段能直接 `require("本地模块")`、`io.open("相对路径")`；自带的 `build/liblite_*.so` 会按绝对路径预加载，裸名 `ffi.load("liblite_image.so")` 在任何 cwd 下都可用。这也意味着**改 C `.so` 或 `helper/*.lua` 都要重启**（`/reload` 只重载 Lua 层模块，不重扫插件快照）。
 
 更细的对比与设计取舍见 [design.md](design.md)；开发/测试规范见 [AGENTS.md](AGENTS.md)。
 

@@ -107,7 +107,7 @@ if [ -f "$ROOT/build/liblite_image.so" ]; then
     rm -f "$LDD_TMP"
 fi
 
-for f in lite-lua lite run.sh check_deps.sh build.sh test.sh install.sh package.sh release.sh launch.sh \
+for f in lite-lua lua.sh lite run.sh check_deps.sh build.sh test.sh install.sh package.sh release.sh launch.sh \
          ort_link.sh cuda_provider.sh see.lua; do
     [ -f "$ROOT/tools/$f" ] && cp "$ROOT/tools/$f" "$DIST/tools/"
 done
@@ -117,7 +117,7 @@ mkdir -p "$DIST/third_party/cjson/lua/5.1"
 cp -r "$ROOT/third_party/luajit" "$DIST/third_party/"
 cp "$ROOT/third_party/cjson/lua/5.1/cjson.so" "$DIST/third_party/cjson/lua/5.1/"
 
-chmod +x "$DIST/tools/lite-lua" "$DIST/tools/lite" "$DIST/tools/run.sh" \
+chmod +x "$DIST/tools/lite-lua" "$DIST/tools/lua.sh" "$DIST/tools/lite" "$DIST/tools/run.sh" \
     "$DIST/tools/check_deps.sh" "$DIST/tools/build.sh" "$DIST/tools/test.sh" \
     "$DIST/tools/install.sh" "$DIST/tools/package.sh" "$DIST/tools/release.sh" \
     "$DIST/tools/launch.sh" "$DIST/tools/ort_link.sh" "$DIST/tools/cuda_provider.sh"
