@@ -594,6 +594,27 @@ do
     local ans, err = a2:run("当前是最新版本吗")
     check(err == nil and ans == final2, "simple question answer")
     check(n2 == 3, "simple question tool budget")
+
+    local ctx3 = Context.new({ cwd = "/tmp", max_turns = 10 })
+    local n3, final3 = 0, nil
+    local provider3 = {
+        stream = function(msgs, ts)
+            n3 = n3 + 1
+            if ts then
+                return {
+                    role = "assistant", content = "",
+                    tool_calls = { { id = "w" .. n3, type = "function",
+                        ["function"] = { name = "bash", arguments = '{"command":"git log -1"}' } } },
+                }
+            end
+            final3 = "杭州明天有雨"
+            return { role = "assistant", content = final3 }
+        end,
+    }
+    local a3 = Agent.new(ctx3, provider3, flat, { append = function() end, save = function() end })
+    local ans3, err3 = a3:run("明天杭州天气如何")
+    check(err3 == nil and ans3 == final3, "weather question answer")
+    check(n3 == 3, "weather question tool budget")
 end
 
 -- 循环被迫结束：收尾请求（不带 tools）+ 重复调用熔断

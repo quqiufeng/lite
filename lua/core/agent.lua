@@ -476,18 +476,27 @@ M.SIMPLE_TURNS = 2
 
 -- 状态/版本/是否类短问题：不要让模型把一次确认变成安装审计。
 -- 只做粗粒度识别，明显是开发任务的句子不命中。
-local TASK_VERBS = { "改", "修", "实现", "升级", "安装", "编译", "打包", "运行", "写", "删", "添加" }
+-- 只有“开头就是动作”的句子才算开发任务；天气/状态/版本问题不因中间出现
+-- “改”“查”等字被误判。
+local TASK_PREFIX = "^(%s*)(改|修|实现|升级|安装|编译|打包|运行|写|删|添加)"
 local function is_simple_question(text)
     text = tostring(text or ""):gsub("%s+", " "):sub(1, 200)
     if #text > 80 then return false end
-    for _, v in ipairs(TASK_VERBS) do
-        if text:find(v, 1, true) then return false end
-    end
+    if text:find(TASK_PREFIX) then return false end
     local lower = text:lower()
     return text:find("最新", 1, true) or text:find("版本", 1, true)
         or text:find("生效", 1, true) or text:find("当前", 1, true)
         or text:find("是不是", 1, true) or text:find("有没有", 1, true)
+        or text:find("做了什么", 1, true) or text:find("改了什么", 1, true)
+        or text:find("什么修改", 1, true) or text:find("变更", 1, true)
+        or text:find("天气", 1, true) or text:find("气温", 1, true)
+        or text:find("新闻", 1, true) or text:find("汇率", 1, true)
+        or text:find("股票", 1, true) or text:find("几点", 1, true)
+        or text:find("日期", 1, true) or text:find("星期", 1, true)
+        or text:find("今天", 1, true)
         or lower:find("version", 1, true) ~= nil
+        or lower:find("weather", 1, true) ~= nil
+        or lower:find("what day", 1, true) ~= nil
 end
 
 function M:_loop(text, stream)
