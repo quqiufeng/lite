@@ -609,7 +609,38 @@ do
     check(Agent.REPEAT_LIMIT == 4 and n2 == 5, "repeat breaker stops early")
     check(#ev2 == 1 and ev2[1].reason:find("repeated", 1, true) ~= nil, "repeat breaker reason")
 
-    -- 3) 不同的工具调用不算卡住
+    -- 3) 命令不同但结果相同 → 无进展熔断
+    local ctx4 = Context.new({ cwd = "/tmp", max_turns = 64 })
+    local n4, ev4, final4 = 0, {}, nil
+    local provider4 = {
+        stream = function(msgs, tools)
+            n4 = n4 + 1
+            if tools then
+                return {
+                    role = "assistant", content = "",
+                    tool_calls = { {
+                        id = "z" .. n4, type = "function",
+                        ["function"] = { name = "bash", arguments = '{"command":"echo ' .. n4 .. '"}' },
+                    } },
+                }
+            end
+            final4 = "结果没有变化，停了。"
+            return { role = "assistant", content = final4 }
+        end,
+    }
+    local flat_tools = {
+        schemas = function() return { { type = "function" } } end,
+        execute = function() return "same output" end,
+    }
+    ctx4:on("turn_limit", function(info) ev4[#ev4 + 1] = info end)
+    local agent4 = Agent.new(ctx4, provider4, flat_tools, { append = function() end, save = function() end })
+    local t4, e4 = agent4:run("go")
+    check(e4 == nil and t4 == final4, "result repeat breaker keeps conclusions")
+    check(Agent.RESULT_REPEAT_LIMIT == 4 and n4 == 5, "result repeat breaker stops early")
+    check(#ev4 == 1 and ev4[1].reason:find("result repeated", 1, true) ~= nil,
+        "result repeat breaker reason")
+
+    -- 4) 不同的工具调用不算卡住
     local ctx3 = Context.new({ cwd = "/tmp", max_turns = 6 })
     local n3, ev3 = 0, 0
     local provider3 = {
@@ -881,13 +912,23 @@ do
         -- 直接写一条，避免白名单断言在「没有 msg 键」时空转成永真。
         mem:put("/agent/session", "s3/msg/00000001",
             { role = "user", content = "needle raw transcript" }, 0)
+        mem:put("/agent/session", "s3/msg/00000002",
+            { role = "assistant", content = "needle raw assistant" }, 0)
+        mem:put("/agent/session", "s3/msg/00000003",
+            { role = "tool", content = "needle raw tool output" }, 0)
         for i = 1, 4 do
             mem:remember_turn("s3", i, "needle question " .. i, "needle answer " .. i)
         end
         local ml = mem:recall("needle", 20)
-        local msg_leak, meta_leak, no_kind, bad_text, turns = false, false, false, false, 0
+        local msg_leak, meta_leak, no_kind, bad_text, turns, raw_user = false, false, false, false, 0, false
         for _, it in ipairs(ml) do
-            if it.key:find("/msg/", 1, true) then msg_leak = true end
+            if it.key:find("/msg/", 1, true) then
+                if it.kind == "user" and it.text == "needle raw transcript" then
+                    raw_user = true
+                else
+                    msg_leak = true
+                end
+            end
             if it.key:find("/meta", 1, true) then meta_leak = true end
             if not it.kind then no_kind = true end
             if it.text:find('{"role"', 1, true) or it.text:find('"content"', 1, true) then
@@ -895,7 +936,8 @@ do
             end
             if it.kind == "turn" then turns = turns + 1 end
         end
-        check(not msg_leak, "recall whitelist: raw transcript not injected")
+        check(not msg_leak, "recall whitelist: non-user raw transcript not injected")
+        check(raw_user, "recall whitelist: user transcript preserved")
         check(not meta_leak, "recall whitelist: session meta not injected")
         check(not no_kind, "recall whitelist: every item tagged with kind")
         check(not bad_text, "recall whitelist: no raw json in item text")
@@ -2601,6 +2643,43 @@ do
     mem:ensure_session("kv2", "/tmp", "m")
     Todos.new(ctx, mem)
     check(#ctx.session.todos == 0, "todos session isolated")
+    mem:close()
+    os.execute("rm -rf " .. shq(dir))
+end
+
+-- session retention: raw transcript capped, old messages dropped
+do
+    local dir = os.tmpname()
+    os.remove(dir)
+    os.execute("mkdir -p " .. shq(dir))
+    local Memory = require("core.memory")
+    local Context = require("context")
+    local Session = require("core.session")
+    local mem = assert(Memory.new({ dir = dir, max_mb = 16 }))
+    local ctx = Context.new({ cwd = "/tmp", id = "ret" })
+    mem:ensure_session("ret", "/tmp", "m")
+    local s = Session.new(ctx, {
+        dir = dir, id = "ret", memory = mem,
+        raw_keep = 3, tool_store_chars = 20, prune_every = 1,
+    })
+    s:append({ role = "user", content = "keep user forever" })
+    for i = 1, 5 do
+        s:append({ role = "tool", tool_call_id = "c" .. i,
+            content = string.rep("x", 100) .. i })
+    end
+    local user = mem:get("/agent/session", "ret/msg/00000001")
+    check(user and user.role == "user" and user.content == "keep user forever",
+        "session user message retained")
+    check(mem:get("/agent/session", "ret/msg/00000002") == nil, "session tool retention drop")
+    local kept = mem:get("/agent/session", "ret/msg/00000004")
+    check(kept and kept.role == "tool" and #kept.content < 100
+        and kept.content:sub(-3) == "…", "session tool result clipped")
+    local loaded = s:load()
+    check(#loaded == 4, "session jsonl retains user + recent")
+    local dropped = mem:prune_session_messages("ret", 2)
+    check(dropped >= 1 and #mem:session_messages("ret", 10) == 3,
+        "session prune messages")
+    check(mem:get("/agent/session", "ret/msg/00000001") ~= nil, "session prune keeps user")
     mem:close()
     os.execute("rm -rf " .. shq(dir))
 end

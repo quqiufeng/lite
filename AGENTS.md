@@ -197,6 +197,7 @@ third_party/                 luajit / cjson / ocr（随包）
 - 写实例持 `mem.lock` 独占锁；`--recall/state/sessions` 只读不加锁，可并发诊断。
 - `mem.bin` 头部（magic/version）损坏时自动备份为 `mem.bin.corrupt-<ts>` 并重建空库，不阻塞启动。
 - `mem.idx` 是可再生的；坏了会自动扫描 pool 重建。
+- 原始消息只保留最近 `LITE_SESSION_RAW_KEEP`（默认 200）条**非 user** 消息；user 消息永久保留；tool 结果入库前截到 `LITE_TOOL_RESULT_CHARS`（默认 8192），老 assistant/tool 靠 turn 摘要/`recall`。
 
 ---
 

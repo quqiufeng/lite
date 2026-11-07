@@ -448,6 +448,24 @@ function M:session_messages(session_id, limit)
     return msgs, math.max(max_n, tonumber(meta and meta.turns) or 0)
 end
 
+function M:prune_session_messages(session_id, keep)
+    local id = tostring(session_id)
+    local meta = self:session_meta(id)
+    local count = tonumber(meta and meta.messages) or 0
+    keep = tonumber(keep) or 200
+    if count <= keep then return 0 end
+    local drop = count - keep
+    local removed = 0
+    for i = 1, drop do
+        local sub = id .. "/msg/" .. string.format("%08d", i)
+        local old = self:get("/agent/session", sub)
+        if not (type(old) == "table" and old.role == "user") then
+            if self:del("/agent/session", sub) then removed = removed + 1 end
+        end
+    end
+    return removed
+end
+
 function M:recall(query, limit, opts)
     limit = limit or 6
     opts = opts or {}
@@ -488,11 +506,12 @@ function M:recall(query, limit, opts)
             local kind = rest:match("^[^/]+/([^/]+)/")
             if kind == "turn" then return "turn" end
             if kind == "working" then return "working" end
+            if kind == "msg" then return "user" end
         end
         return nil
     end
 
-    local WEIGHT = { fact = 1.0, working = 0.9, turn = 0.6 }
+    local WEIGHT = { fact = 1.0, working = 0.9, user = 0.8, turn = 0.6 }
 
     local function add(r)
         -- 目录级 /agent/working（wake 调度状态、todos 兜底）属于运行态：
@@ -509,8 +528,12 @@ function M:recall(query, limit, opts)
         -- 解码失败的条目不是「文本」，是坏数据（写一半、加密残留、二进制尾巴）。
         -- 早先回退成 { c = r.value } 会把这些字节原样拼进 prompt。
         if not ok or type(data) ~= "table" then return end
+        if kind == "user" and data.role ~= "user" then return end
         local text
-        if data.t == "turn" and data.u then
+        if kind == "user" then
+            if type(data.content) ~= "string" then return end
+            text = data.content
+        elseif data.t == "turn" and data.u then
             text = tostring(data.u) .. " => " .. tostring(data.a or "")
         else
             text = tostring(data.c or data.a or "")
@@ -552,10 +575,14 @@ function M:recall(query, limit, opts)
     -- 最多两条 transcript：轮次权重已经调低，但同分时仍可能挤满整块，
     -- 而重复的旧对话对下一轮几乎没有信息量。事实/工作笔记不受此限。
     local keep = {}
+    local users_kept = 0
     for _, it in ipairs(out) do
         if it.kind == "turn" then
             turns_kept = turns_kept + 1
             if turns_kept > 2 then goto continue end
+        elseif it.kind == "user" then
+            users_kept = users_kept + 1
+            if users_kept > 4 then goto continue end
         end
         keep[#keep + 1] = it
         ::continue::

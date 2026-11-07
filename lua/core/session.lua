@@ -13,6 +13,57 @@ local function default_dir()
         .. "/lite/sessions"
 end
 
+-- 原始 transcript 只保留最近 N 条；更老的只靠 turn 摘要/事实召回。
+-- tool 结果通常是最大的一块，入库前先截断，避免一条命令吃满 mem.bin。
+local RAW_KEEP = tonumber(os.getenv("LITE_SESSION_RAW_KEEP")) or 200
+local TOOL_STORE_MAX = tonumber(os.getenv("LITE_TOOL_RESULT_CHARS")) or 8192
+local JSONL_PRUNE_EVERY = 64
+
+local function clip_utf8(s, max)
+    s = tostring(s or "")
+    if max <= 0 or #s <= max then return s end
+    local cut = max
+    while cut > 0 do
+        local b = s:byte(cut + 1)
+        if not b or b < 0x80 or b >= 0xC0 then break end
+        cut = cut - 1
+    end
+    return s:sub(1, cut) .. "…"
+end
+
+local function store_copy(msg, limit)
+    if type(msg) ~= "table" or msg.role ~= "tool" then return msg end
+    if type(msg.content) ~= "string" or #msg.content <= limit then return msg end
+    return {
+        role = msg.role,
+        tool_call_id = msg.tool_call_id,
+        content = clip_utf8(msg.content, limit),
+    }
+end
+
+local function prune_jsonl(self)
+    local f = io.open(self.path, "r")
+    if not f then return end
+    local lines = {}
+    for line in f:lines() do lines[#lines + 1] = line end
+    f:close()
+    if #lines <= self.raw_keep then return end
+    local tmp = self.path .. ".tmp"
+    local w = io.open(tmp, "w")
+    if not w then return end
+    local keep_from = #lines - self.raw_keep + 1
+    for i, line in ipairs(lines) do
+        local keep = i >= keep_from
+        if not keep then
+            local ok, msg = pcall(cjson.decode, line)
+            keep = ok and type(msg) == "table" and msg.role == "user"
+        end
+        if keep then w:write(line, "\n") end
+    end
+    w:close()
+    os.rename(tmp, self.path)
+end
+
 function M.recent_ids(dir, limit)
     dir = dir or default_dir()
     limit = limit or 10
@@ -154,15 +205,20 @@ function M.new(ctx, opts)
         path = base .. "/" .. id .. ".jsonl",
         memory = opts.memory,
         seq = tonumber(opts.seq) or 0,
+        raw_keep = tonumber(opts.raw_keep) or RAW_KEEP,
+        tool_store_chars = tonumber(opts.tool_store_chars) or TOOL_STORE_MAX,
+        prune_every = tonumber(opts.prune_every) or JSONL_PRUNE_EVERY,
+        raw_trimmed = tonumber(opts.raw_trimmed) or 0,
     }, M)
     os.execute("mkdir -p " .. shq(base))
     return self
 end
 
 function M:append(msg)
+    local stored = store_copy(msg, self.tool_store_chars)
     local f = io.open(self.path, "a")
     if not f then return false end
-    local ok, line = pcall(cjson.encode, msg)
+    local ok, line = pcall(cjson.encode, stored)
     if ok then f:write(line, "\n") end
     f:close()
 
@@ -175,16 +231,36 @@ function M:append(msg)
             -- 旧的 1367 条消息被最新几轮顶掉。meta 缺失则补建，存在则对齐 seq。
             meta = self.memory:ensure_session(self.id)
         end
-        local stored = tonumber(meta and meta.messages) or 0
-        if stored > self.seq then self.seq = stored + 1 end
+        local count = tonumber(meta and meta.messages) or 0
+        if count > self.seq then self.seq = count + 1 end
         self.memory:put("/agent/session",
-            self.id .. "/msg/" .. string.format("%08d", self.seq), msg, ttl)
+            self.id .. "/msg/" .. string.format("%08d", self.seq), stored, ttl)
+
+        -- 只保留最近 raw_keep 条原始消息；更老的由 turn 摘要/recall 兜底。
+        if self.raw_keep > 0 and self.seq > self.raw_keep then
+            local drop = self.seq - self.raw_keep
+            local from = (self.raw_trimmed or 0) + 1
+            for i = from, drop do
+                local key = "/agent/session"
+                local sub = self.id .. "/msg/" .. string.format("%08d", i)
+                local old = self.memory:get(key, sub)
+                -- user 的消息永久保留；只淘汰 tool / 旧 assistant 原文。
+                if not (type(old) == "table" and old.role == "user") then
+                    self.memory:del(key, sub)
+                end
+            end
+            if drop > self.raw_trimmed then self.raw_trimmed = drop end
+        end
+
         if meta then
             meta.messages = self.seq
             meta.updated = os.time()
             self.memory:put("/agent/session", self.id .. "/meta", meta,
                 self.memory.TTL and self.memory.TTL.permanent or 0)
         end
+    end
+    if self.seq > self.raw_keep and self.seq % self.prune_every == 0 then
+        prune_jsonl(self)
     end
     return ok
 end

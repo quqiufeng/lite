@@ -384,6 +384,18 @@ end
 -- 同一批工具调用连续重复这么多次，就认为模型卡住了（同一命令反复跑，结果不变）。
 -- 手写循环在 128 轮里烧掉几十万 token 是常态，越早熔断越好。
 M.REPEAT_LIMIT = 4
+M.RESULT_REPEAT_LIMIT = 4
+
+-- 不同命令可能产生同一结果（反复 git log/ls）。只比较调用参数抓不到；
+-- 用「工具名 + 结果哈希」做无进展检测。
+local function result_sig(name, result)
+    local s = tostring(result or "")
+    local h = 5381
+    for i = 1, #s do
+        h = (h * 33 + s:byte(i)) % 4294967296
+    end
+    return tostring(name) .. ":" .. h .. ":" .. #s
+end
 
 local STOP_NOTE = table.concat({
     "<session_context>",
@@ -448,6 +460,7 @@ function M:_loop(text, stream)
 
     local tool_notes = {}
     local last_sig, repeat_n = nil, 0
+    local result_counts, repeated_result = {}, 0
 
     for iter = 1, ctx.settings.max_turns do
         ctx:begin_turn()
@@ -527,6 +540,10 @@ function M:_loop(text, stream)
                 end
             end
             ctx:emit("tool_result", name, result)
+            local rs = result_sig(name, result)
+            local rn = (result_counts[rs] or 0) + 1
+            result_counts[rs] = rn
+            if rn > repeated_result then repeated_result = rn end
             tool_notes[#tool_notes + 1] = {
                 name = name,
                 args = fn.arguments or "",
@@ -570,6 +587,10 @@ function M:_loop(text, stream)
         end
         if repeat_n >= M.REPEAT_LIMIT then
             local why = string.format("the same tool calls repeated %d times in a row", repeat_n)
+            return self:_finalize(stream, why)
+        end
+        if repeated_result >= M.RESULT_REPEAT_LIMIT then
+            local why = string.format("the same tool result repeated %d times", repeated_result)
             return self:_finalize(stream, why)
         end
     end

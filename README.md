@@ -127,7 +127,7 @@ return {
 - 超预算时把旧消息压成 `<session_context>` 块，状态存 `/agent/session/<id>/compact`（`baseline` / `digest` / `block` / `rearm_chars`）；细节仍用 `recall` 找回。压缩只在跨阈值时发生，压完 `baseline` 推进、prompt 继续 append-only —— 这是缓存能命中的前提。
 - system prompt 参考 Pi 分段：`<tools> / <rules> / <memory> / <project_context> / <cwd>`；自动加载 `AGENTS.md` / `CLAUDE.md` / `.lite/instructions.md`（默认截断 4000 字符）。
 - 会话存储也在 KV：`/agent/session/<id>/meta`、`/agent/index/cwd/<hash>/<id>`、`/agent/session/<id>/msg/<seq>`、`/agent/session/<id>/turn/<n>`。
-- `Session:append` 会把完整消息（含 tool_calls/tool result）镜像到 KV 的 `/msg/<seq>`；`/session` 优先用它精确重建，turn 摘要仅兜底。
+- `Session:append` 把消息镜像到 KV 的 `/msg/<seq>`；只保留最近 `LITE_SESSION_RAW_KEEP`（默认 200）条**非 user** 原始消息，user 消息永久保留。更老的 assistant/tool 靠 turn 摘要/`recall`。tool 结果入库前截到 `LITE_TOOL_RESULT_CHARS`（默认 8192）字符，避免一条命令吃满 `mem.bin`。JSONL 镜像同步做保留裁剪（user 行保留）。`/session` 优先用它精确重建，turn 摘要仅兜底。
 - todo 按 `session_id` 存在 `/agent/session/<id>/todos`。
 - `mem.bin` 用 `MAP_SHARED` mmap，`mem.idx` 只读 mmap；`cache_get/prefix` 返回指针，C 层零拷贝，Lua 解码 JSON 时才复制。
 - `mem.lock`：TUI/serve 写进程持独占锁，防止多写覆盖；`--recall/state/sessions` 只读不加锁，可在运行中诊断。
@@ -217,6 +217,8 @@ C ABI 固定为 `char *lite_helper(const char *input)` + 可选 `lite_helper_fre
 | `LITE_MEMORY_FLUSH` | 30 | 自动落盘间隔（秒） |
 | `LITE_CONTEXT_CHARS` | 64000 | prompt 字符预算 |
 | `LITE_CONTEXT_TURNS` | 16 | 保留最近轮数 |
+| `LITE_SESSION_RAW_KEEP` | 200 | 保留的最近非 user 原始消息条数（user 永久保留） |
+| `LITE_TOOL_RESULT_CHARS` | 8192 | tool 结果入库截断上限 |
 | `LITE_INSTRUCTIONS_FILE` | 自动探测 | 项目指令文件；`/dev/null` 禁用 |
 | `LITE_INSTRUCTIONS_CHARS` | 4000 | 指令文件截断上限 |
 | `LITE_THINKING` | — | `1` 启用 thinking |
