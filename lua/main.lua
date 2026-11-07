@@ -31,6 +31,7 @@ lite — DeepSeek 终端 coding agent
   --reasoning-effort LEVEL     high | medium | low
   --sandbox                    bash 使用 bwrap 沙箱（需安装 bubblewrap）
   --approval auto|ask|deny     工具审批策略（默认 auto）
+  --no-plugins                 禁用 helper/ 插件与 hook（默认启用）
   --max-turns N                单次任务工具循环上限（默认 256）
   --debug                      开启调试日志（默认 $TMPDIR/lite-debug.jsonl）
   --debug-log PATH             写 JSONL 调试日志（provider/HTTP）
@@ -142,6 +143,9 @@ local function parse_flags(list)
         elseif a == "--reasoning-effort" then
             flags.reasoning_effort = list[i + 1]
             i = i + 2
+        elseif a == "--no-plugins" then
+            flags.no_plugins = true
+            i = i + 1
         elseif a == "--sandbox" then
             flags.sandbox = true
             i = i + 1
@@ -179,6 +183,7 @@ elseif cmd == "serve" or cmd == "--serve" then
     if flags.reasoning_effort then config.reasoning_effort = flags.reasoning_effort end
     if flags.sandbox then config.sandbox = "enforce" end
     if flags.approval then config.approval = flags.approval end
+    if flags.no_plugins then config.plugins = false end
     if flags.max_turns then config.max_turns = flags.max_turns end
     if flags.debug_log then config.debug_log = flags.debug_log end
     if flags.debug and not config.debug_log then config.debug_log = default_debug_log() end
@@ -322,6 +327,7 @@ elseif cmd == "--tui" then
     if flags.reasoning_effort then config.reasoning_effort = flags.reasoning_effort end
     if flags.sandbox then config.sandbox = "enforce" end
     if flags.approval then config.approval = flags.approval end
+    if flags.no_plugins then config.plugins = false end
     if flags.max_turns then config.max_turns = flags.max_turns end
     if flags.debug_log then config.debug_log = flags.debug_log end
     if flags.debug and not config.debug_log then config.debug_log = default_debug_log() end
@@ -384,6 +390,7 @@ elseif cmd == "--tui" then
         ctx = ctx,
         sandbox = config.sandbox,
         sandbox_net = config.sandbox_net,
+        plugins = config.plugins,
     })
 
     -- 只从当前目录的 mem.bin 恢复；全局 JSONL 不参与（见 Session.from_memory）。
@@ -510,6 +517,7 @@ elseif cmd == "--once" then
         ctx = ctx,
         sandbox = config.sandbox,
         sandbox_net = config.sandbox_net,
+        plugins = config.plugins,
     })
     -- 与 TUI 路径一致：先登记会话 meta，否则 --once 写进 KV 的 msg/*
     -- 没有 /meta 索引，list_sessions 找不到，下次打开就等于没记录。

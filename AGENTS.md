@@ -92,6 +92,12 @@ wrapper 返回 `{ run=function(args,env) ... end }`；重新 build 生成新 `.s
 给插件/脚本（`LITE_CWD`、workspace `?.lua`/`?.so`、预加载 `liblite_*.so`），
 `tools/lite-lua` 给仓库内部脚本（干净，不继承 workspace 状态）。
 
+**hook 插件**：只返回 `hooks`（`before_tool` / `after_tool` / `on_user_turn` /
+`on_compact` / `on_session_end`）不返回 `run` 的插件**不进工具列表**，只当钩子用：
+`before_tool` 返回字符串即拦截（优先于审批），`on_user_turn` 返回值可改写用户文本。
+hook 错误一律 fail-open（记 `_hook_errors`，不炸 agent）。`has_hooks()` 为空时零开销。
+插件与 agent 同进程同权限，跑不受信任的仓库用 `--no-plugins` / `LITE_PLUGINS=0` 全关。
+
 ## 7 参考实现（新功能先查）
 
 参考：Pi `/opt/pi-mono`、Reasonix `/opt/reasonix`、opencode `/opt/opencode`；缓存

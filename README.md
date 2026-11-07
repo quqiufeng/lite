@@ -222,6 +222,25 @@ return {
 
 **插件不热插拔**：schema 在会话启动时扫一次并记忆化（`<workspace>/helper` → `$LITE_ROOT/helper`，`.tool.json` 优先、内嵌 schema 其次），之后每轮复用快照 —— 运行中增删 `helper/*.lua` 不会悄悄改变工具列表（否则 system prompt 一变，DeepSeek 前缀缓存整段失效）。会话启动后新建的插件仍可按名调用，重启后进列表。
 
+**hook 插件**：插件也可以只返回 `hooks` 而不返回 `run`，此时它**不进工具列表**（不动 system prompt），只在关键节点被调用：
+
+```lua
+-- helper/guard.lua
+return {
+  hooks = {
+    before_tool = function(name, args)
+      if name == "bash" and args.command:match("rm%s+%-rf") then
+        return "no destructive commands"
+      end
+    end,
+    after_tool = function(name, args, out) return out .. "|after" end,
+    on_user_turn = function(text) return text .. " [seen]" end,
+  },
+}
+```
+
+`before_tool` 返回字符串即拦截，文本原样成为工具结果，且**优先于审批**；`after_tool` 可替换结果；`on_user_turn` 可改写本轮用户文本；另有 `on_compact` / `on_session_end` 通知。hook 抛错一律 **fail-open**（记进 `_hook_errors`，不炸 agent）；`has_hooks()` 为空时零开销。插件与 agent 同进程同权限，跑不受信任的仓库用 `--no-plugins`（或 `LITE_PLUGINS=0`）把插件和 hook 一起关掉。
+
 运行期要试新代码就走 `lua` 工具：
 
 ```lua
@@ -265,6 +284,7 @@ lua({ code = "return #(args.text:gmatch('%S+'))", input = { text = "a b c" } })
 | `LITE_OCR_MODELS` | `third_party/ocr/models/ocr/` | PP-OCRv4 模型目录 |
 | `LITE_ORT` | `third_party/ocr/lib/libonnxruntime.so.1` | onnxruntime 1.26 |
 | `LITE_APPROVAL` | `auto` | 工具审批：`auto` / `ask` / `deny` |
+| `LITE_PLUGINS` | `1` | `0` 关闭 `helper/` 插件与 hook（同 `--no-plugins`） |
 | `LITE_SANDBOX` | — | `1`/`enforce` 启用 bwrap bash 沙箱 |
 | `LITE_SANDBOX_NET` | `1` | 沙箱内是否允许网络 |
 | `LITE_JSON` | — | 设为 `1` 等价 `--json` |

@@ -51,6 +51,7 @@ do
         "config default token controls")
     check(cfg.max_retries == 2, "config max retries")
     check(cfg.approval == "auto", "config approval")
+    check(cfg.plugins == true, "config plugins on by default")
 
     local cfg2 = require("core.config").load({
         HOME = "/tmp",
@@ -60,6 +61,14 @@ do
         LITE_REASONING_EFFORT = "high",
     })
     check(cfg2.thinking == true and cfg2.reasoning_effort == "high", "config thinking")
+
+    local cfg3 = require("core.config").load({
+        HOME = "/tmp",
+        PWD = "/tmp",
+        LITE_ENV_FILE = "/dev/null",
+        LITE_PLUGINS = "0",
+    })
+    check(cfg3.plugins == false, "config LITE_PLUGINS=0 disables plugins")
 end
 
 -- config .env
@@ -1681,6 +1690,119 @@ return {
     check(t3:execute("syntaxerr", {}):find("load failed", 1, true) ~= nil, "syntax error helper errors")
 
     os.execute("rm -rf " .. shq(dir))
+end
+
+-- plugin hooks (round B): collected once per session, dispatched only when present
+do
+    local dir = os.tmpname()
+    os.remove(dir)
+    os.execute("mkdir -p " .. shq(dir .. "/helper"))
+    local function put(path, body)
+        local f = assert(io.open(path, "wb"))
+        f:write(body)
+        f:close()
+    end
+    put(dir .. "/helper/guard.lua", [[
+return {
+    hooks = {
+        before_tool = function(name, args, env)
+            if name == "bash" and tostring(args.command):find("rm -rf", 1, true) then
+                return "no destructive commands"
+            end
+        end,
+        after_tool = function(name, args, result, env) return result .. "|after" end,
+        on_user_turn = function(text, env) return text .. " [seen]" end,
+    },
+}
+]])
+    put(dir .. "/helper/plain.lua", [[
+return {
+    schema = { description = "plain", parameters = { type = "object", properties = {} } },
+    run = function() return "plain" end,
+}
+]])
+    put(dir .. "/helper/boom.lua",
+        'return { hooks = { before_tool = function() error("boom") end } }')
+
+    local Tools = require("core.tools")
+    local t = Tools.new({ cwd = dir })
+    check(t:has_hooks(), "plugin hooks collected")
+    local listed = {}
+    for _, s in ipairs(t:schemas()) do listed[s["function"].name] = true end
+    check(listed.guard == nil and listed.boom == nil, "hook-only plugin is not a tool")
+    check(listed.plain == true, "plugin with run stays a tool")
+
+    local veto = t:before_tool("bash", { command = "rm -rf /tmp/x" })
+    check(veto ~= nil and veto:find("blocked by hook guard", 1, true) ~= nil
+        and veto:find("no destructive commands", 1, true) ~= nil, "before_tool veto")
+    check(t:before_tool("bash", { command = "ls" }) == nil, "before_tool allows")
+    check(t:after_tool("bash", { command = "ls" }, "raw") == "raw|after", "after_tool rewrites result")
+    check(t:on_user_turn("hi") == "hi [seen]", "on_user_turn rewrites text")
+    -- 插件写错不能带崩 agent：报错记下来，按放行处理
+    check(t:before_tool("other", {}) == nil, "broken hook fails open")
+    check(type(t._hook_errors) == "table" and #t._hook_errors > 0, "hook errors recorded")
+
+    -- --no-plugins：连 helper 工具一起关掉
+    local tn = Tools.new({ cwd = dir, plugins = false })
+    check(not tn:has_hooks(), "plugins=false disables hooks")
+    local leaked = false
+    for _, s in ipairs(tn:schemas()) do
+        if s["function"].name == "plain" or s["function"].name == "guard" then leaked = true end
+    end
+    check(not leaked, "plugins=false disables helper tools")
+
+    os.execute("rm -rf " .. shq(dir))
+end
+
+-- agent hook dispatch points
+do
+    local Context = require("context")
+    local Agent = require("core.agent")
+    local ctx = Context.new({ cwd = "/tmp", max_turns = 3 })
+    local calls, captured = 0, nil
+    local provider = {
+        stream = function(msgs)
+            captured = msgs
+            calls = calls + 1
+            if calls == 1 then
+                return { role = "assistant", content = "", tool_calls = { { id = "c1",
+                    type = "function",
+                    ["function"] = { name = "bash", arguments = '{"command":"rm -rf /"}' } } } }
+            end
+            return { role = "assistant", content = "done" }
+        end,
+    }
+    local executed, ended = false, 0
+    local toolset = {
+        schemas = function() return {} end,
+        execute = function() executed = true; return "raw" end,
+        has_hooks = function() return true end,
+        before_tool = function(_, name)
+            if name == "bash" then return "error: blocked by hook guard: no" end
+        end,
+        after_tool = function(_, _, _, result) return result .. "|after" end,
+        on_user_turn = function(_, text) return text .. " [seen]" end,
+        on_session_end = function() ended = ended + 1 end,
+    }
+    local memory = {
+        context = function() return "" end,
+        remember_turn = function() end,
+        tick = function() end,
+    }
+    local agent = Agent.new(ctx, provider, toolset, { append = function() end }, memory)
+    check(agent:run("hi") == "done", "hook run completes")
+    check(not executed, "before_tool veto skips execution")
+    local blocked, user_seen = false, false
+    for _, m in ipairs(captured or {}) do
+        if m.role == "tool" and type(m.content) == "string"
+            and m.content:find("blocked by hook guard", 1, true) then
+            blocked = m.content
+        end
+        if m.role == "user" and m.content == "hi [seen]" then user_seen = true end
+    end
+    check(blocked and blocked:find("|after", 1, true) ~= nil, "after_tool sees veto result")
+    check(user_seen, "on_user_turn reaches the model")
+    check(ended == 1, "on_session_end fired once")
 end
 
 -- lua tool: out-of-process luajit, args via stdin

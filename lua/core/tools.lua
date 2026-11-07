@@ -219,6 +219,7 @@ function M.new(opts)
         todos = Todos.new(opts.ctx, opts.memory),
         sandbox = Sandbox.enabled(opts.sandbox),
         sandbox_net = opts.sandbox_net ~= false,
+        plugins = opts.plugins ~= false,
         pending_attachment = nil,
     }, M)
     self.real_root = realpath(cwd) or normalize(cwd):gsub("/+$", "")
@@ -895,6 +896,7 @@ end
 
 function M:_helper_roots()
     local roots = {}
+    if not self.plugins then return roots end
     local local_dir = normalize(self.cwd):gsub("/+$", "") .. "/helper"
     roots[#roots + 1] = { scope = "local", dir = local_dir }
     local root = lite_root_dir()
@@ -1105,12 +1107,21 @@ end
 
 -- helper lua 文件返回 { schema = {...}, run = function(args, env) } 即可内嵌声明。
 -- 老写法（<name>.tool.json + <name>.lua）继续可用；两者同时存在时 .tool.json 优先。
-local function helper_lua_schema(name, path)
+-- 同一个文件也可以只声明 hooks（见 HOOK_KINDS），此时它是一个插件而不是工具。
+local HOOK_KINDS = { "before_tool", "after_tool", "on_user_turn", "on_compact", "on_session_end" }
+
+local function helper_lua_load(path)
     local chunk, lerr = loadfile(path)
     if not chunk then return nil, "load failed: " .. tostring(lerr) end
     local ok, mod = pcall(chunk)
     if not ok then return nil, "load failed: " .. tostring(mod) end
-    if type(mod) ~= "table" or type(mod.run) ~= "function" then
+    return mod
+end
+
+local function helper_lua_schema(name, mod)
+    if type(mod) ~= "table" then return nil, "must return { run = function(args, env) }" end
+    if type(mod.run) ~= "function" then
+        if type(mod.hooks) == "table" then return nil end
         return nil, "must return { run = function(args, env) }"
     end
     local schema = mod.schema
@@ -1128,6 +1139,7 @@ function M:_scan_helper_schemas()
     local seen = {}
     local out = {}
     local errors = {}
+    local plugins = {}
     local function push(name, schema)
         seen[name] = true
         out[#out + 1] = {
@@ -1168,14 +1180,28 @@ function M:_scan_helper_schemas()
             table.sort(order)
 
             for _, bare in ipairs(order) do
-                if not seen[bare] and not BUILTIN_TOOLS[bare] then
+                if not BUILTIN_TOOLS[bare] then
                     local lua_path = root.dir .. "/" .. bare .. ".lua"
                     if file_size(lua_path) then
-                        local schema, err = helper_lua_schema(bare, lua_path)
-                        if schema then
-                            push(bare, schema)
-                        elseif err then
-                            errors[bare] = err
+                        local mod, lerr = helper_lua_load(lua_path)
+                        if not mod then
+                            if not seen[bare] then errors[bare] = lerr end
+                        else
+                            if type(mod) == "table" and type(mod.hooks) == "table" then
+                                plugins[#plugins + 1] = {
+                                    name = bare, path = lua_path, dir = root.dir,
+                                    scope = root.scope, mod = mod,
+                                }
+                            end
+                            -- 工具列表里同名只留一个：.tool.json 优先于内嵌 schema。
+                            if not seen[bare] then
+                                local schema, serr = helper_lua_schema(bare, mod)
+                                if schema then
+                                    push(bare, schema)
+                                elseif serr then
+                                    errors[bare] = serr
+                                end
+                            end
                         end
                     end
                 end
@@ -1183,6 +1209,14 @@ function M:_scan_helper_schemas()
         end
     end
     self._helper_errors = errors
+    self._helper_plugins = self.plugins and plugins or {}
+    local kinds = {}
+    for _, p in ipairs(self._helper_plugins) do
+        for _, k in ipairs(HOOK_KINDS) do
+            if type(p.mod.hooks[k]) == "function" then kinds[k] = true end
+        end
+    end
+    self._hook_kinds = kinds
     return out
 end
 
@@ -1191,6 +1225,125 @@ function M:_helper_schemas()
         self._helper_cache = self:_scan_helper_schemas()
     end
     return self._helper_cache
+end
+
+-- 插件 hook。全部走会话快照（`self._helper_plugins`）：hook 列表同样不能在运行中
+-- 变长 —— 中途改插件语义比改工具 schema 更难查，改完重启。
+--
+-- 约定：
+--   before_tool(name, args, env)  返回字符串 = 拦截，该串作为工具结果给模型，
+--                                 工具不执行；返回 false = 拦截（默认文案）。
+--   after_tool(name, args, result, env)  返回字符串 = 替换结果；nil 保持原样。
+--   on_user_turn(text, env)       返回字符串 = 替换本轮 user 文本。
+--   on_compact(info, env)         压缩成功后回调，返回值忽略。
+--   on_session_end(env)           一次 run 收口时回调一次，返回值忽略。
+--
+-- 错误一律 fail-open：hook 抛错 → 记进 `self._hook_errors`，按放行/原样处理。
+-- 插件是附加逻辑，不是执行路径；写错一个 hook 不能把 agent 卡死。
+
+function M:_hook_error(p, kind, err)
+    self._hook_errors = self._hook_errors or {}
+    self._hook_errors[#self._hook_errors + 1] =
+        tostring(p.name) .. "." .. kind .. ": " .. tostring(err)
+end
+
+function M:has_hooks(kind)
+    self:_helper_schemas()
+    local kinds = self._hook_kinds
+    if not kinds then return false end
+    if kind == nil then return next(kinds) ~= nil end
+    return kinds[kind] == true
+end
+
+function M:before_tool(name, args, env)
+    if not self:has_hooks("before_tool") then return nil end
+    for _, p in ipairs(self._helper_plugins) do
+        local fn = p.mod.hooks.before_tool
+        if type(fn) == "function" then
+            local ok, res = pcall(fn, name, args, env or self:_helper_env(p))
+            if not ok then
+                self:_hook_error(p, "before_tool", res)
+            elseif type(res) == "string" and res ~= "" then
+                return "blocked by hook " .. p.name .. ": " .. res
+            elseif res == false then
+                return "blocked by hook " .. p.name
+            end
+        end
+    end
+    return nil
+end
+
+function M:after_tool(name, args, result, env)
+    if not self:has_hooks("after_tool") then return result end
+    for _, p in ipairs(self._helper_plugins) do
+        local fn = p.mod.hooks.after_tool
+        if type(fn) == "function" then
+            local ok, res = pcall(fn, name, args, result, env or self:_helper_env(p))
+            if not ok then
+                self:_hook_error(p, "after_tool", res)
+            elseif type(res) == "string" then
+                result = res
+            end
+        end
+    end
+    return result
+end
+
+function M:on_user_turn(text, env)
+    if not self:has_hooks("on_user_turn") then return text end
+    for _, p in ipairs(self._helper_plugins) do
+        local fn = p.mod.hooks.on_user_turn
+        if type(fn) == "function" then
+            local ok, res = pcall(fn, text, env or self:_helper_env(p))
+            if not ok then
+                self:_hook_error(p, "on_user_turn", res)
+            elseif type(res) == "string" and res ~= "" then
+                text = res
+            end
+        end
+    end
+    return text
+end
+
+function M:on_compact(info, env)
+    if not self:has_hooks("on_compact") then return end
+    for _, p in ipairs(self._helper_plugins) do
+        local fn = p.mod.hooks.on_compact
+        if type(fn) == "function" then
+            local ok, err = pcall(fn, info or {}, env or self:_helper_env(p))
+            if not ok then self:_hook_error(p, "on_compact", err) end
+        end
+    end
+end
+
+function M:on_session_end(env)
+    if not self:has_hooks("on_session_end") then return end
+    for _, p in ipairs(self._helper_plugins) do
+        local fn = p.mod.hooks.on_session_end
+        if type(fn) == "function" then
+            local ok, err = pcall(fn, env or self:_helper_env(p))
+            if not ok then self:_hook_error(p, "on_session_end", err) end
+        end
+    end
+end
+
+-- helper/插件共用的 env：插件与工具同进程同权限，能拿到的就这些。
+function M:_helper_env(p)
+    local ffi = require("ffi")
+    return {
+        cwd = normalize(self.cwd):gsub("/+$", ""),
+        helper_dir = p.dir or "",
+        scope = p.scope,
+        ffi = ffi,
+        load = function(n)
+            local so, serr = self:_helper_so_abs(n)
+            if not so then error(serr) end
+            return ffi.load(so)
+        end,
+        call = function(n, input)
+            return self:native_run(n, input)
+        end,
+    }
 end
 
 function M:_run_helper_tool(name, args)
@@ -1207,21 +1360,7 @@ function M:_run_helper_tool(name, args)
         return "error: helper lua must return { run = function(args, env) }"
     end
 
-    local ffi = require("ffi")
-    local env = {
-        cwd = normalize(self.cwd):gsub("/+$", ""),
-        helper_dir = p.dir,
-        scope = p.scope,
-        ffi = ffi,
-        load = function(n)
-            local so, serr = self:_helper_so_abs(n)
-            if not so then error(serr) end
-            return ffi.load(so)
-        end,
-        call = function(n, input)
-            return self:native_run(n, input)
-        end,
-    }
+    local env = self:_helper_env(p)
     local ok2, res = pcall(mod.run, args or {}, env)
     if not ok2 then
         return "error: helper " .. name .. ": " .. tostring(res)

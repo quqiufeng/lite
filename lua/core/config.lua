@@ -130,6 +130,14 @@ function M.load(env)
             or file.reasoning_effort,
         max_retries = tonumber(getv("LITE_MAX_RETRIES") or file.max_retries) or 2,
         approval = getv("LITE_APPROVAL") or file.approval or "auto",
+        plugins = (function()
+            local v = getv("LITE_PLUGINS")
+            if v == nil then v = file.plugins end
+            if v == nil then return true end
+            if type(v) == "boolean" then return v end
+            v = tostring(v):lower()
+            return not (v == "0" or v == "false" or v == "off" or v == "no")
+        end)(),
         debug_log = getv("LITE_DEBUG_LOG") or file.debug_log,
         sandbox = getv("LITE_SANDBOX") or file.sandbox,
         sandbox_net = (function()

@@ -123,6 +123,7 @@ function M.run(opts)
         ctx = ctx,
         sandbox = config.sandbox,
         sandbox_net = config.sandbox_net,
+        plugins = config.plugins,
     })
     if tools.todos then tools.todos:load() end
     local msg_count = memory:session_message_count(ctx.session.id)

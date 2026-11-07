@@ -1149,12 +1149,36 @@ workspace 的 `?.lua` / `?.so` 前置进 `package.path`/`cpath`，并扫 `build`
 语法错 → `load failed: ...`，按名调用时这些文本原样返回，用户能自己修。
 `/reload` 与 `Tools.new` 会重置快照，运行中新建的 `.lua` 不会偷偷挤进列表。
 
+**hook：只声明 `hooks` 的插件不是工具** —— 插件可以返回
+`{ hooks = { before_tool = ..., after_tool = ..., on_user_turn = ..., on_compact = ...,
+on_session_end = ... } }`，此时 `helper_lua_schema()` 返回 `nil`：它不进 `schemas()`，
+也就不动 system prompt。hook 表随同一个搜索快照一起收集（`_helper_plugins` /
+`_hook_kinds`），**运行中同样不会变长**；`has_hooks(kind)` 先查 `_hook_kinds`，为空直接
+`return false`，不遍历插件，所以没有 hook 的会话零开销。
+
+派发点在 `agent.lua`：`on_user_turn(text)` 可改写本轮用户文本（返回值非 `nil` 才替换）；
+`before_tool(name, args)` 返回字符串即 veto，文本原样作为工具结果（
+`blocked by hook <name>: <reason>`），且**优先于审批**；`after_tool(name, args, out)`
+可替换工具结果；`on_compact` / `on_session_end` 是通知（`session_end` 用
+`_session_ended` 去重）。
+
+**hook 错误一律 fail-open** —— `before_tool` 抛错就记 `_hook_error` 再放行（宁可少拦，
+不可误拦），`after_tool`/通知类抛错则保持原值。插件写错不该让 agent 变砖，错误留在
+`_hook_errors` 里可查。
+
+**`--no-plugins` 总开关** —— 插件与 agent 同进程同权限，跑不受信任的仓库时要能关掉：
+`Tools.new{ plugins = false }` 直接让 `_helper_roots()` 返回 `{}`，工具列表里没有插件、
+hook 一个都不跑。CLI 侧由 `LITE_PLUGINS=0` / `--no-plugins` 落到 `cfg.plugins`。
+
 **验收** —— `tools/auto_unit.lua` 的 helper 快照块（`.tool.json` / 内嵌 schema 均被发现、
 删文件后快照仍在、新增文件被忽略但可按名调用、新 session 重新扫描、坏插件报错）与
 `lua` 工具块（返回值 / `args` / 中文 / table→JSON / 运行错 / 语法错 / 超时）与
 `tools/lua.sh` 块（可执行 / 从 cwd 解析 workspace 模块 / 尊重 `LITE_CWD` / 预加载
-bundled `.so` / `tools/lite-lua` 保持干净）。
+bundled `.so` / `tools/lite-lua` 保持干净）；hook 块（hook-only 插件不进 `schemas()`、
+`before_tool` 拦截与放行、`after_tool` 改写、`on_user_turn` 改写、坏 hook fail-open、
+`plugins=false` 全关）与 agent 级集成（veto 跳过执行、结果带 `|after`、用户文本被改写、
+`on_session_end` 只跑一次）。
 
-**当前回归** —— `./tools/test.sh`：单元 579 项 + `cli.json` / `tui.smoke` /
+**当前回归** —— `./tools/test.sh`：单元 597 项 + `cli.json` / `tui.smoke` /
 `serve.probe` / `serve.smoke` 全通过（`[verified]` 2026-11-07）。§8.30 / §8.33 里的
 "385 项"/"424 项"是各自落地时的历史数字，不再逐节回填。

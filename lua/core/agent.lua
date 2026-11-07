@@ -285,6 +285,10 @@ function M:maybe_compact(stream, reserve, force)
         ok = true, stats = res.stats, baseline = res.baseline,
         rearm_chars = res.rearm_chars,
     })
+    -- 压缩后历史变短，插件若在外部存了索引/镜像，这里重建一次。
+    if self:has_hooks("on_compact") then
+        self.tools:on_compact({ stats = res.stats, baseline = res.baseline })
+    end
     return true
 end
 
@@ -476,8 +480,32 @@ function M:_finalize(stream, why)
     return answer
 end
 
+-- 插件 hook 判定：没有插件声明该 hook 时整条分支都不进（纯内建场景零开销）。
+function M:has_hooks(kind)
+    local t = self.tools
+    if not t or type(t.has_hooks) ~= "function" then return false end
+    return t:has_hooks(kind) and true or false
+end
+
+-- 一次 run 收口只通知一次：--once 直接调；TUI 由 main 退出时调。
+function M:session_end()
+    if self._session_ended then return end
+    self._session_ended = true
+    if self:has_hooks("on_session_end") then
+        local s = self.ctx and self.ctx.session or {}
+        self.tools:on_session_end({
+            id = s.id, turn = s.turn, busy = s.busy,
+        })
+    end
+end
+
 function M:_loop(text, stream)
     local ctx = self.ctx
+    -- on_user_turn：插件可以在进模型前改写本轮输入（补环境信息、加前缀等）。
+    if self:has_hooks("on_user_turn") then
+        local t = self.tools:on_user_turn(text)
+        if type(t) == "string" and t ~= "" then text = t end
+    end
     self._text = text
     local request_tools = self.tools:schemas()
     self:ensure_system(request_tools)
@@ -602,7 +630,14 @@ function M:_loop(text, stream)
                 end
 
                 local decision = self.approval:decide(name)
-                if decision == "allow" then
+                -- before_tool：插件 veto 优先于审批，命中就跳过执行（不改策略状态）。
+                local veto = nil
+                if self:has_hooks("before_tool") then
+                    veto = self.tools:before_tool(name, args)
+                end
+                if veto then
+                    result = "error: " .. tostring(veto)
+                elseif decision == "allow" then
                     result = run_tool()
                 elseif decision == "deny" then
                     result = "error: tool call denied by policy"
@@ -619,6 +654,11 @@ function M:_loop(text, stream)
                         result = "error: tool call rejected by user"
                     end
                 end
+            end
+            -- after_tool：插件可改写工具结果（脱敏、截断、附加摘要）。
+            if self:has_hooks("after_tool") then
+                local r = self.tools:after_tool(name, args, result)
+                if r ~= nil then result = r end
             end
             ctx:emit("tool_result", name, result)
             local rs = result_sig(name, result)
@@ -682,9 +722,11 @@ end
 -- 阻塞入口：--once / 单测。
 function M:run(text)
     self.async = false
-    return self:_loop(text, function(messages, tools, opts, on_delta, on_reasoning)
+    local answer, err = self:_loop(text, function(messages, tools, opts, on_delta, on_reasoning)
         return self.provider.stream(messages, tools, opts, on_delta, on_reasoning)
     end)
+    self:session_end()
+    return answer, err
 end
 
 -- 协程入口：TUI 驱动，yield {kind="http", req=...}。
