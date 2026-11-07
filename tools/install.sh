@@ -34,6 +34,13 @@ fi
 rm -rf "$APP"
 mkdir -p "$APP" "$BIN"
 cp -rL "$DIST/." "$APP/"
+# 源码树安装时默认把 lua/ 做成软链：改 Lua 后重启即生效，不再出现
+# “源码改了但 /usr/local 还是旧副本”。dist 独立部署仍保持实体拷贝。
+if [ "${LITE_INSTALL_LINK_LUA:-0}" = "1" ] && [ "$ROOT" != "$APP" ] && [ -d "$ROOT/lua" ]; then
+    rm -rf "$APP/lua"
+    ln -s "$ROOT/lua" "$APP/lua"
+    echo "install: lua -> $ROOT/lua (symlink)"
+fi
 chmod +x "$APP/tools/lite" "$APP/tools/lite-lua" "$APP/tools/run.sh"
 
 ln -sf "$APP/tools/lite" "$BIN/lite"

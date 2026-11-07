@@ -239,7 +239,7 @@ MUST NOT：
 ./tools/run.sh serve --port 8765            # headless
 ./tools/run.sh attach --port 8765           # 远程 TUI
 ./tools/test.sh                             # check + unit + cli + tui + serve
-./tools/package.sh / ./tools/release.sh     # 打包 / 构建+打包+安装
+./tools/package.sh / ./tools/release.sh     # 打包 / 构建+打包+安装（源码安装默认软链 lua/）
 ```
 
 测试分层（`test.sh` 串联）：`check_deps.sh` → `auto_unit.lua`（当前 487 项）→

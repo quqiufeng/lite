@@ -63,6 +63,10 @@ TUI 完成后，“看见”会进一步包含对话界面与截图，形成完�
 # 构建（LuaJIT 缺失时会构建；同时编译 C KV cache）
 ./tools/build.sh
 
+# 构建 + 打包 + 安装（源码安装默认把 lua/ 软链到源码树，改 Lua 重启即生效）
+./tools/release.sh
+# 想要实体拷贝：LITE_INSTALL_LINK_LUA=0 ./tools/release.sh
+
 export DEEPSEEK_API_KEY="sk-..."
 # 也可写入 .env（自动搜索 cwd → 父目录 → ~/.config/lite/.env → 安装目录，多层合并）
 
