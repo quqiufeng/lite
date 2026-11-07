@@ -26,7 +26,7 @@ local Text = require("core.text")
 local M = {}
 
 -- 单位统一用**字符**（lite 的 budget 一直是字符），涉及"每次请求都付费"的
--- 固定段时再换算成 token 做提示。默认 64000 字符 ≈ 16k tokens。
+-- 固定段时再换算成 token 做提示。默认 64000 字符 ≈ 16k tokens（提示词预算，不是模型窗口）。
 local DEFAULTS = {
     -- 触发线：超过 budget 的这个比例才压一次。
     compact_ratio = 0.85,

@@ -217,7 +217,7 @@ function M:estimate_tokens(chars)
 end
 
 -- 超阈值才压一次。返回 true 表示这次真的压了（调用方应重建视图）。
-function M:maybe_compact(stream, reserve)
+function M:maybe_compact(stream, reserve, force)
     local c = self:compactor()
     local st = self:compact_state()
     local view = self:view_messages()
@@ -226,6 +226,16 @@ function M:maybe_compact(stream, reserve)
     -- 触发线 + 迟滞线取较大者。压完的基座若本身就贴着触发线，
     -- 不设迟滞就会"下一条消息又触发"，每轮压一次。
     local line = c:trigger()
+    -- 参考 Pi/opencode：窗口减去 reserve 也是触发线；取更早的那个。
+    local window = tonumber(self.ctx.settings.context_window) or 0
+    local reserve_tokens = tonumber(self.ctx.settings.reserve_tokens) or 0
+    if window > reserve_tokens and window > 0 then
+        local ratio = self:tok_per_char()
+        if ratio and ratio > 0 then
+            local token_chars = math.floor((window - reserve_tokens) / ratio)
+            if token_chars > 0 and token_chars < line then line = token_chars end
+        end
+    end
     if st and type(st.rearm_chars) == "number" and st.rearm_chars > line then
         line = st.rearm_chars
     end
@@ -234,7 +244,7 @@ function M:maybe_compact(stream, reserve)
         est_tokens = self:estimate_tokens(used),
         tok_per_char = self:tok_per_char(),
     }
-    if used <= line then return false end
+    if used <= line and not force then return false end
 
     local summarize = function(text, prompt)
         return self:summarize(text, prompt, stream)
@@ -343,7 +353,7 @@ function M:request_messages(text, stream, opts)
     local reserve = #block + #todo_block + 200
 
     -- 先在超阈值时压一次；压不动就靠硬上限兜底。
-    self:maybe_compact(stream, reserve)
+    self:maybe_compact(stream, reserve, opts.force_compact)
     local msgs = self:view_messages()
 
     local c = self:compactor()
@@ -492,18 +502,66 @@ function M:_loop(text, stream)
     local tool_notes = {}
     local last_sig, repeat_n = nil, 0
     local result_counts, repeated_result = {}, 0
+    local overflow_retried = false
     local max_turns = ctx.settings.max_turns
     if is_simple_question(text) then max_turns = math.min(max_turns, M.SIMPLE_TURNS) end
+    local token_budget = tonumber(ctx.settings.token_budget) or 0
 
-    for iter = 1, max_turns do
-        ctx:begin_turn()
-        local assistant, err = stream(
-            -- 只有本轮第一次请求注入召回/todo 块，后续工具轮复用同一前缀。
-            self:request_messages(text, stream, { inject_context = (iter == 1) }),
-            self.tools:schemas(),
-            ctx.settings,
+    local function request_stream(inject, force)
+        local req = self:request_messages(text, stream, {
+            inject_context = inject,
+            force_compact = force,
+        })
+        -- outputLimit：让 provider 知道本轮输入大概占了多少 token。
+        ctx.settings.input_tokens = self:estimate_tokens(Compact.total(req))
+        return stream(req, self.tools:schemas(), ctx.settings,
             function(delta) ctx:emit("delta", delta) end,
             function(delta) ctx:emit("reasoning", delta) end)
+    end
+
+    for iter = 1, max_turns do
+        if token_budget > 0 then
+            local u = ctx.session.usage
+            if (u.prompt or 0) + (u.completion or 0) >= token_budget then
+                local answer = string.format(
+                    "（已达到 token 预算 %d：本任务已发 %d 请求、%d prompt tokens。提高 LITE_TOKEN_BUDGET 后继续。）",
+                    token_budget, u.requests or 0, u.prompt or 0)
+                ctx:add_message({ role = "assistant", content = answer })
+                self.session:append({ role = "assistant", content = answer })
+                ctx:emit("assistant", { role = "assistant", content = answer })
+                ctx:end_turn()
+                if self.memory then self:save_usage() end
+                return answer
+            end
+        end
+        ctx:begin_turn()
+        local assistant, err = request_stream(iter == 1, false)
+
+        -- 参考 opencode：provider 明确报上下文过长时，强制压一次再重试。
+        if not assistant and not overflow_retried
+            and self.provider.context_overflow and self.provider.context_overflow(err) then
+            overflow_retried = true
+            self:save_usage()
+            local compacted = self:maybe_compact(stream, 0, true)
+            local retry_msgs
+            if compacted then
+                retry_msgs = self:request_messages(text, stream, {
+                    inject_context = (iter == 1),
+                })
+            else
+                local c = self:compactor()
+                local trimmed
+                retry_msgs, trimmed = self:hard_window(self:view_messages(),
+                    math.floor(c.budget * 0.7))
+                if not trimmed then retry_msgs = nil end
+            end
+            if retry_msgs then
+                ctx.settings.input_tokens = self:estimate_tokens(Compact.total(retry_msgs))
+                assistant, err = stream(retry_msgs, self.tools:schemas(), ctx.settings,
+                    function(delta) ctx:emit("delta", delta) end,
+                    function(delta) ctx:emit("reasoning", delta) end)
+            end
+        end
 
         if not assistant then
             -- 报错前也要落一次账：这一轮已经发出去的请求（含被计费的 miss）

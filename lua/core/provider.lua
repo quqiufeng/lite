@@ -188,6 +188,33 @@ local function clean_messages(messages)
     return out, fixed
 end
 
+-- OpenCode 的 outputLimit 思路：输出不能把剩余窗口吃穿。
+function M.output_limit(opts)
+    local max_out = tonumber(opts.max_output_tokens) or 0
+    if max_out <= 0 then return nil end
+    local window = tonumber(opts.context_window) or 0
+    local input = tonumber(opts.input_tokens) or 0
+    local reserve = tonumber(opts.reserve_tokens) or 0
+    if window > 0 and input > 0 then
+        local room = window - input - reserve
+        if room < 1024 then room = 1024 end
+        if room < max_out then max_out = room end
+    end
+    return math.floor(max_out)
+end
+
+function M.context_overflow(err)
+    local s = tostring(err or ""):lower()
+    return s:find("context length", 1, true) ~= nil
+        or s:find("context_length", 1, true) ~= nil
+        or s:find("maximum context", 1, true) ~= nil
+        or s:find("too many tokens", 1, true) ~= nil
+        or s:find("input is too long", 1, true) ~= nil
+        or s:find("request too large", 1, true) ~= nil
+        or (s:find("http 400", 1, true) ~= nil and s:find("token", 1, true) ~= nil)
+        or (s:find("http 400", 1, true) ~= nil and s:find("context", 1, true) ~= nil)
+end
+
 local function build_request(messages, tools, opts)
     if not opts.api_key or opts.api_key == "" then
         return nil, nil, nil, "missing DEEPSEEK_API_KEY"
@@ -203,6 +230,8 @@ local function build_request(messages, tools, opts)
     if tools and #tools > 0 then body.tools = tools end
     -- 不带上 include_usage，DeepSeek 不会在流末尾返回 usage，命中率就无从观测。
     body.stream_options = { include_usage = true }
+    local max_out = M.output_limit(opts)
+    if max_out then body.max_tokens = max_out end
     if opts.thinking then body.thinking = { type = "enabled" } end
     if opts.reasoning_effort and opts.reasoning_effort ~= "" then
         body.reasoning_effort = opts.reasoning_effort

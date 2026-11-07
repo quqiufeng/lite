@@ -45,6 +45,10 @@ do
     })
     check(cfg.model == "deepseek-flash-x", "config env override")
     check(cfg.max_turns == 256, "config default max_turns")
+    check(cfg.context_chars == 64000, "config default context chars")
+    check(cfg.context_window == 64000 and cfg.reserve_tokens == 8192
+        and cfg.max_output_tokens == 8192 and cfg.token_budget == 0,
+        "config default token controls")
     check(cfg.max_retries == 2, "config max retries")
     check(cfg.approval == "auto", "config approval")
 
@@ -396,6 +400,20 @@ do
     end
     check(seen and seen.cache_hit == 4000 and seen.cache_miss == 1000,
         "provider usage openai style")
+end
+
+-- token/context helpers
+do
+    local P = require("core.provider")
+    check(P.context_overflow("HTTP 400: context_length_exceeded"), "provider context overflow")
+    check(P.context_overflow("HTTP 400: maximum context length exceeded"), "provider max context")
+    check(not P.context_overflow("HTTP 401: auth"), "provider normal 400 not overflow")
+    local lim = P.output_limit({ context_window = 64000, input_tokens = 16000,
+        reserve_tokens = 8192, max_output_tokens = 8192 })
+    check(lim == 8192, "provider output limit roomy")
+    local lim2 = P.output_limit({ context_window = 20000, input_tokens = 18000,
+        reserve_tokens = 1000, max_output_tokens = 8192 })
+    check(lim2 == 1024, "provider output limit floor")
 end
 
 -- usage 累积与命中率

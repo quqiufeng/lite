@@ -46,7 +46,7 @@ TUI 完成后，“看见”会进一步包含对话界面与截图，形成完�
   - 旧轮次不进 prompt，需要时用 `recall` 查回；
   - `mem.bin` 头部损坏（magic/version 不符）不阻塞启动：自动改名为 `mem.bin.corrupt-<ts>` 后以空库继续，`mem.idx` 一并备份。
 - **有界上下文 + 低频压缩**：prompt 一直 append-only，只在跨过预算阈值（`LITE_CONTEXT_CHARS`，默认 64k 字符）时压一次。压缩把旧内容折成**三段结构**——稳定前缀（system + 首条 user，≤8% 预算）、一段结构化 digest（固定小标题、禁止编造、硬性字数上限）、近期原文尾巴（预算的 10%，边界避开 tool result）——然后记 baseline 继续追加。用户自己的话有独立预算、逐字保留、不进摘要（约束被摘要丢掉就再也找不回来，而它约束的代码还在工作区里）。折叠收益不足或摘要超标时**拒绝**这次检查点，并带迟滞（rearm）避免"每轮都压"——重复压会打断缓存前缀，比不压更贵。`--json` 输出 `{"type":"compact"}` 事件，TUI 里显示 `compact: prompt N -> M chars`。
-- **用量与缓存可观测**：解析流末尾的 `usage`（`prompt_cache_hit/miss_tokens`），按会话累积；TUI 状态栏 `cache:N%` 显示前缀缓存命中率，`--once --json` 输出 `{"type":"usage"}` 事件。命中率是判断"prompt 前缀是否稳定"的唯一硬指标。
+- **用量与缓存可观测**：解析流末尾的 `usage`（`prompt_cache_hit/miss_tokens`），按会话累积；TUI 状态栏 `cache:N%` 显示前缀缓存命中率，`--once --json` 输出 `{"type":"usage"}` 事件。命中率是判断"prompt 前缀是否稳定"的唯一硬指标。**输出 token 按剩余窗口动态限制**；provider 报上下文过长时自动强制 compact 后重试一次。
 - **上下文压力可见**：状态栏 `ctx:N%` 显示当前 prompt 占压缩触发线的比例（≥60% 才出现），数字来自真实 `usage` 校准的 chars→tokens 比例（实测误差 2%），不是纯字符猜测。预算小于固定前缀的 3 倍时会自动抬高并提示，避免"预算比 system prompt 还小"导致压缩永远失败、只能丢历史。
 - **TUI + diff**：`--tui` 交互；assistant Markdown/代码块渲染、`Tab` 文件路径补全、鼠标滚轮/`PgUp`/`PgDn` 上翻历史、**左键拖选 transcript 选中文本，松开即复制到剪贴板**（`xclip`/`wl-copy`/`xsel`/`pbcopy`，都没有时退化为 OSC 52，走 ssh 也能用）、`?` 帮助、`Esc×2` 终止当前回复、忙时继续输入排队（`queue:N` / `⏳` 待发送）、`quit` + Enter 退出、启动时自动恢复同 cwd 最近会话；`/session` 选择/新建会话；`Ctrl+G` 打开 `git diff`，支持 split/unified、hunk 跳转、单文件、大 diff 虚拟滚动。
 - **Todo list**：`todo` 工具维护多步任务；状态栏 `todo:done/total`，`Ctrl+T` 打开列表；持久化到本地记忆并随 serve/attach 广播。
@@ -219,8 +219,12 @@ C ABI 固定为 `char *lite_helper(const char *input)` + 可选 `lite_helper_fre
 | `LITE_MAX_TURNS` | 256 | 单次 agent 循环上限 |
 | `LITE_MEMORY_MB` | 100 | mem.bin 容量 |
 | `LITE_MEMORY_FLUSH` | 30 | 自动落盘间隔（秒） |
-| `LITE_CONTEXT_CHARS` | 64000 | prompt 字符预算 |
+| `LITE_CONTEXT_CHARS` | 64000 | prompt 字符预算（不是模型窗口） |
 | `LITE_CONTEXT_TURNS` | 16 | 保留最近轮数 |
+| `LITE_CONTEXT_WINDOW` | 64000 | 模型窗口 tokens（用于压缩触发/output limit） |
+| `LITE_RESERVE_TOKENS` | 8192 | 预留输出 tokens |
+| `LITE_MAX_OUTPUT_TOKENS` | 8192 | 单次输出上限 |
+| `LITE_TOKEN_BUDGET` | 0 | 会话 token 预算，0=不限 |
 | `LITE_SESSION_RAW_KEEP` | 200 | 保留的最近非 user 原始消息条数（user 永久保留） |
 | `LITE_TOOL_RESULT_CHARS` | 8192 | tool 结果入库截断上限 |
 | `LITE_INSTRUCTIONS_FILE` | 自动探测 | 项目指令文件；`/dev/null` 禁用 |

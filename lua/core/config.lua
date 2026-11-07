@@ -115,6 +115,10 @@ function M.load(env)
         memory_flush = tonumber(getv("LITE_MEMORY_FLUSH") or file.memory_flush) or 30,
         context_chars = tonumber(getv("LITE_CONTEXT_CHARS") or file.context_chars) or 64000,
         context_turns = tonumber(getv("LITE_CONTEXT_TURNS") or file.context_turns) or 16,
+        context_window = tonumber(getv("LITE_CONTEXT_WINDOW") or file.context_window) or 64000,
+        reserve_tokens = tonumber(getv("LITE_RESERVE_TOKENS") or file.reserve_tokens) or 8192,
+        max_output_tokens = tonumber(getv("LITE_MAX_OUTPUT_TOKENS") or file.max_output_tokens) or 8192,
+        token_budget = tonumber(getv("LITE_TOKEN_BUDGET") or file.token_budget) or 0,
         thinking = (function()
             local v = getv("LITE_THINKING") or getv("DEEPSEEK_THINKING") or file.thinking
             if v == nil then return false end
