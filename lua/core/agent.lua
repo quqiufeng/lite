@@ -161,8 +161,18 @@ end
 
 -- 真正发给模型的视图：system + [摘要块] + baseline 之后的原文。
 -- 摘要块位置固定（紧跟 system），所以两轮之间前缀稳定，缓存能命中。
-function M:view_messages()
+function M:view_messages(simple)
     local all = self.ctx.session.messages
+    if simple then
+        -- 独立短问题：system + 当前 user 起的本轮消息（含刚执行的 tool 结果），
+        -- 不携带旧历史/compact/todo。
+        local start = #all
+        while start > 1 and all[start].role ~= "user" do start = start - 1 end
+        local out = {}
+        if all[1] and all[1].role == "system" then out[1] = all[1] end
+        for i = start, #all do out[#out + 1] = all[i] end
+        return out
+    end
     local st = self:compact_state()
     local out = {}
     if all[1] and all[1].role == "system" then out[1] = all[1] end
@@ -348,7 +358,9 @@ end
 -- 以及 design.md §8.31。
 function M:request_messages(text, stream, opts)
     opts = opts or {}
-    local inject = opts.inject_context ~= false
+    local simple = opts.simple == true
+    -- 短问题是独立 side question：不注入召回、todo、compact 或旧历史。
+    local inject = opts.inject_context ~= false and not simple
     local block = ""
     if inject and self.memory then
         local query = self.prompt.recall_query(text, self.ctx.session.messages)
@@ -364,9 +376,11 @@ function M:request_messages(text, stream, opts)
     local todo_block = inject and self.prompt.todos_block(self.ctx.session.todos) or ""
     local reserve = #block + #todo_block + 200
 
-    -- 先在超阈值时压一次；压不动就靠硬上限兜底。
-    self:maybe_compact(stream, reserve, opts.force_compact)
-    local msgs = self:view_messages()
+    -- 独立短问题不压、不带历史；否则走正常低频压缩。
+    if not simple then
+        self:maybe_compact(stream, reserve, opts.force_compact)
+    end
+    local msgs = self:view_messages(simple)
 
     local c = self:compactor()
     local used = Compact.total(msgs) + reserve
@@ -493,7 +507,7 @@ M.SIMPLE_TURNS = 2
 local TASK_VERBS = { "改", "修", "实现", "升级", "安装", "编译", "打包", "运行", "写", "删", "添加" }
 local CODEISH = {
     "代码", "文件", "目录", "仓库", "git", "commit", "测试", "编译", "安装",
-    "报错", "错误", "bug", "log", "函数", "模块", "接口", "日志", "修复",
+    "报错", "错误", "bug", "log", "code", "函数", "模块", "接口", "日志", "修复",
 }
 local function is_simple_question(text)
     text = tostring(text or ""):gsub("%s+", " "):sub(1, 200)
@@ -525,7 +539,14 @@ function M:_loop(text, stream)
     self._text = text
     local simple_question = is_simple_question(text)
     local request_tools = self.tools:schemas()
-    if simple_question then request_tools = {} end
+    if simple_question then
+        local only = {}
+        for _, schema in ipairs(request_tools) do
+            local fn = schema["function"] or {}
+            if fn.name == "web" then only[#only + 1] = schema end
+        end
+        request_tools = only
+    end
     self:ensure_system(request_tools, simple_question)
 
     local user = { role = "user", content = text }
@@ -537,13 +558,14 @@ function M:_loop(text, stream)
     local result_counts, repeated_result = {}, 0
     local overflow_retried = false
     local max_turns = ctx.settings.max_turns
-    if simple_question then max_turns = 1 end
+    if simple_question then max_turns = 2 end
     local token_budget = tonumber(ctx.settings.token_budget) or 0
 
     local function request_stream(inject, force)
         local req = self:request_messages(text, stream, {
             inject_context = inject,
             force_compact = force,
+            simple = simple_question,
         })
         -- outputLimit：让 provider 知道本轮输入大概占了多少 token。
         ctx.settings.input_tokens = self:estimate_tokens(Compact.total(req))
@@ -580,6 +602,7 @@ function M:_loop(text, stream)
             if compacted then
                 retry_msgs = self:request_messages(text, stream, {
                     inject_context = (iter == 1),
+                    simple = simple_question,
                 })
             else
                 local c = self:compactor()

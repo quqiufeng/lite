@@ -4,6 +4,7 @@ local Todos = require("core.todos")
 local Sandbox = require("core.sandbox")
 local Proc = require("core.proc")
 local Text = require("core.text")
+local http = require("core.http")
 
 local M = {}
 M.__index = M
@@ -17,7 +18,7 @@ local READ_MAX_LINES = 2000
 local READ_MAX_BYTES = 50 * 1024
 local READ_LINE_MAX = 2000
 local BUILTIN_TOOLS = {
-    bash = true, read = true, resize = true, native = true,
+    bash = true, web = true, read = true, resize = true, native = true,
     write = true, edit = true, remember = true, recall = true, todo = true,
 }
 
@@ -276,11 +277,28 @@ function M:schemas()
             type = "function",
             ["function"] = {
                 name = "bash",
-                description = "Run a shell command in the workspace (auto-approved).",
+                description = "Run a shell command on the host. Network access (curl/wget) is allowed; use bash for builds/tests and live external data. Do not inspect repository files with it unless the user asks about the project.",
                 parameters = {
                     type = "object",
                     properties = { command = { type = "string" } },
                     required = { "command" },
+                },
+            },
+        },
+        {
+            type = "function",
+            ["function"] = {
+                name = "web",
+                description = "Fetch an HTTP(S) URL through the bundled libcurl wrapper (GET, redirects, timeout). "
+                    .. "Use only for live external data such as weather/news; never for repository files. "
+                    .. "Returns the response body, optionally capped by max_chars.",
+                parameters = {
+                    type = "object",
+                    properties = {
+                        url = { type = "string" },
+                        max_chars = { type = "integer" },
+                    },
+                    required = { "url" },
                 },
             },
         },
@@ -584,6 +602,21 @@ function M:_resolve_external_image(path)
         end
     end
     return nil
+end
+
+function M:web(url, max_chars)
+    url = tostring(url or "")
+    if not url:match("^https?://") then
+        return "error: web URL must start with http:// or https://"
+    end
+    local rc, status, body = http.get(url, {}, 1024 * 1024)
+    if rc ~= 0 then return "error: web request failed: " .. tostring(body) end
+    if status ~= 200 then
+        return string.format("error: HTTP %d: %s", status, tostring(body):sub(1, 500))
+    end
+    local cap = tonumber(max_chars) or 12000
+    if #body > cap then body = body:sub(1, cap) .. "\n... [web truncated]" end
+    return body
 end
 
 function M:read(path, offset, limit)
@@ -1211,6 +1244,8 @@ function M:execute(name, args)
     local ok, out = pcall(function()
         if name == "bash" then
             return self:bash(args.command or "")
+        elseif name == "web" then
+            return self:web(args.url, args.max_chars)
         elseif name == "read" then
             return self:read(args.path, args.offset, args.limit)
         elseif name == "ocr" then

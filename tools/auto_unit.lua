@@ -589,13 +589,6 @@ do
         stream = function(msgs, ts)
             captured2 = msgs
             n2 = n2 + 1
-            if ts and #ts > 0 then
-                return {
-                    role = "assistant", content = "",
-                    tool_calls = { { id = "s" .. n2, type = "function",
-                        ["function"] = { name = "bash", arguments = '{"command":"git log -1"}' } } },
-                }
-            end
             final2 = "是最新版本"
             return { role = "assistant", content = final2 }
         end,
@@ -605,34 +598,48 @@ do
     local ans, err = a2:run("当前是最新版本吗")
     check(err == nil and ans == final2, "simple question answer")
     check(n2 == 1, "simple question tool budget")
-    local no_tools_in_prompt = true
+    local no_repo_tools = true
     for _, m in ipairs(captured2 or {}) do
         if m.role == "system" and tostring(m.content):find("- bash:", 1, true) then
-            no_tools_in_prompt = false
+            no_repo_tools = false
         end
     end
-    check(no_tools_in_prompt, "simple question prompt has no tools")
+    check(no_repo_tools, "simple question prompt has no repo tools")
+    check(#captured2 == 2 and captured2[1].role == "system" and captured2[2].role == "user",
+        "simple question is isolated system+user")
 
     local ctx3 = Context.new({ cwd = "/tmp", max_turns = 10 })
     local n3, final3 = 0, nil
+    local captured3
     local provider3 = {
         stream = function(msgs, ts)
+            captured3 = msgs
             n3 = n3 + 1
-            if ts and #ts > 0 then
+            if n3 == 1 then
+                check(ts and #ts == 1 and ts[1]["function"].name == "web", "weather web tool exposed")
                 return {
                     role = "assistant", content = "",
                     tool_calls = { { id = "w" .. n3, type = "function",
-                        ["function"] = { name = "bash", arguments = '{"command":"git log -1"}' } } },
+                        ["function"] = { name = "web", arguments = '{"url":"https://wttr.in/Hangzhou?format=j1"}' } } },
                 }
             end
             final3 = "杭州明天有雨"
             return { role = "assistant", content = final3 }
         end,
     }
-    local a3 = Agent.new(ctx3, provider3, flat, { append = function() end, save = function() end })
+    local web_tools = {
+        schemas = function()
+            return { { type = "function", ["function"] = { name = "web", description = "fetch" } } }
+        end,
+        execute = function(_, name, args) return "weather-data:" .. tostring(args.url) end,
+    }
+    local a3 = Agent.new(ctx3, provider3, web_tools, { append = function() end, save = function() end })
     local ans3, err3 = a3:run("明天杭州天气如何")
     check(err3 == nil and ans3 == final3, "weather question answer")
-    check(n3 == 1, "weather question tool budget")
+    check(n3 == 2, "weather question uses web then answer")
+    local saw_tool = false
+    for _, m in ipairs(captured3 or {}) do if m.role == "tool" then saw_tool = true end end
+    check(saw_tool, "weather tool result returned to model")
 end
 
 -- 循环被迫结束：收尾请求（不带 tools）+ 重复调用熔断

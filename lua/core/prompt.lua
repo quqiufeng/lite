@@ -3,7 +3,7 @@
 local M = {}
 
 local ORDER = { "preamble", "now", "tools", "capabilities", "native", "rules", "memory", "project_context", "cwd" }
-local DEFAULT_PROJECT_CHARS = 4000
+local DEFAULT_PROJECT_CHARS = 16000
 local context_cache = {}
 
 local function read_capped(path, max)
@@ -93,8 +93,10 @@ function M.sections(ctx, opts)
         preamble = "You are lite, a concise terminal coding agent running in the user's workspace. " ..
             "Help the user inspect files, run commands, and modify code.",
         now = "Current local date/time: " .. os.date("%Y-%m-%d %A %H:%M:%S %Z") .. ".",
-        tools = simple and "(none)" or tools,
-        capabilities = simple and "No tools are available for this turn. Answer directly in plain text; do not emit tool-call syntax or XML tags." or table.concat({
+        tools = tools,
+        capabilities = simple and (#tool_lines > 0
+            and "Only the listed tools are available for this turn. Use them only for live external data; never inspect repository files or git. If the source is unavailable, say so."
+            or "No tools are available for this turn. Answer directly in plain text; do not emit tool-call syntax or XML tags.") or table.concat({
             "You can act on the user's machine, not just chat:",
             "- Inspect and change the workspace with bash/read/write/edit; bash runs on the host.",
             "- Operate local processes and network; when DISPLAY is available, use automation/x11.lua and automation/xdo.lua (LuaJIT FFI to libX11/libxdo) for window focus, mouse, keyboard, and screenshots without xdotool/wmctrl.",
@@ -115,7 +117,9 @@ function M.sections(ctx, opts)
             "7. You may also compile manually with bash (cc -shared -fPIC ...), and call a workspace .so with luajit -e/ffi.load.",
             "Native helpers run in-process and are not sandboxed; keep them narrow, prefer existing tools first, and respect approval.",
         }, "\n"),
-        rules = simple and "- Answer directly in plain text; do not emit tool-call XML.\n- Be concise."
+        rules = simple and (#tool_lines > 0
+            and "- Use web only for live network data; do not run git/ls/cat/read repository files.\n- Answer directly in plain text; do not emit tool-call XML.\n- Be concise."
+            or "- Answer directly in plain text; do not emit tool-call XML.\n- Be concise.")
             or table.concat(rules, "\n"),
         memory = "You have persistent local memory for this workspace (mem.bin). " ..
             "A <memory> message may be inserted with entries retrieved for the current request; " ..

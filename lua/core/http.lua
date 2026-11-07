@@ -56,6 +56,10 @@ local CURLOPT_SSL_VERIFYPEER = 64
 local CURLOPT_CONNECTTIMEOUT = 78
 local CURLOPT_TIMEOUT = 13
 local CURLOPT_ACCEPT_ENCODING = 10102
+local CURLOPT_HTTPGET = 80
+local CURLOPT_FOLLOWLOCATION = 52
+local CURLOPT_MAXREDIRS = 68
+local CURLOPT_USERAGENT = 10018
 local CURLINFO_RESPONSE_CODE = 0x200002
 
 local CURLMSG_DONE = 1
@@ -127,6 +131,52 @@ function M.post_stream(url, headers, payload, on_data)
         return tonumber(rc), 0, ffi.string(curl.curl_easy_strerror(rc))
     end
     return 0, tonumber(code[0]), body
+end
+
+-- 阻塞 GET（web 工具）；max_bytes 防大页面吃内存。
+function M.get(url, headers, max_bytes)
+    global_init()
+    max_bytes = tonumber(max_bytes) or (1024 * 1024)
+    local h = curl.curl_easy_init()
+    if h == nil then return -1, 0, "curl_easy_init failed" end
+
+    local chunks, total = {}, 0
+    local cb = ffi.cast(write_cb_t, function(ptr, size, nmemb)
+        local n = tonumber(size) * tonumber(nmemb)
+        if n <= 0 then return 0 end
+        if total < max_bytes then
+            local take = math.min(n, max_bytes - total)
+            chunks[#chunks + 1] = ffi.string(ptr, take)
+            total = total + take
+        end
+        return n
+    end)
+
+    local list = nil
+    for _, v in ipairs(headers or {}) do
+        list = curl.curl_slist_append(list, v)
+    end
+    curl.curl_easy_setopt(h, CURLOPT_URL, ffi.cast("const char *", url))
+    curl.curl_easy_setopt(h, CURLOPT_HTTPGET, ffi.cast("long", 1))
+    curl.curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, ffi.cast("long", 1))
+    curl.curl_easy_setopt(h, CURLOPT_MAXREDIRS, ffi.cast("long", 5))
+    curl.curl_easy_setopt(h, CURLOPT_USERAGENT, ffi.cast("const char *", "lite-agent/0.1"))
+    if list then curl.curl_easy_setopt(h, CURLOPT_HTTPHEADER, list) end
+    curl.curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, cb)
+    curl.curl_easy_setopt(h, CURLOPT_NOSIGNAL, ffi.cast("long", 1))
+    curl.curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, ffi.cast("long", 1))
+    curl.curl_easy_setopt(h, CURLOPT_ACCEPT_ENCODING, ffi.cast("const char *", ""))
+    curl.curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, ffi.cast("long", 20))
+    curl.curl_easy_setopt(h, CURLOPT_TIMEOUT, ffi.cast("long", 60))
+
+    local rc = curl.curl_easy_perform(h)
+    local code = ffi.new("long[1]")
+    curl.curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, code)
+    if list then curl.curl_slist_free_all(list) end
+    curl.curl_easy_cleanup(h)
+
+    if rc ~= 0 then return tonumber(rc), 0, ffi.string(curl.curl_easy_strerror(rc)) end
+    return 0, tonumber(code[0]), table.concat(chunks)
 end
 
 -- 非阻塞请求组。当前 agent 一次只有一个请求，但接口支持多个。

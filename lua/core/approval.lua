@@ -4,6 +4,7 @@ M.__index = M
 
 local READONLY = {
     read = true,
+    web = true,
     ocr = true,
     recall = true,
     remember = true,

@@ -10,7 +10,8 @@ AI-native harness：记忆、工具、FFI、X11。
 | harness | `lua/`：循环、工具、记忆、TUI/serve、compact |
 | 机器 | `bash` 直达 shell、编译器、系统 `.so`、X11、GPU |
 
-**能力 = `bash` + 编译器 + FFI + `native`**；内置工具只是快捷键。
+**能力 = `bash`/`web` + 编译器 + FFI + `native`**；内置工具只是快捷键。
+- `web`：内置 libcurl GET，只取 live data，不翻仓库。
 同目录只允许一个写实例（`mem.lock`）；上下文有界，旧内容靠 `recall`。
 
 ## 1 看见自己
@@ -20,15 +21,13 @@ AI-native harness：记忆、工具、FFI、X11。
 ```bash
 ./tools/lite-lua tools/see.lua --list
 ./tools/lite-lua tools/see.lua --class wechat --width 1280
-# 其他过滤：--pid / --name --exact / --active / --full
 ```
 
-输出图片路径后 `read`；`--tui --snapshot FILE` 是更便宜的文本快照；
-`state/sessions --json` 查记忆和会话。
+输出图片路径后 `read`；`--tui --snapshot FILE` 是文本快照；`state/sessions --json` 查状态。
 
 ## 2 代码地图
 
-- `lua/main.lua`：入口；`lua/core/`：agent/tools/memory/prompt/session/compact
+- `lua/main.lua`：入口；`lua/core/`：agent/tools/memory/prompt/session/compact（含 web）
 - `lua/tui/`、`lua/ffi/`、`src/{cache,image,x11}/`、`automation/`、`helper/`、`tools/`
 - `lua/tui/mouse.lua` + `clipboard.lua`：拖选/剪贴板；选区在 `screen.lua`
 
