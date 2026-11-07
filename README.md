@@ -92,6 +92,7 @@ export DEEPSEEK_API_KEY="sk-..."
 ./tools/run.sh --tui --snapshot /tmp/lite-screen.txt --snapshot-text "hello"
 ./tools/run.sh state --json
 ./tools/run.sh sessions --json
+./tools/run.sh plugins --json   # helper/ 插件清单 + 加载错误
 
 # 无 UI 执行一轮（流式输出 + 工具循环）
 ./tools/run.sh --once "看一下当前目录，解释这个项目"
@@ -220,7 +221,7 @@ return {
 }
 ```
 
-**插件不热插拔**：schema 在会话启动时扫一次并记忆化（`<workspace>/helper` → `$LITE_ROOT/helper`，`.tool.json` 优先、内嵌 schema 其次），之后每轮复用快照 —— 运行中增删 `helper/*.lua` 不会悄悄改变工具列表（否则 system prompt 一变，DeepSeek 前缀缓存整段失效）。会话启动后新建的插件仍可按名调用，重启后进列表。
+**插件不热插拔**：schema 在会话启动时扫一次并记忆化（`<workspace>/helper` → `$LITE_ROOT/helper`，`.tool.json` 优先、内嵌 schema 其次），之后每轮复用快照 —— 运行中增删 `helper/*.lua` 不会悄悄改变工具列表（否则 system prompt 一变，DeepSeek 前缀缓存整段失效）。会话启动后新建的插件仍可按名调用，重启后进列表。加载了哪些、错在哪，用 `lite plugins`（`--json` 给脚本）看：它只读快照不触发加载，列 `name/path/scope/tool/hooks` 与错误；TUI 启动只在有错误时打一行 `plugin <name> failed: ...`。
 
 **hook 插件**：插件也可以只返回 `hooks` 而不返回 `run`，此时它**不进工具列表**（不动 system prompt），只在关键节点被调用：
 

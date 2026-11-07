@@ -86,6 +86,18 @@ function M.run(ctx, agent, memory, opts)
     populate(opts.messages, opts.messages and #opts.messages > 0
         and ("restored " .. #opts.messages .. " messages") or nil)
 
+    -- 插件坏了以前完全静默（`_helper_errors` 只存不展示）。启动只提示错误，清单用
+    -- `lite plugins`；`--no-plugins` 下不打扰。
+    do
+        local tools = agent.tools
+        if tools and tools.plugin_report then
+            local rep = tools:plugin_report()
+            for _, err in ipairs(rep.errors or {}) do
+                transcript:add("info", string.format("plugin %s failed: %s", err.name, err.error))
+            end
+        end
+    end
+
     local function switch_to(id)
         if busy then
             transcript:add("info", "无法切换：当前正在执行")

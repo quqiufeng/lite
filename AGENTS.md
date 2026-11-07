@@ -59,6 +59,7 @@ Chrome/WebView/CEF/Electron；不起 `xdotool/wmctrl/import`；不用 `systemd -
 ./tools/test.sh
 ./tools/run.sh                 # TUI；另见 --once/--recall/state/sessions/serve/attach
 ./tools/run.sh --once --json "prompt"
+./tools/run.sh plugins [--json]   # helper/ 插件清单 + 加载错误（只读快照）
 ./tools/run.sh --tui --snapshot out.txt
 ./tools/release.sh             # build + package + install；源码安装软链 lua/
 ```
@@ -97,6 +98,10 @@ wrapper 返回 `{ run=function(args,env) ... end }`；重新 build 生成新 `.s
 `before_tool` 返回字符串即拦截（优先于审批），`on_user_turn` 返回值可改写用户文本。
 hook 错误一律 fail-open（记 `_hook_errors`，不炸 agent）。`has_hooks()` 为空时零开销。
 插件与 agent 同进程同权限，跑不受信任的仓库用 `--no-plugins` / `LITE_PLUGINS=0` 全关。
+
+**查插件用 `lite plugins`**：只读启动快照、不触发加载，列每项的
+`name/path/scope/tool/hooks` 与错误（`--json` 给脚本）；启动时只打印错误
+（`plugin <name> failed: ...`），清单不打扰。别靠翻 `helper/` 猜加载了啥。
 
 ## 7 参考实现（新功能先查）
 

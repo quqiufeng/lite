@@ -11,8 +11,11 @@ local M = {}
 
 local HINT = "lite TUI · Enter 发送 · Ctrl+J 换行 · Tab 补全 · /session 会话 · Ctrl+G diff · Ctrl+T todo · ? help · Ctrl+D 退出"
 
-local function populate(transcript, messages)
+local function populate(transcript, messages, plugin_errors)
     transcript:add("info", HINT)
+    for _, err in ipairs(plugin_errors or {}) do
+        transcript:add("info", string.format("plugin %s failed: %s", err.name, err.error))
+    end
     for _, m in ipairs(messages or {}) do
         if m.role == "user" then
             transcript:add("user", m.content or "")
@@ -58,7 +61,7 @@ function M.render(ctx, opts)
     end
 
     local transcript = Transcript.new()
-    populate(transcript, opts.messages)
+    populate(transcript, opts.messages, opts.plugin_errors)
 
     local composer = Composer.new()
     if opts.text and opts.text ~= "" then composer:insert(opts.text) end

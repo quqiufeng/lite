@@ -1149,6 +1149,14 @@ workspace 的 `?.lua` / `?.so` 前置进 `package.path`/`cpath`，并扫 `build`
 语法错 → `load failed: ...`，按名调用时这些文本原样返回，用户能自己修。
 `/reload` 与 `Tools.new` 会重置快照，运行中新建的 `.lua` 不会偷偷挤进列表。
 
+**清单可见** —— 快照藏起来的另一面是"我看不到它加载了啥"，所以 `lite plugins`
+（`--json` 给脚本）只读快照、**不做加载**：打印两侧 root、每个插件的
+`name / path / scope / tool / hooks`、每条错误，以及 `tool_count` / `hook_count`；
+`--no-plugins` 下直接回 `plugins: disabled`。数据源只有 `plugin_report()`
+（`_scan_helper_schemas` 边扫边填 `_helper_meta`），`plugins_report()` 只负责渲染人读文本。
+启动时只打印**错误**（`plugin <name> failed: <err>`；TUI 在 `tui/loop.lua`，`--tui
+--snapshot` 同样进快照），清单不打扰正常会话，`--no-plugins` 下一条都不打。
+
 **hook：只声明 `hooks` 的插件不是工具** —— 插件可以返回
 `{ hooks = { before_tool = ..., after_tool = ..., on_user_turn = ..., on_compact = ...,
 on_session_end = ... } }`，此时 `helper_lua_schema()` 返回 `nil`：它不进 `schemas()`，
@@ -1177,8 +1185,9 @@ hook 一个都不跑。CLI 侧由 `LITE_PLUGINS=0` / `--no-plugins` 落到 `cfg.
 bundled `.so` / `tools/lite-lua` 保持干净）；hook 块（hook-only 插件不进 `schemas()`、
 `before_tool` 拦截与放行、`after_tool` 改写、`on_user_turn` 改写、坏 hook fail-open、
 `plugins=false` 全关）与 agent 级集成（veto 跳过执行、结果带 `|after`、用户文本被改写、
-`on_session_end` 只跑一次）。
+`on_session_end` 只跑一次）；`plugin_report` 块（`tool_count`/`hook_count` 计数、坏插件
+归入 `errors`、按名查 `path/scope/tool/hooks`）。
 
-**当前回归** —— `./tools/test.sh`：单元 597 项 + `cli.json` / `tui.smoke` /
+**当前回归** —— `./tools/test.sh`：单元 609 项 + `cli.json` / `tui.smoke` /
 `serve.probe` / `serve.smoke` 全通过（`[verified]` 2026-11-07）。§8.30 / §8.33 里的
 "385 项"/"424 项"是各自落地时的历史数字，不再逐节回填。

@@ -19,6 +19,7 @@ lite — DeepSeek 终端 coding agent
   lite --tui --snapshot out.txt   输出整屏快照（AI 验收）
   lite state [--json]          输出会话/记忆/todo 状态
   lite sessions [--json]       列出同 cwd 会话
+  lite plugins [--json]        列出 helper/ 插件与加载错误
   lite --check                 检查运行依赖
   lite --once "<prompt>"       无 UI 单轮/工具循环（流式输出）
   lite --recall "<query>"      查询当前目录的本地记忆
@@ -73,6 +74,7 @@ local SUBCOMMANDS = {
     ["--version"] = true, ["--help"] = true, ["-h"] = true,
     serve = true, ["--serve"] = true, attach = true, ["--attach"] = true,
     state = true, ["--state"] = true, sessions = true, ["--sessions"] = true,
+    plugins = true, ["--plugins"] = true,
     ["--check"] = true, ["--recall"] = true, ["--tui"] = true, ["--once"] = true,
 }
 
@@ -278,6 +280,21 @@ elseif cmd == "state" or cmd == "--state" or cmd == "sessions" or cmd == "--sess
     end
     memory:close()
     os.exit(0)
+elseif cmd == "plugins" or cmd == "--plugins" then
+    -- helper/ 是隐式加载的：坏了、被 --no-plugins 关掉、藏在哪个 root，都只能问这里。
+    local flags = parse_flags(rest)
+    local config = require("core.config").load()
+    if flags.no_plugins then config.plugins = false end
+    local Tools = require("core.tools")
+    local tools = Tools.new({ cwd = config.cwd, plugins = config.plugins })
+    local rep = tools:plugin_report()
+    if json then
+        emit({ type = "plugins", cwd = config.cwd, plugins = rep })
+    else
+        print("cwd " .. config.cwd)
+        print(tools:plugins_report())
+    end
+    os.exit(0)
 elseif cmd == "--check" then
     local deps = require("core.deps")
     local ok, rows = deps.check()
@@ -422,6 +439,7 @@ elseif cmd == "--tui" then
         end
         local ok, err = require("tui.snapshot").write(flags.snapshot, ctx, {
             messages = restored,
+            plugin_errors = tools:plugin_report().errors,
             text = flags.snapshot_text,
             todo = flags.snapshot_todo,
             diff = flags.snapshot_diff,

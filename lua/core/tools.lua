@@ -1140,7 +1140,8 @@ function M:_scan_helper_schemas()
     local out = {}
     local errors = {}
     local plugins = {}
-    local function push(name, schema)
+    local meta = {}
+    local function push(name, schema, origin)
         seen[name] = true
         out[#out + 1] = {
             type = "function",
@@ -1150,6 +1151,12 @@ function M:_scan_helper_schemas()
                 parameters = schema.parameters,
             },
         }
+        if origin then
+            meta[name] = {
+                name = name, path = origin.path, scope = origin.scope,
+                tool = true, hooks = {},
+            }
+        end
     end
     for _, root in ipairs(self:_helper_roots()) do
         local listed = io.popen("ls -1 " .. shq(root.dir) .. " 2>/dev/null")
@@ -1168,7 +1175,7 @@ function M:_scan_helper_schemas()
                     if ok and type(schema) == "table"
                         and (schema.name == nil or schema.name == name)
                         and type(schema.parameters) == "table" then
-                        push(name, schema)
+                        push(name, schema, { path = root.dir .. "/" .. line, scope = root.scope })
                     end
                 end
                 local bare = line:match("^([%w_][%w_%-]*)%.lua$")
@@ -1197,7 +1204,7 @@ function M:_scan_helper_schemas()
                             if not seen[bare] then
                                 local schema, serr = helper_lua_schema(bare, mod)
                                 if schema then
-                                    push(bare, schema)
+                                    push(bare, schema, { path = lua_path, scope = root.scope })
                                 elseif serr then
                                     errors[bare] = serr
                                 end
@@ -1217,6 +1224,18 @@ function M:_scan_helper_schemas()
         end
     end
     self._hook_kinds = kinds
+    for _, p in ipairs(self._helper_plugins) do
+        local row = meta[p.name]
+        if not row then
+            row = { name = p.name, path = p.path, scope = p.scope, tool = false }
+            meta[p.name] = row
+        end
+        row.hooks = {}
+        for _, k in ipairs(HOOK_KINDS) do
+            if type(p.mod.hooks[k]) == "function" then row.hooks[#row.hooks + 1] = k end
+        end
+    end
+    self._helper_meta = meta
     return out
 end
 
@@ -1225,6 +1244,68 @@ function M:_helper_schemas()
         self._helper_cache = self:_scan_helper_schemas()
     end
     return self._helper_cache
+end
+
+-- 插件清单：helper 是隐式加载的，坏了没人看得见（`_helper_errors` 以前只存不展示）。
+-- 只读快照，不做任何加载；`lite plugins` 和 TUI 启动都走这里。
+function M:plugin_report()
+    if self.plugins then self:_helper_schemas() end
+    local entries = {}
+    for _, row in pairs(self._helper_meta or {}) do entries[#entries + 1] = row end
+    table.sort(entries, function(a, b) return a.name < b.name end)
+
+    local errors = {}
+    for name, err in pairs(self._helper_errors or {}) do
+        errors[#errors + 1] = { name = name, error = tostring(err) }
+    end
+    table.sort(errors, function(a, b) return a.name < b.name end)
+
+    local roots = {}
+    if self.plugins then roots = self:_helper_roots() end
+
+    local rep = {
+        enabled = self.plugins and true or false,
+        entries = entries,
+        errors = errors,
+        roots = roots,
+        tool_count = 0,
+        hook_count = 0,
+    }
+    for _, row in ipairs(entries) do
+        if row.tool then rep.tool_count = rep.tool_count + 1 end
+        if #row.hooks > 0 then rep.hook_count = rep.hook_count + 1 end
+    end
+    return rep
+end
+
+-- 人读版本，给 `lite plugins` 和 TUI 提示用。
+function M:plugins_report()
+    local rep = self:plugin_report()
+    local lines = {}
+    if not rep.enabled then
+        lines[#lines + 1] = "plugins: disabled (--no-plugins / LITE_PLUGINS=0)"
+        return table.concat(lines, "\n")
+    end
+    lines[#lines + 1] = string.format(
+        "plugins: %d helper tool(s), %d hook plugin(s), %d error(s)",
+        rep.tool_count, rep.hook_count, #rep.errors)
+    for _, root in ipairs(rep.roots) do
+        lines[#lines + 1] = string.format("root[%s]: %s", tostring(root.scope), tostring(root.dir))
+    end
+    if #rep.entries == 0 then
+        lines[#lines + 1] = "  (no helper plugins)"
+    end
+    for _, row in ipairs(rep.entries) do
+        local kinds = {}
+        if row.tool then kinds[#kinds + 1] = "tool" end
+        if #row.hooks > 0 then kinds[#kinds + 1] = "hooks=" .. table.concat(row.hooks, ",") end
+        lines[#lines + 1] = string.format("  %-20s %-28s %s",
+            row.name, table.concat(kinds, " "), tostring(row.path or ""))
+    end
+    for _, err in ipairs(rep.errors) do
+        lines[#lines + 1] = string.format("  error %s: %s", err.name, err.error)
+    end
+    return table.concat(lines, "\n")
 end
 
 -- 插件 hook。全部走会话快照（`self._helper_plugins`）：hook 列表同样不能在运行中

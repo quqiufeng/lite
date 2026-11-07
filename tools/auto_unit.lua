@@ -1754,6 +1754,62 @@ return {
     os.execute("rm -rf " .. shq(dir))
 end
 
+-- plugin report: helper 隐式加载，坏了也要有个地方看
+do
+    local dir = os.tmpname()
+    os.remove(dir)
+    os.execute("mkdir -p " .. shq(dir .. "/helper"))
+    local function put(path, body)
+        local f = assert(io.open(path, "wb"))
+        f:write(body)
+        f:close()
+    end
+    put(dir .. "/helper/plain.lua", [[
+return {
+    schema = { description = "plain", parameters = { type = "object", properties = {} } },
+    run = function() return "plain" end,
+}
+]])
+    put(dir .. "/helper/both.lua", [[
+return {
+    schema = { description = "both", parameters = { type = "object", properties = {} } },
+    run = function() return "both" end,
+    hooks = { before_tool = function() end, on_user_turn = function(t) return t end },
+}
+]])
+    put(dir .. "/helper/guard.lua",
+        'return { hooks = { after_tool = function(n, a, r) return r end } }')
+    put(dir .. "/helper/broken.lua", "return { }")
+
+    local Tools = require("core.tools")
+    local t = Tools.new({ cwd = dir })
+    local rep = t:plugin_report()
+    check(type(rep) == "table", "plugin report is a table")
+    check(rep.tool_count == 2, "plugin report counts tools")
+    check(rep.hook_count == 2, "plugin report counts hook plugins")
+    check(#rep.errors == 1 and rep.errors[1].name == "broken", "plugin report lists errors")
+    local by = {}
+    for _, row in ipairs(rep.entries or {}) do by[row.name] = row end
+    check(by.plain and by.plain.tool and #by.plain.hooks == 0, "report: tool-only entry")
+    check(by.guard and not by.guard.tool and #by.guard.hooks == 1
+        and by.guard.hooks[1] == "after_tool", "report: hook-only entry")
+    check(by.both and by.both.tool and #by.both.hooks == 2, "report: tool+hook entry")
+    check(by.plain.scope == "local" and by.plain.path ~= nil, "report: scope and path")
+
+    local text = t:plugins_report()
+    check(text:find("2 helper tool", 1, true) ~= nil, "plugins_report tool count")
+    check(text:find("broken", 1, true) ~= nil, "plugins_report error line")
+    check(text:find("root", 1, true) ~= nil, "plugins_report roots")
+
+    -- 关掉插件时清单不该显示任何 helper
+    local tn = Tools.new({ cwd = dir, plugins = false })
+    local trep = tn:plugin_report()
+    check(trep.tool_count == 0 and #trep.entries == 0 and #trep.errors == 0,
+        "report empty with plugins=false")
+
+    os.execute("rm -rf " .. shq(dir))
+end
+
 -- agent hook dispatch points
 do
     local Context = require("context")
