@@ -15,6 +15,7 @@ local Complete = require("tui.complete")
 local SessionView = require("tui.session_view")
 local Session = require("core.session")
 local Reload = require("core.reload")
+local Agent = require("core.agent")
 local CoreText = require("core.text")
 local http = require("core.http")
 
@@ -327,6 +328,24 @@ function M.run(ctx, agent, memory, opts)
         return true
     end
 
+    local function interrupt_current()
+        if active_proc then
+            active_proc:cancel()
+            active_proc = nil
+            co = nil
+            finish_agent()
+            if start_next then start_next() end
+            if draw then draw() end
+            return true
+        elseif active_req and multi then
+            http.cancel(multi, active_req)
+            active_req = nil
+            resume_agent(nil, "cancelled")
+            return true
+        end
+        return false
+    end
+
     local function submit()
         local text = composer:get_text()
         if text == "" then return end
@@ -349,6 +368,10 @@ function M.run(ctx, agent, memory, opts)
             local block = transcript:add("queued", text)
             queue[#queue + 1] = { text = text, block = block }
             transcript:reset_scroll()
+            if Agent.is_simple_question and Agent.is_simple_question(text) then
+                local stopped = interrupt_current()
+                transcript:add("info", stopped and "当前任务已中断，先处理这个问题" or "已排队")
+            end
             if draw then draw() end
             return
         end

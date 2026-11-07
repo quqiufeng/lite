@@ -84,6 +84,10 @@ export DEEPSEEK_API_KEY="sk-..."
 # 无人值守：每 300 秒唤醒执行任务
 ./tools/run.sh serve --port 8765 --wake 300 --task "检查 CI 并修复"
 
+# 调试模式：记录每次请求的 system_prompt 和原始 API response
+./tools/run.sh --tui --debug        # 默认 /tmp/lite-debug.jsonl
+./tools/run.sh --tui --debug --debug-log /tmp/my.jsonl
+
 # AI 自观察：整屏快照 / 机器可读状态
 ./tools/run.sh --tui --snapshot /tmp/lite-screen.txt --snapshot-text "hello"
 ./tools/run.sh state --json

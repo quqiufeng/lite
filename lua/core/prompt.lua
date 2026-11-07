@@ -2,7 +2,7 @@
 -- 参考 Pi system-prompt sections 与 Reasonix prefix/recall 的稳定前缀思路。
 local M = {}
 
-local ORDER = { "preamble", "tools", "capabilities", "native", "rules", "memory", "project_context", "cwd" }
+local ORDER = { "preamble", "now", "tools", "capabilities", "native", "rules", "memory", "project_context", "cwd" }
 local DEFAULT_PROJECT_CHARS = 4000
 local context_cache = {}
 
@@ -86,13 +86,15 @@ function M.sections(ctx, opts)
     rules[#rules + 1] = "- Use remember(key, content, tags) for durable project facts."
     rules[#rules + 1] = "- Use recall(query, limit) when older context is needed."
 
-    local project = M.project_context(cwd)
+    local simple = opts.simple == true
+    local project = simple and nil or M.project_context(cwd)
 
     return {
         preamble = "You are lite, a concise terminal coding agent running in the user's workspace. " ..
             "Help the user inspect files, run commands, and modify code.",
-        tools = tools,
-        capabilities = table.concat({
+        now = "Current local date/time: " .. os.date("%Y-%m-%d %A %H:%M:%S %Z") .. ".",
+        tools = simple and "(none)" or tools,
+        capabilities = simple and "No tools are available for this turn. Answer directly in plain text; do not emit tool-call syntax or XML tags." or table.concat({
             "You can act on the user's machine, not just chat:",
             "- Inspect and change the workspace with bash/read/write/edit; bash runs on the host.",
             "- Operate local processes and network; when DISPLAY is available, use automation/x11.lua and automation/xdo.lua (LuaJIT FFI to libX11/libxdo) for window focus, mouse, keyboard, and screenshots without xdotool/wmctrl.",
@@ -102,7 +104,7 @@ function M.sections(ctx, opts)
             "- In serve/wake mode you may run without a user present.",
             "- Sandbox/approval policy still applies: bash may be sandboxed, native/FFI runs in-process and needs approval when configured.",
         }, "\n"),
-        native = table.concat({
+        native = simple and "" or table.concat({
             "Use this self-extension flow only when built-in tools and system libraries are insufficient.",
             "1. Write C or C++ exporting: char *lite_helper(const char *input); and optionally void lite_helper_free(char *out); input/output are UTF-8 strings, usually JSON.",
             "2. Build: native(action=\"build\", name=\"x\", code=..., lang=\"c\", libs={\"m\"}). Default scope=local writes <cwd>/helper; scope=global writes $LITE_ROOT/helper.",
@@ -113,7 +115,8 @@ function M.sections(ctx, opts)
             "7. You may also compile manually with bash (cc -shared -fPIC ...), and call a workspace .so with luajit -e/ffi.load.",
             "Native helpers run in-process and are not sandboxed; keep them narrow, prefer existing tools first, and respect approval.",
         }, "\n"),
-        rules = table.concat(rules, "\n"),
+        rules = simple and "- Answer directly in plain text; do not emit tool-call XML.\n- Be concise."
+            or table.concat(rules, "\n"),
         memory = "You have persistent local memory for this workspace (mem.bin). " ..
             "A <memory> message may be inserted with entries retrieved for the current request; " ..
             "it can be stale, so use it only when relevant. The prompt keeps only recent turns; " ..

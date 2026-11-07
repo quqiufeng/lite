@@ -253,9 +253,18 @@ local function build_request(messages, tools, opts)
                 end
             end
         end
+        local system_prompt = ""
+        for _, m in ipairs(cleaned) do
+            if m.role == "system" then
+                system_prompt = tostring(m.content or "")
+                break
+            end
+        end
         opts.debug:log("request", {
             model = body.model,
             messages = #cleaned,
+            system_prompt = system_prompt,
+            system_prompt_bytes = #system_prompt,
             bytes = #payload,
             images = images,
             image_bytes = image_bytes,
@@ -322,6 +331,8 @@ function M.stream(messages, tools, opts, on_delta, on_reasoning)
                 attempt = attempt,
                 status = status,
                 rc = rc,
+                body = tostring(raw or ""),
+                body_bytes = #tostring(raw or ""),
                 error = rc ~= 0 and tostring(raw) or nil,
             })
         end
@@ -362,6 +373,8 @@ function M.finish_request(req)
         req.debug:log("response", {
             status = req.status,
             rc = req.rc,
+            body = tostring(req.body or ""),
+            body_bytes = #tostring(req.body or ""),
             error = req.err,
         })
     end

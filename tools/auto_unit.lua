@@ -555,6 +555,16 @@ do
     check(calls == 2, "agent loop count")
 end
 
+-- 简单问题识别：短问题优先，不按天气等主题枚举
+do
+    local A = require("core.agent")
+    check(A.is_simple_question("明天杭州天气如何"), "simple question weather")
+    check(A.is_simple_question("你查一下杭州这三天的天气"), "simple question lookup")
+    check(A.is_simple_question("现在是什么版本 做了什么修改"), "simple question status")
+    check(not A.is_simple_question("修改 lua/tui/loop.lua 的鼠标逻辑"), "task with code not simple")
+    check(not A.is_simple_question("实现一个天气查询工具，改 tools.lua"), "task with verbs not simple")
+end
+
 -- 旧会话 system prompt 必须刷新；简单状态问题限制工具轮
 do
     local Context = require("context")
@@ -574,11 +584,12 @@ do
     check(appends == 0, "system prompt refresh does not duplicate")
 
     local ctx2 = Context.new({ cwd = "/tmp", max_turns = 10 })
-    local n2, final2 = 0, nil
+    local n2, final2, captured2 = 0, nil, nil
     local provider = {
         stream = function(msgs, ts)
+            captured2 = msgs
             n2 = n2 + 1
-            if ts then
+            if ts and #ts > 0 then
                 return {
                     role = "assistant", content = "",
                     tool_calls = { { id = "s" .. n2, type = "function",
@@ -593,14 +604,21 @@ do
     local a2 = Agent.new(ctx2, provider, flat, { append = function() end, save = function() end })
     local ans, err = a2:run("当前是最新版本吗")
     check(err == nil and ans == final2, "simple question answer")
-    check(n2 == 3, "simple question tool budget")
+    check(n2 == 1, "simple question tool budget")
+    local no_tools_in_prompt = true
+    for _, m in ipairs(captured2 or {}) do
+        if m.role == "system" and tostring(m.content):find("- bash:", 1, true) then
+            no_tools_in_prompt = false
+        end
+    end
+    check(no_tools_in_prompt, "simple question prompt has no tools")
 
     local ctx3 = Context.new({ cwd = "/tmp", max_turns = 10 })
     local n3, final3 = 0, nil
     local provider3 = {
         stream = function(msgs, ts)
             n3 = n3 + 1
-            if ts then
+            if ts and #ts > 0 then
                 return {
                     role = "assistant", content = "",
                     tool_calls = { { id = "w" .. n3, type = "function",
@@ -614,7 +632,7 @@ do
     local a3 = Agent.new(ctx3, provider3, flat, { append = function() end, save = function() end })
     local ans3, err3 = a3:run("明天杭州天气如何")
     check(err3 == nil and ans3 == final3, "weather question answer")
-    check(n3 == 3, "weather question tool budget")
+    check(n3 == 1, "weather question tool budget")
 end
 
 -- 循环被迫结束：收尾请求（不带 tools）+ 重复调用熔断

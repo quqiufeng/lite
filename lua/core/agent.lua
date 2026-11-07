@@ -26,23 +26,35 @@ function M.new(ctx, provider, tools, session, memory)
     return self
 end
 
-function M:system_prompt()
-    return self.prompt.system_prompt(self.ctx, { tools = self.tools:schemas() })
+function M:system_prompt(active_tools, simple)
+    return self.prompt.system_prompt(self.ctx, {
+        tools = active_tools or self.tools:schemas(),
+        simple = simple,
+    })
 end
 
-function M:ensure_system()
+function M:ensure_system(active_tools, simple)
     local msgs = self.ctx.session.messages
-    local prompt = self:system_prompt()
+    local prompt = self:system_prompt(active_tools, simple)
+    local changed = false
     if #msgs == 0 or msgs[1].role ~= "system" then
         local msg = { role = "system", content = prompt }
         table.insert(msgs, 1, msg)
         self.session:append(msg)
-        return
-    end
+        changed = true
     -- 旧会话恢复出来的是旧 system prompt；不刷新的话 prompt 改动永远不生效。
     -- 只替换内存中的首条，不重复 append；下个进程启动再刷新一次即可。
-    if msgs[1].content ~= prompt then
+    elseif msgs[1].content ~= prompt then
         msgs[1] = { role = "system", content = prompt }
+        changed = true
+    end
+    if changed and self.ctx.settings.debug then
+        self.ctx.settings.debug:log("system_prompt", {
+            content = prompt,
+            bytes = #prompt,
+            simple = simple == true,
+            tools = active_tools and #active_tools or 0,
+        })
     end
     -- 历史中意外混入的 system 消息（旧恢复逻辑会插在中间）也清掉。
     for i = #msgs, 2, -1 do
@@ -478,15 +490,17 @@ M.SIMPLE_TURNS = 2
 -- 只做粗粒度识别，明显是开发任务的句子不命中。
 -- 通用判断：短问题、且没有代码/仓库上下文，就不要把工具循环开到底。
 -- 不按“天气/新闻”等主题枚举；具体该查网络还是回答“不知道”由 prompt 约束。
-local TASK_PREFIX = "^(%s*)(改|修|实现|升级|安装|编译|打包|运行|写|删|添加)"
+local TASK_VERBS = { "改", "修", "实现", "升级", "安装", "编译", "打包", "运行", "写", "删", "添加" }
 local CODEISH = {
     "代码", "文件", "目录", "仓库", "git", "commit", "测试", "编译", "安装",
-    "报错", "错误", "bug", "函数", "模块", "接口", "日志", "修复",
+    "报错", "错误", "bug", "log", "函数", "模块", "接口", "日志", "修复",
 }
 local function is_simple_question(text)
     text = tostring(text or ""):gsub("%s+", " "):sub(1, 200)
     if #text > 80 or text:find("\n") then return false end
-    if text:find(TASK_PREFIX) then return false end
+    for _, v in ipairs(TASK_VERBS) do
+        if text:sub(1, #v) == v then return false end
+    end
     for _, w in ipairs(CODEISH) do
         if text:find(w, 1, true) then return false end
     end
@@ -497,12 +511,22 @@ local function is_simple_question(text)
         or text:find("几", 1, true) ~= nil or text:find("多少", 1, true) ~= nil
         or text:find("最新", 1, true) ~= nil or text:find("版本", 1, true) ~= nil
         or text:find("当前", 1, true) ~= nil
+        -- 短请求句：查一下/搜一下/看看/告诉我；代码/仓库词已在上面排除。
+        or text:find("查", 1, true) ~= nil
+        or text:find("搜", 1, true) ~= nil
+        or text:find("看看", 1, true) ~= nil
+        or text:find("告诉我", 1, true) ~= nil
 end
+
+M.is_simple_question = is_simple_question
 
 function M:_loop(text, stream)
     local ctx = self.ctx
     self._text = text
-    self:ensure_system()
+    local simple_question = is_simple_question(text)
+    local request_tools = self.tools:schemas()
+    if simple_question then request_tools = {} end
+    self:ensure_system(request_tools, simple_question)
 
     local user = { role = "user", content = text }
     ctx:add_message(user)
@@ -513,7 +537,7 @@ function M:_loop(text, stream)
     local result_counts, repeated_result = {}, 0
     local overflow_retried = false
     local max_turns = ctx.settings.max_turns
-    if is_simple_question(text) then max_turns = math.min(max_turns, M.SIMPLE_TURNS) end
+    if simple_question then max_turns = 1 end
     local token_budget = tonumber(ctx.settings.token_budget) or 0
 
     local function request_stream(inject, force)
@@ -523,7 +547,7 @@ function M:_loop(text, stream)
         })
         -- outputLimit：让 provider 知道本轮输入大概占了多少 token。
         ctx.settings.input_tokens = self:estimate_tokens(Compact.total(req))
-        return stream(req, self.tools:schemas(), ctx.settings,
+        return stream(req, request_tools, ctx.settings,
             function(delta) ctx:emit("delta", delta) end,
             function(delta) ctx:emit("reasoning", delta) end)
     end
@@ -588,6 +612,18 @@ function M:_loop(text, stream)
         local calls = assistant.tool_calls
         if not calls or #calls == 0 then
             local answer = assistant.content or ""
+            if simple_question and (answer:find("DSML", 1, true)
+                or answer:find("<|", 1, true) or answer:find("<｜｜", 1, true)) then
+                -- 没有 tools 时模型有时会吐原始 tool-call XML；绝不能展示给用户。
+                answer = "（当前没有可用工具，无法获取实时信息。）"
+                assistant.content = answer
+            end
+            if answer:match("^%s*$") then
+                answer = simple_question
+                    and "（这是一个简短问题，但我无法从当前上下文确认答案。）"
+                    or "（模型没有返回内容。）"
+                assistant.content = answer
+            end
             if self.memory then
                 self.memory:remember_turn(ctx.session.id, ctx.session.turn, text, answer, tool_notes)
                 self.memory:tick()

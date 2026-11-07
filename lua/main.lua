@@ -32,6 +32,7 @@ lite — DeepSeek 终端 coding agent
   --sandbox                    bash 使用 bwrap 沙箱（需安装 bubblewrap）
   --approval auto|ask|deny     工具审批策略（默认 auto）
   --max-turns N                单次任务工具循环上限（默认 256）
+  --debug                      开启调试日志（默认 $TMPDIR/lite-debug.jsonl）
   --debug-log PATH             写 JSONL 调试日志（provider/HTTP）
 
 环境:
@@ -83,6 +84,10 @@ elseif cmd:sub(1, 1) == "-" and not SUBCOMMANDS[cmd] then
     cmd = "--tui"
 end
 for i = 2, #clean do rest[#rest + 1] = clean[i] end
+
+local function default_debug_log()
+    return (os.getenv("TMPDIR") or "/tmp") .. "/lite-debug.jsonl"
+end
 
 local function parse_flags(list)
     local flags, pos = {}, {}
@@ -146,6 +151,9 @@ local function parse_flags(list)
         elseif a == "--max-turns" then
             flags.max_turns = tonumber(list[i + 1])
             i = i + 2
+        elseif a == "--debug" then
+            flags.debug = true
+            i = i + 1
         elseif a == "--debug-log" then
             flags.debug_log = list[i + 1]
             i = i + 2
@@ -173,6 +181,7 @@ elseif cmd == "serve" or cmd == "--serve" then
     if flags.approval then config.approval = flags.approval end
     if flags.max_turns then config.max_turns = flags.max_turns end
     if flags.debug_log then config.debug_log = flags.debug_log end
+    if flags.debug and not config.debug_log then config.debug_log = default_debug_log() end
     if not config.api_key or config.api_key == "" then
         io.stderr:write("lite: missing DEEPSEEK_API_KEY\n")
         os.exit(2)
@@ -315,6 +324,7 @@ elseif cmd == "--tui" then
     if flags.approval then config.approval = flags.approval end
     if flags.max_turns then config.max_turns = flags.max_turns end
     if flags.debug_log then config.debug_log = flags.debug_log end
+    if flags.debug and not config.debug_log then config.debug_log = default_debug_log() end
     if not flags.snapshot and (not config.api_key or config.api_key == "") then
         io.stderr:write("lite: missing DEEPSEEK_API_KEY\n")
         os.exit(2)
@@ -446,6 +456,8 @@ elseif cmd == "--once" then
 
     local config = require("core.config").load()
     if flags.max_turns then config.max_turns = flags.max_turns end
+    if flags.debug_log then config.debug_log = flags.debug_log end
+    if flags.debug and not config.debug_log then config.debug_log = default_debug_log() end
     if not config.api_key or config.api_key == "" then
         if json then emit({ type = "error", error = "missing DEEPSEEK_API_KEY" })
         else io.stderr:write("lite: missing DEEPSEEK_API_KEY\n") end
