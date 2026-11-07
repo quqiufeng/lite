@@ -537,6 +537,47 @@ do
     check(calls == 2, "agent loop count")
 end
 
+-- 旧会话 system prompt 必须刷新；简单状态问题限制工具轮
+do
+    local Context = require("context")
+    local Agent = require("core.agent")
+    local ctx = Context.new({ cwd = "/tmp", max_turns = 10 })
+    ctx.session.messages = {
+        { role = "system", content = "OLD SYSTEM" },
+        { role = "user", content = "hi" },
+    }
+    local tools = { schemas = function() return {} end, execute = function() end }
+    local appends = 0
+    local agent = Agent.new(ctx, {}, tools, { append = function() appends = appends + 1 end })
+    agent:ensure_system()
+    check(ctx.session.messages[1].content ~= "OLD SYSTEM", "system prompt refresh")
+    check(ctx.session.messages[1].content:find("simple yes/no/status/version", 1, true) ~= nil,
+        "system prompt refresh content")
+    check(appends == 0, "system prompt refresh does not duplicate")
+
+    local ctx2 = Context.new({ cwd = "/tmp", max_turns = 10 })
+    local n2, final2 = 0, nil
+    local provider = {
+        stream = function(msgs, ts)
+            n2 = n2 + 1
+            if ts then
+                return {
+                    role = "assistant", content = "",
+                    tool_calls = { { id = "s" .. n2, type = "function",
+                        ["function"] = { name = "bash", arguments = '{"command":"git log -1"}' } } },
+                }
+            end
+            final2 = "是最新版本"
+            return { role = "assistant", content = final2 }
+        end,
+    }
+    local flat = { schemas = function() return {} end, execute = function() return "same" end }
+    local a2 = Agent.new(ctx2, provider, flat, { append = function() end, save = function() end })
+    local ans, err = a2:run("当前是最新版本吗")
+    check(err == nil and ans == final2, "simple question answer")
+    check(n2 == 3, "simple question tool budget")
+end
+
 -- 循环被迫结束：收尾请求（不带 tools）+ 重复调用熔断
 do
     local Context = require("context")

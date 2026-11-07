@@ -32,10 +32,21 @@ end
 
 function M:ensure_system()
     local msgs = self.ctx.session.messages
+    local prompt = self:system_prompt()
     if #msgs == 0 or msgs[1].role ~= "system" then
-        local msg = { role = "system", content = self:system_prompt() }
+        local msg = { role = "system", content = prompt }
         table.insert(msgs, 1, msg)
         self.session:append(msg)
+        return
+    end
+    -- 旧会话恢复出来的是旧 system prompt；不刷新的话 prompt 改动永远不生效。
+    -- 只替换内存中的首条，不重复 append；下个进程启动再刷新一次即可。
+    if msgs[1].content ~= prompt then
+        msgs[1] = { role = "system", content = prompt }
+    end
+    -- 历史中意外混入的 system 消息（旧恢复逻辑会插在中间）也清掉。
+    for i = #msgs, 2, -1 do
+        if msgs[i].role == "system" then table.remove(msgs, i) end
     end
 end
 
@@ -451,6 +462,24 @@ function M:_finalize(stream, why)
     return answer
 end
 
+M.SIMPLE_TURNS = 2
+
+-- 状态/版本/是否类短问题：不要让模型把一次确认变成安装审计。
+-- 只做粗粒度识别，明显是开发任务的句子不命中。
+local TASK_VERBS = { "改", "修", "实现", "升级", "安装", "编译", "打包", "运行", "写", "删", "添加" }
+local function is_simple_question(text)
+    text = tostring(text or ""):gsub("%s+", " "):sub(1, 200)
+    if #text > 80 then return false end
+    for _, v in ipairs(TASK_VERBS) do
+        if text:find(v, 1, true) then return false end
+    end
+    local lower = text:lower()
+    return text:find("最新", 1, true) or text:find("版本", 1, true)
+        or text:find("生效", 1, true) or text:find("当前", 1, true)
+        or text:find("是不是", 1, true) or text:find("有没有", 1, true)
+        or lower:find("version", 1, true) ~= nil
+end
+
 function M:_loop(text, stream)
     local ctx = self.ctx
     self._text = text
@@ -463,8 +492,10 @@ function M:_loop(text, stream)
     local tool_notes = {}
     local last_sig, repeat_n = nil, 0
     local result_counts, repeated_result = {}, 0
+    local max_turns = ctx.settings.max_turns
+    if is_simple_question(text) then max_turns = math.min(max_turns, M.SIMPLE_TURNS) end
 
-    for iter = 1, ctx.settings.max_turns do
+    for iter = 1, max_turns do
         ctx:begin_turn()
         local assistant, err = stream(
             -- 只有本轮第一次请求注入召回/todo 块，后续工具轮复用同一前缀。
@@ -597,7 +628,7 @@ function M:_loop(text, stream)
         end
     end
 
-    return self:_finalize(stream, string.format("used all %d tool-loop turns", ctx.settings.max_turns))
+    return self:_finalize(stream, string.format("used all %d tool-loop turns", max_turns))
 end
 
 -- 阻塞入口：--once / 单测。
