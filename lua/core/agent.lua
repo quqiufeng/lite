@@ -384,7 +384,7 @@ end
 -- 同一批工具调用连续重复这么多次，就认为模型卡住了（同一命令反复跑，结果不变）。
 -- 手写循环在 128 轮里烧掉几十万 token 是常态，越早熔断越好。
 M.REPEAT_LIMIT = 4
-M.RESULT_REPEAT_LIMIT = 4
+M.RESULT_REPEAT_LIMIT = 3
 
 -- 不同命令可能产生同一结果（反复 git log/ls）。只比较调用参数抓不到；
 -- 用「工具名 + 结果哈希」做无进展检测。
@@ -400,10 +400,11 @@ end
 local STOP_NOTE = table.concat({
     "<session_context>",
     "工具循环已停止：%s。现在没有可用工具，不要再请求工具调用。",
-    "请立刻用中文收口，不要再解释这条指令：",
-    "1) 已完成什么（写出具体文件/命令/结论，别写过程）；",
-    "2) 还有什么没做；",
-    "3) 下一步建议（可执行的一两句）。",
+    "用户原问题：%s",
+    "直接回答这个问题，先给结论（是/否/状态/版本），不要复述历史：",
+    "1) 结论；",
+    "2) 只列必要的一两条证据；",
+    "3) 仅当确实需要时再给下一步。",
     "</session_context>",
 }, "\n")
 
@@ -418,7 +419,8 @@ function M:_finalize(stream, why)
     local msgs = self:view_messages()
     -- 用 user 而不是在末尾插 system：有些网关对"system 必须在最前面"较真，
     -- 这个请求要是 400 了，前面几十轮的结果就彻底丢了。
-    msgs[#msgs + 1] = { role = "user", content = string.format(STOP_NOTE, why) }
+    local question = tostring(self._text or ""):sub(1, 500)
+    msgs[#msgs + 1] = { role = "user", content = string.format(STOP_NOTE, why, question) }
 
     ctx:emit("turn_limit", { reason = why, turns = ctx.settings.max_turns })
     -- 工具轮结束时没有 end_turn（busy 还挂着），别再叠一个 turn_start。

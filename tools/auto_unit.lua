@@ -560,9 +560,13 @@ do
             return { role = "assistant", content = "总结：已看目录，下一步装依赖。" }
         end,
     }
+    local tool_seq = 0
     local tools = {
         schemas = function() return { { type = "function" } } end,
-        execute = function(_, name, args) return "ok:" .. tostring(args.command) end,
+        execute = function(_, name, args)
+            tool_seq = tool_seq + 1
+            return "ok:" .. tostring(args.command) .. ":" .. tool_seq
+        end,
     }
     local session = { append = function(_, m) results[#results + 1] = m end, save = function() end }
     ctx:on("turn_limit", function(info) events[#events + 1] = info end)
@@ -578,6 +582,8 @@ do
     check(type(reqs[4].last.content) == "string"
         and reqs[4].last.content:find("used all 3 tool-loop turns", 1, true) ~= nil,
         "turn limit note explains why")
+    check(reqs[4].last.content:find("用户原问题：hi", 1, true) ~= nil,
+        "turn limit note includes original question")
     check(#events == 1 and events[1].turns == 3, "turn limit event")
     check(events[1] and events[1].reason:find("used all 3", 1, true) ~= nil, "turn limit reason")
     local last = ctx.session.messages[#ctx.session.messages]
@@ -636,7 +642,7 @@ do
     local agent4 = Agent.new(ctx4, provider4, flat_tools, { append = function() end, save = function() end })
     local t4, e4 = agent4:run("go")
     check(e4 == nil and t4 == final4, "result repeat breaker keeps conclusions")
-    check(Agent.RESULT_REPEAT_LIMIT == 4 and n4 == 5, "result repeat breaker stops early")
+    check(Agent.RESULT_REPEAT_LIMIT == 3 and n4 == 4, "result repeat breaker stops early")
     check(#ev4 == 1 and ev4[1].reason:find("result repeated", 1, true) ~= nil,
         "result repeat breaker reason")
 

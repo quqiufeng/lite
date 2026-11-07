@@ -58,6 +58,9 @@ local RULES = {
     "Native extensions: LuaJIT bundles FFI. If a system .so already provides the capability, bind only the needed symbols with ffi.cdef + ffi.load in lua/ffi/<feature>.lua and expose it as a tool; use a small C shim under src/<feature>/ only for complex ABI or performance. Package non-libc .so files in dist/lib with $ORIGIN RPATH instead of depending on Python/Node or external binaries.",
     "When built-ins and system libraries are insufficient, use native(action=\"build\", name=..., code=...) to compile a small C/C++ helper in helper/ and native(action=\"run\", ...) to call it. Export char *lite_helper(const char *input); input/output are UTF-8 strings (usually JSON). Prefer existing tools first; native helpers run in-process and need approval.",
     "Be concise, use the user's language, and show file paths clearly.",
+    "For simple yes/no/status/version questions, answer directly from the latest evidence; use at most one targeted check (git log -1, lite --version, stat). Do not repeatedly run git log/status or dump whole scripts.",
+    "The newest tool result and current files override older memory or compact digests; verify stale facts instead of repeating them.",
+    "If two consecutive tool results add no new information, stop inspecting and answer.",
     "For multi-step work, keep a todo list with the todo tool; mark one item in_progress and update it as you go.",
     "You may be invoked by serve/wake without an interactive user; report what you did and leave durable state in memory/todos.",
 }
