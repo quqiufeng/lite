@@ -1113,4 +1113,8 @@ cache_ratio 0.799   reuse 0.936   requests 2
 端点归一/行尾裁剪/清除/resize 丢弃、`utf8.len("中a")==2`、SGR
 press `\27[<0;5;3M` / drag `\27[<32;9;4M` / release / 右键 / 滚轮解析，
 以及 mouse 状态机的点击不清选区、拖拽后复制、`cancel` 三条路径；
-UI 侧按 §9 用 `tmux capture-pane` 或 `--tui --snapshot` 验收。
+UI 侧按 `AGENTS.md` §4 的铁律用 `tmux capture-pane` 或 `--tui --snapshot` 验收。
+
+**当前回归** —— `./tools/test.sh`：单元 545 项 + `cli.json` / `tui.smoke` /
+`serve.probe` / `serve.smoke` 全通过（`[verified]` 2026-11-07）。§8.30 / §8.33 里的
+"385 项"/"424 项"是各自落地时的历史数字，不再逐节回填。
