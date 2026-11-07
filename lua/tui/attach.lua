@@ -3,6 +3,7 @@ local cjson = require("cjson")
 local Terminal = require("tui.terminal")
 local Screen = require("tui.screen")
 local Input = require("tui.input")
+local Mouse = require("tui.mouse")
 local Composer = require("tui.composer")
 local Transcript = require("tui.transcript")
 local Status = require("tui.status")
@@ -40,6 +41,7 @@ function M.run(opts)
 
     local w, h = Terminal.size()
     local screen = Screen.new(w, h)
+    local mouse = Mouse.new(screen)
     local input = Input.new()
     local composer = Composer.new()
     local transcript = Transcript.new()
@@ -177,9 +179,20 @@ function M.run(opts)
     end
 
     local function handle(ev)
+        if ev.key == "mouse" then
+            if approval_view or help_view or todo_view or diff_view then return end
+            local _, th = layout(h, composer)
+            mouse:handle(ev, { top = 1, bottom = th })
+            if mouse.message then
+                transcript:add("info", mouse.message)
+                mouse.message = nil
+            end
+            return
+        end
         if ev.key == "wheel" then
             if not (approval_view or help_view or todo_view or diff_view) then
                 local _, th = layout(h, composer)
+                mouse:cancel()
                 if ev.dy > 0 then
                     transcript:scroll_up(3)
                 else
@@ -313,6 +326,9 @@ function M.run(opts)
             if busy then spinner_i = (spinner_i + 1) % #SPINNER end
 
             screen:clear()
+            if (approval_view or help_view or todo_view or diff_view) and screen:has_selection() then
+                mouse:cancel()
+            end
             if approval_view then
                 approval_view:render(screen, w, h)
                 screen.cursor.visible = false

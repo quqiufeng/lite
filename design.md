@@ -558,6 +558,8 @@ lua/tui/
 ├── composer.lua     多行输入 / 历史 / Ctrl+C·D·L
 ├── transcript.lua   消息块 / 工具输出折叠 / 流式追加 / 滚动
 ├── status.lua       model / turn / cwd / memory 命中数
+├── mouse.lua        左键拖选状态机（begin/update/copy）
+├── clipboard.lua    剪贴板写入（xclip → wl-copy → xsel → pbcopy → OSC 52）
 └── tui.lua          布局 + 事件循环 + 提交
 ```
 
@@ -584,6 +586,9 @@ cell = { ch = "字", fg = 0, bg = 0, attr = 0 }
 ### 8.5 输入
 
 - `input.lua` 解析字节流：方向键、PageUp/Down、Home/End、Ctrl+字母、粘贴、UTF-8。
+- 鼠标：SGR 序列 `ESC[<b;x;yM|m` → `{key="mouse", action, button, x, y}`；
+  `action ∈ press/drag/release`，`code>=64` 视为滚轮；X10 旧编码一并归一。
+  终端侧开 `?1002h`（按下+拖拽）+ `?1006h`（SGR 坐标）。
 - `composer.lua`：单/多行输入、历史、光标移动、kill 行。
 - 键位建议：
   - Enter 提交；Ctrl+J 换行；Ctrl+C 取消/清空；Ctrl+D 退出（空输入时）。
@@ -1044,3 +1049,68 @@ cache_ratio 0.799   reuse 0.936   requests 2
 6. 触发线仍是字符口径。有了 `tok_per_char` 校准后，可以改成 token 口径
    （例如 `LITE_CONTEXT_TOKENS`），和模型真实窗口直接对齐 ——
    参考实现（Pi 16k reserve / Reasonix 90% / opencode 85%）都是按 token 算的。
+
+### 8.34 鼠标拖选 + 复制（transcript 文本选择）
+
+终端原生选择在有鼠标上报（`?1002h`）时会被吃掉，所以拖选必须自己实现。
+分三层，各自只管一件事：
+
+**选区（`screen.lua`）** —— 状态只存在屏幕层，`Screen.sel = {y0,x0,y1,x1}`，
+坐标是 1-based 的屏幕列/行：
+
+- `set_selection(y0,x0,y1,x1)`：接受任意方向（`y1<y0` 或同行 `x1<x0` 才交换端点），
+  统一成"先上后下、行内先左后右"。改 `sel` 后清 `self.prev`，强制整屏重绘。
+- `clear_selection()` / `has_selection()`：释放、以及给 overlay 判断用。
+- `resize` 直接丢掉 `sel` —— 尺寸一变，行列坐标就没有意义了。
+- 行内区间由局部函数 `sel_span(sel,y,w)` 给：首行从 `x0` 开始，末行到 `x1` 结束，
+  中间行整行 `1..w`；不在范围内返回 nil。
+- `selection_text()`：逐行按**屏幕列**取 `rows[y]`，从 `sel_span` 的 `[a,b]` 取；
+  宽字符在起始列加入、`cont` 列跳过，`nil` 列补空格。`gsub("%s+$","")` 去行尾空白，
+  再丢掉整体首尾的空行，`\n` 连接 —— 复制出来的东西可以直接粘进邮件/patch。
+
+**高亮（`styled_row(row,w,sel,y)`）** —— 关键点：高亮在**渲染时**按 `sel_span` 现算
+（命中区间就把 style 覆盖成 `reverse`），不是 `put()` 时烧进 cell。因为
+`put()` 发生在 `set_selection` 之前，烧进去会被下一次重绘覆盖，或者反过来在
+拖动时留下残影；渲染时现算则顺序无关，任何时候 `invalidate` + `render` 都自洽。
+
+**状态机（`mouse.lua`）** —— `Mouse.new(screen)` → `{dragging, moved, message}`，
+`M:handle(ev,bounds)` 返回 `"begin"/"update"/"copy"/nil`：
+
+- 只认左键（`ev.button ~= 0` 直接忽略），右键/中键留给终端和宿主程序。
+- press：只在 transcript 可见区（`top..bottom`）内生效；composer/status 上的按下
+  直接忽略。`dragging=true` `moved=false`，先摆一个零宽选区作为锚点。
+- drag：与当前选区端点比，位置没变就早退（鼠标每像素都发事件，早退能省掉大量重绘）；
+  否则 `moved=true` 并重设选区 → 视觉上就是反色块在跟手。
+- release：`moved` 为假说明只是点了一下 → 清选区、返回 nil（不打扰用户）；
+  有拖拽才 `selection_text()` → `clipboard.copy()` → 清选区 →
+  返回 `"已复制 N 字符 · <通道>"`（`utf8.len` 数字符，不是字节）。
+- `M:cancel()`：滚轮/切 overlay/窗口变化时调用，避免半截选区残留。
+
+**剪贴板（`clipboard.lua`）** —— 按 `xclip → wl-copy → xsel → pbcopy` 顺序探测，
+探测结果缓存（`io.popen("command -v ...")` 只跑一次）；命令不存在就落到
+**OSC 52**（`ESC]52;c;<base64>BEL`），所以 ssh 里也能把选区送到本地剪贴板。
+`M.copy(text)` 返回 `ok, how`，`how` 直接进上面那条提示——用户能立刻看出
+"复制到哪去了"（`xclip` 还是 `osc52`），这比静默失败好排查得多。
+
+**接线（`loop.lua` / `attach.lua`）** —— 事件循环里 mouse 分支排在最前：
+任何 overlay（approval/help/session/todo/diff）打开时直接返回，把鼠标还给 overlay；
+否则按 `M.layout(h,composer)` 算出 transcript 的可见行区间交给 `handle`，
+返回消息就写进 transcript 的 `info` 块并 `draw()`。滚轮分支先 `cancel()`
+再滚 —— 滚动会让内容位移，旧选区对应的文字已经不是用户看到的那些了。
+`attach.lua` 同样处理（它没有 `session_view`）。overlay 打开时如果还有选区，
+重绘前主动清掉。
+
+**为什么不是"把选择权还给终端"** —— 可以，但代价是 TUI 内所有鼠标上报都得关掉，
+滚轮、点击折叠、后续的点击定位全没了。自己实现选区换来的是一致的鼠标语义，
+代价是几十行状态机 + 一个剪贴板探针。
+
+**退化与边界** —— 没有 `xclip`/`wl-copy`/`xsel`/`pbcopy` 时不报错，走 OSC 52；
+终端不支持 OSC 52（或 tmux 未配置 `set-clipboard on`）时复制静默无效，
+但提示里的 `how` 会写 `osc52`，用户能自己判断；`resize`、切 overlay、
+滚轮都会打断选区，符合"拖选是一次性的临时操作"的心智模型。
+
+**验收** —— 单元测试覆盖：选区设置/取文本（`"world\nsecond"`）/反色高亮/
+端点归一/行尾裁剪/清除/resize 丢弃、`utf8.len("中a")==2`、SGR
+press `\27[<0;5;3M` / drag `\27[<32;9;4M` / release / 右键 / 滚轮解析，
+以及 mouse 状态机的点击不清选区、拖拽后复制、`cancel` 三条路径；
+UI 侧按 §9 用 `tmux capture-pane` 或 `--tui --snapshot` 验收。

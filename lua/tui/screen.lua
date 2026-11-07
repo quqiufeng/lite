@@ -40,6 +40,7 @@ function M.new(w, h)
         h = h or 24,
         rows = {},
         prev = {},
+        sel = nil,
         cursor = { x = 1, y = 1, visible = false },
     }, M)
     self:clear()
@@ -53,12 +54,73 @@ end
 
 function M:resize(w, h)
     self.w, self.h = w, h
+    self.sel = nil
     self:clear()
     self.prev = {}
 end
 
 function M:invalidate()
     self.prev = {}
+end
+
+-- 鼠标选区：左上 (y0,x0) → 右下 (y1,x1)，坐标都是 1 基屏幕列/行。
+-- 高亮只在渲染时叠加 reverse，不改动字符本身。
+function M:set_selection(y0, x0, y1, x1)
+    if y1 < y0 or (y1 == y0 and x1 < x0) then
+        y0, x0, y1, x1 = y1, x1, y0, x0
+    end
+    self.sel = { y0 = y0, x0 = x0, y1 = y1, x1 = x1 }
+    self.prev = {}
+end
+
+function M:clear_selection()
+    if not self.sel then return end
+    self.sel = nil
+    self.prev = {}
+end
+
+function M:has_selection()
+    return self.sel ~= nil
+end
+
+-- 选区在当前行的可见区间；行内返回 [x0,x1]。
+local function sel_span(sel, y, w)
+    if not sel or y < sel.y0 or y > sel.y1 then return nil end
+    local a = (y == sel.y0) and sel.x0 or 1
+    local b = (y == sel.y1) and sel.x1 or w
+    if a > b then return nil end
+    return a, b
+end
+
+-- 选区文本：每行去掉尾部空白，首尾空行去掉。
+function M:selection_text()
+    local sel = self.sel
+    if not sel then return "" end
+    local lines = {}
+    for y = sel.y0, sel.y1 do
+        local a, b = sel_span(sel, y, self.w)
+        if a then
+            local row = self.rows[y] or {}
+            local seg = {}
+            -- 按屏幕列取，不能按压缩后的字符数组取：中文宽字符占两列。
+            for x = a, math.min(b, self.w) do
+                local cell = row[x]
+                if cell and cell.cont then
+                    -- 宽字符的后半列，字符已在起始列加入。
+                elseif cell and cell.ch ~= "" then
+                    seg[#seg + 1] = cell.ch
+                else
+                    seg[#seg + 1] = " "
+                end
+            end
+            lines[#lines + 1] = (table.concat(seg):gsub("%s+$", ""))
+        else
+            lines[#lines + 1] = ""
+        end
+    end
+    while #lines > 0 and lines[1] == "" do table.remove(lines, 1) end
+    while #lines > 0 and lines[#lines] == "" do table.remove(lines) end
+    return table.concat(lines, "\n")
 end
 
 -- 写入文本；返回下一个 x。超出边界自动截断。
@@ -115,9 +177,10 @@ function M:row_text(y)
     return table.concat(out)
 end
 
-local function styled_row(row, w)
+local function styled_row(row, w, sel, y)
     local out = {}
     local cur = nil
+    local a, b = sel_span(sel, y, w)
     for x = 1, w do
         local cell = row[x]
         local ch = (cell and cell.ch ~= "") and cell.ch or " "
@@ -126,6 +189,7 @@ local function styled_row(row, w)
         end
         if ch then
             local style = cell and cell.style or "default"
+            if a and x >= a and x <= b then style = "reverse" end
             if style ~= cur then
                 out[#out + 1] = "\27[0m" .. (STYLES[style] or "")
                 cur = style
@@ -144,7 +208,7 @@ function M:render()
         local text = self:row_text(y)
         if text ~= self.prev[y] then
             out[#out + 1] = string.format("\27[%d;1H", y)
-            out[#out + 1] = styled_row(self.rows[y] or {}, self.w)
+            out[#out + 1] = styled_row(self.rows[y] or {}, self.w, self.sel, y)
             out[#out + 1] = "\27[K"
         end
     end

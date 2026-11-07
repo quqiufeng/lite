@@ -7,6 +7,7 @@ local ITEMS = {
     { "Ctrl+J", "insert newline" },
     { "Tab", "complete file path" },
     { "Wheel/PgUp/PgDn", "scroll transcript" },
+    { "Drag (left)", "select text · copy on release" },
     { "Ctrl+O", "expand/collapse last tool" },
     { "Ctrl+G", "open git diff" },
     { "Ctrl+T", "open todo list" },

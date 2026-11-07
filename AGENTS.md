@@ -30,6 +30,7 @@ AI-native harness：记忆、工具、FFI、X11。
 
 - `lua/main.lua`：入口；`lua/core/`：agent/tools/memory/prompt/session/compact
 - `lua/tui/`、`lua/ffi/`、`src/{cache,image,x11}/`、`automation/`、`helper/`、`tools/`
+- `lua/tui/mouse.lua` + `clipboard.lua`：拖选/剪贴板；选区在 `screen.lua`
 
 ## 3 记忆
 
@@ -83,7 +84,6 @@ wrapper 返回 `{ run=function(args,env) ... end }`；重新 build 生成新 `.s
 
 ## 7 参考实现（新功能先查）
 
-参考：Pi `/opt/pi-mono`、Reasonix `/opt/reasonix`、opencode `/opt/opencode`；
-缓存 `/opt/code_caches/<name>_cache`；工具 `/opt/my_db`（`ai_code_search.sh` 语义、
-`cache_query` 符号、`ctx.py` caller/callee）。逐项目查，不要 cross-search；只借鉴思路。
+参考：Pi `/opt/pi-mono`、Reasonix `/opt/reasonix`、opencode `/opt/opencode`；缓存
+`/opt/code_caches/<name>_cache`；工具 `/opt/my_db`。逐项目查，不 cross-search，只借鉴思路。
 符号：Go `pkg::Func`、C++ `Class::method`、TS 导出名。

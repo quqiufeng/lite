@@ -2908,6 +2908,108 @@ do
     check(captured:find("ctx:", 1, true) == nil, "status hides ctxeng without probe")
 end
 
+-- 鼠标拖选 + 复制
+do
+    local S = require("tui.screen")
+    local s = S.new(20, 4)
+    s:put(1, 1, "hello world")
+    s:put(1, 2, "second line")
+    s:set_selection(1, 7, 2, 6)
+    check(s:has_selection(), "screen selection set")
+    check(s:selection_text() == "world\nsecond", "screen selection text: " .. s:selection_text())
+    check(s:render():find("\27[7m", 1, true) ~= nil, "screen selection highlight")
+    s:clear_selection()
+    check(not s:has_selection() and s:selection_text() == "", "screen selection cleared")
+    check(s:render():find("\27[7m", 1, true) == nil, "screen selection highlight cleared")
+
+    -- 反向拖拽（右下 → 左上）要归一化
+    s:set_selection(2, 6, 1, 7)
+    check(s.sel.y0 == 1 and s.sel.x0 == 7 and s.sel.y1 == 2 and s.sel.x1 == 6,
+          "screen selection normalize")
+
+    -- 宽字符：选区按屏幕列，不按压缩字符数组
+    local s2 = S.new(20, 2)
+    s2:put(1, 1, "中a中")
+    s2:set_selection(1, 1, 1, 5)
+    check(s2:selection_text() == "中a中", "screen selection wide chars: " .. s2:selection_text())
+
+    -- 行尾空白裁掉，首尾空行去掉
+    s:set_selection(1, 1, 4, 20)
+    check(s:selection_text() == "hello world\nsecond line",
+          "screen selection trims: " .. s:selection_text())
+    s:resize(30, 6)
+    check(not s:has_selection(), "screen resize drops selection")
+
+    local U = require("tui.utf8")
+    check(U.len("中a") == 2 and U.len("") == 0, "utf8 len chars")
+
+    -- 输入层：SGR 鼠标按下 / 拖拽 / 松手 / 右键 / 滚轮
+    local I = require("tui.input")
+    local inp = I.new()
+    local evs = inp:feed("\27[<0;5;3M")
+    check(#evs == 1 and evs[1].key == "mouse" and evs[1].action == "press"
+          and evs[1].button == 0 and evs[1].x == 5 and evs[1].y == 3, "input mouse press")
+    evs = inp:feed("\27[<32;9;4M")
+    check(#evs == 1 and evs[1].action == "drag" and evs[1].x == 9 and evs[1].y == 4,
+          "input mouse drag")
+    evs = inp:feed("\27[<0;9;4m")
+    check(#evs == 1 and evs[1].action == "release" and evs[1].button == 0, "input mouse release")
+    evs = inp:feed("\27[<2;1;1M")
+    check(#evs == 1 and evs[1].action == "press" and evs[1].button == 2,
+          "input mouse right button passthrough")
+    evs = inp:feed("\27[<64;3;3M")
+    check(#evs == 1 and evs[1].key == "wheel" and evs[1].dy == 1, "input wheel down")
+    evs = inp:feed("\27[<65;3;3M")
+    check(#evs == 1 and evs[1].key == "wheel" and evs[1].dy == -1, "input wheel up")
+
+    -- 选区状态机（剪贴板打桩，不碰系统命令）
+    local clip = require("tui.clipboard")
+    local orig_copy = clip.copy
+    local copied
+    clip.copy = function(text) copied = text; return true, "stub" end
+    local Mouse = require("tui.mouse")
+    local ms = S.new(20, 5)
+    ms:put(1, 1, "hello world")
+    local m = Mouse.new(ms)
+    local bounds = { top = 1, bottom = 5 }
+    check(m:handle({ key = "mouse", action = "press", button = 0, x = 1, y = 1 }, bounds) == "begin",
+          "mouse begin")
+    check(ms:has_selection(), "mouse press selects")
+    check(m:handle({ key = "mouse", action = "drag", button = 0, x = 6, y = 1 }, bounds) == "update",
+          "mouse drag updates")
+    check(m:handle({ key = "mouse", action = "release", button = 0, x = 6, y = 1 }, bounds) == "copy",
+          "mouse release copies")
+    check(copied == "hello", "mouse copied: " .. tostring(copied))
+    check(not ms:has_selection(), "mouse clears selection after copy")
+    check((m.message or ""):find("已复制", 1, true) ~= nil, "mouse copy message")
+
+    -- 单击不复制
+    copied = nil
+    m:handle({ key = "mouse", action = "press", button = 0, x = 2, y = 1 }, bounds)
+    check(m:handle({ key = "mouse", action = "release", button = 0, x = 2, y = 1 }, bounds) == nil,
+          "mouse click no copy")
+    check(copied == nil, "mouse click no clipboard")
+
+    -- 右键忽略
+    check(m:handle({ key = "mouse", action = "press", button = 2, x = 2, y = 1 }, bounds) == nil,
+          "mouse right button ignored")
+
+    -- 正文区外不开始选择；拖拽仍夹到边界
+    m:handle({ key = "mouse", action = "press", button = 0, x = 2, y = 1 },
+             { top = 1, bottom = 3 })
+    local before = ms.sel and ms.sel.y0
+    check(m:handle({ key = "mouse", action = "press", button = 0, x = 2, y = 4 },
+                   { top = 1, bottom = 3 }) == nil, "mouse ignores press outside")
+    check(ms.sel and ms.sel.y0 == before, "mouse outside press keeps selection")
+    m:handle({ key = "mouse", action = "drag", button = 0, x = 99, y = 99 },
+             { top = 1, bottom = 3 })
+    check(ms.sel and ms.sel.y1 == 3, "mouse drag clamps to bounds")
+
+    m:cancel()
+    check(not ms:has_selection(), "mouse cancel clears")
+    clip.copy = orig_copy
+end
+
 -- entry
 check(loadfile(root .. "/lua/main.lua") ~= nil, "load lua/main.lua")
 

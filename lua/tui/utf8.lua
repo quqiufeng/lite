@@ -75,4 +75,19 @@ function M.width_str(s)
     return w
 end
 
+-- 字符数（不是字节数）。
+function M.len(s)
+    local n, i = 0, 1
+    while i <= #s do
+        local ch, ni = M.decode(s, i)
+        if not ch then
+            i = i + 1
+        else
+            i = ni
+        end
+        n = n + 1
+    end
+    return n
+end
+
 return M

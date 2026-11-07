@@ -76,14 +76,15 @@ function M.enter()
     raw.c_cc[VTIME] = 0
     ffi.C.tcsetattr(0, TCSANOW, raw)
 
-    M.write("\27[?1049h\27[?25l\27[?1000h\27[?1006h\27[2J\27[H")
+    -- 1002 = 按键按下/松开 + 拖拽移动（选区复制用）；1006 = SGR 坐标
+    M.write("\27[?1049h\27[?25l\27[?1000h\27[?1002h\27[?1006h\27[2J\27[H")
     return { orig = orig, active = true }
 end
 
 function M.leave(t)
     if not t or not t.active then return end
     t.active = false
-    M.write("\27[0m\27[?25h\27[?1006l\27[?1000l\27[?1049l")
+    M.write("\27[0m\27[?25h\27[?1006l\27[?1002l\27[?1000l\27[?1049l")
     ffi.C.tcsetattr(0, TCSANOW, t.orig)
 end
 

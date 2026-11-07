@@ -2,6 +2,7 @@
 local Terminal = require("tui.terminal")
 local Screen = require("tui.screen")
 local Input = require("tui.input")
+local Mouse = require("tui.mouse")
 local Composer = require("tui.composer")
 local Transcript = require("tui.transcript")
 local Status = require("tui.status")
@@ -36,6 +37,7 @@ function M.run(ctx, agent, memory, opts)
 
     local w, h = Terminal.size()
     local screen = Screen.new(w, h)
+    local mouse = Mouse.new(screen)
 
     local busy = false
     local quitting = false
@@ -58,7 +60,7 @@ function M.run(ctx, agent, memory, opts)
     local mem_count = 0
     local last_stats = -1
 
-    local HINT = "lite TUI · Enter 发送 · Ctrl+J 换行 · Tab 补全 · /session 会话 · Esc×2 终止 · Ctrl+G diff · Ctrl+T todo · ? help · Ctrl+D 退出"
+    local HINT = "lite TUI · Enter 发送 · Ctrl+J 换行 · Tab 补全 · 左键拖选=复制 · /session 会话 · Esc×2 终止 · Ctrl+G diff · Ctrl+T todo · ? help · Ctrl+D 退出"
 
     local function populate(messages, label)
         transcript:clear()
@@ -425,9 +427,22 @@ function M.run(ctx, agent, memory, opts)
     end
 
     local function handle(ev)
+        if ev.key == "mouse" then
+            if approval_view or help_view or session_view or todo_view or diff_view then return end
+            local _, th = M.layout(h, composer)
+            local r = mouse:handle(ev, { top = 1, bottom = th })
+            if r then
+                local msg = mouse.message
+                mouse.message = nil
+                if msg and msg ~= "" then transcript:add("info", msg) end
+                if draw then draw() end
+            end
+            return
+        end
         if ev.key == "wheel" then
             if not (approval_view or help_view or session_view or todo_view or diff_view) then
                 local _, th = M.layout(h, composer)
+                mouse:cancel()
                 if ev.dy > 0 then
                     transcript:scroll_up(3)
                 else
@@ -559,6 +574,9 @@ function M.run(ctx, agent, memory, opts)
 
     draw = function()
         screen:clear()
+        if approval_view or help_view or session_view or todo_view or diff_view then
+            if screen:has_selection() then mouse:cancel() end
+        end
         if approval_view then
             approval_view:render(screen, w, h)
             screen.cursor.visible = false

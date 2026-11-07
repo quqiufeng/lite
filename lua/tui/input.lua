@@ -1,5 +1,6 @@
 -- 键序列解析：UTF-8 / 方向键 / Ctrl / bracketed paste。
 local utf8 = require("tui.utf8")
+local bit = require("bit")
 
 local M = {}
 M.__index = M
@@ -11,19 +12,32 @@ local CSI_KEYS = {
     ["1~"] = "home", ["7~"] = "home", ["4~"] = "end", ["8~"] = "end",
 }
 
-local function mouse_event(code, x, y)
-    if code and code >= 64 then
+local function mouse_event(code, x, y, final)
+    code = code or 0
+    if code >= 64 then
         local b = code % 4
         if b == 0 then return { key = "wheel", dy = 1, x = x, y = y } end
         if b == 1 then return { key = "wheel", dy = -1, x = x, y = y } end
+        return { key = "wheel", dy = 0, x = x, y = y }
     end
-    return { key = "mouse" }
+    local motion = bit.band(code, 32) ~= 0
+    local btn = bit.band(code, 3)
+    local action
+    if final == "m" or btn == 3 then
+        action = "release"
+    elseif motion then
+        action = "drag"
+    else
+        action = "press"
+    end
+    return { key = "mouse", action = action, button = btn, x = x, y = y }
 end
 
 local function parse_mouse(seq)
     local btn, x, y = seq:match("^<(%-?%d+);(%d+);(%d+)[Mm]$")
     if not btn then return nil end
-    return mouse_event(tonumber(btn), tonumber(x), tonumber(y))
+    local f = seq:sub(-1)
+    return mouse_event(tonumber(btn), tonumber(x), tonumber(y), f)
 end
 
 local function parse_escape(buf, i)
