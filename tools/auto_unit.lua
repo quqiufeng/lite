@@ -873,6 +873,57 @@ do
         check(max_turn == 1, "memory session max turn")
         local list = mem:list_sessions("/proj", 5)
         check(#list == 2, "memory list sessions")
+
+        -- 召回白名单：原始 transcript（/<sid>/msg/<seq>）和 <sid>/meta 不进 prompt。
+        -- 旧行为会把 msg 的原始 JSON 当文本拼进记忆块，一条就吃掉整个字符预算。
+        mem:ensure_session("s3", "/proj", "m")
+        -- 真实 transcript 就是 session.lua append 写下的 /<sid>/msg/<seq> 原始 JSON；
+        -- 直接写一条，避免白名单断言在「没有 msg 键」时空转成永真。
+        mem:put("/agent/session", "s3/msg/00000001",
+            { role = "user", content = "needle raw transcript" }, 0)
+        for i = 1, 4 do
+            mem:remember_turn("s3", i, "needle question " .. i, "needle answer " .. i)
+        end
+        local ml = mem:recall("needle", 20)
+        local msg_leak, meta_leak, no_kind, bad_text, turns = false, false, false, false, 0
+        for _, it in ipairs(ml) do
+            if it.key:find("/msg/", 1, true) then msg_leak = true end
+            if it.key:find("/meta", 1, true) then meta_leak = true end
+            if not it.kind then no_kind = true end
+            if it.text:find('{"role"', 1, true) or it.text:find('"content"', 1, true) then
+                bad_text = true
+            end
+            if it.kind == "turn" then turns = turns + 1 end
+        end
+        check(not msg_leak, "recall whitelist: raw transcript not injected")
+        check(not meta_leak, "recall whitelist: session meta not injected")
+        check(not no_kind, "recall whitelist: every item tagged with kind")
+        check(not bad_text, "recall whitelist: no raw json in item text")
+        check(turns <= 2, "recall budget: at most 2 turns")
+
+        -- 加权评分：事实(tag 命中高权重)排在轮次之前，轮次不再挤满记忆块。
+        mem:remember_fact("needle-fact", "needle canonical fact text", { "needle" })
+        mem:remember_turn("s3", 5, "needle", "needle")
+        local wl = mem:recall("needle", 20)
+        local first_fact = nil
+        for i, it in ipairs(wl) do
+            if it.kind == "fact" then first_fact = i break end
+        end
+        check(first_fact ~= nil and first_fact < 4, "recall weight: fact ranks before turns")
+        check(mem:get("/agent/knowledge", "needle-fact") ~= nil, "recall weight: fact stored")
+
+        -- 不可解析的 JSON（写一半 / 二进制尾巴）必须跳过，不能当文本注入。
+        local fcache = require("ffi.cache")
+        fcache.set(mem.h, "/agent/knowledge/broken-needle", '{"c":"needle half",', 0)
+        local broken_seen, broken_raw = false, false
+        for _, it in ipairs(mem:recall("needle", 20)) do
+            if it.key:find("broken-needle", 1, true) then
+                broken_seen = true
+                broken_raw = it.text:find('{"c"', 1, true) ~= nil
+            end
+        end
+        check(not broken_seen and not broken_raw, "recall: unparseable entry skipped")
+
         check(mem:session_meta("s1").title == "hello", "memory session meta")
         check(#mem:list_sessions("/other", 5) == 0, "memory list sessions cwd")
         local st = mem:stats()
@@ -922,6 +973,45 @@ do
         check(os.execute("ls " .. shq(dir) .. " | grep -q 'mem.bin.corrupt-'") == 0
             or os.execute("ls " .. shq(dir) .. " | grep -q 'mem.bin.corrupt-'") == true,
             "corrupt: backup file kept")
+        os.execute("rm -rf " .. shq(dir))
+    end
+
+    -- 陈旧索引自愈：mem.idx 里的哈希节点指向已被覆盖（标记 DELETED）的条目时，
+    -- 必须丢弃索引并按 pool 重建，而不是让 cache_get 返回 nil —— 这是记忆链断裂的根因。
+    do
+        local dir = dir .. "-staleidx"
+        os.execute("mkdir -p " .. shq(dir))
+        local mem = Memory.new({ dir = dir, max_mb = 32 })
+        check(mem ~= nil, "staleidx: seed open")
+        if mem then
+            mem:remember_fact("keep", "v1", { "t" })
+            mem:close()
+        end
+        local sf = io.open(dir .. "/mem.idx", "rb")
+        local stale = sf and sf:read("*a") or ""
+        if sf then sf:close() end
+        check(#stale > 0, "staleidx: index file written")
+
+        local mem2 = Memory.new({ dir = dir, max_mb = 32 })
+        check(mem2 ~= nil, "staleidx: reopen for overwrite")
+        if mem2 then
+            mem2:remember_fact("keep", "v2", { "t" })
+            mem2:close()
+        end
+        local wf = assert(io.open(dir .. "/mem.idx", "wb"))
+        wf:write(stale)
+        wf:close()
+
+        local mem3 = Memory.new({ dir = dir, max_mb = 32 })
+        check(mem3 ~= nil, "staleidx: reopen over stale index")
+        if mem3 then
+            local v = mem3:get("/agent/knowledge", "keep")
+            check(v ~= nil, "staleidx: stale index discarded, entry readable")
+            if v then
+                check(v.c == "v2", "staleidx: rebuilt entry carries latest value")
+            end
+            mem3:close()
+        end
         os.execute("rm -rf " .. shq(dir))
     end
 

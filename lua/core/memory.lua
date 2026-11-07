@@ -170,7 +170,8 @@ function M:touch_session(id, cwd, model, title, turn)
     id = tostring(id or "session")
     local meta = self:session_meta(id)
     if not meta then
-        if not cwd then return nil end
+        -- 没有 cwd 也必须建 meta：启动期（TUI 恢复、serve 唤醒）先记轮次后补 cwd，
+        -- 早先这里 return nil 会让整段会话没有 meta，messages/turns 全丢。
         meta = self:ensure_session(id, cwd, model, title)
     end
     meta.updated = os.time()
@@ -246,16 +247,63 @@ function M:remember_working(key, content, ttl, session_id)
     return self:put("/agent/working", key, value, ttl or TTL.working)
 end
 
+-- 单轮对话落盘上限：assistant 侧可能是整段工具循环输出，原样存会让一条 turn
+-- 赶上几十 KB（实测 63KB），召回预算被一条记录吃光。截断而不是丢弃。
+local TURN_USER_MAX = 800
+local TURN_ASSIST_MAX = 1536
+
+local function clip_utf8(s, max)
+    s = tostring(s or "")
+    if max <= 0 or #s <= max then return s end
+    local cut = max
+    -- 退到 UTF-8 起始字节，避免把多字节字符劈成半个
+    while cut > 0 do
+        local b = s:byte(cut + 1)
+        if not b or b < 0x80 or b >= 0xC0 then break end
+        cut = cut - 1
+    end
+    return s:sub(1, cut) .. "…"
+end
+
+-- tools 只留名字：参数（大段文件内容/命令输出）是纯噪音，且体积最大。
+local function tool_names(tools)
+    if type(tools) ~= "table" then
+        return tools and tostring(tools) or nil
+    end
+    local out = {}
+    for _, t in ipairs(tools) do
+        local name
+        if type(t) == "table" then
+            name = tostring(t.name or t.tool or t[1] or "tool")
+        else
+            name = tostring(t)
+        end
+        out[#out + 1] = name
+        if #out >= 12 then break end
+    end
+    return #out > 0 and out or nil
+end
+
 function M:remember_turn(session_id, turn, user, assistant, tools)
-    local key = string.format("%s/turn/%d", session_id or "session", turn or 0)
+    local sid = tostring(session_id or "session")
+    local meta = self:session_meta(sid)
+    local prev = tonumber(meta and meta.turns) or 0
+    turn = tonumber(turn) or 0
+    -- turn 编号必须单调：会话恢复失败时 ctx.session.turn 会退回 0，直接照写就会
+    -- 覆盖 turn/1、turn/2…，历史轮次在召回里被静默换成最新几轮。以 msg 序号为锚。
+    local by_msgs = math.floor((tonumber(meta and meta.messages) or 0) / 2)
+    if turn <= prev or turn <= by_msgs then
+        turn = math.max(prev, by_msgs) + 1
+    end
+    local key = string.format("%s/turn/%d", sid, turn)
     local ok = self:put("/agent/session", key, {
         t = "turn",
-        u = user,
-        a = assistant,
-        tools = tools,
+        u = clip_utf8(user, TURN_USER_MAX),
+        a = clip_utf8(assistant, TURN_ASSIST_MAX),
+        tools = tool_names(tools),
         ts = os.time(),
     }, TTL.long)
-    self:touch_session(session_id, nil, nil, user, turn)
+    self:touch_session(sid, nil, nil, user, turn)
     return ok
 end
 
@@ -393,28 +441,55 @@ function M:recall(query, limit, opts)
         return hits / #terms
     end
 
-    local seen, out = {}, {}
+    local seen, out, turns_kept = {}, {}, 0
     local working_prefix = "/agent/working/"
+    local KNOW = "/agent/knowledge/"
+    local SESS = "/agent/session/"
+
+    -- 白名单：只放「长期事实」和「会话内可复用的轮次/工作笔记」进来。
+    -- 原始 transcript（/<sid>/msg/<seq>）和 <sid>/meta 一律不注入：msg 是逐条原始
+    -- JSON，一条就能吃掉整个字符预算，还会把最近几轮的原文反复塞给模型。
+    local function allowed(key)
+        if key:sub(1, #KNOW) == KNOW then return "fact" end
+        if key:sub(1, #SESS) == SESS then
+            local rest = key:sub(#SESS + 1)
+            local kind = rest:match("^[^/]+/([^/]+)/")
+            if kind == "turn" then return "turn" end
+            if kind == "working" then return "working" end
+        end
+        return nil
+    end
+
+    local WEIGHT = { fact = 1.0, working = 0.9, turn = 0.6 }
+
     local function add(r)
         -- 目录级 /agent/working（wake 调度状态、todos 兜底）属于运行态：
         -- 既不该跨会话注入，也不该被 tag 检索带进来。
         if r.key:sub(1, #working_prefix) == working_prefix then return end
+        local kind = allowed(r.key)
+        if not kind then return end
         if want_session and r.key:sub(1, #session_prefix) == session_prefix then
             if r.key:sub(1, #want_session) ~= want_session then return end
         end
         if seen[r.key] then return end
         seen[r.key] = true
         local ok, data = pcall(cjson.decode, r.value)
-        data = ok and data or { c = r.value }
+        -- 解码失败的条目不是「文本」，是坏数据（写一半、加密残留、二进制尾巴）。
+        -- 早先回退成 { c = r.value } 会把这些字节原样拼进 prompt。
+        if not ok or type(data) ~= "table" then return end
         local text
         if data.t == "turn" and data.u then
             text = tostring(data.u) .. " => " .. tostring(data.a or "")
         else
-            text = tostring(data.c or data.a or r.value)
+            text = tostring(data.c or data.a or "")
         end
+        if text == "" then return end
         local sc = score(text, r.key, data.tags)
         if sc > 0 then
-            out[#out + 1] = { key = r.key, data = data, text = text, score = sc }
+            out[#out + 1] = {
+                key = r.key, data = data, text = text,
+                kind = kind, score = sc * (WEIGHT[kind] or 1.0),
+            }
         end
     end
 
@@ -442,7 +517,18 @@ function M:recall(query, limit, opts)
     if #out > limit then
         for i = #out, limit + 1, -1 do table.remove(out, i) end
     end
-    return out
+    -- 最多两条 transcript：轮次权重已经调低，但同分时仍可能挤满整块，
+    -- 而重复的旧对话对下一轮几乎没有信息量。事实/工作笔记不受此限。
+    local keep = {}
+    for _, it in ipairs(out) do
+        if it.kind == "turn" then
+            turns_kept = turns_kept + 1
+            if turns_kept > 2 then goto continue end
+        end
+        keep[#keep + 1] = it
+        ::continue::
+    end
+    return keep
 end
 
 -- 搜索 + 组装：按字符预算拼成可注入 prompt 的记忆块。
