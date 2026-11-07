@@ -143,6 +143,12 @@ do
         "prompt includes project instructions")
     check(full_sp:find("current user request is the active task", 1, true) ~= nil,
         "prompt gives the current request priority")
+    check(full_sp:find("read-only requests", 1, true) ~= nil,
+        "prompt guards read-only work")
+    check(full_sp:find("multiple parts or sources", 1, true) ~= nil,
+        "prompt requires covering every requested part")
+    check(full_sp:find("After running git log", 1, true) ~= nil,
+        "prompt requires summarizing git log")
     os.execute("rm -rf " .. shq(idir))
 
     local items = { { key = "/agent/knowledge/x", text = "LITE-42", score = 1 } }
