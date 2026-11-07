@@ -106,6 +106,8 @@ function M.run(ctx, agent, memory, opts)
         if memory then
             memory:ensure_session(id, ctx.session.cwd, ctx.session.model)
         end
+        -- 换会话必须重接 usage，否则状态栏会带着上一个会话的账继续累加。
+        agent:restore_usage()
         if agent.tools and agent.tools.todos then
             agent.tools.todos:load()
             ctx:emit("todos", ctx.session.todos)
@@ -126,6 +128,7 @@ function M.run(ctx, agent, memory, opts)
         if memory then
             memory:ensure_session(id, ctx.session.cwd, ctx.session.model)
         end
+        agent:restore_usage()
         if agent.tools and agent.tools.todos then
             agent.tools.todos:load()
             ctx:emit("todos", ctx.session.todos)

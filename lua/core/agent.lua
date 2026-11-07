@@ -111,6 +111,24 @@ function M:compact_state()
     return st
 end
 
+-- usage 落盘/恢复。挂在 agent 上而不是 context 上：context 不认识 memory，
+-- memory 又只在 agent 手里。调用点只有"一轮结束"和"会话装载"两处，不逐请求写
+-- —— 工具循环里一轮能发几十次请求，逐次落盘等于每轮几十次 fsync。
+-- 存 permanent TTL 且 key 不在召回白名单（只放 fact/turn/working），不会进 prompt。
+function M:save_usage()
+    if not (self.memory and self.memory.save_usage) then return false end
+    local ctx = self.ctx
+    if not ctx then return false end
+    return self.memory:save_usage(ctx.session.id, ctx.session.usage)
+end
+
+function M:restore_usage()
+    if not (self.memory and self.memory.load_usage) then return false end
+    local ctx = self.ctx
+    if not ctx then return false end
+    return ctx:restore_usage(self.memory:load_usage(ctx.session.id))
+end
+
 function M:save_compact_state(st)
     self._compact_state = st
     if not (self.memory and self.memory.put) then return end
@@ -413,6 +431,7 @@ function M:_finalize(stream, why)
     if self.memory then
         self.memory:remember_turn(ctx.session.id, ctx.session.turn, self._text or "", answer, {})
         self.memory:tick()
+        self:save_usage()
     end
     ctx:end_turn()
     return answer
@@ -441,6 +460,9 @@ function M:_loop(text, stream)
             function(delta) ctx:emit("reasoning", delta) end)
 
         if not assistant then
+            -- 报错前也要落一次账：这一轮已经发出去的请求（含被计费的 miss）
+            -- 不能因为最后一步失败就从统计里消失。
+            self:save_usage()
             ctx:fail(err)
             ctx:end_turn()
             return nil, err
@@ -456,6 +478,7 @@ function M:_loop(text, stream)
             if self.memory then
                 self.memory:remember_turn(ctx.session.id, ctx.session.turn, text, answer, tool_notes)
                 self.memory:tick()
+                self:save_usage()
             end
             ctx:end_turn()
             return answer

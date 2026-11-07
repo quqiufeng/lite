@@ -389,6 +389,8 @@ elseif cmd == "--tui" then
     local msg_count = memory:session_message_count(ctx.session.id)
     local session = Session.new(ctx, { memory = memory, seq = math.max(#ctx.session.messages, msg_count) })
     local agent = Agent.new(ctx, Provider, tools, session, memory)
+    -- 恢复会话时把落盘的 usage 接回来，否则状态栏/命中率从 0 开始。
+    agent:restore_usage()
 
     if flags.snapshot then
         local patch = ""
@@ -494,6 +496,7 @@ elseif cmd == "--once" then
     memory:ensure_session(ctx.session.id, config.cwd, config.model)
     local session = Session.new(ctx, { memory = memory })
     local agent = Agent.new(ctx, Provider, tools, session, memory)
+    agent:restore_usage()
 
     if json then
         ctx:on("reasoning", function(text) emit({ type = "reasoning", text = text }) end)

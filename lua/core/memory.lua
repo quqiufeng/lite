@@ -307,6 +307,38 @@ function M:remember_turn(session_id, turn, user, assistant, tools)
     return ok
 end
 
+-- usage 落盘：进程一退，会话级命中率就没了，事后再想复盘"这一晚到底发了多少请求、
+-- 前缀命中多少"只能靠猜。这里只存累计计数，一条 JSON 几百字节，每轮覆盖写一次。
+--
+-- 存 permanent 而不是 long：long 只有 1 天，隔天回来看就空了；usage 和 meta 一样
+-- 属于"会话的账本"，跟着会话走。召回白名单只放 fact/turn/working，这个 key 不会被
+-- recall 带进 prompt。
+local USAGE_FIELDS = {
+    "requests", "prompt", "completion", "cache_hit", "cache_miss",
+    "prefix_hit", "prefix_denom",
+}
+
+function M:save_usage(session_id, usage)
+    if type(usage) ~= "table" then return false end
+    local sid = tostring(session_id or "session")
+    local out = {}
+    for _, k in ipairs(USAGE_FIELDS) do
+        out[k] = math.floor(tonumber(usage[k]) or 0)
+    end
+    local last = type(usage.last) == "table" and usage.last or {}
+    out.last_prompt = math.floor(tonumber(last.prompt) or 0)
+    out.last_reuse = tonumber(last.reuse)
+    out.ts = os.time()
+    return self:put("/agent/session", sid .. "/usage", out, TTL.permanent)
+end
+
+function M:load_usage(session_id)
+    local sid = tostring(session_id or "session")
+    local u = self:get("/agent/session", sid .. "/usage")
+    if type(u) ~= "table" then return nil end
+    return u
+end
+
 local function utf8_chars(s)
     local out = {}
     local i = 1

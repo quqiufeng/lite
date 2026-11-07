@@ -178,6 +178,24 @@ function M:add_usage(u)
     end
 end
 
+-- 把落盘的 usage 接回来（或清空：u 为 nil）。不这么做的话，恢复会话后状态栏
+-- 从 0 开始算，"这一晚总共发了 700 次请求、前缀命中 99%"这种账目就跨不过进程边界。
+-- 只接累计值 + 上一轮 prompt（给 add_usage 算可复用前缀的分母用），不接 last 里的
+-- 命中明细 —— 那是"上一次请求"的快照，读到的是别人的，留着只会误导。
+function M:restore_usage(u)
+    local s = self.session and self.session.usage
+    if not s then return false end
+    local src = type(u) == "table" and u or {}
+    for _, k in ipairs({ "requests", "prompt", "completion", "cache_hit",
+        "cache_miss", "prefix_hit", "prefix_denom" }) do
+        s[k] = math.floor(tonumber(src[k]) or 0)
+    end
+    local prev = math.floor(tonumber(src.last_prompt) or 0)
+    s.last = prev > 0 and { prompt = prev, restored = true } or nil
+    self:emit("usage", s.last, s)
+    return true
+end
+
 -- 会话级缓存命中率（0~1）；没有任何请求时返回 nil。
 -- 注意：这个值包含"新增内容"的 miss，工具输出多的时候会掉，属于正常现象；
 -- 判断前缀是否稳定请用 prefix_ratio()。

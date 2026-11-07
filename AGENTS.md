@@ -241,7 +241,7 @@ MUST NOT：
 ./tools/package.sh / ./tools/release.sh     # 打包 / 构建+打包+安装
 ```
 
-测试分层（`test.sh` 串联）：`check_deps.sh` → `auto_unit.lua`（当前 461 项）→
+测试分层（`test.sh` 串联）：`check_deps.sh` → `auto_unit.lua`（当前 487 项）→
 CLI JSON → `tui_smoke.sh` → `serve_smoke.sh`。失败产物落 `artifacts/`。
 
 **写回归时先验证它抓得住 bug**：在修复前的 commit 上跑一遍，确认会 FAIL。

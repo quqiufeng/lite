@@ -937,6 +937,51 @@ do
             mem2:close()
         end
 
+        -- usage 落盘：进程一退，"这一晚发了多少请求、前缀命中多少"就没了。
+        -- 只存累计值 + 上一轮 prompt，重开进程要能原样接回来。
+        local memU = Memory.new({ dir = dir, max_mb = 32 })
+        check(memU ~= nil, "usage: reopen for persist")
+        if memU then
+            check(memU:load_usage("s9") == nil, "usage: absent before save")
+            local uok = memU:save_usage("s9", {
+                requests = 12, prompt = 34000, completion = 900,
+                cache_hit = 30000, cache_miss = 4000,
+                prefix_hit = 29000, prefix_denom = 30000,
+                last = { prompt = 2800, reuse = 0.98 },
+            })
+            check(uok == true, "usage: save writes")
+            memU:close()
+        end
+
+        local memU2 = Memory.new({ dir = dir, max_mb = 32 })
+        local u = memU2 and memU2:load_usage("s9")
+        check(type(u) == "table" and u.requests == 12 and u.prompt == 34000
+            and u.cache_hit == 30000 and u.last_prompt == 2800,
+            "usage: survives reopen")
+
+        -- 装回 context：累计值原样接回，last 只留上一轮 prompt 当分母。
+        local Uctx = require("context")
+        local c = Uctx.new({ api_key = "x" })
+        c.session.id = "s9"
+        check(c:restore_usage(u) == true, "usage: restore ok")
+        check(c.session.usage.requests == 12 and c.session.usage.prompt == 34000,
+            "usage: restore cumulative")
+        check(c.session.usage.last and c.session.usage.last.prompt == 2800
+            and c.session.usage.last.restored == true,
+            "usage: restore keeps prev prompt")
+        -- 接回后第一个请求就能算可复用前缀，不必两轮暖场：分母 += min(2800, 3000)。
+        local denom0 = c.session.usage.prefix_denom
+        check(denom0 == 30000, "usage: restore keeps cumulative prefix denom")
+        c:add_usage({ prompt = 3000, cache_hit = 2700, cache_miss = 300 })
+        check(c.session.usage.prefix_denom - denom0 == 2800,
+            "usage: restored prev feeds denom")
+        check(c.session.usage.last.prev_prompt == 2800, "usage: restored prev is visible")
+        -- nil = 清空（切到新会话时不能带着别的会话的账）
+        check(c:restore_usage(nil) == true, "usage: restore nil ok")
+        check(c.session.usage.requests == 0 and c.session.usage.last == nil,
+            "usage: restore nil clears")
+        if memU2 then memU2:close() end
+
         local mem3 = Memory.new({ dir = dir, max_mb = 32 })
         local Tools = require("core.tools")
         local t = Tools.new({ cwd = dir, memory = mem3 })

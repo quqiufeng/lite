@@ -127,6 +127,7 @@ function M.run(opts)
         seq = math.max(#ctx.session.messages, msg_count),
     })
     local agent = Agent.new(ctx, Provider, tools, session, memory)
+    agent:restore_usage()
 
     local server, serr = net.listen(host, port)
     if not server then
