@@ -133,8 +133,19 @@ do
     local sp = Prompt.system_prompt(ctx, { tools = tools })
     check(sp:find("You are lite", 1, true) ~= nil, "prompt preamble")
     check(sp:find("<tools>", 1, true) ~= nil
-        and sp:find("- bash: run commands", 1, true) ~= nil, "prompt tools")
+        and sp:find("bash", 1, true) ~= nil, "prompt tools")
+    -- 工具描述已经在 API 的 tools 字段里逐字发了，system 里再抄一遍 = 纯重复，
+    -- 还占着每个请求都要付的前缀 token。system 只留一张名字表。
+    check(sp:find("- bash: run commands", 1, true) == nil, "prompt tools skips descriptions")
+    check(sp:find("`tools` field", 1, true) ~= nil, "prompt tools points at the schema field")
     check(sp:find("<rules>", 1, true) ~= nil, "prompt rules")
+    local sec = Prompt.sections(ctx, { tools = tools })
+    check(#sec.tools < 400, "tools section stays a compact roster")
+    check(#sec.rules < 1900, "rules section stays compact")
+    -- RULES 里曾整段复述 <native> 的自造工具流程（一次请求付两遍）。
+    check(sec.rules:find("lite_helper", 1, true) == nil, "rules do not repeat the native flow")
+    check(sec.rules:find("ffi.load", 1, true) == nil and sec.rules:find("dist/lib", 1, true) == nil,
+        "rules do not repeat the FFI packaging notes")
     check(sp:find("<native>", 1, true) ~= nil and sp:find("lite_helper", 1, true) ~= nil,
         "prompt native flow")
     check(sp:find("<memory>", 1, true) ~= nil, "prompt memory policy")
@@ -156,15 +167,52 @@ do
         "prompt guards read-only work")
     check(full_sp:find("multiple parts or sources", 1, true) ~= nil,
         "prompt requires covering every requested part")
-    check(full_sp:find("After running git log", 1, true) ~= nil,
+    check(full_sp:find("After git log", 1, true) ~= nil,
         "prompt requires summarizing git log")
     os.execute("rm -rf " .. shq(idir))
+
+    -- system prompt 必须是稳定前缀：时间、轮次等易变内容每轮变一次，
+    -- 前缀缓存就整条废掉（真实 API 实测命中率从 97% 掉到 71%）。
+    -- 时钟改放每轮末尾的 <runtime> 块，system 里逐字节不许变。
+    local real_date = os.date
+    local clock = os.time()
+    local function fake_clock(t)
+        return function(fmt, when)
+            if type(fmt) == "string" and fmt:find("%H", 1, true) then
+                return real_date(fmt, when or t)
+            end
+            return real_date(fmt, when)
+        end
+    end
+    os.date = fake_clock(clock)
+    local sp_a = Prompt.system_prompt(ctx, { tools = tools })
+    os.date = fake_clock(clock + 3600)
+    local sp_b = Prompt.system_prompt(ctx, { tools = tools })
+    os.date = real_date
+    check(sp_a == sp_b, "prompt system is byte-stable across renders")
+    check(sp_a:find("Current local date/time", 1, true) == nil,
+        "prompt system keeps the clock out of the cached prefix")
+
+    local rt = Prompt.runtime_block(ctx, { turn = 3, max_turns = 12 })
+    check(rt:find("Current local date/time", 1, true) ~= nil,
+        "runtime block carries the clock")
+    check(rt:find("turn 3/12", 1, true) ~= nil, "runtime block carries loop budget")
+    check(rt:find("9 turn", 1, true) ~= nil, "runtime block counts remaining turns")
+
+    -- 上下文预算：同样是易变数字，只能放末尾，且必须能换算成 token。
+    local bd = Prompt.budget_block(ctx, { used = 16000, budget = 64000, tok_per_char = 0.25 })
+    check(bd:find("16000/64000", 1, true) ~= nil, "budget block shows used/budget chars")
+    check(bd:find("(25%)", 1, true) ~= nil, "budget block shows percent used")
+    check(bd:find("12000 tokens", 1, true) ~= nil, "budget block converts the remaining chars to tokens")
+    check(Prompt.budget_block(ctx, { used = 68000, budget = 64000 }):find("over by 4000", 1, true) ~= nil,
+        "budget block reports overshoot")
+    check(Prompt.budget_block(ctx, {}) == "", "budget block is empty without numbers")
 
     local items = { { key = "/agent/knowledge/x", text = "LITE-42", score = 1 } }
     local block = Prompt.memory_block(items, { max_chars = 300 })
     check(block:find("LITE-42", 1, true) ~= nil, "prompt memory item")
     check(block:find("recall", 1, true) ~= nil, "prompt memory recall hint")
-    check(sp:find("images are attached", 1, true) ~= nil, "prompt image rule")
+    check(sp:find("images may also come from temp dirs", 1, true) ~= nil, "prompt image rule")
 
     local msgs = {
         { role = "user", content = "previous question" },
@@ -1861,6 +1909,98 @@ do
     check(ended == 1, "on_session_end fired once")
 end
 
+-- 只读并发：read 收 paths 批量读，省 N-1 次往返
+do
+    local dir = os.tmpname()
+    os.remove(dir)
+    os.execute("mkdir -p " .. shq(dir))
+    local function put(path, data)
+        local f = assert(io.open(path, "wb"))
+        f:write(data)
+        f:close()
+    end
+    put(dir .. "/a.txt", "alpha body\n")
+    put(dir .. "/b.txt", "beta body\n")
+    local Tools = require("core.tools")
+    local t = Tools.new({ cwd = dir })
+
+    local one = t:execute("read", { path = "a.txt" })
+    check(one:find("alpha body", 1, true) ~= nil, "read single file still works")
+
+    local many = t:execute("read", { paths = { "a.txt", "b.txt" } })
+    check(many:find("=== a.txt ===", 1, true) ~= nil, "read_many header a")
+    check(many:find("=== b.txt ===", 1, true) ~= nil, "read_many header b")
+    check(many:find("alpha body", 1, true) ~= nil and many:find("beta body", 1, true) ~= nil,
+        "read_many concatenates both bodies")
+
+    local none = t:execute("read", { paths = {} })
+    check(none:find("^error") ~= nil, "read_many empty paths errors")
+    check(t:execute("read", {}):find("^error") ~= nil, "read without path errors")
+
+    local spec = t.tool_spec and t:tool_spec("read")
+    if spec then check(spec.properties.paths ~= nil, "read schema has paths") end
+    os.execute("rm -rf " .. shq(dir))
+end
+
+-- 同一参数反复失败：第一次不提示，第二次起钉死「别再原样重发」；成功后清账
+do
+    local Agent = require("core.agent")
+    local fake = { _failures = {} }
+    local args = '{"path":"missing.txt"}'
+    check(Agent._failure_note(fake, "read", args, "error: no such file") == "",
+        "first failure is quiet")
+    local second = Agent._failure_note(fake, "read", args, "error: no such file")
+    check(second:find("failed 2 times", 1, true) ~= nil, "second failure warns")
+    check(second:find("will not change", 1, true) ~= nil, "warning says cause is stable")
+    local rec = Agent._failure_note(fake, "read", args, "fine")
+    check(rec:find("recovered after 2 failed attempts", 1, true) ~= nil, "recovery note")
+    check(next(fake._failures) == nil, "success clears the failure record")
+
+    -- 换参数就是新的一个坑，不共享计数
+    Agent._failure_note(fake, "read", '{"path":"x"}', "error: e")
+    check(Agent._failure_note(fake, "read", '{"path":"y"}', "error: e") == "",
+        "different args start their own counter")
+    -- 非字符串结果（附件等）不算失败
+    check(Agent._failure_note(fake, "read", "z", nil) == "", "nil result is not a failure")
+end
+
+-- session_end 写程序性记忆：只记反复没解决的，且每次 run 只写一次
+do
+    local Agent = require("core.agent")
+    local saved = {}
+    local memory = {
+        remember_fact = function(_, key, content, tags)
+            saved[#saved + 1] = { key = key, content = content, tags = tags }
+            return true
+        end,
+    }
+    local ctx = { session = { id = "t1", turn = 1 }, settings = { approval = "auto" } }
+    local function mk()
+        return Agent.new(ctx, { chat = function() end },
+            { schemas = function() return {} end, execute = function() end,
+              has_hooks = function() return false end }, { append = function() end }, memory)
+    end
+    local once = '{"path":"nope"}'
+
+    local a1 = mk()
+    Agent._failure_note(a1, "read", once, "error: no such file")
+    a1:session_end()
+    check(#saved == 0, "one-off failure is not memorized")
+
+    local a2 = mk()
+    Agent._failure_note(a2, "read", once, "error: no such file")
+    Agent._failure_note(a2, "read", once, "error: no such file")
+    a2:session_end()
+    check(#saved == 1, "repeated failure remembered once")
+    check(saved[1].content:find("failed 2 times", 1, true) ~= nil, "lesson records count")
+    check(saved[1].tags[2] == "failure", "lesson tagged failure")
+
+    a2._failures[once] = nil
+    Agent._failure_note(a2, "read", '{"path":"other"}', "error: e")
+    a2:session_end()
+    check(#saved == 1, "session_end is idempotent")
+end
+
 -- lua tool: out-of-process luajit, args via stdin
 do
     local dir = os.tmpname()
@@ -1973,7 +2113,11 @@ do
     -- 让 DeepSeek 的前缀缓存从插入点往后全部失效。
     check(mem_idx ~= nil and user_idx ~= nil, "agent memory injected")
     check(mem_idx > user_idx, "agent memory block goes last, not mid-conversation")
-    check(mem_idx == #captured, "agent memory block is the final message")
+    -- 时钟/轮次块（每轮都变）跟在召回块后面，一起待在末尾。
+    local tail = captured[#captured] or {}
+    check(mem_idx == #captured - 1 and tail.role == "system"
+        and tail.content:find("Current local date/time", 1, true) ~= nil,
+        "agent runtime block is the final message")
 end
 
 -- approval policy
@@ -2148,7 +2292,8 @@ do
     local toolset = { schemas = function() return {} end, execute = function() end }
     local agent = Agent.new(ctx, provider, toolset, { append = function() end })
     agent:run("hi")
-    check(got and #got == 2 and got[1].role == "system" and got[2].role == "user",
+    check(got and #got == 3 and got[1].role == "system" and got[2].role == "user"
+        and got[3].content:find("Current local date/time", 1, true) ~= nil,
         "system prompt is sent once")
 end
 
@@ -2295,6 +2440,12 @@ do
     check(fixed > 0, "budget floor: fixed prefix measured")
     check(agent:compactor().budget >= fixed * 3, "budget floor: budget raised above fixed prefix")
 
+    local tail = msgs[#msgs]
+    check(tail.role == "system" and tail.content:find("Context budget:", 1, true) ~= nil,
+        "request tail carries the context budget")
+    check(tail.content:find(tostring(agent:compactor().budget), 1, true) ~= nil,
+        "context budget uses the effective (raised) budget")
+
     local raised = false
     for _, e in ipairs(events) do
         if e.reason == "budget raised" then raised = true end
@@ -2416,8 +2567,15 @@ do
 
     check(#snaps >= 2, "prefix stability: two requests captured")
     local a, b = snaps[1], snaps[2]
-    -- a 的最后一条是召回块，b 的前 #a-1 条必须与 a 逐条相同
-    local stable = #a - 1
+    -- 末尾的 system 块（召回块 + 时钟/轮次块）每轮都重新生成，不属于历史；
+    -- 比对时先把它们剥掉，再检查历史部分逐条相同。
+    local function stable_len(t)
+        local n = #t
+        while n > 1 and t[n].role == "system" do n = n - 1 end
+        return n
+    end
+    local stable = math.min(stable_len(a), stable_len(b))
+    check(stable >= 2, "prefix stability: shared history prefix found")
     local same = true
     for i = 1, stable do
         if a[i] ~= b[i] then
@@ -3395,6 +3553,71 @@ do
     m:cancel()
     check(not ms:has_selection(), "mouse cancel clears")
     clip.copy = orig_copy
+end
+
+-- 工具失败要回传「原发参数 + schema 必填项」，退出码翻译成语义
+do
+    local Tools = require("core.tools")
+    local dir = os.tmpname()
+    os.remove(dir)
+    os.execute("mkdir -p " .. shq(dir))
+    local t = Tools.new({ cwd = dir })
+
+    check(Tools.exit_note(0) == "" and Tools.exit_note(nil) == "", "exit note zero")
+    check(Tools.exit_note(124):find("timed out", 1, true) ~= nil, "exit note 124")
+    check(Tools.exit_note(127):find("command not found", 1, true) ~= nil, "exit note 127")
+    check(Tools.exit_note(3) == "\n[exit 3]", "exit note other")
+
+    local out = t:execute("bash", { command = "exit 3" })
+    check(out:find("[exit 3]", 1, true) ~= nil, "bash reports exit code")
+    local nf = t:execute("bash", { command = "definitely_not_a_command_xyz" })
+    check(nf:find("command not found", 1, true) ~= nil, "bash 127 note")
+    check(nf:find("exit 127", 1, true) ~= nil, "bash 127 code")
+
+    local req = t:required_args("edit")
+    check(req[1] == "path" and req[2] == "old" and req[3] == "new", "required args edit")
+
+    local bad = t:execute("edit", { path = "a.txt", old = "x" })
+    check(bad:find("required: path, old, new", 1, true) ~= nil, "error hint required")
+    check(bad:find("old=x", 1, true) ~= nil, "error hint args sent")
+    local miss = t:execute("edit", {})
+    check(miss:find("required: path, old, new", 1, true) ~= nil, "error hint empty args")
+
+    local okout = t:execute("write", { path = "ok.txt", content = "hi" })
+    check(okout:find("%[tool ") == nil, "no hint on success")
+    os.execute("rm -rf " .. shq(dir))
+end
+
+-- agent：工具参数 JSON 坏掉时回传原始串 + 必填项
+do
+    local Context = require("context")
+    local Agent = require("core.agent")
+    local ctx = Context.new({ cwd = "/tmp", max_turns = 3 })
+    local calls = 0
+    local provider = {
+        stream = function()
+            calls = calls + 1
+            if calls == 1 then
+                return { role = "assistant", content = "", tool_calls = { {
+                    id = "c1", type = "function",
+                    ["function"] = { name = "bash", arguments = '{"command":' },
+                } } }
+            end
+            return { role = "assistant", content = "done" }
+        end,
+    }
+    local tools = {
+        schemas = function() return {} end,
+        required_args = function(_, name) return name == "bash" and { "command" } or {} end,
+        execute = function() return "should not run" end,
+    }
+    local session = { append = function() end, save = function() end }
+    local agent = Agent.new(ctx, provider, tools, session)
+    agent:run("hi")
+    local res = ctx.session.messages[4].content
+    check(res:find("invalid tool arguments JSON", 1, true) ~= nil, "agent bad json error")
+    check(res:find('{"command":', 1, true) ~= nil, "agent bad json raw args")
+    check(res:find("required: command", 1, true) ~= nil, "agent bad json required")
 end
 
 -- entry

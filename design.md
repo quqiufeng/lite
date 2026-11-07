@@ -1188,6 +1188,68 @@ bundled `.so` / `tools/lite-lua` 保持干净）；hook 块（hook-only 插件�
 `on_session_end` 只跑一次）；`plugin_report` 块（`tool_count`/`hook_count` 计数、坏插件
 归入 `errors`、按名查 `path/scope/tool/hooks`）。
 
-**当前回归** —— `./tools/test.sh`：单元 609 项 + `cli.json` / `tui.smoke` /
+### 8.36 harness 不再拖后腿：可缓存前缀 + 自我感知 + 失败可修
+
+模型能用多好，一半取决于 harness 递过去的东西。这一节全是"模型本来能做好、但被
+harness 挡着"的地方，改动都在 `lua/core/{prompt,agent,tools}.lua`。
+
+**system prompt 每轮变 = 前缀缓存全废** —— 旧版 `ORDER` 里有 `now` 段，时钟写进
+系统提示，导致每次请求 system 都不同，DeepSeek 前缀缓存从第一条起就 miss。现在
+`ORDER` 只留稳定段，时钟/轮次/预算一律走 `M.runtime_block(ctx, opts)`（
+`prompt.lua:154`），由 `agent.lua:request_messages` 拼成**本轮最后一条 system 消息**：
+第一条 `Current local date/time: <date>.`，有 turn + max_turns 时再补
+`Tool-loop turn %d/%d: %d turn(s) left before the loop stops…`。规则见 §8.31：易变内容
+只许追加在末尾，绝不插中间、绝不动前缀。
+
+**模型不知道自己还剩几轮、还能塞多少** —— 旧版循环达到 `max_turns` 是"突然被掐断"，
+模型最后只能拿残缺结论交差；上下文同理，`maybe_compact` 会背着模型把历史压成摘要。
+现在两块合一（同一条尾部 system，每轮只有一个）：
+
+- `runtime_block` 告知 turn/max_turns 与剩余轮数，模型可以提前收尾而不是被截断。
+- `M.budget_block(ctx, opts)`（`prompt.lua:171`）用 `Compact.total(out)` 的真实规模算：
+  `Context budget: %d/%d chars used (%.0f%%); %d chars left before compaction`，超了改说
+  `over by %d chars, compaction is due`，有 `tok_per_char` 时再附 `(~%d tokens left)`。
+  没有数字时返回 `""`（不占位、不污染提示）。
+
+**工具失败只回一句 `error: ...`，模型靠猜补参数** —— 三处补齐，都不改 schema：
+
+| 位置 | 现在多给什么 |
+|---|---|
+| `M.exit_note(rc)`（`tools.lua:525`） | 124 → `timed out (120s)`、126 → `cannot execute (permission denied)`、127 → `command not found`、其余 `[exit N]`；`bash` 用 `… 2>&1; echo __lite_rc=$?` 真拿到退出码（`popen:close()` 只回 true） |
+| `tool_spec` / `required_args` / `error_hint`（`tools.lua:1650`） | 失败结果尾部追加 `[tool <name>] args sent: … \| required: …`，照 schema 补即可，不用回忆 |
+| 坏 JSON 参数（`agent.lua:623`） | 回 `error: invalid tool arguments JSON; you sent: <raw≤300>; required: <csv>. Send valid JSON with these keys.` |
+
+**同一调用反复失败，模型会一模一样地重发** —— `M:_failure_note`
+（`agent.lua:494`）以 `tool + 原参数` 为键计数：第 2 次起追加
+`[this exact call has now failed N times; the error will not change] …Change the arguments,
+fix the cause, or use another tool instead of resending it.`；后来成功则删账并给
+`[recovered after N failed attempts]`（让它知道刚才的绕路值不值）；表超 100 条整表清空
+防长会话胀死。
+
+**一次读五个文件要五趟往返** —— `read` 增 `paths` 数组（`required = {}`，`path` 与
+`paths` 二选一），`M:read_many`（`tools.lua:670`）逐条以 `=== <path> ===` 分隔拼一个
+结果。**没有**为了并发引入线程/fork：省下的是 N-1 次 API 往返，那才是大头。图片不同——
+附件槽只有一个，批里出现图片会被标注 "a batch keeps only the last image, read images
+one per call"。
+
+**教训不落盘，下次同一个坑再踩** —— `M:session_end`（`agent.lua:530`，
+`_session_ended` 去重，`M:run` 收尾调用）把 `_failures` 里 `n >= 2`（反复失败且**最终
+没恢复**）的最多 3 条写成 `remember_fact("fail/<ts>", "Tool calls that kept failing…")`。
+只写"付过代价"的坑：一次就通的随机失败不写，避免污染 `knowledge`。
+
+**system prompt 瘦身** —— 工具清单原先在提示里重复一遍名字+一句描述，与 API 的
+`tools` 字段冲突且白烧 token；现在 `sections()` 的 tools 段只说
+`Names only; each tool's description, parameters, and defaults are sent in the API \`tools\`
+field, which is authoritative:` 再跟纯名字（实测 `#sec.tools` 从 ~1.2k 降到 41 字节）；
+`RULES` 删掉与 schema/`AGENTS.md` 重复的两条（`lite_helper`、`ffi.load`/`dist/lib`），
+`#sec.rules` 1890。
+
+**验收** —— `tools/auto_unit.lua` 覆盖：prompt 稳定块（`os.date` mock 后两次 `sections()`
+字节相同）、`runtime_block` 三种形态、5 条 `budget_block`（未超/超支/带 token 估算/无数字
+返回空）、预算块确实在消息末尾、`sections()` 五条精简断言、`exit_note` 与 `bash` 真退出码、
+`required_args("edit")`、`error_hint` 尾部参数、坏 JSON 提示、`read_many` 分隔与单图提示、
+`_failure_note` 三次失败/成功清账/恢复提示、`session_end` 程序性记忆只写 `n>=2` 且只跑一次。
+
+**当前回归** —— `./tools/test.sh`：单元 662 项 + `cli.json` / `tui.smoke` /
 `serve.probe` / `serve.smoke` 全通过（`[verified]` 2026-11-07）。§8.30 / §8.33 里的
 "385 项"/"424 项"是各自落地时的历史数字，不再逐节回填。

@@ -335,15 +335,18 @@ function M:schemas()
                 name = "read",
                 description = "Read a text file, list a directory, or read an image "
                     .. "(JPEG/PNG/GIF/WebP) in the workspace. Image data is attached "
-                    .. "to the conversation for visual understanding.",
+                    .. "to the conversation for visual understanding. "
+                    .. "Use `paths` (array) to read several text files in one call instead of "
+                    .. "several turns; images must be read one per call.",
                 parameters = {
                     type = "object",
                     properties = {
                         path = { type = "string" },
+                        paths = { type = "array", items = { type = "string" } },
                         offset = { type = "integer" },
                         limit = { type = "integer" },
                     },
-                    required = { "path" },
+                    required = {},
                 },
             },
         },
@@ -521,6 +524,16 @@ function M:start_bash(command)
     return Proc.new(run, { timeout = 120 })
 end
 
+-- 退出码 → 一句话语义：模型不用猜 124/127 是什么。
+function M.exit_note(rc)
+    rc = tonumber(rc)
+    if not rc or rc == 0 then return "" end
+    if rc == 124 then return "\n[exit 124: timed out (120s)]" end
+    if rc == 126 then return "\n[exit 126: cannot execute (permission denied)]" end
+    if rc == 127 then return "\n[exit 127: command not found]" end
+    return "\n[exit " .. tostring(rc) .. "]"
+end
+
 function M:bash(command)
     local cmd
     local command2 = self:_env_prefix() .. command
@@ -535,11 +548,17 @@ function M:bash(command)
         cmd = "bash -lc " .. shq(command2)
     end
 
-    local p = io.popen("timeout 120 " .. cmd .. " 2>&1", "r")
+    local p = io.popen("timeout 120 " .. cmd .. " 2>&1; echo __lite_rc=$?", "r")
     if not p then return "error: cannot start bash" end
     local out = p:read("*a") or ""
-    local ok = p:close()
-    if not ok then out = out .. "\n[exit nonzero]" end
+    p:close()
+    local rc = tonumber(out:match("__lite_rc=(%d+)%s*$"))
+    if rc then out = out:gsub("__lite_rc=%d+%s*$", "") end
+    if not rc then
+        out = out .. "\n[exit nonzero]"
+    else
+        out = out .. M.exit_note(rc)
+    end
     return truncate_mid(out, BASH_MAX_OUT)
 end
 
@@ -644,6 +663,23 @@ function M:web(url, max_chars)
     local cap = tonumber(max_chars) or 12000
     if #body > cap then body = body:sub(1, cap) .. "\n... [web truncated]" end
     return body
+end
+
+-- 一轮里要读好几个文件时，别来回四五趟：一次拿全，省掉 N-1 次往返。
+-- 图片只能单读（附件队列只有一个槽），批里出现图片会标注出来。
+function M:read_many(paths, offset, limit)
+    if type(paths) ~= "table" then paths = { paths } end
+    local out = {}
+    for i = 1, #paths do
+        local p = tostring(paths[i])
+        local one = self:read(p, offset, limit)
+        if self.pending_attachment then
+            one = one .. "\n[image attached; a batch keeps only the last image, read images one per call]"
+        end
+        out[#out + 1] = string.format("=== %s ===\n%s", p, one)
+    end
+    if #out == 0 then return "error: read needs path or paths" end
+    return table.concat(out, "\n")
 end
 
 function M:read(path, offset, limit)
@@ -1610,6 +1646,48 @@ function M:edit(path, old, new)
     return "edited " .. abs .. "\n" .. diff
 end
 
+-- 工具失败时把「原发参数」和「schema 必填项」一起回传，模型照着补就行，不用猜。
+function M:tool_spec(name)
+    local ok, list = pcall(function() return self:schemas() end)
+    if not ok or type(list) ~= "table" then return nil end
+    for _, s in ipairs(list) do
+        local fn = s["function"]
+        if fn and fn.name == name then return fn.parameters or {} end
+    end
+    return nil
+end
+
+function M:required_args(name)
+    local p = self:tool_spec(name)
+    local list = {}
+    for _, k in ipairs((p and p.required) or {}) do list[#list + 1] = tostring(k) end
+    return list
+end
+
+function M:error_hint(name, args, out)
+    if type(out) ~= "string" or not out:match("^error") then return out end
+    local p = self:tool_spec(name)
+    if not p then return out end
+    local keys = {}
+    for k in pairs(p.properties or {}) do keys[#keys + 1] = k end
+    table.sort(keys)
+    local sent = {}
+    for _, k in ipairs(keys) do
+        local v = args and args[k]
+        if v ~= nil then
+            local s = tostring(v):gsub("%s+", " ")
+            if #s > 40 then s = s:sub(1, 40) .. "..." end
+            sent[#sent + 1] = k .. "=" .. s
+        end
+    end
+    local req = self:required_args(name)
+    local parts = {}
+    if #sent > 0 then parts[#parts + 1] = "args sent: " .. table.concat(sent, ", ") end
+    if #req > 0 then parts[#parts + 1] = "required: " .. table.concat(req, ", ") end
+    if #parts == 0 then return out end
+    return out .. "\n[tool " .. name .. "] " .. table.concat(parts, " | ")
+end
+
 function M:execute(name, args)
     args = args or {}
     local ok, out = pcall(function()
@@ -1620,6 +1698,10 @@ function M:execute(name, args)
         elseif name == "lua" then
             return self:lua(args)
         elseif name == "read" then
+            if type(args.paths) == "table" then
+                return self:read_many(args.paths, args.offset, args.limit)
+            end
+            if args.path == nil then return "error: read needs path or paths" end
             return self:read(args.path, args.offset, args.limit)
         elseif name == "ocr" then
             return self:ocr(args.path, args.boxes)
@@ -1654,8 +1736,8 @@ function M:execute(name, args)
         if helper_out ~= nil then return helper_out end
         return "error: unknown tool " .. tostring(name)
     end)
-    if not ok then return "error: " .. tostring(out) end
-    return truncate(out)
+    if not ok then return self:error_hint(name, args, "error: " .. tostring(out)) end
+    return truncate(self:error_hint(name, args, out))
 end
 
 return M

@@ -37,7 +37,7 @@ TUI 完成后，“看见”会进一步包含对话界面与截图，形成完�
 ## 特性
 
 - **DeepSeek 流式对话**：OpenAI 兼容 `/chat/completions` + SSE；支持 `thinking` / `reasoning_effort`，TUI 用灰色 `…` 块显示思考过程。
-- **工具循环**：`bash / lua / web / read / ocr / write / edit / resize / native / todo`，文件工具限制在 workspace；TUI 即时显示 `tool:<name>` 与结果。`bash` 异步执行，长命令不冻结 TUI，`Ctrl+C` 可取消；`read` 支持文本/目录/图片（JPEG/PNG/GIF/WebP，图片以 user `image_url` 传入；图片还可从 `$TMPDIR`/`/tmp`/`/var/tmp` 只读打开，文本仍限 workspace）；`web` 走内置 libcurl GET（live data 用，不读仓库）；`ocr` 走系统 PP-OCRv4（中文/英文，可选）；`resize` 走内置 `liblite_image.so`（LuaJIT FFI，PNG/JPEG/WebP 解码+缩放+编码）；`edit` 成功返回 unified diff；`lua` 在子进程里执行一段 LuaJIT（`args` 走 JSON、默认 30s 超时可到 120s、审批同 `bash`），是运行期试插件的唯一动态出口。工具输出统一 **head+tail 双端裁剪**（bash 32KB，其余 30KB）：只留头部会砍掉编译报错/测试失败摘要，模型只能重跑一遍，那是"省 token 反而更贵"。
+- **工具循环**：`bash / lua / web / read / ocr / write / edit / resize / native / todo`，文件工具限制在 workspace；TUI 即时显示 `tool:<name>` 与结果。`bash` 异步执行，长命令不冻结 TUI，`Ctrl+C` 可取消；`read` 支持文本/目录/图片（JPEG/PNG/GIF/WebP，图片以 user `image_url` 传入；图片还可从 `$TMPDIR`/`/tmp`/`/var/tmp` 只读打开，文本仍限 workspace；`paths` 数组可一次读 N 个文件，图片一次一张）；`web` 走内置 libcurl GET（live data 用，不读仓库）；`ocr` 走系统 PP-OCRv4（中文/英文，可选）；`resize` 走内置 `liblite_image.so`（LuaJIT FFI，PNG/JPEG/WebP 解码+缩放+编码）；`edit` 成功返回 unified diff；`lua` 在子进程里执行一段 LuaJIT（`args` 走 JSON、默认 30s 超时可到 120s、审批同 `bash`），是运行期试插件的唯一动态出口。工具输出统一 **head+tail 双端裁剪**（bash 32KB，其余 30KB）：只留头部会砍掉编译报错/测试失败摘要，模型只能重跑一遍，那是"省 token 反而更贵"。
 - **工具审批**：`--approval ask|deny`；危险工具弹出 once / always / reject，always 按 session 记忆；serve/attach 通过协议审批。
 - **本地上下文记忆**：
   - 每个项目目录生成 `mem.bin` + `mem.idx`；
@@ -46,6 +46,7 @@ TUI 完成后，“看见”会进一步包含对话界面与截图，形成完�
   - 旧轮次不进 prompt，需要时用 `recall` 查回；
   - `mem.bin` 头部损坏（magic/version 不符）不阻塞启动：自动改名为 `mem.bin.corrupt-<ts>` 后以空库继续，`mem.idx` 一并备份。
 - **有界上下文 + 低频压缩**：prompt 一直 append-only，只在跨过预算阈值（`LITE_CONTEXT_CHARS`，默认 64k 字符）时压一次。压缩把旧内容折成**三段结构**——稳定前缀（system + 首条 user，≤8% 预算）、一段结构化 digest（固定小标题、禁止编造、硬性字数上限）、近期原文尾巴（预算的 10%，边界避开 tool result）——然后记 baseline 继续追加。用户自己的话有独立预算、逐字保留、不进摘要（约束被摘要丢掉就再也找不回来，而它约束的代码还在工作区里）。折叠收益不足或摘要超标时**拒绝**这次检查点，并带迟滞（rearm）避免"每轮都压"——重复压会打断缓存前缀，比不压更贵。`--json` 输出 `{"type":"compact"}` 事件，TUI 里显示 `compact: prompt N -> M chars`。
+- **prompt 前缀稳定 + 自我感知**：system prompt 字节不再逐轮漂移，时钟/`turn N/M`/剩余预算统一拼成**消息尾部的 runtime 块**，因此每一轮都能命中 prefix cache（热会话命中率从 97% 掉到 71% 的漂移被消掉）。尾部块同时告诉模型"还能用几轮工具循环""上下文还剩多少字符、超过多少就要压缩"，模型不必靠撞墙发现边界。工具失败会把**原始参数 + required 键 + 退出码语义**（124 超时 / 126 不能执行 / 127 命令不存在 / 其它 `[exit N]`）回传，同一调用连续失败会追加 `[this exact call has now failed N times…]`，恢复后给 `[recovered after N failed attempts]`；会话结束时 `session_end` 把"反复失败且未恢复"的教训落成程序性记忆（最多 3 条），下一轮自动召回。
 - **用量与缓存可观测**：解析流末尾的 `usage`（`prompt_cache_hit/miss_tokens`），按会话累积；TUI 状态栏 `cache:N%` 显示前缀缓存命中率，`--once --json` 输出 `{"type":"usage"}` 事件。命中率是判断"prompt 前缀是否稳定"的唯一硬指标。**输出 token 按剩余窗口动态限制**；provider 报上下文过长时自动强制 compact 后重试一次。
 - **上下文压力可见**：状态栏 `ctx:N%` 显示当前 prompt 占压缩触发线的比例（≥60% 才出现），数字来自真实 `usage` 校准的 chars→tokens 比例（实测误差 2%），不是纯字符猜测。预算小于固定前缀的 3 倍时会自动抬高并提示，避免"预算比 system prompt 还小"导致压缩永远失败、只能丢历史。
 - **TUI + diff**：`--tui` 交互；assistant Markdown/代码块渲染、`Tab` 文件路径补全、鼠标滚轮/`PgUp`/`PgDn` 上翻历史、**左键拖选 transcript 选中文本，松开即复制到剪贴板**（`xclip`/`wl-copy`/`xsel`/`pbcopy`，都没有时退化为 OSC 52，走 ssh 也能用）、`?` 帮助、`Esc×2` 终止当前回复、忙时继续输入排队（`queue:N` / `⏳` 待发送）、`quit` + Enter 退出、启动时自动恢复同 cwd 最近会话；`/session` 选择/新建会话；`Ctrl+G` 打开 `git diff`，支持 split/unified、hunk 跳转、单文件、大 diff 虚拟滚动。

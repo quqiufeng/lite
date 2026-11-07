@@ -2,7 +2,9 @@
 -- 参考 Pi system-prompt sections 与 Reasonix prefix/recall 的稳定前缀思路。
 local M = {}
 
-local ORDER = { "preamble", "now", "tools", "capabilities", "native", "rules", "memory", "project_context", "cwd" }
+-- 注意：时钟/轮次预算这类每轮都变的内容不能进 system（会让 prefix cache 每轮失效），
+-- 走 M.runtime_block 追加到本轮末尾。
+local ORDER = { "preamble", "tools", "capabilities", "native", "rules", "memory", "project_context", "cwd" }
 local DEFAULT_PROJECT_CHARS = 16000
 local context_cache = {}
 
@@ -50,52 +52,49 @@ end
 
 local RULES = {
     "Inspect the workspace before changing it; read a file before editing.",
-    "bash runs on the host with the workspace as cwd; it can access the network and filesystem and is not sandboxed unless the user enables it.",
-    "Do not assume commands are sandboxed or auto-approved; avoid destructive operations unless the user asks.",
+    "bash runs on the host with the workspace as cwd; it can reach the network and filesystem and is not sandboxed unless the user enables it.",
+    "Do not assume commands are sandboxed or auto-approved; avoid destructive operations unless asked.",
     "Use edit for small changes; write only for new files or full rewrites.",
-    "Tool output is truncated; narrow reads/commands when output is large.",
-    "Use read for files, directories, and images (JPEG/PNG/GIF/WebP); images are attached for visual understanding and may also come from temp dirs, while text reads stay inside the workspace; use resize to scale them.",
-    "Native extensions: LuaJIT bundles FFI. If a system .so already provides the capability, bind only the needed symbols with ffi.cdef + ffi.load in lua/ffi/<feature>.lua and expose it as a tool; use a small C shim under src/<feature>/ only for complex ABI or performance. Package non-libc .so files in dist/lib with $ORIGIN RPATH instead of depending on Python/Node or external binaries.",
-    "When built-ins and system libraries are insufficient, use native(action=\"build\", name=..., code=...) to compile a small C/C++ helper in helper/ and native(action=\"run\", ...) to call it. Export char *lite_helper(const char *input); input/output are UTF-8 strings (usually JSON). Prefer existing tools first; native helpers run in-process and need approval.",
+    "Tool output is truncated; narrow reads and commands when output is large.",
+    "read handles files, directories, and images; text reads stay inside the workspace, images may also come from temp dirs.",
     "Be concise, use the user's language, and show file paths clearly.",
-    "For simple yes/no/status/version questions, answer directly from the latest evidence; use at most one targeted check (git log -1, lite --version, stat). Do not repeatedly run git log/status or dump whole scripts.",
-    "For questions requiring live external data, use web; if a response is truncated or unusable, retry with a larger max_chars or a more specific URL. Never inspect git/repo docs for live data, and never invent it.",
-    "The newest tool result and current files override older memory or compact digests; verify stale facts instead of repeating them.",
-    "The current user request is the active task. Treat todos and memory as background: do not resume an older task unless the user asks to continue it.",
-    "For read-only requests (read, inspect, list, summarize), do not run tests/builds or modify files unless the user asks; do not turn it into an unrequested audit.",
-    "If the request has multiple parts or sources, track each and address every part in the final answer; do not silently drop one.",
-    "After running git log, summarize the relevant commits or changes instead of only executing the command.",
+    "For simple yes/no/status/version questions, answer directly from the latest evidence; use at most one targeted check (git log -1, lite --version, stat). Do not repeat git log/status or dump whole scripts.",
+    "For live external data use web; if truncated, retry with a larger max_chars or a more specific URL. Never inspect git/repo docs for live data, and never invent it.",
+    "Newest tool results and current files override older memory or summaries; verify stale facts instead of repeating them.",
+    "The current user request is the active task. Todos and memory are background: do not resume an older task unless asked.",
+    "For read-only requests (read, inspect, list, summarize), do not run tests/builds or modify files unless asked; do not turn it into an unrequested audit.",
+    "If the request has multiple parts or sources, address every part in the final answer; never silently drop one.",
+    "After git log, summarize the relevant commits instead of only running the command.",
     "If two consecutive tool results add no new information, stop inspecting and answer.",
-    "For multi-step work, keep a todo list with the todo tool; mark one item in_progress and update it as you go.",
-    "You may be invoked by serve/wake without an interactive user; report what you did and leave durable state in memory/todos.",
+    "For multi-step work keep a todo list; one item in_progress at a time.",
+    "You may be invoked by serve/wake without a user; report what you did and leave durable state in memory/todos.",
 }
 
 function M.sections(ctx, opts)
     opts = opts or {}
     local cwd = ctx.session.cwd or "."
 
-    local tool_lines = {}
+    local tool_names = {}
     for _, schema in ipairs(opts.tools or {}) do
         local fn = schema["function"] or {}
-        if fn.name then
-            tool_lines[#tool_lines + 1] = string.format("- %s: %s",
-                fn.name, fn.description or "")
-        end
+        if fn.name then tool_names[#tool_names + 1] = fn.name end
     end
-    local tools = #tool_lines > 0 and table.concat(tool_lines, "\n")
-        or "(none)\nAdditional tools may be available."
+    -- 描述/参数/默认值已在 API 的 tools 字段逐字发出；这里再抄一遍是纯重复，
+    -- 还占着每个请求都要付的前缀 token。只留一张名字表 + 权威来源指路。
+    local tools = "(none)\nAdditional tools may be available."
+    if #tool_names > 0 then
+        tools = "Names only; each tool's description, parameters, and defaults are sent in the API " ..
+            "`tools` field, which is authoritative:\n" .. table.concat(tool_names, ", ")
+    end
 
     local rules = {}
     for _, r in ipairs(RULES) do rules[#rules + 1] = "- " .. r end
-    rules[#rules + 1] = "- Use remember(key, content, tags) for durable project facts."
-    rules[#rules + 1] = "- Use recall(query, limit) when older context is needed."
 
     local project = M.project_context(cwd)
 
     return {
         preamble = "You are lite, a concise terminal coding agent running in the user's workspace. " ..
             "Help the user inspect files, run commands, and modify code.",
-        now = "Current local date/time: " .. os.date("%Y-%m-%d %A %H:%M:%S %Z") .. ".",
         tools = tools,
         capabilities = table.concat({
             "You can act on the user's machine, not just chat:",
@@ -146,6 +145,49 @@ end
 
 function M.system_prompt(ctx, opts)
     return M.render(M.sections(ctx, opts))
+end
+
+-- 每轮易变上下文：本地时钟 + 循环预算。作为本轮最后一条 system 消息追加，
+-- 让 system prompt（前缀）保持字节稳定，命中 provider 的 prefix cache。
+function M.runtime_block(ctx, opts)
+    opts = opts or {}
+    local lines = { "Current local date/time: " .. os.date("%Y-%m-%d %A %H:%M:%S %Z") .. "." }
+    local turn = tonumber(opts.turn)
+    local max_turns = tonumber(opts.max_turns)
+        or tonumber(ctx and ctx.settings and ctx.settings.max_turns)
+    if turn and max_turns then
+        lines[#lines + 1] = string.format(
+            "Tool-loop turn %d/%d: %d turn(s) left before the loop stops and you must answer with what you have.",
+            turn, max_turns, math.max(max_turns - turn, 0))
+    end
+    return table.concat(lines, "\n")
+end
+
+-- 上下文预算：与 runtime_block 一样每轮都在变，只能追加在末尾。
+-- 模型要能自己判断"还能塞多少、什么时候会被压缩"，否则它会一直读大文件、
+-- 直到 harness 在它不知情的时候把历史压成摘要。
+function M.budget_block(ctx, opts)
+    opts = opts or {}
+    local used = tonumber(opts.used)
+    local budget = tonumber(opts.budget)
+        or tonumber(ctx and ctx.settings and ctx.settings.context_chars)
+    if not used or not budget or budget <= 0 then return "" end
+    local left = budget - used
+    local line
+    if left >= 0 then
+        line = string.format("Context budget: %d/%d chars used (%.0f%%); %d chars left before compaction",
+            used, budget, used / budget * 100, left)
+    else
+        line = string.format("Context budget: %d/%d chars used; over by %d chars, compaction is due",
+            used, budget, -left)
+    end
+    local ratio = tonumber(opts.tok_per_char)
+    if ratio and ratio > 0 then
+        line = line .. string.format(" (~%d tokens left).", math.floor(math.max(left, 0) * ratio))
+    else
+        line = line .. "."
+    end
+    return line
 end
 
 -- 记忆块：预算内注入，明确告知可能过期并提示 recall。

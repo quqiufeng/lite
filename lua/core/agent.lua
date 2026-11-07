@@ -17,6 +17,7 @@ function M.new(ctx, provider, tools, session, memory)
         memory = memory,
         prompt = Prompt,
         async = false,
+        _failures = {},
     }, M)
     self.approval = Approval.new({
         mode = ctx.settings.approval,
@@ -364,6 +365,11 @@ function M:request_messages(text, stream, opts)
     end
 
     local reserve = #block + 200
+    -- 时钟 + 轮次预算：每轮都变，只能放末尾（见下）。
+    local rt = self.prompt.runtime_block(self.ctx, {
+        turn = opts.turn, max_turns = opts.max_turns,
+    })
+    reserve = reserve + #rt + 4
     self:maybe_compact(stream, reserve, opts.force_compact)
     local msgs = self:view_messages()
 
@@ -380,12 +386,6 @@ function M:request_messages(text, stream, opts)
         end
     end
 
-    if block == "" then
-        -- 没有额外块时请求就是这个规模，直接记下来校准。
-        self._last_request_chars = Compact.total(msgs)
-        return msgs
-    end
-
     -- 追加到**最末尾**，不要插在中间。
     --
     -- 召回内容每轮不同（随 query 变）。插在会话中间会把后面所有消息整体位移，
@@ -396,6 +396,13 @@ function M:request_messages(text, stream, opts)
     for i = 1, #msgs do out[#out + 1] = msgs[i] end
     if block ~= "" then
         out[#out + 1] = { role = "system", content = block }
+    end
+    -- 时钟 + 剩余轮次：同一套理由，只能追加在末尾；模型每轮都能看到自己还剩几次工具调用。
+    -- 上下文预算同理（用组装后的真实规模算），拼在同一块里，保证每轮只有一个尾部 system。
+    if rt ~= "" then
+        local bd = self.prompt.budget_block(self.ctx, { used = Compact.total(out), budget = c.budget })
+        if bd ~= "" then rt = rt .. "\n" .. bd end
+        out[#out + 1] = { role = "system", content = rt }
     end
     -- 本次真正发出去的规模，供下一轮用真实 usage 反推 chars→tokens。
     self._last_request_chars = Compact.total(out)
@@ -480,6 +487,38 @@ function M:_finalize(stream, why)
     return answer
 end
 
+-- 同一调用（工具+原参数）反复失败时，直说“这么重试不会变”，
+-- 免得模型第三、四轮继续把一模一样的参数再发一遍。
+local FAIL_NOTE_KEEP = 200
+
+function M:_failure_note(name, raw_args, result)
+    local key = tostring(name) .. "\0" .. tostring(raw_args or "")
+    local rec = self._failures[key]
+    local ok = type(result) == "string" and not result:match("^error")
+    if ok then
+        -- 后来成功了：这个坑不用写进程序性记忆。
+        self._failures[key] = nil
+        if rec and rec.n > 1 then
+            return string.format("\n[recovered after %d failed attempts]", rec.n)
+        end
+        return ""
+    end
+    if not rec then
+        local size = 0
+        for _ in pairs(self._failures) do size = size + 1 end
+        if size >= 100 then self._failures = {} end
+        rec = { name = name, args = tostring(raw_args or ""), n = 0,
+                head = tostring(result):gsub("%s+", " "):sub(1, FAIL_NOTE_KEEP) }
+        self._failures[key] = rec
+    end
+    rec.n = rec.n + 1
+    if rec.n < 2 then return "" end
+    return string.format(
+        "\n[this exact call has now failed %d times; the error will not change] "
+            .. "Change the arguments, fix the cause, or use another tool instead of resending it.",
+        rec.n)
+end
+
 -- 插件 hook 判定：没有插件声明该 hook 时整条分支都不进（纯内建场景零开销）。
 function M:has_hooks(kind)
     local t = self.tools
@@ -491,6 +530,26 @@ end
 function M:session_end()
     if self._session_ended then return end
     self._session_ended = true
+    -- 程序性记忆：只写“付出过代价、后来也没解决”的坑，
+    -- 一次就通的随机失败不写，免得污染知识库。
+    local lessons, n = {}, 0
+    for _, rec in pairs(self._failures or {}) do
+        if rec.n >= 2 then
+            n = n + 1
+            if n <= 3 then
+                lessons[#lessons + 1] = string.format(
+                    "- `%s %s` failed %d times in a row: %s",
+                    rec.name, rec.args:gsub("%s+", " "):sub(1, 80), rec.n, rec.head)
+            end
+        end
+    end
+    if #lessons > 0 and self.memory and type(self.memory.remember_fact) == "function" then
+        self.memory:remember_fact(
+            "fail/" .. os.date("%Y%m%d-%H%M%S"),
+            "Tool calls that kept failing this session (avoid repeating verbatim):\n"
+                .. table.concat(lessons, "\n"),
+            { "agent", "failure" })
+    end
     if self:has_hooks("on_session_end") then
         local s = self.ctx and self.ctx.session or {}
         self.tools:on_session_end({
@@ -521,10 +580,12 @@ function M:_loop(text, stream)
     local max_turns = ctx.settings.max_turns
     local token_budget = tonumber(ctx.settings.token_budget) or 0
 
-    local function request_stream(inject, force)
+    local function request_stream(inject, force, turn)
         local req = self:request_messages(text, stream, {
             inject_context = inject,
             force_compact = force,
+            turn = turn or 1,
+            max_turns = max_turns,
         })
         -- outputLimit：让 provider 知道本轮输入大概占了多少 token。
         ctx.settings.input_tokens = self:estimate_tokens(Compact.total(req))
@@ -549,7 +610,7 @@ function M:_loop(text, stream)
             end
         end
         ctx:begin_turn()
-        local assistant, err = request_stream(iter == 1, false)
+        local assistant, err = request_stream(iter == 1, false, iter)
 
         -- 参考 opencode：provider 明确报上下文过长时，强制压一次再重试。
         if not assistant and not overflow_retried
@@ -614,7 +675,16 @@ function M:_loop(text, stream)
             local args = decode_args(fn.arguments)
             local result
             if args == nil then
-                result = "error: invalid tool arguments JSON"
+                -- 把原发参数串和该工具的必填项回传，模型能自己修好这条调用。
+                local raw = tostring(fn.arguments or "")
+                if #raw > 300 then raw = raw:sub(1, 300) .. "..." end
+                result = "error: invalid tool arguments JSON; you sent: " .. raw
+                local req = {}
+                if self.tools.required_args then req = self.tools:required_args(name) end
+                if #req > 0 then
+                    result = result .. "; required: " .. table.concat(req, ", ")
+                end
+                result = result .. ". Send valid JSON with these keys."
             else
                 ctx:set_status("tool")
                 ctx:emit("tool_start", name, args)
@@ -660,6 +730,9 @@ function M:_loop(text, stream)
                 local r = self.tools:after_tool(name, args, result)
                 if r ~= nil then result = r end
             end
+            -- 同一参数反复失败：在结果尾巴把话说死，别再原样重发。
+            local fnote = self:_failure_note(name, fn.arguments, result)
+            if fnote ~= "" then result = tostring(result) .. fnote end
             ctx:emit("tool_result", name, result)
             local rs = result_sig(name, result)
             local rn = (result_counts[rs] or 0) + 1

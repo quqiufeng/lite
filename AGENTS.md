@@ -41,6 +41,11 @@ AI-native harness：记忆、工具、FFI、X11。
 最近 `LITE_SESSION_RAW_KEEP`（默认 200）条非 user 原文 + user 永久；tool 结果入库截到
 `LITE_TOOL_RESULT_CHARS`（默认 8192），旧内容靠 turn 摘要/`recall`。写实例持 `mem.lock`。
 
+system prompt 必须**字节稳定**（时钟/轮次/预算都追加在消息末尾的同一个尾部块，走
+`prompt.runtime_block` / `prompt.budget_block`），否则前缀缓存全丢；工具清单在 system 里
+只列名字，schema 以 API `tools` 字段为准。会话结束 `session_end` 把"反复失败未恢复"
+（同 tool+args 失败 ≥2 次）写成 `fail/<ts>` 事实。
+
 ## 4 铁律
 
 MUST：改代码后 `./tools/test.sh` 通过；依赖变更同步 `tools/check_deps.sh` 和本文件；
@@ -66,6 +71,11 @@ Chrome/WebView/CEF/Electron；不起 `xdotool/wmctrl/import`；不用 `systemd -
 
 工具输出 ≤ 32KB；`read` 文本/目录限 workspace，图片可读 `$TMPDIR:/tmp:/var/tmp`；
 `bash` 可异步长跑，TUI 里 `Ctrl+C` 取消。回归测试先在修复前 commit 确认 FAIL。
+
+工具失败要**可自修**：报错带原参数 + `required` 键 + 退出码语义（`tools.exit_note`：
+124 超时 / 126 不可执行 / 127 未找到），同一调用连续失败第 2 次起追加
+`[this exact call has now failed N times]`，成功时清账。多文件只读用
+`read` 的 `paths` 数组批量读（N 个文件 1 次往返），图片一次一张。
 
 ## 6 原生扩展
 
