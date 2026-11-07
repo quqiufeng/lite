@@ -1588,8 +1588,10 @@ return M
             parameters = { type = "object", properties = { value = { type = "string" } } },
         })
         check(wrapped:find("installed helper tool", 1, true) ~= nil, "native wrap")
+        -- helper dir was scanned at session start: schema only shows up in a new session
+        local t2 = Tools.new({ cwd = dir })
         local found = false
-        for _, schema in ipairs(t:schemas()) do
+        for _, schema in ipairs(t2:schemas()) do
             if schema["function"].name == "echo_tool" then found = true end
         end
         check(found, "native schema discovered")
@@ -1598,6 +1600,117 @@ return M
     else
         print("SKIP native helper (cc missing)")
     end
+end
+
+-- helper snapshot (round A): scan once per session
+do
+    local cjson = require("cjson")
+    local dir = os.tmpname()
+    os.remove(dir)
+    os.execute("mkdir -p " .. shq(dir .. "/helper"))
+
+    local function write(path, body)
+        local f = io.open(path, "wb")
+        f:write(body)
+        f:close()
+    end
+    local function names_of(t)
+        local set = {}
+        for _, schema in ipairs(t:schemas()) do set[schema["function"].name] = schema end
+        return set
+    end
+
+    write(dir .. "/helper/probe_json.tool.json", cjson.encode({
+        description = "json sidecar probe",
+        parameters = { type = "object", properties = {} },
+    }))
+    write(dir .. "/helper/probe_lua.lua", [[
+return {
+    schema = {
+        description = "embedded schema probe",
+        parameters = { type = "object", properties = { value = { type = "string" } } },
+    },
+    run = function(args, env) return "probe:" .. tostring(args.value) end,
+}
+]])
+
+    local Tools = require("core.tools")
+    local field = function(set, name, ...)
+        local cur = set and set[name] and set[name]["function"]
+        for _, k in ipairs({ ... }) do
+            if type(cur) ~= "table" then return nil end
+            cur = cur[k]
+        end
+        return cur
+    end
+
+    local t = Tools.new({ cwd = dir })
+    local first = names_of(t)
+    check(first.probe_json ~= nil, "helper .tool.json discovered")
+    check(first.probe_lua ~= nil, "helper .lua embedded schema discovered")
+    check(field(first, "probe_lua", "description") == "embedded schema probe",
+        "helper .lua schema description")
+    check(type(field(first, "probe_lua", "parameters")) == "table"
+        and type(field(first, "probe_lua", "parameters", "properties")) == "table"
+        and field(first, "probe_lua", "parameters", "properties", "value") ~= nil,
+        "helper .lua schema parameters")
+    check(t:execute("probe_lua", { value = "hi" }) == "probe:hi", "helper .lua run")
+
+    -- snapshot: mid-session file churn must not rescan (forks + prefix cache)
+    os.remove(dir .. "/helper/probe_json.tool.json")
+    check(names_of(t).probe_json ~= nil, "helper snapshot keeps removed schema")
+    write(dir .. "/helper/late.lua", "return { schema = { description = 'late probe',"
+        .. " parameters = { type = 'object', properties = {} } },"
+        .. " run = function() return 'late:hi' end }")
+    check(names_of(t).late == nil, "helper snapshot ignores new files")
+    check(t:execute("late", {}):find("unknown tool", 1, true) == nil, "late helper callable by name")
+
+    -- a new session rescans
+    local t2 = Tools.new({ cwd = dir })
+    local second = names_of(t2)
+    check(second.probe_json == nil, "new session drops removed schema")
+    check(second.late ~= nil, "new session picks up new schema")
+
+    -- broken plugins must not enter the tool list
+    write(dir .. "/helper/broken.lua", "return { }")
+    write(dir .. "/helper/syntaxerr.lua", "return {")
+    local t3 = Tools.new({ cwd = dir })
+    local third = names_of(t3)
+    check(third.broken == nil and third.syntaxerr == nil, "invalid helper not listed")
+    check(t3:execute("broken", {}):find("must return", 1, true) ~= nil, "invalid helper errors")
+    check(t3:execute("syntaxerr", {}):find("load failed", 1, true) ~= nil, "syntax error helper errors")
+
+    os.execute("rm -rf " .. shq(dir))
+end
+
+-- lua tool: out-of-process luajit, args via stdin
+do
+    local dir = os.tmpname()
+    os.remove(dir)
+    os.execute("mkdir -p " .. shq(dir))
+    local Tools = require("core.tools")
+    local t = Tools.new({ cwd = dir })
+
+    check(t:execute("lua", { code = "return 1 + 1" }) == "2", "lua tool returns value")
+    check(t:execute("lua", { code = "return args.a .. args.b", input = { a = "x", b = "y" } }) == "xy",
+        "lua tool args from stdin json")
+    check(t:execute("lua", { code = 'return "it\'s 中文"' }) == "it's 中文",
+        "lua tool string passthrough")
+    check(t:execute("lua", { code = "return { x = 1 }" }) == '{"x":1}', "lua tool table to json")
+    check(t:execute("lua", { code = "error('boom')" }):find("boom", 1, true) ~= nil,
+        "lua tool runtime error surfaced")
+    local se = t:execute("lua", { code = "return (" })
+    check(se:find("load", 1, true) ~= nil or se:find("error", 1, true) ~= nil,
+        "lua tool syntax error surfaced")
+    check(t:execute("lua", { code = "while true do end", timeout = 1 }):find("timeout", 1, true) ~= nil,
+        "lua tool timeout")
+    check(t:execute("lua", { code = "local ffi = require('ffi'); return ffi.os" }) == "Linux",
+        "lua tool has ffi")
+    check(t:execute("lua", { code = "return require('core.tools') ~= nil" }) == "true",
+        "lua tool sees lua/ package path")
+    check(t:execute("lua", {}):find("code", 1, true) ~= nil, "lua tool requires code")
+
+    os.execute("rm -rf " .. shq(dir))
 end
 
 -- agent memory injection

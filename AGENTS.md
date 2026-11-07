@@ -75,11 +75,20 @@ Chrome/WebView/CEF/Electron；不起 `xdotool/wmctrl/import`；不用 `systemd -
 - `.so` 用 `$ORIGIN` RPATH；打包只复制非 libc 依赖到 `dist/lib/`。
 - 大库/模型不随包：见 `README.md` 的 `ort_link.sh`、`cuda_provider.sh`、`LITE_DIST_WITH_*`。
 - 热重载：Lua 清 `package.loaded[...]` 后 require；TUI `/reload`。C `.so` 改完要重启。
+  `/reload` 只重载 `core.tools` / `core.prompt` / `ffi.*`，**不重扫插件快照**。
 
 `native` 自造工具：`build` / `run` / `wrap`；ABI 为
 `char *lite_helper(const char *input)` + 可选 `lite_helper_free`（UTF-8/JSON）。
 插件发现 `<workspace>/helper` → `$LITE_ROOT/helper`；`scope=local|global` 控制写入侧。
 wrapper 返回 `{ run=function(args,env) ... end }`；重新 build 生成新 `.so`，免重启。
+
+**插件不热插拔**（`design.md:8.35`）：`helper/*.lua` 里返回
+`{ schema={...}, run=function(args,env) end }` 即可同时声明工具名和实现
+（`.tool.json` 写法仍可用、优先）。schema 只在会话启动扫一次并记忆化，之后每轮
+`schemas()` 用快照 —— 运行时新建/删除 `.lua` 不影响工具列表（避免打掉前缀缓存），
+但可按名调用，重启后进列表。运行时要试新代码走 `lua` 工具（进程外
+`tools/lite-lua -e`，`args` 走 `LITE_LUA_ARGS` JSON，默认 30s 超时，审批同 `bash`），
+**这是唯一动态出口**；改 C `.so` 或插件要生效都得重启。
 
 ## 7 参考实现（新功能先查）
 

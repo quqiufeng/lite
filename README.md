@@ -37,7 +37,7 @@ TUI 完成后，“看见”会进一步包含对话界面与截图，形成完�
 ## 特性
 
 - **DeepSeek 流式对话**：OpenAI 兼容 `/chat/completions` + SSE；支持 `thinking` / `reasoning_effort`，TUI 用灰色 `…` 块显示思考过程。
-- **工具循环**：`bash / web / read / ocr / write / edit / resize / native / todo`，文件工具限制在 workspace；TUI 即时显示 `tool:<name>` 与结果。`bash` 异步执行，长命令不冻结 TUI，`Ctrl+C` 可取消；`read` 支持文本/目录/图片（JPEG/PNG/GIF/WebP，图片以 user `image_url` 传入；图片还可从 `$TMPDIR`/`/tmp`/`/var/tmp` 只读打开，文本仍限 workspace）；`web` 走内置 libcurl GET（live data 用，不读仓库）；`ocr` 走系统 PP-OCRv4（中文/英文，可选）；`resize` 走内置 `liblite_image.so`（LuaJIT FFI，PNG/JPEG/WebP 解码+缩放+编码）；`edit` 成功返回 unified diff。工具输出统一 **head+tail 双端裁剪**（bash 32KB，其余 30KB）：只留头部会砍掉编译报错/测试失败摘要，模型只能重跑一遍，那是"省 token 反而更贵"。
+- **工具循环**：`bash / lua / web / read / ocr / write / edit / resize / native / todo`，文件工具限制在 workspace；TUI 即时显示 `tool:<name>` 与结果。`bash` 异步执行，长命令不冻结 TUI，`Ctrl+C` 可取消；`read` 支持文本/目录/图片（JPEG/PNG/GIF/WebP，图片以 user `image_url` 传入；图片还可从 `$TMPDIR`/`/tmp`/`/var/tmp` 只读打开，文本仍限 workspace）；`web` 走内置 libcurl GET（live data 用，不读仓库）；`ocr` 走系统 PP-OCRv4（中文/英文，可选）；`resize` 走内置 `liblite_image.so`（LuaJIT FFI，PNG/JPEG/WebP 解码+缩放+编码）；`edit` 成功返回 unified diff；`lua` 在子进程里执行一段 LuaJIT（`args` 走 JSON、默认 30s 超时可到 120s、审批同 `bash`），是运行期试插件的唯一动态出口。工具输出统一 **head+tail 双端裁剪**（bash 32KB，其余 30KB）：只留头部会砍掉编译报错/测试失败摘要，模型只能重跑一遍，那是"省 token 反而更贵"。
 - **工具审批**：`--approval ask|deny`；危险工具弹出 once / always / reject，always 按 session 记忆；serve/attach 通过协议审批。
 - **本地上下文记忆**：
   - 每个项目目录生成 `mem.bin` + `mem.idx`；
@@ -52,7 +52,7 @@ TUI 完成后，“看见”会进一步包含对话界面与截图，形成完�
 - **Todo list**：`todo` 工具维护多步任务；状态栏 `todo:done/total`，`Ctrl+T` 打开列表；持久化到本地记忆并随 serve/attach 广播。
 - **serve / attach**：`lite serve --port 8765` 启动 headless 服务端；`lite attach --port 8765` 在任意终端或 tmux tab 实时显示并交互，所有客户端共享同一会话与事件流。待处理 prompt 持久化在 KV，重启可恢复；attach 连接时回放会话历史；SIGINT/SIGTERM 优雅退出。
 - **定时唤醒**：`serve --wake 300 --task "检查 CI"`（或 `--task-file` / `.lite/wake.md`）；空闲时自动提交，记录上次结果并随 attach 广播。无人值守仍需先补工具审批/沙箱。
-- **自扩展 native helper**：模型可用 `native` 工具自己写 C/C++、编译 `helper/<name>.so`、写 Lua wrapper + schema，立即变成可调用工具；插件可在 `<workspace>/helper` 或 `$LITE_ROOT/helper`，重编译不需要重启。
+- **自扩展 native helper**：模型可用 `native` 工具自己写 C/C++、编译 `helper/<name>.so`、写 Lua wrapper + schema，立即变成可调用工具；插件可在 `<workspace>/helper` 或 `$LITE_ROOT/helper`，C `.so` 重编译后下一次调用即生效。纯 Lua 插件（`helper/<name>.lua` 返回 `{ schema, run }`）走会话启动快照，改完要重启；运行期试新脚本用 `lua` 工具。
 - **纯 native**：LuaJIT + C KV cache + C 图像模块；无 Node / Python / WebView / Electron。图像 `.so` 随 dist 打包，目标机无需另装 ImageMagick/Pillow。
 
 ---
@@ -203,10 +203,33 @@ native(action="build", name="x", code=C_OR_CPP, lang="c", libs={"m"})
   -> helper/x-<timestamp>.so + helper/x.json
 native(action="run", name="x", input="...")
 native(action="wrap", name="x", lua=..., description=..., parameters={...})
-  -> helper/x.lua + helper/x.tool.json，立即成为可调用工具 x(...)
+  -> helper/x.lua + helper/x.tool.json（下次会话成为工具 x(...)）
 ```
 
 C ABI 固定为 `char *lite_helper(const char *input)` + 可选 `lite_helper_free`；输入/输出是 UTF-8 字符串（通常 JSON）。插件按 `<workspace>/helper` → `$LITE_ROOT/helper` 顺序发现，本地优先；`scope=local|global` 控制写哪一侧。重编译生成新 `.so` 路径，下一次调用即生效。
+
+纯 Lua 插件更省一步：一个文件同时声明工具名和实现。
+
+```lua
+-- helper/wordcount.lua
+return {
+  schema = { name = "wordcount", description = "统计文本词数",
+             parameters = { type = "object", properties = { text = { type = "string" } },
+                            required = { "text" } } },
+  run = function(args, env) return tostring(#(args.text:gmatch("%S+"))) end,
+}
+```
+
+**插件不热插拔**：schema 在会话启动时扫一次并记忆化（`<workspace>/helper` → `$LITE_ROOT/helper`，`.tool.json` 优先、内嵌 schema 其次），之后每轮复用快照 —— 运行中增删 `helper/*.lua` 不会悄悄改变工具列表（否则 system prompt 一变，DeepSeek 前缀缓存整段失效）。会话启动后新建的插件仍可按名调用，重启后进列表。
+
+运行期要试新代码就走 `lua` 工具：
+
+```lua
+lua({ code = "return #(args.text:gmatch('%S+'))", input = { text = "a b c" } })
+-- -> "3"
+```
+
+它在子进程里跑 `tools/lite-lua -e`，`args` 走 JSON，默认 30s 超时（最多 120s），审批同 `bash`；死循环只撞超时，不会卡住 agent。这也意味着**改 C `.so` 或 `helper/*.lua` 都要重启**（`/reload` 只重载 Lua 层模块，不重扫插件快照）。
 
 更细的对比与设计取舍见 [design.md](design.md)；开发/测试规范见 [AGENTS.md](AGENTS.md)。
 

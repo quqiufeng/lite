@@ -1115,6 +1115,38 @@ press `\27[<0;5;3M` / drag `\27[<32;9;4M` / release / 右键 / 滚轮解析，
 以及 mouse 状态机的点击不清选区、拖拽后复制、`cancel` 三条路径；
 UI 侧按 `AGENTS.md` §4 的铁律用 `tmux capture-pane` 或 `--tui --snapshot` 验收。
 
-**当前回归** —— `./tools/test.sh`：单元 545 项 + `cli.json` / `tui.smoke` /
+### 8.35 插件模型：会话快照 + `lua` 工具（已落地）
+
+插件不是一套新架构，就是把**已有的 native helper 机制**扩到 Lua：一个
+`<name>.lua` 返回 `{ schema = {...}, run = function(args, env) end }` 就同时声明了
+工具描述和实现；老写法 `<name>.tool.json` + `<name>.lua` 继续可用（`.tool.json` 优先）。
+
+**三个时机，只有一个入口进工具列表**
+
+1. **会话开始**：`_scan_helper_schemas()` 扫一眼 `<workspace>/helper` → `$LITE_ROOT/helper`，
+   把 `schema` / `run` / `hooks` 一次读进内存，`_helper_cache` 惰性记忆化。
+   之后每轮 `schemas()` 直接返回快照，**不再 `ls` fork**。
+2. **运行时试新东西**：走 `lua` 工具 → `tools/lite-lua -e <adapter>`（进程外，参数走
+   `LITE_LUA_ARGS` 的 JSON → 片段里的 `args`，`timeout` 默认 30s 可到 120s）。
+   它**不进工具列表**，所以改代码不会打掉前缀缓存；审批同 `bash`。
+3. **改了 C `.so` 或 `helper/*.lua`**：重启（`/reload` 只重载 `core.tools` /
+   `core.prompt` / `ffi.*`，**保留 helper 快照**）。
+
+**为什么不做热插拔** —— schema 是 system prompt 之后的第一段，任何动态插入/
+删除都会让 DeepSeek 前缀缓存整段失效（§8.31 同一个坑）。而"改完立刻生效"的需求，
+`lua -e` 已经满足，还更安全：新代码跑在子进程里，死循环只撞 30s 超时，崩溃不带崩 agent。
+
+**为什么不做进程内 `loadstring`** —— 同上：一个 `while true do end` 会卡死 agent 主循环，
+`error()` 直接冒到事件循环。进程外多一次 `exec`，换的是崩溃隔离。
+
+**失败可见** —— 坏插件不进工具列表，但错误不吞：缺 `run` → `must return { run = ... }`，
+语法错 → `load failed: ...`，按名调用时这些文本原样返回，用户能自己修。
+`/reload` 与 `Tools.new` 会重置快照，运行中新建的 `.lua` 不会偷偷挤进列表。
+
+**验收** —— `tools/auto_unit.lua` 的 helper 快照块（`.tool.json` / 内嵌 schema 均被发现、
+删文件后快照仍在、新增文件被忽略但可按名调用、新 session 重新扫描、坏插件报错）与
+`lua` 工具块（返回值 / `args` / 中文 / table→JSON / 运行错 / 语法错 / 超时）。
+
+**当前回归** —— `./tools/test.sh`：单元 571 项 + `cli.json` / `tui.smoke` /
 `serve.probe` / `serve.smoke` 全通过（`[verified]` 2026-11-07）。§8.30 / §8.33 里的
 "385 项"/"424 项"是各自落地时的历史数字，不再逐节回填。

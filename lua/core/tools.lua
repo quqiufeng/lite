@@ -20,6 +20,7 @@ local READ_LINE_MAX = 2000
 local BUILTIN_TOOLS = {
     bash = true, web = true, read = true, resize = true, native = true,
     write = true, edit = true, remember = true, recall = true, todo = true,
+    lua = true,
 }
 
 local function shq(s)
@@ -282,6 +283,31 @@ function M:schemas()
                     type = "object",
                     properties = { command = { type = "string" } },
                     required = { "command" },
+                },
+            },
+        },
+        {
+            type = "function",
+            ["function"] = {
+                name = "lua",
+                description = "Run a Lua snippet out-of-process (tools/lite-lua -e, 30s timeout). "
+                    .. "The snippet sees `args` (JSON `input`, if given) and can return a value "
+                    .. "(tables are JSON-encoded). LuaJIT FFI and bundled cjson are available. "
+                    .. "Use it for one-off logic, FFI probing, or data munging without writing files.",
+                parameters = {
+                    type = "object",
+                    properties = {
+                        code = { type = "string" },
+                        input = {
+                            type = "object",
+                            description = "optional JSON value exposed to the snippet as `args`",
+                        },
+                        timeout = {
+                            type = "integer",
+                            description = "seconds before the snippet is killed (default 30, max 120)",
+                        },
+                    },
+                    required = { "code" },
                 },
             },
         },
@@ -955,7 +981,8 @@ function M:_helper_find(name, need_lua)
         local paths = self:_helper_paths(name, root.scope)
         if paths then
             if need_lua then
-                if file_size(paths.tool) and file_size(paths.lua) then return paths end
+                -- schema 可以内嵌在 .lua 里，.tool.json 变成可选
+                if file_size(paths.lua) then return paths end
             elseif file_size(paths.src) or file_size(paths.manifest) then
                 return paths
             end
@@ -1076,40 +1103,94 @@ function M:native_list()
     return table.concat(lines, "\n")
 end
 
-function M:_helper_schemas()
+-- helper lua 文件返回 { schema = {...}, run = function(args, env) } 即可内嵌声明。
+-- 老写法（<name>.tool.json + <name>.lua）继续可用；两者同时存在时 .tool.json 优先。
+local function helper_lua_schema(name, path)
+    local chunk, lerr = loadfile(path)
+    if not chunk then return nil, "load failed: " .. tostring(lerr) end
+    local ok, mod = pcall(chunk)
+    if not ok then return nil, "load failed: " .. tostring(mod) end
+    if type(mod) ~= "table" or type(mod.run) ~= "function" then
+        return nil, "must return { run = function(args, env) }"
+    end
+    local schema = mod.schema
+    if type(schema) ~= "table" or type(schema.parameters) ~= "table" then return nil end
+    if schema.name ~= nil and schema.name ~= name then
+        return nil, "schema.name does not match file name"
+    end
+    return schema
+end
+
+-- 扫描一次就是一次 ls fork。原来每轮 schemas() 都扫，既是白烧 fork，也让运行中
+-- 新建的 helper 悄悄挤进工具列表 —— schema 一变前缀缓存全废。这里固定成会话快照，
+-- 运行时试验请用 lua 工具（进程外 -e），改 helper 后重启生效。
+function M:_scan_helper_schemas()
     local seen = {}
     local out = {}
+    local errors = {}
+    local function push(name, schema)
+        seen[name] = true
+        out[#out + 1] = {
+            type = "function",
+            ["function"] = {
+                name = name,
+                description = schema.description or "",
+                parameters = schema.parameters,
+            },
+        }
+    end
     for _, root in ipairs(self:_helper_roots()) do
-        local p = io.popen("ls -1 " .. shq(root.dir) .. " 2>/dev/null")
-        if p then
-            for line in p:lines() do
+        local listed = io.popen("ls -1 " .. shq(root.dir) .. " 2>/dev/null")
+        if listed then
+            local entries = {}
+            for line in listed:lines() do entries[#entries + 1] = line end
+            listed:close()
+
+            local by_name = {}
+            local order = {}
+            for _, line in ipairs(entries) do
                 local name = line:match("^([%w_][%w_%-]*)%.tool%.json$")
                 if name and not BUILTIN_TOOLS[name] and not seen[name] then
-                    local f = io.open(root.dir .. "/" .. line, "rb")
-                    if f then
-                        local raw = f:read("*a")
-                        f:close()
-                        local ok, schema = pcall(cjson.decode, raw or "")
-                        if ok and type(schema) == "table"
-                            and (schema.name == nil or schema.name == name)
-                            and type(schema.parameters) == "table" then
-                            seen[name] = true
-                            out[#out + 1] = {
-                                type = "function",
-                                ["function"] = {
-                                    name = name,
-                                    description = schema.description or "",
-                                    parameters = schema.parameters,
-                                },
-                            }
+                    local raw = read_file(root.dir .. "/" .. line)
+                    local ok, schema = pcall(cjson.decode, raw or "")
+                    if ok and type(schema) == "table"
+                        and (schema.name == nil or schema.name == name)
+                        and type(schema.parameters) == "table" then
+                        push(name, schema)
+                    end
+                end
+                local bare = line:match("^([%w_][%w_%-]*)%.lua$")
+                if bare and not by_name[bare] then
+                    by_name[bare] = true
+                    order[#order + 1] = bare
+                end
+            end
+            table.sort(order)
+
+            for _, bare in ipairs(order) do
+                if not seen[bare] and not BUILTIN_TOOLS[bare] then
+                    local lua_path = root.dir .. "/" .. bare .. ".lua"
+                    if file_size(lua_path) then
+                        local schema, err = helper_lua_schema(bare, lua_path)
+                        if schema then
+                            push(bare, schema)
+                        elseif err then
+                            errors[bare] = err
                         end
                     end
                 end
             end
-            p:close()
         end
     end
+    self._helper_errors = errors
     return out
+end
+
+function M:_helper_schemas()
+    if not self._helper_cache then
+        self._helper_cache = self:_scan_helper_schemas()
+    end
+    return self._helper_cache
 end
 
 function M:_run_helper_tool(name, args)
@@ -1206,6 +1287,72 @@ function M:native(action, name, code, lang, libs, input, lua_code, description, 
     return "error: action must be build, run, wrap, remove, or list"
 end
 
+-- lua 工具：进程外跑一段 LuaJIT（tools/lite-lua -e），参数以 JSON 走环境变量。
+-- 刻意不做进程内 loadstring：死循环会卡住 agent，崩溃会带崩主进程。
+local LUA_TOOL_ADAPTER = [=[
+local okj, cjson = pcall(require, "cjson")
+if not okj then io.write("error: cjson unavailable") os.exit(0) end
+local raw = os.getenv("LITE_LUA_ARGS") or "{}"
+local okd, req = pcall(cjson.decode, raw)
+if not okd or type(req) ~= "table" then
+  io.write("error: bad args: " .. tostring(req)) os.exit(0)
+end
+args = req.input
+local chunk, err = loadstring(req.code or "", "=lua")
+if not chunk then io.write("error: " .. tostring(err)) os.exit(0) end
+local ok, res = pcall(chunk)
+if not ok then io.write("error: " .. tostring(res)) os.exit(0) end
+if type(res) == "table" then
+  local okj2, j = pcall(cjson.encode, res)
+  if okj2 then res = j end
+end
+if res ~= nil then io.write(tostring(res)) end
+os.exit(0)
+]=]
+
+local function lite_lua_bin(cwd)
+    local cands = {}
+    local root = lite_root_dir()
+    if root then cands[#cands + 1] = root .. "/tools/lite-lua" end
+    cands[#cands + 1] = (normalize(cwd or "."):gsub("/+$", "")) .. "/tools/lite-lua"
+    for _, p in ipairs(cands) do
+        local f = io.open(p, "r")
+        if f then
+            f:close()
+            return p
+        end
+    end
+    return nil
+end
+
+function M:lua(args)
+    args = args or {}
+    local code = tostring(args.code or "")
+    if code == "" then return "error: code is required" end
+    local bin = lite_lua_bin(self.cwd)
+    if not bin then return "error: tools/lite-lua not found (set LITE_ROOT)" end
+    local req = { code = code }
+    if args.input ~= nil then req.input = args.input end
+    local ok, payload = pcall(cjson.encode, req)
+    if not ok then return "error: cannot encode input: " .. tostring(payload) end
+    local timeout = math.floor(tonumber(args.timeout) or 30)
+    if timeout < 1 then timeout = 1 end
+    if timeout > 120 then timeout = 120 end
+    local cmd = "timeout " .. tostring(timeout) .. " env LITE_LUA_ARGS=" .. shq(payload)
+        .. " " .. shq(bin) .. " -e " .. shq(LUA_TOOL_ADAPTER)
+    -- LuaJIT 的 popen:close() 只返回 true，拿不到退出码，所以让 shell 回显 rc。
+    local proc = io.popen("sh -c " .. shq(cmd .. '; echo "__lite_rc=$?"') .. " 2>&1")
+    if not proc then return "error: cannot spawn " .. tostring(bin) end
+    local out = proc:read("*a") or ""
+    proc:close()
+    local rc = tonumber(out:match("__lite_rc=(%d+)%s*$"))
+    out = out:gsub("%s*__lite_rc=%d+%s*$", "")
+    if rc == 124 then
+        return "error: timeout after " .. tostring(timeout) .. "s"
+    end
+    return truncate(out)
+end
+
 function M:write(path, content)
     local abs, err = self:resolve(path)
     if not abs then return "error: " .. err end
@@ -1246,6 +1393,8 @@ function M:execute(name, args)
             return self:bash(args.command or "")
         elseif name == "web" then
             return self:web(args.url, args.max_chars)
+        elseif name == "lua" then
+            return self:lua(args)
         elseif name == "read" then
             return self:read(args.path, args.offset, args.limit)
         elseif name == "ocr" then
