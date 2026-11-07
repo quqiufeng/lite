@@ -14,6 +14,11 @@ static uint64_t hash_fnv1a(const void* data, size_t len) {
     return hash;
 }
 
+// 对外暴露：索引加载时校验桶归属（key 是否真的落在这个桶里）
+uint64_t cache_hash_fnv1a(const void* data, size_t len) {
+    return hash_fnv1a(data, len);
+}
+
 // 从 pool 分配 hash bucket 数组
 static size_t alloc_buckets(cache_t* cache, size_t count) {
     size_t size = sizeof(cache_hash_bucket_t) * count;

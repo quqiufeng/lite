@@ -403,6 +403,9 @@ static void discard_loaded_index(cache_t* cache) {
     cache->hash.buckets_offset = 0;
     cache->hash.bucket_count = 0;
     cache->hash.size = 0;
+    // 回滚后上层会扫描重建，统计值必须归零，否则会重复累加
+    cache->memory_used = 0;
+    cache->entry_count = 0;
 }
 
 // 校验持久化 sorted 索引引用的 entry 偏移是否仍落在 pool 内且头部完好。
@@ -419,6 +422,75 @@ static int loaded_offsets_valid(cache_t* cache) {
         if (off + cache_entry_total_size(h) > used) return 0;
     }
     return 1;
+}
+
+// 校验持久化的 hash 索引：节点链必须落在 pool 内、指向的 entry 头部完好、
+// 未被标记删除，且 key 确实哈希到它所在的桶。
+//
+// 历史 bug：write_hash_index 把 pool 里的 bucket 数组原样落盘，节点可能指向
+// 已被标记 CACHE_ENTRY_DELETED 的 entry。重开后 cache_hash_lookup 不检查 flags，
+// cache_get 命中墓碑后返回 NULL —— 表现为「记忆丢了」。
+static int loaded_hash_valid(cache_t* cache, const cache_hash_bucket_t* buckets,
+                             size_t bucket_count, size_t saved_size) {
+    size_t used = cache->pool.used;
+    if (bucket_count == 0) return saved_size == 0;
+    if (used < CACHE_HEADER_SIZE) return saved_size == 0;
+    size_t nodes = 0;
+
+    for (size_t i = 0; i < bucket_count; i++) {
+        size_t off = buckets[i].entry_offset;
+        size_t guard = 0;
+        while (off) {
+            if ((off % MYDB_ALIGN) != 0) return 0;
+            if (off < CACHE_HEADER_SIZE || off + sizeof(cache_hash_bucket_t) > used) return 0;
+            if (++guard > saved_size + 1) return 0;  // 环或异常长链
+
+            cache_hash_bucket_t* node = (cache_hash_bucket_t*)CACHE_PTR(cache, off);
+            size_t eoff = node->entry_offset;
+            if (eoff < CACHE_HEADER_SIZE || eoff + CACHE_ENTRY_HEADER_ALIGNED > used) return 0;
+
+            cache_entry_header_t* h = (cache_entry_header_t*)CACHE_PTR(cache, eoff);
+            if (h->key_len == 0 || h->key_len > CACHE_MAX_KEY_LEN ||
+                h->value_len > CACHE_MAX_VALUE_LEN) return 0;
+            if (eoff + cache_entry_total_size(h) > used) return 0;
+            if (h->flags & CACHE_ENTRY_DELETED) return 0;  // 指向墓碑
+
+            const char* key = (const char*)CACHE_PTR(cache, eoff + sizeof(cache_entry_header_t));
+            if (cache_hash_fnv1a(key, h->key_len) % bucket_count != i) return 0;
+
+            nodes++;
+            off = node->next_offset;
+        }
+    }
+    return nodes == saved_size;
+}
+
+// 加载路径从不重算 cache->memory_used（只有扫描重建会累加），导致带索引启动后
+// memory_used 恒为 0 —— 淘汰逻辑因此永不触发，pool 只会一路增长。
+// 这里线性走一遍 pool，重算 used 与 live entry 数，并核对 hash 里的节点数：
+// 节点数对不上说明有活 entry 没被索引到（数据在、但查不到），回退重建。
+static size_t rebuild_usage_from_pool(cache_t* cache) {
+    size_t offset = CACHE_HEADER_SIZE;
+    size_t used = 0;
+    size_t live = 0;
+    while (offset + sizeof(cache_entry_header_t) <= cache->pool.used) {
+        cache_entry_header_t* h = (cache_entry_header_t*)CACHE_PTR(cache, offset);
+        if (h->key_len == 0 || h->key_len > CACHE_MAX_KEY_LEN ||
+            h->value_len > CACHE_MAX_VALUE_LEN) {
+            offset += MYDB_ALIGN;
+            continue;
+        }
+        size_t total = cache_entry_total_size(h);
+        if (offset + total > cache->pool.used) break;
+        if (!(h->flags & CACHE_ENTRY_DELETED)) {
+            used += total;
+            live++;
+        }
+        offset += total;
+    }
+    cache->memory_used = used;
+    cache->entry_count = live;
+    return live;
 }
 
 int cache_index_load(cache_t* cache) {
@@ -509,7 +581,18 @@ int cache_index_load(cache_t* cache) {
                     size_t bucket_count = *(size_t*)data;
                     size_t hash_size = *(size_t*)((char*)data + 8);
                     size_t buckets_data_size = bucket_count * sizeof(cache_hash_bucket_t);
-                    
+
+                    // 落盘内容必须先自洽：容量合法、字节数不超过本条索引的数据区
+                    if (bucket_count == 0 || buckets_data_size / sizeof(cache_hash_bucket_t) != bucket_count ||
+                        buckets_data_size > entry->data_size - 16 ||
+                        !loaded_hash_valid(cache, (const cache_hash_bucket_t*)((char*)data + 16),
+                                           bucket_count, hash_size)) {
+                        CACHE_LOG( "[CACHE] persisted hash index is stale/unusable, discarding\n");
+                        munmap(base, file_size);
+                        discard_loaded_index(cache);
+                        return -1;
+                    }
+
                     // Allocate buckets in pool (since existing code uses CACHE_PTR)
                     size_t pool_offset = pool_alloc_offset(&cache->pool, buckets_data_size);
                     if (pool_offset) {
@@ -591,6 +674,17 @@ int cache_index_load(cache_t* cache) {
         return -1;
     }
     
+    // 重算 memory_used / entry_count（见 rebuild_usage_from_pool 注释），
+    // 并核对 hash 节点数：活 entry 比索引多 → 有数据查不到，弃用索引交给扫描重建。
+    size_t live = rebuild_usage_from_pool(cache);
+    if (live != cache->hash.size) {
+        CACHE_LOG("[CACHE] hash index covers %zu of %zu live entries, discarding\n",
+                  cache->hash.size, live);
+        munmap(base, file_size);
+        discard_loaded_index(cache);
+        return -1;
+    }
+
     // Store mmap info for cleanup
     cache->index_mmap_base = base;
     cache->index_mmap_size = file_size;

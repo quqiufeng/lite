@@ -189,6 +189,7 @@ struct cache {
 // ====== 内部函数（其他模块使用）======
 
 // Hash 索引操作
+uint64_t cache_hash_fnv1a(const void* data, size_t len);
 int cache_hash_init(cache_t* cache);
 int cache_hash_insert(cache_t* cache, size_t entry_offset, const char* key, size_t key_len);
 int cache_hash_remove(cache_t* cache, const char* key, size_t key_len);
