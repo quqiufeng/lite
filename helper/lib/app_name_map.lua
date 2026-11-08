@@ -154,6 +154,30 @@ return {
         },
       },
       regions = {
+        bubble = {
+          note = "聊天区（气泡）",
+          static = true,
+          x0 = 520,
+          x1 = 2560,
+          y0 = 100,
+          y1 = 1040,
+        },
+        input = {
+          note = "聊天输入框",
+          static = true,
+          x0 = 760,
+          x1 = 2500,
+          y0 = 1105,
+          y1 = 1235,
+        },
+        panel = {
+          note = "左栏搜索结果面板",
+          static = true,
+          x0 = 70,
+          x1 = 520,
+          y0 = 80,
+          y1 = 1040,
+        },
         rail = {
           axis = "y",
           min_peak = 2,
@@ -162,6 +186,14 @@ return {
           x1 = 72,
           y0 = 20,
           y1 = 1400,
+        },
+        search = {
+          note = "左栏顶部搜索框（标题栏下方，需真实点击而非 ctrl+f）",
+          static = true,
+          x0 = 90,
+          x1 = 486,
+          y0 = 28,
+          y1 = 74,
         },
         toolbar = {
           axis = "x",

@@ -312,7 +312,12 @@ function actions.save(args, env)
     m.apps[app] = m.apps[app] or {}
     m.apps[app].buttons = args.buttons or m.apps[app].buttons
     if args.window then m.apps[app].window = args.window end
-    if args.regions then m.apps[app].regions = args.regions end
+    if args.regions then
+        local regs = {}
+        for k, v in pairs(m.apps[app].regions or {}) do regs[k] = v end
+        for k, v in pairs(args.regions) do regs[k] = v end
+        m.apps[app].regions = U.inject_static(regs, args.class or app)
+    end
     local ok, err = save_map(U, m)
     if not ok then error("save failed: " .. tostring(err)) end
     return "saved " .. U.map_path
@@ -450,6 +455,13 @@ function actions.learn(args, env)
         regs[rname] = { axis = g.axis, count = g.count, pitch = g.pitch,
             x0 = g.rect.x0, y0 = g.rect.y0, x1 = g.rect.x1, y1 = g.rect.y1 }
     end
+    -- 静态区域（search/panel/input 等）由 discover 测不到，learn 不能整块覆盖：
+    -- 新测到的为准，旧的（含手工/历史）在同名缺失时保留，否则每次重跑 learn 都会把
+    -- search 这类 region 刷掉，调用方只能退回硬编码坐标。
+    local prev = (map.apps[app] or {}).regions or {}
+    for k, v in pairs(prev) do if regs[k] == nil then regs[k] = v end end
+    U.inject_static(regs, args.class or app)   -- search/panel/input/bubble 由脚本提供
+    for k, v in pairs(args.regions or {}) do regs[k] = v end
     map.apps[app] = { window = { title = w:name(), class = args.class, w = img.w, h = img.h },
         regions = regs, buttons = buttons }
     assert(save_map(U, map))

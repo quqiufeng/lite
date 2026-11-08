@@ -29,12 +29,34 @@
 -- 无反馈的槽位保留 verified=false，不当作按钮使用。hover_text 保留 OCR 原始串，
 -- 便于回溯 name 被人工订正前的识别结果。
 --
--- 特殊控件（大输入框、无 tooltip 的面板入口）不走 hover：它们悬停没反应，
--- 只能 mark 手工补坐标 + click 一次 + 截图 read 看结果（如搜索框点完出现
--- 绿框和下拉），确认后 verified=true。走像素投影只会把它当一片色块，别硬套。
+-- 坐标只有两个来源，按控件类型分流：
 --
--- map 文件由 learn/hover 整份重写（serialize 规整格式），重跑即覆盖，属预期行为；
--- 认错的名字直接改 map 或改 clean_name 规则，历史版本交给 git。
+--   A. 规则排列图标（rail 竖排 / toolbar 横排）
+--      ── 全自动，agent 不用看图。投影 → 连通域 → 悬停 → diff 确认 → OCR 取名。
+--   B. 特殊控件（搜索框、输入框、结果面板、聊天区这类大块区域）
+--      ── 悬停没反应（无 tooltip、无面板变化），像素投影只会把它当一片色块，
+--         别硬套 hover。走人工确认：截图 read + OCR 定坐标 → mark/click 一次
+--         → 再截图 read 看结果（如搜索框点完出现绿框和下拉）→ verified=true。
+--
+-- ★ 真源规则（改坐标只改这一处）
+--
+--   真源 = 本文件的 STATIC_REGIONS[app]  ← agent 唯一该手写的坐标表
+--   产物 = helper/lib/app_name_map.lua   ← learn/hover/save 用 serialize 整份重写
+--
+--   所以别直接改产物：下一次 learn 会把它覆盖，改动就没了（搜索框曾这样丢过）。
+--   要调 B 类坐标，改 STATIC_REGIONS → 重跑生成脚本 → 产物自动带上。
+--
+--   生成流程：
+--     1. agent 截图 read + OCR 确定 B 类的 x0,y0,x1,y1
+--     2. 写进 STATIC_REGIONS（带 note，写明为什么不能靠 hover）
+--     3. 跑 learn（全量发现）或 save（只重写文件）→ 生成 app_name_map.lua
+--     4. 重跑 learn 应得到同一份产物（幂等），否则说明合并逻辑漏了键
+--
+--   合并规则 M.inject_static：只覆盖 `old == nil` 或 `old.static == true` 的键。
+--     - B 类每次重跑都被脚本值刷写 → 幂等 ✅
+--     - A 类实测出来的 rail/toolbar 无 static 标记 → 不被误伤 ✅
+--     - learn 顺序：prev 补缺 → inject_static → args.regions（人工临时覆盖优先）
+--   认错的名字直接改 map 或改 clean_name 规则，历史版本交给 git。
 local M = {}
 
 local function sh(cmd)
@@ -399,6 +421,40 @@ function M.rescale(b, from, to)
     n.x1, n.y1 = n.x0 + n.w - 1, n.y0 + n.h - 1
     n.cx, n.cy = f(b.cx or (b.x0 + b.w / 2), sx), f(b.cy or (b.y0 + b.h / 2), sy)
     return n
+end
+
+-- 固定区域：discover 只测「成排等距的图标」，搜索框、结果面板、输入框、气泡区
+-- 这类单控件或大块矩形永远测不到。所以按 class 写在这里，由生成脚本 learn/save
+-- 一并落盘（真源只有这一处），调用方（helper/wechat.lua）再从 map 读，不硬编码。
+-- ★ 坐标真源：B 类（悬停无反馈的大块控件）只写这里，重跑生成脚本才不会被覆盖。
+--   新加 app 就加一个 STATIC_REGIONS[class]，键名与 helper/<app>.lua 里取的一致。
+local STATIC_REGIONS = {
+    wechat = {
+        search = { x0 = 90, y0 = 28, x1 = 486, y1 = 74,
+            note = "左栏顶部搜索框（标题栏下方，需真实点击而非 ctrl+f）" },
+        panel  = { x0 = 70, y0 = 80, x1 = 520, y1 = 1040,
+            note = "左栏搜索结果面板" },
+        input  = { x0 = 760, y0 = 1105, x1 = 2500, y1 = 1235,
+            note = "聊天输入框" },
+        bubble = { x0 = 520, y0 = 100, x1 = 2560, y1 = 1040,
+            note = "聊天区（气泡）" },
+    },
+}
+
+-- 把 static region 注入 regs：脚本是静态区的真源（覆盖旧的 static/手工项），
+-- discover 实测出来的 rail/toolbar 等不同名，互不影响。
+function M.inject_static(regs, class)
+    regs = regs or {}
+    for k, v in pairs(STATIC_REGIONS[class or "wechat"] or {}) do
+        local old = regs[k]
+        if old == nil or old.static then
+            local c = {}
+            for kk, vv in pairs(v) do c[kk] = vv end
+            c.static = true
+            regs[k] = c
+        end
+    end
+    return regs
 end
 
 -- 给一个框找最近的 OCR 文字（同行优先），用作名字候选
