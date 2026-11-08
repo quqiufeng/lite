@@ -289,12 +289,10 @@ function M:remember_turn(session_id, turn, user, assistant, tools)
     local meta = self:session_meta(sid)
     local prev = tonumber(meta and meta.turns) or 0
     turn = tonumber(turn) or 0
-    -- turn 编号必须单调：会话恢复失败时 ctx.session.turn 会退回 0，直接照写就会
-    -- 覆盖 turn/1、turn/2…，历史轮次在召回里被静默换成最新几轮。以 msg 序号为锚。
-    local by_msgs = math.floor((tonumber(meta and meta.messages) or 0) / 2)
-    if turn <= prev or turn <= by_msgs then
-        turn = math.max(prev, by_msgs) + 1
-    end
+    -- turn 编号必须单调：恢复路径现在用 session_messages() 返回的真实上界
+    -- （memory.lua:max_turn 扫 turn/ 键），正常不会倒退；这里只留一道兜底，
+    -- 防止调用方传 0 时覆盖掉 turn/1。
+    if turn <= prev then turn = prev + 1 end
     local key = string.format("%s/turn/%d", sid, turn)
     local ok = self:put("/agent/session", key, {
         t = "turn",
@@ -395,6 +393,20 @@ function M:session_message_count(id)
     return #rows
 end
 
+function M:max_turn(session_id)
+    local id = tostring(session_id)
+    local rows = self:search_prefix(
+        string.format("/agent/session/%s/turn/", id), { max_results = 0 })
+    local max_n = 0
+    for _, r in ipairs(rows) do
+        local n = tonumber(tostring(r.key):match("/turn/(%d+)$"))
+        if n and n > max_n then max_n = n end
+    end
+    local meta = self:session_meta(id)
+    local by_meta = tonumber(meta and meta.turns) or 0
+    return math.max(max_n, by_meta)
+end
+
 function M:session_messages(session_id, limit)
     limit = limit or 20
     local id = tostring(session_id)
@@ -419,8 +431,9 @@ function M:session_messages(session_id, limit)
             if ok and type(m) == "table" then msgs[#msgs + 1] = m end
         end
         while #msgs > limit do table.remove(msgs, 1) end
-        local meta = self:session_meta(id)
-        return msgs, (meta and tonumber(meta.turns)) or 0
+        -- 真正的上界是 turn/ 里最大的编号：meta.turns 是 touch_session 记录的计数器，
+        -- 恢复失败/崩溃退出时会落后于实际键，照它写下一轮就会覆盖 turn/1、turn/2。
+        return msgs, self:max_turn(id)
     end
 
     local prefix = string.format("/agent/session/%s/turn/", id)
@@ -470,26 +483,20 @@ function M:recall(query, limit, opts)
     limit = limit or 6
     opts = opts or {}
     query = tostring(query or "")
+    -- 召回统计：只看得到「注入了几条」，看不到「扫了多少候选、丢了多少」，
+    -- 调权重就只能靠感觉。计数器只在进程内，stats() 里输出。
+    local st = self.stat or { calls = 0, candidates = 0, injected = 0, dropped = 0 }
+    self.stat = st
+    st.calls = st.calls + 1
     local terms = build_terms(query)
     local session_prefix = "/agent/session/"
     local want_session = opts.session_id and (session_prefix .. tostring(opts.session_id) .. "/") or nil
 
-    local function score(text, key, tags)
-        if #terms == 0 then return 0.5 end
-        local hay = (tostring(text) .. " " .. tostring(key)):lower()
-        local hits = 0
-        for _, w in ipairs(terms) do
-            if hay:find(w, 1, true) then hits = hits + 1 end
-        end
-        for _, t in ipairs(tags or {}) do
-            local tl = tostring(t):lower()
-            for _, w in ipairs(terms) do
-                if tl == w then hits = hits + 1 end
-            end
-        end
-        if hits == 0 then return 0 end
-        return hits / #terms
-    end
+    -- 打分候选池：先收集原文（hay），扫完再统一按 IDF + 长度 + 年龄打分。
+    -- 旧版 hits/#terms 让 200 字笔记和 2 万字整段对话同分，同分又按 a.key<b.key
+    -- 排序（字典序里 msg<turn<working，越旧越靠前），所以召回质量一直不稳。
+    local tstat = {}
+    for _, w in ipairs(terms) do tstat[w] = { df = 0, w = 1 } end
 
     local seen, out, turns_kept = {}, {}, 0
     local working_prefix = "/agent/working/"
@@ -506,6 +513,8 @@ function M:recall(query, limit, opts)
             local kind = rest:match("^[^/]+/([^/]+)/")
             if kind == "turn" then return "turn" end
             if kind == "working" then return "working" end
+            -- 原始 transcript：只有 user 原文放行（用户自己的话不过期），assistant/tool
+            -- 的原始 JSON 一律不进 prompt —— 下面 add() 里按 data.role 二次过滤。
             if kind == "msg" then return "user" end
         end
         return nil
@@ -539,35 +548,100 @@ function M:recall(query, limit, opts)
             text = tostring(data.c or data.a or "")
         end
         if text == "" then return end
-        local sc = score(text, r.key, data.tags)
-        if sc > 0 then
-            out[#out + 1] = {
-                key = r.key, data = data, text = text,
-                kind = kind, score = sc * (WEIGHT[kind] or 1.0),
-            }
-        end
+        local tl = {}
+        for _, t in ipairs(data.tags or {}) do tl[#tl + 1] = tostring(t):lower() end
+        out[#out + 1] = {
+            key = r.key, data = data, text = text, kind = kind,
+            ts = tonumber(data.ts),
+            hay = (text .. " " .. r.key):lower(),
+            tags_low = table.concat(tl, " "),
+        }
     end
 
     -- 只召回长期事实与会话内内容。
     -- 目录级 /agent/working（wake 调度状态、todos 兜底）属于运行态，不注入 prompt；
     -- 会话级工作记忆在 /agent/session/<id>/working/，由下面的 session 前缀覆盖。
-    local prefixes = { "/agent/knowledge/" }
-    prefixes[#prefixes + 1] = want_session or session_prefix
-    for _, p in ipairs(prefixes) do
-        for _, r in ipairs(self:search_prefix(p, { max_results = limit * 8 })) do
+    -- 扫描分槽：knowledge 一次；会话内按 turn/ working/ msg/ 分开扫。
+    -- 旧版按 "/agent/session/<sid>/" 整棵前缀扫，字典序 msg<turn<working，
+    -- 长会话里 msg 把候选窗口吃满，turn/working 永远进不了候选。
+    local scans = 0
+    local function scan(p, n)
+        scans = scans + 1
+        for _, r in ipairs(self:search_prefix(p, { max_results = n or limit * 8 })) do
+            add(r)
+        end
+    end
+    scan("/agent/knowledge/")
+    if want_session then
+        scan(want_session .. "turn/")
+        scan(want_session .. "working/")
+        -- msg/ 也扫：user 原文永久保留（add() 按 role 过滤掉 assistant/tool）。
+        -- 单独一槽 + 有界，不会像旧版整棵前缀扫那样把 turn/working 挤掉。
+        scan(want_session .. "msg/", limit * 4)
+    else
+        -- 跨会话召回（recall 工具）：按 cwd 索引取最近几个会话，逐个扫 turn/ 与
+        -- working/，每个槽有界，不会被 msg/meta 挤掉。
+        local ok_s, list = pcall(self.list_sessions, self, opts.cwd or self.cwd, 6)
+        if ok_s and type(list) == "table" then
+            for _, meta in ipairs(list) do
+                if type(meta) == "table" and meta.id then
+                    local base = session_prefix .. meta.id .. "/"
+                    scan(base .. "turn/", limit * 4)
+                    scan(base .. "working/", limit * 2)
+                end
+            end
+        end
+    end
+
+    -- tag 检索：旧版对每个 term 各扫一次（terms 上限 32 → 每轮 30+ 次线性扫描）。
+    -- 前 8 个 term 覆盖绝大部分命中，长尾丢掉换扫描次数。
+    for i = 1, math.min(#terms, 8) do
+        scans = scans + 1
+        for _, r in ipairs(cache.search_tag(self.h, terms[i], { max_results = limit * 4 })) do
             add(r)
         end
     end
 
+    -- 统一打分：IDF（候选里到处出现 = 不值钱）+ 长度归一（长文命中更廉价）
+    -- + 年龄衰减（30 天减半）。空/无命中直接淘汰，不再「人人 0.5」。
+    local n = #out
+    for _, it in ipairs(out) do
+        for _, w in ipairs(terms) do
+            if it.hay:find(w, 1, true) or it.tags_low:find(w, 1, true) then
+                tstat[w].df = tstat[w].df + 1
+            end
+        end
+    end
     for _, w in ipairs(terms) do
-        for _, r in ipairs(cache.search_tag(self.h, w, { max_results = limit * 4 })) do
-            add(r)
+        tstat[w].w = math.log(1 + (n + 1) / (tstat[w].df + 1))
+    end
+    local now = os.time()
+    st.candidates = st.candidates + #out
+    local kept = {}
+    for _, it in ipairs(out) do
+        local hits, tot = 0, 0
+        for _, w in ipairs(terms) do
+            local tw = tstat[w].w
+            tot = tot + tw
+            if it.hay:find(w, 1, true) then
+                hits = hits + tw
+            elseif it.tags_low:find(w, 1, true) then
+                hits = hits + tw * 0.5
+            end
+        end
+        if hits > 0 then
+            local lenpen = 1 / (1 + math.log(1 + #it.text / 600))
+            local age = it.ts and math.max(0, now - it.ts) or 0
+            local decay = 1 / (1 + age / (30 * 86400))
+            it.score = (hits / math.max(tot, 1e-9)) * lenpen * decay * (WEIGHT[it.kind] or 1.0)
+            kept[#kept + 1] = it
         end
     end
-
+    out = kept
     table.sort(out, function(a, b)
         if a.score ~= b.score then return a.score > b.score end
-        return a.key < b.key
+        if (a.ts or 0) ~= (b.ts or 0) then return (a.ts or 0) > (b.ts or 0) end
+        return a.key > b.key
     end)
     if #out > limit then
         for i = #out, limit + 1, -1 do table.remove(out, i) end
@@ -587,6 +661,8 @@ function M:recall(query, limit, opts)
         keep[#keep + 1] = it
         ::continue::
     end
+    st.injected = st.injected + #keep
+    st.dropped = st.dropped + math.max(0, #out - #keep)
     return keep
 end
 
@@ -608,10 +684,15 @@ end
 
 function M:stats()
     if not self.h then return {} end
+    local st = self.stat or {}
     return {
         count = cache.count(self.h),
         used = cache.memory_used(self.h),
         max = cache.memory_max(self.h),
+        recall_calls = st.calls or 0,
+        recall_candidates = st.candidates or 0,
+        recall_injected = st.injected or 0,
+        recall_dropped = st.dropped or 0,
     }
 end
 

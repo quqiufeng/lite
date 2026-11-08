@@ -1720,7 +1720,10 @@ function M:execute(name, args)
             return "remembered " .. tostring(args.key)
         elseif name == "recall" then
             if not self.memory then return "error: memory disabled" end
-            local items = self.memory:recall(args.query, args.limit or 5)
+            -- 显式 recall 才允许翻原始 transcript，并带上当前会话 id（否则跨会话扫）。
+            local sid = self.ctx and self.ctx.session and self.ctx.session.id
+            local items = self.memory:recall(args.query, args.limit or 5,
+                { session_id = sid, transcript = true, cwd = self.ctx and self.ctx.session and self.ctx.session.cwd })
             if #items == 0 then return "no memory found" end
             local out = {}
             for _, it in ipairs(items) do
