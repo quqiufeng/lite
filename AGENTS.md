@@ -125,8 +125,19 @@ Chrome/WebView/CEF/Electron；不起 `xdotool/wmctrl/import`；不用 `systemd -
 反应是「写一个」，不是「等重启」或「做不到」。范例：`rg` 没装 → `helper/cgrep.c`
 （pthread + regex，59 个 lua 文件 1ms）→ `helper/cgrep.lua` 包一层 → 当场调用。
 
-系统有 `.so` 就直接 `ffi.cdef` + `ffi.load`，封装放 `lua/ffi/<feature>.lua`，
-工具在 `lua/core/tools.lua` 暴露；复杂 ABI/热路径才写 `src/<feature>/`。
+**选路优先级（从省力到费劲，别跳级）**：
+
+1. **系统已有 `.so`** → 直接 `ffi.cdef` + `ffi.load`，**一个 `helper/<x>.lua` 就完事**（零编译、
+   零子进程、零 `.so` 产物）。没装开发头也照做：`nm -D --defined-only lib<x>.so.N` 抄导出符号手写
+   cdef 即可（`helper/pdftext.lua` 就是这么吃 `libpoppler-glib.so.8` 的）。**先找库再动手**：
+   `ls /usr/lib/x86_64-linux-gnu/lib*.so.*`、`pacman/dpkg -S` 看已装了什么。
+2. **库没有、或热路径/复杂 ABI** → 才自己写 C：`native build`（`helper/`，模型自造）或
+   `src/<feature>/`（进仓库的正式模块），封装放 `lua/ffi/<feature>.lua`，工具在
+   `lua/core/tools.lua` 暴露。
+
+手写 cdef 的代价是丢掉编译期检查：符号错只会在调用时炸 `undefined symbol`，靠试错收敛
+（pdftext 连踩 `poppler_page_new` → `poppler_page_free`/`poppler_document_free`，最终统一
+`g_object_unref`）。所以第 1 步的前提是**符号表里确实有它**，别猜。
 
 - C ABI：`int lite_<feature>_...` + `const char *lite_<feature>_error(void)`。
 - `.so` 用 `$ORIGIN` RPATH；打包只复制非 libc 依赖到 `dist/lib/`。
@@ -188,6 +199,7 @@ hook 错误一律 fail-open（记 `_hook_errors`，不炸 agent）。`has_hooks(
 | `search` | DeepSeek Search：关键词→rerank 结果+摘要 | 需要 `DEEPSEEK_API_KEY` |
 | `fetch` | DeepSeek Fetch：URL→Markdown 正文 | 同上；替代原始 HTTP 抓页面 |
 | `tokens` | 每日 token 账本查询 | 数据源 `/agent/usage`，跨会话同一本账 |
+| `pdftext` | 抽 PDF 文本（`path/first/last/max_chars`） | 纯 Lua FFI 直连 `libpoppler-glib.so.8`，零编译零子进程；本机无 poppler 头文件，cdef 手写（导出符号 `poppler_document_get_page`/`poppler_page_get_text`），释放用 `g_object_unref`（`poppler_page_free`/`poppler_document_free` 已不在 134 里）；缺库报装 `libpoppler-glib8` |
 
 `music` 的 `dav://` 语义：`dav://host:port/路径` 列目录**直接流播**（默认整库随机，
 `limit=N` 限首数，`index=N` 选第几首）；**只写 `dav://` 不带路径会 PROPFIND 失败**，
