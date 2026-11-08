@@ -51,6 +51,14 @@ for p in libpng libjpeg libwebp; do
     fi
 done
 
+for p in sdl2 SDL2_ttf; do
+    if pkg-config --exists "$p" 2>/dev/null; then
+        echo "[OK]   $p     $(pkg-config --modversion "$p")"
+    else
+        echo "[WARN] $p     missing (optional, ./tools/run.sh --gui)"
+    fi
+done
+
 for c in cc c++; do
     if command -v "$c" >/dev/null 2>&1; then
         echo "[OK]   $c"

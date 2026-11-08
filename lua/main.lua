@@ -76,6 +76,7 @@ local SUBCOMMANDS = {
     state = true, ["--state"] = true, sessions = true, ["--sessions"] = true,
     plugins = true, ["--plugins"] = true,
     ["--check"] = true, ["--recall"] = true, ["--tui"] = true, ["--once"] = true,
+    ["--gui"] = true,
 }
 
 local cmd = clean[1]
@@ -333,7 +334,7 @@ elseif cmd == "--recall" then
     end
     memory:close()
     os.exit(0)
-elseif cmd == "--tui" then
+elseif cmd == "--tui" or cmd == "--gui" then
     local flags, pos = parse_flags(rest)
     -- 无子命令时未知选项会落到这里（见上面 SUBCOMMANDS 那段），别静默吞掉
     if #pos > 0 then
@@ -453,6 +454,18 @@ elseif cmd == "--tui" then
         if logger then logger:close() end
         if not ok then
             io.stderr:write("lite snapshot: " .. tostring(err) .. "\n")
+            os.exit(1)
+        end
+        os.exit(0)
+    end
+
+    if cmd == "--gui" then
+        local gok, gerr = require("gui.transcript").run(ctx, { agent = agent })
+        memory:close()
+        http.multi_free(multi)
+        if logger then logger:close() end
+        if not gok then
+            io.stderr:write("lite gui: " .. tostring(gerr) .. "\n")
             os.exit(1)
         end
         os.exit(0)

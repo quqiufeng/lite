@@ -73,6 +73,7 @@ Chrome/WebView/CEF/Electron；不起 `xdotool/wmctrl/import`；不用 `systemd -
 ./tools/run.sh --once --json "prompt"
 ./tools/run.sh plugins [--json]   # helper/ 插件清单 + 加载错误（只读快照）
 ./tools/run.sh --tui --snapshot out.txt
+./tools/run.sh --gui           # 自绘 GUI（SDL2+SDL2_ttf，见 lua/gui/，可选依赖）
 ./tools/release.sh             # build + package + install；源码安装软链 lua/
 ```
 
