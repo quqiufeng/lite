@@ -117,6 +117,29 @@ local function state_key(session_id)
     return tostring(session_id) .. "/compact"
 end
 
+local function msg_anchor(m)
+    if type(m) ~= "table" then return nil end
+    local text = Text.content_text(m.content)
+    local h = 5381
+    for i = 1, #text do h = (h * 33 + text:byte(i)) % 4294967296 end
+    local ids = {}
+    for _, tc in ipairs(m.tool_calls or {}) do ids[#ids + 1] = tostring(tc.id or "") end
+    return { role = m.role, hash = h, bytes = #text, ids = table.concat(ids, ",") }
+end
+
+local function anchor_matches(m, a)
+    if type(m) ~= "table" or type(a) ~= "table" then return false end
+    if m.role ~= a.role then return false end
+    local text = Text.content_text(m.content)
+    if #text ~= a.bytes then return false end
+    local h = 5381
+    for i = 1, #text do h = (h * 33 + text:byte(i)) % 4294967296 end
+    if h ~= a.hash then return false end
+    local ids = {}
+    for _, tc in ipairs(m.tool_calls or {}) do ids[#ids + 1] = tostring(tc.id or "") end
+    return table.concat(ids, ",") == a.ids
+end
+
 -- 压缩状态：{ baseline = 已折叠到第几条, digest = 摘要正文, block = 渲染块,
 --              rearm_chars = 下次值得再压的规模 }
 -- 优先存 KV（跨进程/重启可恢复）；没有 KV 时退回进程内。
@@ -136,11 +159,20 @@ function M:compact_state()
     if type(st.block) == "string" and Compact.sanitize_block then
         st.block = Compact.sanitize_block(st.block)
     end
-    -- 重启后只恢复最近 raw_keep 条消息，baseline 仍是旧会话的绝对下标。
-    -- baseline >= 当前数组长度时，从它后面截会把新 user 消息整个漏掉；
-    -- digest 已经代表更老的内容，此时从 system 后重新开始才是安全视图。
-    local total = #(self.ctx.session.messages or {})
-    if total > 0 and (st.baseline or 0) >= total then st.baseline = 1 end
+    -- baseline 是数组下标，跨重启会失效；有 anchor 就按消息内容重新定位。
+    -- 找不到锚点说明它已经被 raw_keep 截掉，digest 已覆盖更老内容，从
+    -- system 后重新开始，绝不能把当前 user 切掉。
+    local msgs = self.ctx.session.messages or {}
+    local total = #msgs
+    if st.anchor then
+        local found
+        for i = 1, total do
+            if anchor_matches(msgs[i], st.anchor) then found = i end
+        end
+        st.baseline = found or 1
+    elseif total > 0 and (st.baseline or 0) >= total then
+        st.baseline = 1
+    end
     return st
 end
 
@@ -164,6 +196,9 @@ end
 
 function M:save_compact_state(st)
     self._compact_state = st
+    if type(st) == "table" and type(st.baseline) == "number" then
+        st.anchor = msg_anchor(self.ctx.session.messages[st.baseline])
+    end
     if not (self.memory and self.memory.put) then return end
     local ttl = (self.memory.TTL and self.memory.TTL.long) or 0
     self.memory:put("/agent/session", state_key(self.ctx.session.id), st, ttl)
@@ -234,6 +269,11 @@ function M:view_messages(opts)
     if from > 0 and from >= #all then from = 1 end
     if from < 1 and all[1] and all[1].role == "system" then from = 1 end
 
+    local last_user
+    for i = #all, 1, -1 do
+        if all[i].role == "user" then last_user = i; break end
+    end
+
     -- 动态窗口：有 digest 时才可以丢弃未折叠的旧尾巴；没有 digest 的
     -- 普通会话仍保留完整历史，交给 hard_window/compact 兜底。
     if opts.budget and st and st.block and st.block ~= "" then
@@ -245,6 +285,10 @@ function M:view_messages(opts)
             if used + chars > budget and start <= #all then break end
             used = used + chars
             start = i
+        end
+        -- 当前 turn 的 user 必须保留，即使尾部 tool 输出把它挤出预算。
+        if last_user and last_user > from and start > last_user then
+            start = last_user
         end
         -- tool result 不能脱离它的 assistant 调用；向前补齐配对。
         while start > from + 1 and all[start] and all[start].role == "tool" do
@@ -406,6 +450,12 @@ function M:hard_window(msgs, budget)
         acc = acc + c
         start = i
     end
+    -- 当前 turn 的 user 不能因为尾部太大被丢弃。
+    local last_user
+    for i = n, lead + 1, -1 do
+        if msgs[i].role == "user" then last_user = i; break end
+    end
+    if last_user and start > last_user then start = last_user end
     -- 尾巴不能以孤立的 tool 结果开头（对应的 tool_calls 被丢了会 400）
     while start > lead + 1 and start <= n and msgs[start].role == "tool" do
         start = start - 1
@@ -424,7 +474,7 @@ function M:hard_window(msgs, budget)
                 .. "</session_context>", dropped),
     }
     for i = start, n do out[#out + 1] = msgs[i] end
-    return out, true, dropped
+    return repair_tool_pairs(out), true, dropped
 end
 
 -- 组装发出去的完整消息列表：视图 + 召回块。

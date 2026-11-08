@@ -341,6 +341,59 @@ do
         if m.role == "user" and m.content == "CURRENT-REQUEST" then current = true end
     end
     check(not bad_pair and current, "compact view drops incomplete tool-call groups")
+
+    -- 当前 turn 的 user 不能被尾部 tool 输出挤出动态窗口
+    ctx.session.messages = {
+        { role = "system", content = "SYS" },
+        { role = "user", content = "CURRENT-REQUEST" },
+        { role = "assistant", content = "", tool_calls = {
+            { id = "t1", type = "function", ["function"] = { name = "bash", arguments = "{}" } },
+        } },
+        { role = "tool", tool_call_id = "t1", content = string.rep("z", 400) },
+    }
+    agent._compact_state = {
+        baseline = 1, digest = "DIGEST",
+        block = "<session_context>\nHISTORY\n</session_context>",
+    }
+    local tool_view = agent:view_messages({ budget = 80, reserve = 0 })
+    local kept_user = false
+    for _, m in ipairs(tool_view) do
+        if m.role == "user" and m.content == "CURRENT-REQUEST" then kept_user = true end
+    end
+    check(kept_user, "dynamic window keeps current turn user above tool output")
+
+    -- compact anchor：重启后按消息内容找回 baseline，而不是信任旧下标
+    local store = {}
+    local mem = {
+        get = function(_, _, key) return store[key] end,
+        put = function(_, _, key, value) store[key] = value; return true end,
+        TTL = { long = 1 },
+    }
+    local actx = Context.new({ cwd = "/tmp", max_turns = 4 })
+    local old_messages = {
+        { role = "system", content = "SYS" },
+        { role = "user", content = "OLD-REQUEST" },
+        { role = "assistant", content = "OLD-ANSWER" },
+    }
+    actx.session.messages = old_messages
+    local anchor_agent = Agent.new(actx, { stream = function() end },
+        { schemas = function() return {} end }, { append = function() end }, mem)
+    anchor_agent:save_compact_state({
+        baseline = 2, digest = "DIGEST",
+        block = "<session_context>\nHISTORY\n</session_context>",
+    })
+    actx.session.messages = {
+        { role = "system", content = "SYS" },
+        { role = "user", content = "OLD-REQUEST" },
+        { role = "assistant", content = "OLD-ANSWER" },
+        { role = "user", content = "NEW-REQUEST" },
+    }
+    check(anchor_agent:compact_state().baseline == 2, "compact anchor relocates baseline")
+    actx.session.messages = {
+        { role = "system", content = "SYS" },
+        { role = "user", content = "NEW-REQUEST" },
+    }
+    check(anchor_agent:compact_state().baseline == 1, "missing compact anchor rebases to head")
 end
 
 -- tools
