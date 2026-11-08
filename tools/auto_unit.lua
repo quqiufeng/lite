@@ -262,6 +262,85 @@ do
     check(clean_digest:find("## Pending & next step", 1, true) == nil
         and clean_digest:find("## Files", 1, true) ~= nil,
         "compact sanitizes stale digest pending")
+
+    -- 重启只恢复最近消息时，旧 baseline 不能把新 user 消息截掉
+    local Context = require("context")
+    local Agent = require("core.agent")
+    local ctx = Context.new({ cwd = "/tmp", max_turns = 4 })
+    ctx.session.messages = {
+        { role = "system", content = "SYS" },
+        { role = "user", content = "old question" },
+        { role = "assistant", content = "old answer" },
+        { role = "user", content = "CURRENT-REQUEST" },
+    }
+    local agent = Agent.new(ctx, { stream = function() end },
+        { schemas = function() return {} end }, { append = function() end })
+    agent._compact_state = {
+        baseline = 999, digest = "DIGEST",
+        block = "<session_context>\nHISTORY\n</session_context>",
+    }
+    local view = agent:view_messages()
+    local saw_current = false
+    for _, m in ipairs(view) do
+        if m.role == "user" and m.content == "CURRENT-REQUEST" then saw_current = true end
+    end
+    check(saw_current, "compact baseline rebases after restart")
+
+    -- 动态滑动窗口：从当前数组尾部按预算向前装，当前 user 永远保留
+    ctx.session.messages = {
+        { role = "system", content = "SYS" },
+        { role = "user", content = "OLD-" .. string.rep("x", 400) },
+        { role = "assistant", content = "OLD-ANSWER-" .. string.rep("y", 400) },
+        { role = "user", content = "CURRENT-REQUEST" },
+    }
+    agent._compact_state = {
+        baseline = 1, digest = "DIGEST",
+        block = "<session_context>\nHISTORY\n</session_context>",
+    }
+    local window = agent:view_messages({ budget = 220, reserve = 0 })
+    local has_current, has_old = false, false
+    for _, m in ipairs(window) do
+        if m.role == "user" and m.content == "CURRENT-REQUEST" then has_current = true end
+        if type(m.content) == "string" and m.content:find("OLD-", 1, true) then has_old = true end
+    end
+    check(has_current, "dynamic window always keeps the current user")
+    check(not has_old, "dynamic window slides old messages out")
+
+    -- 恢复窗口从 tool 结果中间开始时，不能把孤儿 tool 发给 API
+    ctx.session.messages = {
+        { role = "system", content = "SYS" },
+        { role = "tool", tool_call_id = "orphan", content = "orphan result" },
+        { role = "user", content = "CURRENT-REQUEST" },
+    }
+    agent._compact_state = {
+        baseline = 1, digest = "DIGEST",
+        block = "<session_context>\nHISTORY\n</session_context>",
+    }
+    local repaired = agent:view_messages()
+    local orphan, saw_user = false, false
+    for _, m in ipairs(repaired) do
+        if m.role == "tool" then orphan = true end
+        if m.role == "user" and m.content == "CURRENT-REQUEST" then saw_user = true end
+    end
+    check(not orphan and saw_user, "compact view drops orphan leading tool messages")
+
+    -- assistant 的多个 tool_calls 缺少任意一个 tool 结果时，整组丢弃
+    ctx.session.messages = {
+        { role = "system", content = "SYS" },
+        { role = "assistant", content = "", tool_calls = {
+            { id = "a1", type = "function", ["function"] = { name = "bash", arguments = "{}" } },
+            { id = "a2", type = "function", ["function"] = { name = "bash", arguments = "{}" } },
+        } },
+        { role = "tool", tool_call_id = "a1", content = "only one" },
+        { role = "user", content = "CURRENT-REQUEST" },
+    }
+    local fixed = agent:view_messages()
+    local bad_pair, current = false, false
+    for _, m in ipairs(fixed) do
+        if m.role == "tool" or (m.role == "assistant" and m.tool_calls) then bad_pair = true end
+        if m.role == "user" and m.content == "CURRENT-REQUEST" then current = true end
+    end
+    check(not bad_pair and current, "compact view drops incomplete tool-call groups")
 end
 
 -- tools

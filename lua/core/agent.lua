@@ -136,6 +136,11 @@ function M:compact_state()
     if type(st.block) == "string" and Compact.sanitize_block then
         st.block = Compact.sanitize_block(st.block)
     end
+    -- 重启后只恢复最近 raw_keep 条消息，baseline 仍是旧会话的绝对下标。
+    -- baseline >= 当前数组长度时，从它后面截会把新 user 消息整个漏掉；
+    -- digest 已经代表更老的内容，此时从 system 后重新开始才是安全视图。
+    local total = #(self.ctx.session.messages or {})
+    if total > 0 and (st.baseline or 0) >= total then st.baseline = 1 end
     return st
 end
 
@@ -164,9 +169,58 @@ function M:save_compact_state(st)
     self.memory:put("/agent/session", state_key(self.ctx.session.id), st, ttl)
 end
 
--- 真正发给模型的视图：system + [摘要块] + baseline 之后的原文。
--- 摘要块位置固定（紧跟 system），所以两轮之间前缀稳定，缓存能命中。
-function M:view_messages()
+-- 发给 API 的消息必须满足 tool_calls/tool 配对：assistant 的每个 id
+-- 都要有紧随其后的 tool 结果。恢复窗口/预算裁剪可能从中间切开，
+-- 这里做最后一道结构修复，宁可少一条旧消息，也不能让整个请求 400。
+local function repair_tool_pairs(msgs)
+    local out = {}
+    local i = 1
+    while i <= #msgs do
+        local m = msgs[i]
+        if m.role == "tool" then
+            -- 前面没有对应 assistant 的孤儿 tool 结果
+            i = i + 1
+        elseif m.role == "assistant" and type(m.tool_calls) == "table"
+            and #m.tool_calls > 0 then
+            local j = i + 1
+            local tools = {}
+            while j <= #msgs and msgs[j].role == "tool" do
+                tools[#tools + 1] = msgs[j]
+                j = j + 1
+            end
+            local expected, got = {}, {}
+            for _, tc in ipairs(m.tool_calls) do
+                local id = tc.id or tc["tool_call_id"]
+                if id then expected[id] = true end
+            end
+            for _, t in ipairs(tools) do
+                if expected[t.tool_call_id] then got[t.tool_call_id] = true end
+            end
+            local complete = true
+            for id in pairs(expected) do
+                if not got[id] then complete = false end
+            end
+            if complete then
+                out[#out + 1] = m
+                for _, t in ipairs(tools) do out[#out + 1] = t end
+            end
+            i = j
+        else
+            out[#out + 1] = m
+            i = i + 1
+        end
+    end
+    return out
+end
+
+-- 真正发给模型的视图：system + [摘要块] + 动态尾部窗口。
+--
+-- baseline 只是 compact checkpoint 的锚点，不再直接作为唯一 slice 下标：
+-- 从当前消息数组末尾按预算向前装，当前 user 消息永远最后、永远保留。
+-- baseline 无效（重启只恢复了最近 N 条）时从 system 后重新开始；有 digest
+-- 时再按预算向前滑，避免旧绝对下标把新消息截掉。
+function M:view_messages(opts)
+    opts = opts or {}
     local all = self.ctx.session.messages
     local st = self:compact_state()
     local out = {}
@@ -174,14 +228,38 @@ function M:view_messages()
     if st and st.block and st.block ~= "" then
         out[#out + 1] = { role = "system", content = st.block }
     end
+
     local from = st and (st.baseline or 0) or 0
     if from < 0 then from = 0 end
-    -- 还没压过时 baseline=0，但第 1 条 system 上面已经单独放过了，
-    -- 不跳过就会把整段 system prompt 发两遍（多付一份输入 token）。
+    if from > 0 and from >= #all then from = 1 end
     if from < 1 and all[1] and all[1].role == "system" then from = 1 end
-    -- 单条就超预算的 tool 结果：发出去时按 msg_cap 截一刀，原文不动
-    -- （transcript / KV 里仍是全的）。cap 只由 budget 决定，所以同一条
-    -- 消息每次算出来的裁剪结果一样 —— 前缀缓存照样命中。
+
+    -- 动态窗口：有 digest 时才可以丢弃未折叠的旧尾巴；没有 digest 的
+    -- 普通会话仍保留完整历史，交给 hard_window/compact 兜底。
+    if opts.budget and st and st.block and st.block ~= "" then
+        local head = Compact.total(out) + (tonumber(opts.reserve) or 0)
+        local budget = math.max(1, (tonumber(opts.budget) or 0) - head)
+        local start, used = #all + 1, 0
+        for i = #all, from + 1, -1 do
+            local chars = Compact.msg_chars(all[i])
+            if used + chars > budget and start <= #all then break end
+            used = used + chars
+            start = i
+        end
+        -- tool result 不能脱离它的 assistant 调用；向前补齐配对。
+        while start > from + 1 and all[start] and all[start].role == "tool" do
+            start = start - 1
+        end
+        if start <= #all then from = start - 1 end
+    end
+
+    -- 恢复的最近消息可能从 tool 结果中间开始；没有前面的 assistant
+    -- tool_calls 时，开头的 tool 消息是孤儿，必须丢掉，否则真实 API
+    -- 会报 "insufficient tool messages following tool_calls"。
+    while from < #all and all[from + 1] and all[from + 1].role == "tool" do
+        from = from + 1
+    end
+
     local clips
     if from < #all then clips = self:compactor():clips(all) end
     for i = from + 1, #all do
@@ -192,7 +270,7 @@ function M:view_messages()
             out[#out + 1] = all[i]
         end
     end
-    return out
+    return repair_tool_pairs(out)
 end
 
 -- 摘要调用：走和主循环同一个 stream（sync 或 async 协程），
@@ -377,9 +455,8 @@ function M:request_messages(text, stream, opts)
     })
     reserve = reserve + #rt + 4
     self:maybe_compact(stream, reserve, opts.force_compact)
-    local msgs = self:view_messages()
-
     local c = self:compactor()
+    local msgs = self:view_messages({ budget = c.budget, reserve = reserve })
     local used = Compact.total(msgs) + reserve
     if used > math.floor(c.budget * 2) then
         local trimmed, dropped

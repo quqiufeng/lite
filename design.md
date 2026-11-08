@@ -884,6 +884,7 @@ lite 的差距与本轮已落地（P0）：
 - **检查点验收**：摘要 > 2×cap 就拒绝；折叠后规模 >= 折叠前也拒绝。宁可这次不压，也不要留一个"看起来压过了"的假结果。
 - **摘要请求不带 tools / 不带 thinking**：摘要用不到工具定义，带上只是白付 schema token，而且它本来就不和主对话共享缓存前缀。
 - **历史摘要只能当背景**：摘要块标 `historical-only`；`ok/继续` 等裸确认不逐字保留，旧 `Pending & next step` 在兼容旧 checkpoint 时剔除；当前 user 请求在块后，永远优先。
+- **动态滑动窗口**：视图从当前消息数组尾部按预算向前装，baseline 只作 compact 锚点；baseline 越界时 rebase，当前 user 消息永远最后且永远保留。
 - **上一次 digest 要显式合并**：lite 的 digest 存 KV（不在 transcript 里），不会被自动卷进折叠区。不合并就会每压一次丢一段历史（对应 opencode 的 `[previous compaction][transcript]` 拼法）。
 - **无 KV 时的内存兜底**：状态一丢 baseline 归零，下次请求会把整段历史重新摘一遍 —— 每次请求多花一次摘要调用。
 - **尾巴逐级缩小重试**（opencode `SHRINK_STEPS` 思路）：`1 → 0.5 → 0.25`，把"没东西可折"和"失败"区分开，并在 reason 里报出试过的倍数。

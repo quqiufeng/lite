@@ -12,6 +12,9 @@ echo "== deps =="
 echo "== unit =="
 "$ROOT/tools/lite-lua" "$ROOT/tools/auto_unit.lua"
 
+echo "== live =="
+"$ROOT/tools/live_smoke.sh"
+
 echo "== cli =="
 OUT="$("$ROOT/tools/run.sh" --check --json || true)"
 if ! echo "$OUT" | grep -q '"type":"check"'; then
