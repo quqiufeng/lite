@@ -63,15 +63,66 @@ local function shell(cmd)
     return out
 end
 
--- 依赖环境变量（~/.config/lite/.env 由 run.sh 注入）
+-- 进程环境缺变量时回退读 dotenv（进程环境优先，与 tools/lua.sh 顺序一致）
+local dotenv
+local function env(key)
+    local v = os.getenv(key)
+    if v and v ~= "" then return v end
+    if dotenv == nil then
+        dotenv = {}
+        local home = os.getenv("HOME") or ""
+        for _, p in ipairs({ home .. "/.env", home .. "/.config/lite/.env" }) do
+            local f = io.open(p, "r")
+            if f then
+                for line in f:lines() do
+                    local k, val = line:match("^%s*([%w_]+)%s*=%s*(.-)%s*$")
+                    if k and dotenv[k] == nil then
+                        dotenv[k] = val:gsub("^['\"]", ""):gsub("['\"]$", "")
+                    end
+                end
+                f:close()
+            end
+        end
+    end
+    return dotenv[key]
+end
+
+-- dav://host:port/path → http://host:port + /path（davs:// → https）
+local function split_dav(u)
+    local scheme, rest = tostring(u or ""):match("^(dav%a*)://(.+)$")
+    if not scheme then return nil end
+    local proto = (scheme == "davs") and "https" or "http"
+    local host, path = rest:match("^([^/]+)(/.*)$")
+    if not host then return proto .. "://" .. rest end
+    return proto .. "://" .. host, (path:gsub("/+$", ""))
+end
+
+-- 任意 URL 里的 dav:// 转 http(s)://
+function M.http(u)
+    local b, p = split_dav(u)
+    if not b then return u end
+    return p and (b .. p) or b
+end
+
+-- 依赖环境变量（或 ~/.env、~/.config/lite/.env 回退）；WEBDAV_URL 也可写成 dav://
 function M.cfg()
-    local base = os.getenv("WEBDAV_URL")
-    local user = os.getenv("WEBDAV_USER")
-    local pass = os.getenv("WEBDAV_PASS")
-    local root = os.getenv("WEBDAV_MUSIC")
+    local base = env("WEBDAV_URL")
+    local user = env("WEBDAV_USER")
+    local pass = env("WEBDAV_PASS")
+    local root = env("WEBDAV_MUSIC")
+    local hb, hp = split_dav(base)
+    if hb then
+        base = hb
+        if not root or root == "" then root = hp end
+    end
+    local rb, rp = split_dav(root)
+    if rb then
+        base = rb
+        root = rp
+    end
     if not (base and user and pass and root) then
         return nil, "缺 WebDAV 配置：WEBDAV_URL / WEBDAV_USER / WEBDAV_PASS / WEBDAV_MUSIC"
-            .. "（写进 ~/.config/lite/.env，run.sh 会注入环境）"
+            .. "（写进 ~/.env 或 ~/.config/lite/.env；也可直接给 dav://host:port/路径）"
     end
     return {
         base = base:gsub("/+$", ""),
@@ -152,6 +203,39 @@ local function request(url, auth, headers, method, timeout, out_file)
     return body or true
 end
 
+-- PROPFIND 单个目录（Depth: 1，平铺），只留音频；条目带绝对 url
+local function propfind(c, target)
+    local xml, err = request(target, c.auth,
+        { "Depth: 1", "Content-Type: application/xml; charset=utf-8" },
+        "PROPFIND", 30)
+    if not xml then return nil, "PROPFIND 失败: " .. tostring(err) end
+    local origin = target:match("^(%a+://[^/]+)") or c.base
+    local entries, seen = {}, {}
+    for href in xml:gmatch("<[%a]*:?[Hh][Rr][Ee][Ff]>([^<]+)<") do
+        local dec = urldec(href)
+        local name = dec:match("([^/]+)/?$") or dec
+        local ext = name:match("%.([%w]+)$")
+        if ext and EXT[ext:lower()] and not seen[dec] then
+            seen[dec] = true
+            local url = href:match("^%a+://") and href or (origin .. href)
+            entries[#entries + 1] = { href = href, name = name, url = url }
+        end
+    end
+    table.sort(entries, function(a, b) return a.name < b.name end)
+    return entries
+end
+
+-- 列任意 dav:// 目录（不缓存）
+function M.list_at(url)
+    local c, err = M.cfg()
+    if not c then return nil, err end
+    local target = M.http(tostring(url):gsub("/+$", "")) .. "/"
+    local entries, perr = propfind(c, target)
+    if not entries then return nil, perr end
+    if #entries == 0 then return nil, "目录里没有音频文件：" .. target end
+    return entries
+end
+
 -- 列根目录（Depth: 1，平铺）；结果缓存到磁盘，LIST_TTL 秒内复用
 local list_cache = nil
 
@@ -179,21 +263,8 @@ function M.list(force)
             end
         end
     end
-    local xml, err = request(c.base .. urlenc(c.root) .. "/", c.auth,
-        { "Depth: 1", "Content-Type: application/xml; charset=utf-8" },
-        "PROPFIND", 30)
-    if not xml then return nil, "PROPFIND 失败: " .. tostring(err) end
-    local entries, seen = {}, {}
-    for href in xml:gmatch("<[%a]*:?[Hh][Rr][Ee][Ff]>([^<]+)<") do
-        local dec = urldec(href)
-        local name = dec:match("([^/]+)/?$") or dec
-        local ext = name:match("%.([%w]+)$")
-        if ext and EXT[ext:lower()] and not seen[dec] then
-            seen[dec] = true
-            entries[#entries + 1] = { href = href, name = name }
-        end
-    end
-    table.sort(entries, function(a, b) return a.name < b.name end)
+    local entries, perr = propfind(c, c.base .. urlenc(c.root) .. "/")
+    if not entries then return nil, perr end
     if #entries == 0 then
         return nil, "曲库为空或 PROPFIND 没解析出音频（检查 WEBDAV_MUSIC）"
     end
@@ -238,13 +309,23 @@ local function hash(s)
     return string.format("%08x", h)
 end
 
--- 按需下载到本地缓存；返回本地路径（已存在则直接复用）
+-- 按需下载到本地缓存；href 可为绝对 URL 或相对 base 的路径
 function M.fetch(href)
     local c = M.cfg()
     if not c then return nil, "缺 WebDAV 配置" end
-    local ext = (href:match("%.([%w]+)$") or "bin"):lower()
+    local url = tostring(href)
+    if not url:match("^%a+://") then url = c.base .. url end
+    return M.fetch_url(url)
+end
+
+-- 下载任意（已 http(s) 化的）URL 到本地缓存；已存在则复用
+function M.fetch_url(url)
+    local c, cerr = M.cfg()
+    if not c then return nil, cerr end
+    url = M.http(tostring(url))
+    local ext = (url:match("%.([%w]+)$") or "bin"):lower()
     os.execute("mkdir -p " .. CACHE)
-    local dest = string.format("%s/%s.%s", CACHE, hash(href), ext)
+    local dest = string.format("%s/%s.%s", CACHE, hash(url), ext)
     local f = io.open(dest, "rb")
     if f then
         local size = f:seek("end")
@@ -252,8 +333,7 @@ function M.fetch(href)
         if size and size > 4096 then return dest end
     end
     local tmp = dest .. ".part"
-    local ok, err = request(c.base .. href, c.auth,
-        { "Accept: */*" }, nil, 600, tmp)
+    local ok, err = request(url, c.auth, { "Accept: */*" }, nil, 600, tmp)
     if not ok then return nil, "下载失败: " .. tostring(err) end
     os.rename(tmp, dest)
     return dest

@@ -114,6 +114,24 @@ actions.play = function(M, args, env)
         if not p then error("下载「" .. hit.name .. "」失败: " .. tostring(derr)) end
         files = { p }
         label = hit.name
+    elseif is_url and src:match("^davs?://") then
+        -- dav://host:port/路径 → 列目录 → 按需下载（index=N 只取第 N 首）
+        local wd = wdlib(env)
+        local entries, lerr = wd.list_at(src)
+        if not entries then error(tostring(lerr)) end
+        if args.index then
+            local hit = entries[args.index]
+            if not hit then error("index 超出范围（1.." .. #entries .. "）") end
+            entries = { hit }
+        end
+        files = {}
+        for _, e in ipairs(entries) do
+            local p, derr = wd.fetch_url(e.url)
+            if not p then error("下载「" .. e.name .. "」失败: " .. tostring(derr)) end
+            files[#files + 1] = p
+        end
+        label = src:gsub("/+$", ""):match("[^/]+/?$") or src
+        label = label .. " 目录"
     else
         files = { src }
     end
