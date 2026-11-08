@@ -1984,6 +1984,12 @@ do
     local dir = os.tmpname()
     os.remove(dir)
     os.execute("mkdir -p " .. shq(dir .. "/helper"))
+    -- 隔离 global 根：仓库自带 helper/ 会通过 LITE_ROOT 混进来（计数就不稳定）
+    local real_getenv = os.getenv
+    os.getenv = function(k)
+        if k == "LITE_ROOT" then return dir end
+        return real_getenv(k)
+    end
     local function put(path, body)
         local f = assert(io.open(path, "wb"))
         f:write(body)
@@ -2032,6 +2038,7 @@ return {
     check(trep.tool_count == 0 and #trep.entries == 0 and #trep.errors == 0,
         "report empty with plugins=false")
 
+    os.getenv = real_getenv
     os.execute("rm -rf " .. shq(dir))
 end
 
@@ -3795,6 +3802,126 @@ do
     check(res:find("invalid tool arguments JSON", 1, true) ~= nil, "agent bad json error")
     check(res:find('{"command":', 1, true) ~= nil, "agent bad json raw args")
     check(res:find("required: command", 1, true) ~= nil, "agent bad json required")
+end
+
+-- helper/search.lua + helper/fetch.lua（DeepSeek Search/Fetch 插件）
+do
+    local cjson = require("cjson")
+    local hdir = root .. "/helper"
+    local calls, queue = {}, {}
+    local real_http = package.loaded["core.http"]
+    package.loaded["core.http"] = {
+        post_stream = function(url, headers, body)
+            calls[#calls + 1] = { url = url, body = body, auth = headers and headers[1] }
+            local r = table.remove(queue, 1) or { 0, 200, "{}" }
+            return r[1], r[2], r[3]
+        end,
+    }
+    local env = { helper_dir = hdir, cwd = root }
+    local ok_search, Search = pcall(dofile, hdir .. "/search.lua")
+    local ok_fetch, Fetch = pcall(dofile, hdir .. "/fetch.lua")
+    package.loaded["core.http"] = real_http
+
+    check(ok_search and type(Search) == "table" and type(Search.run) == "function"
+        and Search.schema.name == "search", "search plugin loads with schema")
+    check(ok_fetch and type(Fetch) == "table" and type(Fetch.run) == "function"
+        and Fetch.schema.name == "fetch", "fetch plugin loads with schema")
+    check(type(Search.schema.parameters.required) == "table"
+        and Search.schema.parameters.required[1] == "query", "search schema requires query")
+    check(Fetch.schema.parameters.properties.url ~= nil, "fetch schema has url property")
+
+    -- 参数校验在任何网络调用之前就失败
+    local before = #calls
+    check(Search.run({}, env):find("required: query", 1, true) ~= nil, "search rejects empty query")
+    check(Search.run({ query = string.rep("x", 129) }, env):find("128", 1, true) ~= nil,
+        "search rejects overlong query")
+    check(Search.run({ query = "ok", count = 99 }, env):find("1-50", 1, true) ~= nil,
+        "search rejects bad count")
+    check(Fetch.run({}, env):find("required: url", 1, true) ~= nil, "fetch rejects missing url")
+    check(Fetch.run({ url = "example.com/a" }, env):find("absolute http", 1, true) ~= nil,
+        "fetch rejects relative url")
+    check(Fetch.run({ url = "https://u:p@example.com/x" }, env):find("credentials", 1, true) ~= nil,
+        "fetch rejects credential url")
+    check(#calls == before, "validation failures never hit the network")
+
+    -- 有 key 时的成功/失败路径
+    -- 注入 key：本机 LuaJIT 无 os.setenv，临时包 os.getenv（结束时还原）
+    local real_getenv = os.getenv
+    local fake_env = {}
+    os.getenv = function(k)
+        if k == "DEEPSEEK_API_KEY" or k == "LITE_DEEPSEEK_API_KEY" then return fake_env[k] end
+        return real_getenv(k)
+    end
+    package.loaded["core.http"] = {
+        post_stream = function(url, headers, body)
+            calls[#calls + 1] = { url = url, body = body, auth = headers and headers[1] }
+            local r = table.remove(queue, 1) or { 0, 200, "{}" }
+            return r[1], r[2], r[3]
+        end,
+    }
+    local env2 = { helper_dir = hdir, cwd = root }
+    local Search2 = dofile(hdir .. "/search.lua")
+    local Fetch2 = dofile(hdir .. "/fetch.lua")
+
+    -- 没 key：明确报缺 key，不发请求
+    local n0 = #calls
+    check(Search2.run({ query = "x" }, env2):find("DEEPSEEK_API_KEY", 1, true) ~= nil,
+        "search reports a missing API key")
+    check(#calls == n0, "missing key means no request")
+
+    -- 有 key
+    fake_env.DEEPSEEK_API_KEY = "sk-unit"
+
+    queue = { { 0, 200, cjson.encode({ results = {
+        { title = "Alpha", url = "https://a.example/1", rerank_score = 2.5, authority = 3,
+          date = "2026-01-02T00:00:00Z", site_name = "A", summary = "A summary", snippet = "snip" },
+        { title = "Beta", url = "https://b.example/2", rerank_score = 1.1, snippet = "b snip" },
+    } }) } }
+    local out = Search2.run({ query = "hello", count = 2, ori_question = "q?", need_content = true }, env2)
+    check(out:find("2 result", 1, true) ~= nil, "search renders result count")
+    check(out:find("https://a.example/1", 1, true) ~= nil and out:find("A summary", 1, true) ~= nil,
+        "search renders url and summary")
+    check(out:find("score 2.50", 1, true) ~= nil, "search renders rerank score")
+    local last = calls[#calls]
+    check(last.url == "https://api.deepseek.com/v1/tools/search", "search posts to the documented path")
+    check(last.auth == "Authorization: Bearer sk-unit", "search sends bearer auth")
+    local sent = cjson.decode(last.body)
+    check(sent.count == 2 and sent.query == "hello" and sent.need_content == true
+        and sent.ori_question == "q?", "search forwards count/query/need_content/ori_question")
+
+    queue = { { 0, 200, '{"results":[]}' } }
+    check(Search2.run({ query = "zzz" }, env2):find("no results", 1, true) ~= nil, "search reports empty results")
+
+    n0 = #calls
+    queue = { { 0, 408, "timeout" }, { 0, 429, "slow" }, { 0, 500, "boom" } }
+    local r429 = Search2.run({ query = "x" }, env2)
+    check(#calls - n0 == 3, "search retries 3 times on 408/429/5xx")
+    check(r429:find("gave up after 3 attempts", 1, true) ~= nil, "search reports retry exhaustion")
+
+    n0 = #calls
+    queue = { { 0, 402, "no money" }, { 0, 200, "{}" } }
+    check(Search2.run({ query = "x" }, env2):find("HTTP 402", 1, true) ~= nil, "search surfaces 402")
+    check(#calls - n0 == 1, "search does not retry 402")
+
+    queue = { { 0, 200, cjson.encode({ title = "Doc", content = "# Hi\nbody" }) } }
+    local fo = Fetch2.run({ url = "https://a.example/doc" }, env2)
+    check(fo:find("# Doc", 1, true) ~= nil and fo:find("body", 1, true) ~= nil,
+        "fetch renders title and markdown body")
+    check(calls[#calls].url == "https://api.deepseek.com/v1/tools/fetch", "fetch posts to the documented path")
+
+    queue = { { 0, 404, "nope" } }
+    check(Fetch2.run({ url = "https://a.example/doc" }, env2):find("HTTP 404", 1, true) ~= nil,
+        "fetch surfaces 404")
+    queue = { { 0, 200, "<html>oops</html>" } }
+    check(Fetch2.run({ url = "https://a.example/doc" }, env2):find("non-JSON", 1, true) ~= nil,
+        "fetch rejects non-JSON 200")
+    queue = { { 7, 0, "couldn't connect" }, { 7, 0, "couldn't connect" },
+        { 7, 0, "couldn't connect" } }
+    check(Fetch2.run({ url = "https://a.example/doc" }, env2):find("curl failed", 1, true) ~= nil,
+        "fetch reports transport failure")
+
+    os.getenv = real_getenv
+    package.loaded["core.http"] = real_http
 end
 
 -- entry

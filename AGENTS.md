@@ -113,6 +113,27 @@ hook 错误一律 fail-open（记 `_hook_errors`，不炸 agent）。`has_hooks(
 `name/path/scope/tool/hooks` 与错误（`--json` 给脚本）；启动时只打印错误
 （`plugin <name> failed: ...`），清单不打扰。别靠翻 `helper/` 猜加载了啥。
 
+**调一次插件工具的完整链路**（`lua/core/tools.lua`）：
+
+1. 发现 —— `_scan_helper_schemas`（`:1173`）遍历 `_helper_roots()`：`<cwd>/helper`
+   （local）→ `$LITE_ROOT/helper`（global），每个根一次 `ls -1` **平铺**，只认
+   `*.tool.json` 与 `*.lua`；`helper/lib/` 之类子目录不会被当插件（search/fetch 就靠这个共享共用库）。
+2. 快照 —— `helper_lua_load`（`:1148`，`loadfile`+`pcall`）→ `helper_lua_schema`
+   （`:1156`）：`run`+`schema` = 工具，只有 `hooks` = 纯钩子；`BUILTIN_TOOLS` 不可覆盖；
+   同名 `.tool.json` 优先。结果 memo 进 `_helper_cache`（`:1277`）。
+3. 上桌 —— `M:schemas`（`:276`）把快照拼进 API `tools` 字段；system prompt 里只列名字，
+   保证字节稳定。
+4. 派发 —— 模型 tool_call → agent 循环 → `M:call`：内建 if-else 链先走，都不中才落
+   `_run_helper_tool`（`:1465`）。
+5. 执行 —— `loadfile` **每次调用都重读文件** → 校验 `table.run` → `_helper_env(p)`
+   （`:1444`，`{cwd, helper_dir, scope, ffi, load(so), call(native)}`）→
+   `pcall(mod.run, args, env)`。
+6. 回流 —— `nil`→`(helper returned nil)`；抛错→`error: helper <name>: ...`；
+   否则 `truncate`(≤32KB) → `error_hint`（同调用失败计数）→ 回消息。
+
+所以「不热插拔」只针对第 2 步的**工具清单**：改插件实现立刻生效（第 5 步重读），
+新建/删除 `.lua` 才需要重启；钩子走 `has_hooks`（`:1366`）旁路，与工具派发无关。
+
 ## 7 参考实现（新功能先查）
 
 参考：Pi `/opt/pi-mono`、Reasonix `/opt/reasonix`、opencode `/opt/opencode`；缓存
