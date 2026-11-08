@@ -1566,6 +1566,20 @@ do
     os.execute("rm -rf " .. shq(dir))
 end
 
+-- OCR JSON 容错：libocr 把识别文本原样拼进 JSON，文本里的裸引号会让整串非法
+do
+    local OCR = require("ffi.ocr")
+    local bad = '[{"x":1,"y":2,"w":3,"h":4,"text":"a"},'
+        .. '{"x":448,"y":1320,"w":5,"h":3,"text":"*"""},'
+        .. '{"x":469,"y":1320,"w":7,"h":4,"text":"""},'
+        .. '{"x":193,"y":1347,"w":111,"h":9,"text":"月江"}]'
+    local boxes = OCR.parse(bad)
+    check(#boxes == 4, "ocr parse salvages malformed quotes")
+    check(boxes[2] and boxes[2].text:find('"', 1, true) ~= nil, "ocr parse keeps quote inside text")
+    check(boxes[4] and boxes[4].text == "月江" and boxes[4].w == 111, "ocr parse keeps trailing box")
+    check(#OCR.parse('[{"x":1,"y":2,"w":3,"h":4,"text":"ok"}]') == 1, "ocr parse plain json")
+end
+
 -- OCR (optional system PP-OCRv4)
 do
     local sample = (arg[0]:match("^(.*)/[^/]+$") or ".") .. "/../testdata/ocr_sample.png"

@@ -231,6 +231,31 @@ function M.raw(path)
     return s
 end
 
+-- libocr 把识别文本原样拼进 JSON，文本里的裸引号（如 `*"`）会让整串非法。
+-- cjson 失败时按对象逐个捞回：每块的前缀固定是 `{"x":N,"y":N,"w":N,"h":N,"text":"`，
+-- 块尾是 `"}`，块间以 `,{"x":` 分隔。
+local function salvage(s)
+    local out = {}
+    local body = s:match("^%s*%[(.*)%]%s*$") or s
+    local pos = 1
+    while true do
+        local _, after, x, y, w, h = body:find('"x":(%d+),"y":(%d+),"w":(%d+),"h":(%d+),"text":"', pos)
+        if not x then break end
+        local nxt = body:find(',{"x":', after + 1, true)
+        local seg = body:sub(after + 1, (nxt or #body + 1) - 1)
+        local text = seg:match('^(.-)"%s*%}%s*$')
+        if text then
+            out[#out + 1] = {
+                x = tonumber(x), y = tonumber(y),
+                w = tonumber(w), h = tonumber(h), text = text,
+            }
+        end
+        if not nxt then break end
+        pos = nxt
+    end
+    return out
+end
+
 local function decode(s)
     if not s or s == "" then return {} end
     s = Text.sanitize(s)
@@ -238,8 +263,11 @@ local function decode(s)
     if ok and type(res) == "table" then return res end
     local clean = s:gsub("[%z\1-\8\11\12\14-\31]", " ")
     ok, res = pcall(cjson.decode, clean)
-    return ok and type(res) == "table" and res or {}
+    if ok and type(res) == "table" then return res end
+    return salvage(clean)
 end
+
+M.parse = decode
 
 function M.run(path)
     local raw, err = M.raw(path)
