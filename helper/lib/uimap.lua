@@ -1,7 +1,7 @@
 -- uimap: 图标/按钮视觉定位库 —— 从截图里找出「可点击元素」的位置，产出 map 文件。
 --
 -- 目标：不靠 OCR 猜坐标，也不用 xdotool 式固定坐标硬编码，而是
---   截图 → 找图标 → 悬停确认 → 读 tooltip 取名 → 落盘 app_name_map.lua
+--   截图 → 找图标 → 悬停确认 → 读 tooltip 取名 → 落盘 app_<class>_map.lua
 -- 之后 helper/wechat.lua 之类只要 `click({app="wechat", name="聊天记录"})` 即可。
 --
 -- 分工（本文件只做纯逻辑，不碰 FFI/窗口/鼠标，方便单测）：
@@ -21,7 +21,7 @@
 --   9. label        用 OCR 文本给槽位取名（裁剪/扩边由动作层负责）
 --  10. serialize    给出稳定字段序的 Lua 源码，写回 map 文件（可重复 diff）
 --
--- 产出文件 helper/lib/app_name_map.lua 形如：
+-- 产出文件 helper/lib/app_<class>_map.lua 形如：
 --   apps.wechat = { window = {...}, buttons = { [i] = { name, x, y, w, h,
 --                 region = "rail"|"toolbar", verified = true|false,
 --                 hover = true, hover_kind = "tip"|"panel"|"none", hover_text = "OCR 原文" } } }
@@ -40,20 +40,24 @@
 --
 -- ★ 真源规则（改坐标只改这一处）
 --
---   真源 = 本文件的 STATIC_REGIONS[app]  ← agent 唯一该手写的坐标表
---   产物 = helper/lib/app_name_map.lua   ← learn/hover/save 用 serialize 整份重写
+--   真源 = helper/lib/apps/<class>.lua    ← agent 唯一该手写的坐标表（每个 app 一份）
+--   产物 = helper/lib/app_<class>_map.lua ← learn/hover/save 用 serialize 整份重写
+--
+--   本文件（引擎）不含任何具体 app 的坐标；按 class 用 M.static_regions(class)
+--   加载 helper/lib/apps/<class>.lua（返回 { static = { <name> = {x0,y0,x1,y1,note} } }）。
+--   新增 app = 新增一个 apps/<class>.lua，引擎不用改。
 --
 --   所以别直接改产物：下一次 learn 会把它覆盖，改动就没了（搜索框曾这样丢过）。
---   要调 B 类坐标，改 STATIC_REGIONS → 重跑生成脚本 → 产物自动带上。
+--   要调 B 类坐标，改 apps/<class>.lua → 重跑生成脚本 → 产物自动带上。
 --
 --   生成流程：
 --     1. agent 截图 read + OCR 确定 B 类的 x0,y0,x1,y1
---     2. 写进 STATIC_REGIONS（带 note，写明为什么不能靠 hover）
---     3. 跑 learn（全量发现）或 save（只重写文件）→ 生成 app_name_map.lua
+--     2. 写进 helper/lib/apps/<class>.lua（带 note，写明为什么不能靠 hover）
+--     3. 跑 learn（全量发现）或 save（只重写文件）→ 生成 app_<class>_map.lua
 --     4. 重跑 learn 应得到同一份产物（幂等），否则说明合并逻辑漏了键
 --
---   合并规则 M.inject_static：只覆盖 `old == nil` 或 `old.static == true` 的键。
---     - B 类每次重跑都被脚本值刷写 → 幂等 ✅
+--   合并规则 M.inject_static：脚本对这些键是真源，同名旧值一律覆盖并补 static=true。
+--     - B 类每次重跑都被脚本值刷写 → 幂等 ✅（旧值丢了 static 标记也照样修回）
 --     - A 类实测出来的 rail/toolbar 无 static 标记 → 不被误伤 ✅
 --     - learn 顺序：prev 补缺 → inject_static → args.regions（人工临时覆盖优先）
 --   认错的名字直接改 map 或改 clean_name 规则，历史版本交给 git。
@@ -423,38 +427,95 @@ function M.rescale(b, from, to)
     return n
 end
 
--- 固定区域：discover 只测「成排等距的图标」，搜索框、结果面板、输入框、气泡区
--- 这类单控件或大块矩形永远测不到。所以按 class 写在这里，由生成脚本 learn/save
--- 一并落盘（真源只有这一处），调用方（helper/wechat.lua）再从 map 读，不硬编码。
--- ★ 坐标真源：B 类（悬停无反馈的大块控件）只写这里，重跑生成脚本才不会被覆盖。
---   新加 app 就加一个 STATIC_REGIONS[class]，键名与 helper/<app>.lua 里取的一致。
-local STATIC_REGIONS = {
-    wechat = {
-        search = { x0 = 90, y0 = 28, x1 = 486, y1 = 74,
-            note = "左栏顶部搜索框（标题栏下方，需真实点击而非 ctrl+f）" },
-        panel  = { x0 = 70, y0 = 80, x1 = 520, y1 = 1040,
-            note = "左栏搜索结果面板" },
-        input  = { x0 = 760, y0 = 1105, x1 = 2500, y1 = 1235,
-            note = "聊天输入框" },
-        bubble = { x0 = 520, y0 = 100, x1 = 2560, y1 = 1040,
-            note = "聊天区（气泡）" },
-    },
-}
+-- 固定区域（B 类）：discover 只测「成排等距的图标」，搜索框、结果面板、输入框、
+-- 气泡区这类单控件或大块矩形永远测不到。数据按 app 拆到 helper/lib/apps/<class>.lua，
+-- 本引擎不含任何具体 app 的坐标；生成脚本 learn/save 把它们一并落盘到 map。
+local APP_DIR = (function()
+    local src = (debug.getinfo(1, "S") or {}).source or ""
+    local dir = src:match("^@(.*)[/\\][^/\\]*$")
+    return (dir or ".") .. "/apps"
+end)()
 
--- 把 static region 注入 regs：脚本是静态区的真源（覆盖旧的 static/手工项），
--- discover 实测出来的 rail/toolbar 等不同名，互不影响。
-function M.inject_static(regs, class)
-    regs = regs or {}
-    for k, v in pairs(STATIC_REGIONS[class or "wechat"] or {}) do
-        local old = regs[k]
-        if old == nil or old.static then
-            local c = {}
-            for kk, vv in pairs(v) do c[kk] = vv end
-            c.static = true
-            regs[k] = c
+local _static = {}
+
+-- 手工注册静态区域（测试/外部注入，优先于文件）：M.register_static("wechat", {...})
+function M.register_static(class, tbl)
+    _static[class] = type(tbl) == "table" and tbl or {}
+    return _static[class]
+end
+
+-- 读某 app 的静态区域：注册值 > helper/lib/apps/<class>.lua > 空表。
+-- 插件不热插拔，结果记忆化即可。
+function M.static_regions(class)
+    class = class or "wechat"
+    if _static[class] then return _static[class] end
+    local mod = loadfile(APP_DIR .. "/" .. class .. ".lua")
+    local t = {}
+    if mod then
+        local ok, m = pcall(mod)
+        if ok and type(m) == "table" then
+            t = type(m.static) == "table" and m.static or m
         end
     end
+    _static[class] = t
+    return t
+end
+
+-- 把 static region 注入 regs：脚本是这些键的真源，**无条件**覆盖同名的旧值
+-- （旧值可能是上一轮 learn 落的、已丢 static 标记的副本），并补 static=true。
+-- discover 实测出来的 rail/toolbar 等不同名的键不受影响。
+function M.inject_static(regs, class)
+    regs = regs or {}
+    for k, v in pairs(M.static_regions(class)) do
+        local c = {}
+        for kk, vv in pairs(v) do c[kk] = vv end
+        c.static = true
+        regs[k] = c
+    end
     return regs
+end
+
+-- 生成脚本的参数解析（不含任何 app 坐标，apps/<class>.lua 共用）：
+--   ./tools/lua.sh helper/lib/apps/<class>.lua                 → save（只灌静态区）
+--   ./tools/lua.sh helper/lib/apps/<class>.lua --learn         → learn（需窗口在前台）
+--   ... --app "微信"                   xdotool 能识别的窗口名（search --name），写进 map.window
+--   ... --class wechat                map 键，默认取脚本里的 class
+--   ... --buttons 'return { 搜索 = { x=287,y=51,w=392,h=35 } }'
+--                                    特殊按钮表（中心点 + 尺寸），落盘到 buttons
+--   ... --window 'return { class="wechat" }'  完整窗口描述，优先于 --app
+-- 返回 { mode="save"|"learn", app=, class=, buttons=, window= }
+function M.mapgen_args(argv, defaults)
+    local d = defaults or {}
+    local o = { mode = "save", app = d.app, class = d.class }
+    local function tbl(s, what)
+        local chunk, err = loadstring((s:gsub("^return%s*", "return ")))
+        if not chunk then error("bad " .. what .. ": " .. tostring(err)) end
+        local ok, v = pcall(chunk)
+        if not ok or type(v) ~= "table" then error("bad " .. what .. ": not a table") end
+        return v
+    end
+    local i = 1
+    argv = argv or {}
+    while argv[i] do
+        local a = tostring(argv[i]):gsub("^%-%-?", "")
+        local v = argv[i + 1]
+        if a == "learn" then
+            o.mode = "learn"
+        elseif a == "app" and v then
+            o.app = v
+        elseif a == "class" and v then
+            o.class = v
+        elseif a == "buttons" and v then
+            o.buttons = tbl(v, "--buttons")
+        elseif a == "window" and v then
+            o.window = tbl(v, "--window")
+        end
+        i = i + 1
+    end
+    -- --app 只作窗口检索名（xdotool search --name），不伪造 window：
+    -- 产物里的 window 由真实窗口/已有 map 提供，否则重跑会把 title/尺寸写残。
+    o.class = o.class or o.app
+    return o
 end
 
 -- 给一个框找最近的 OCR 文字（同行优先），用作名字候选

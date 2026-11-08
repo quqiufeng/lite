@@ -1,4 +1,4 @@
--- uimap 工具：视觉定位 → 真实点击 → 截图 diff 确认 → 写入 app_name_map.lua。
+-- uimap 工具：视觉定位 → 真实点击 → 截图 diff 确认 → 写入 app_<class>_map.lua（每 app 一文件）。
 -- 与 agent 同进程，窗口操作走 lua/ffi/x11.lua + xdo。
 local U, X, seen = nil, nil, {}
 
@@ -9,7 +9,7 @@ local function lib(env)
     local chunk, err = loadfile(dir .. "/lib/uimap.lua")
     if not chunk then error("cannot load uimap.lua: " .. tostring(err)) end
     U = chunk()
-    U.map_path = dir .. "/lib/app_name_map.lua"
+    U.map_dir = dir .. "/lib"
     return U
 end
 
@@ -19,28 +19,41 @@ local function winlib()
     return X
 end
 
-local function load_map(U)
-    local chunk = loadfile(U.map_path)
-    if not chunk then return { apps = {} } end
+-- 每个 app 一个产物文件：helper/lib/app_<class>_map.lua（顶层就是该 app 的
+-- buttons/regions/window，可直接 dofile，不再套一层 apps = { ... }）。
+local function map_path(U, app)
+    return U.map_dir .. "/app_" .. tostring(app) .. "_map.lua"
+end
+
+local function load_map(U, app)
+    local empty = { class = app, buttons = {}, regions = {} }
+    local chunk = loadfile(map_path(U, app))
+    if not chunk then return empty end
     local ok, t = pcall(chunk)
-    if not ok or type(t) ~= "table" then return { apps = {} } end
-    t.apps = t.apps or {}
+    if not ok or type(t) ~= "table" then return empty end
+    t.class = t.class or app
+    t.buttons = t.buttons or {}
+    t.regions = t.regions or {}
     return t
 end
 
-local function save_map(U, map)
-    local body = "-- 自动生成：helper/lib/uimap.lua learn 产出，勿手改坐标注释以外内容。\n"
-        .. "return " .. U.serialize(map) .. "\n"
-    local f, err = io.open(U.map_path, "w")
+local function save_map(U, app, conf)
+    conf = conf or {}
+    conf.class = conf.class or app
+    local p = map_path(U, app)
+    local body = "-- 自动生成：helper/lib/apps/" .. tostring(app)
+        .. ".lua 产出，勿手改（改脚本重跑）。\n"
+        .. "return " .. U.serialize(conf) .. "\n"
+    local f, err = io.open(p, "w")
     if not f then return false, err end
     f:write(body)
     f:close()
-    return true
+    return true, p
 end
 
 local function find_win(U, app)
-    local m = load_map(U)
-    local p = (m.apps[app] or {}).window or {}
+    local m = load_map(U, app)
+    local p = m.window or {}
     local W = winlib()
     -- 主窗口：标题 + class 同时限定；同名/同 class 的其它窗口（如「朋友圈」）用 pick=1 取候选里最大的
     local w = W.resolve({ name = p.title or app, class = p.class or app, pick = 1, viewable = p.viewable })
@@ -64,15 +77,15 @@ local actions = {}
 
 function actions.probe(args, env)
     local U = lib(env)
-    local m = load_map(U)
     local app = assert(args.app, "required: app")
+    local m = load_map(U, app)
     local w, _ = find_win(U, app)
     local shot = (args.shot or "/tmp/uimap-" .. app .. ".png")
     local ok, err = w:capture(shot)
     if not ok then error("capture failed: " .. tostring(err)) end
     local img, derr = U.load_gray(shot)
     if not img then error("decode failed: " .. tostring(derr)) end
-    local prof = (m.apps[app] or {}).regions or {}
+    local prof = m.regions or {}
     local out = {}
     for rname, r in pairs(args.regions and { [args.region or "all"] = args.regions } or prof) do
         if type(r) == "table" and r.x1 then
@@ -152,7 +165,7 @@ function actions.hover(args, env)
     local U = lib(env)
     local app = assert(args.app, "required: app")
     local w, m = find_win(U, app)
-    local A = m.apps[app] or {}
+    local A = m
     local d = require("ffi.xdo").new()
     local dwell = args.dwell or 1400
     local ww, wh = (A.window and A.window.w) or 1200, (A.window and A.window.h) or 800
@@ -271,7 +284,7 @@ function actions.hover(args, env)
     d:move_abs(park.x, park.y)
     pcall(require("ffi.xdo").sync, d)
     d:close()
-    local ok = args.write and save_map(U, m)
+    local ok = args.write and save_map(U, app, m)
     return string.format("app=%s hovered=%d reacted=%d wrote=%s\n%s", app, #pts, hits,
         tostring(ok == true or ok == nil), table.concat(row, "\n"))
 end
@@ -279,9 +292,9 @@ end
 function actions.click(args, env)
     local U = lib(env)
     local app, name = assert(args.app, "required: app"), assert(args.name, "required: name")
-    local m = load_map(U)
+    local m = load_map(U, app)
     local rec
-    for _, b in ipairs(((m.apps[app] or {}).buttons) or {}) do
+    for _, b in ipairs(m.buttons or {}) do
         if b.name == name then rec = b break end
     end
     if not rec then error("no mapped button: " .. app .. "/" .. name) end
@@ -292,9 +305,19 @@ end
 
 function actions.show(args, env)
     local U = lib(env)
-    local m = load_map(U)
     local lines = {}
-    for app, conf in pairs(m.apps) do
+    local names = {}
+    local p = io.popen('ls -1 "' .. U.map_dir .. '" 2>/dev/null')
+    if p then
+        for f in p:lines() do
+            local app = f:match("^app_(.+)_map%.lua$"):gsub("__", "_")
+            if app then names[#names + 1] = app end
+        end
+        p:close()
+    end
+    table.sort(names)
+    for _, app in ipairs(names) do
+        local conf = load_map(U, app)
         lines[#lines + 1] = app .. " window=" .. tostring(conf.window and conf.window.title)
         for _, b in ipairs(conf.buttons or {}) do
             lines[#lines + 1] = string.format("  %-14s (%4d,%4d) %dx%d verified=%s changed=%s",
@@ -307,20 +330,39 @@ end
 
 function actions.save(args, env)
     local U = lib(env)
-    local m = load_map(U)
     local app = assert(args.app, "required: app")
-    m.apps[app] = m.apps[app] or {}
-    m.apps[app].buttons = args.buttons or m.apps[app].buttons
-    if args.window then m.apps[app].window = args.window end
+    local m = load_map(U, app)
+    if args.buttons then
+        -- 按名字合并：同名覆盖字段（保留槽位序），新名字追加，绝不清空已有按钮
+        local old = m.buttons or {}
+        local idx, out = {}, {}
+        for i, b in ipairs(old) do
+            out[i] = b
+            if b.name then idx[b.name] = i end
+        end
+        for _, v in pairs(args.buttons) do
+            local c, nm = {}, v.name
+            for kk, vv in pairs(v) do c[kk] = vv end
+            if nm and idx[nm] then
+                local tgt = out[idx[nm]]
+                for kk, vv in pairs(c) do tgt[kk] = vv end
+            else
+                out[#out + 1] = c
+                if nm then idx[nm] = #out end
+            end
+        end
+        m.buttons = out
+    end
+    if args.window then m.window = args.window end
     if args.regions then
         local regs = {}
-        for k, v in pairs(m.apps[app].regions or {}) do regs[k] = v end
+        for k, v in pairs(m.regions or {}) do regs[k] = v end
         for k, v in pairs(args.regions) do regs[k] = v end
-        m.apps[app].regions = U.inject_static(regs, args.class or app)
+        m.regions = U.inject_static(regs, args.class or app)
     end
-    local ok, err = save_map(U, m)
-    if not ok then error("save failed: " .. tostring(err)) end
-    return "saved " .. U.map_path
+    local ok, p = save_map(U, app, m)
+    if not ok then error("save failed: " .. tostring(p)) end
+    return "saved " .. tostring(p)
 end
 
 -- ---- 通用发现：不依赖预置区域，纯图像 + 几何聚类 ----
@@ -448,7 +490,7 @@ function actions.learn(args, env)
                 changed = math.floor(ratio * 10000) / 10000, verified = ratio > 0.002 }
         end
     end
-    local map = load_map(U)
+    local map = load_map(U, app)
     local regs = {}
     for i, g in ipairs(groups) do
         local rname = region_name(g.rect, img)
@@ -458,17 +500,18 @@ function actions.learn(args, env)
     -- 静态区域（search/panel/input 等）由 discover 测不到，learn 不能整块覆盖：
     -- 新测到的为准，旧的（含手工/历史）在同名缺失时保留，否则每次重跑 learn 都会把
     -- search 这类 region 刷掉，调用方只能退回硬编码坐标。
-    local prev = (map.apps[app] or {}).regions or {}
+    local prev = map.regions or {}
     for k, v in pairs(prev) do if regs[k] == nil then regs[k] = v end end
     U.inject_static(regs, args.class or app)   -- search/panel/input/bubble 由脚本提供
     for k, v in pairs(args.regions or {}) do regs[k] = v end
-    map.apps[app] = { window = { title = w:name(), class = args.class, w = img.w, h = img.h },
-        regions = regs, buttons = buttons }
-    assert(save_map(U, map))
+    map.window = { title = w:name(), class = args.class, w = img.w, h = img.h }
+    map.regions = regs
+    map.buttons = buttons
+    local _, lp = save_map(U, app, map)
     local okn = 0
     for _, b in ipairs(buttons) do if b.verified then okn = okn + 1 end end
     return string.format("learned %s: %d buttons (%d verified) %dx%d -> %s",
-        app, #buttons, okn, img.w, img.h, U.map_path)
+        app, #buttons, okn, img.w, img.h, tostring(lp))
 end
 
 -- ---- 剩下 ~20% 靠眼睛：放大裁剪 + 坐标网格，read 看图后手工补录 ----
@@ -521,9 +564,8 @@ function actions.mark(args, env)
     local app = assert(args.app, "required: app")
     local items = args.items
     if type(items) ~= "table" or #items == 0 then error("required: items = {{name,x,y,w,h},...}") end
-    local m = load_map(U)
-    local conf = m.apps[app] or {}
-    m.apps[app] = conf
+    local m = load_map(U, app)
+    local conf = m
     conf.buttons = conf.buttons or {}
     local idx, added, upd = {}, 0, 0
     for i, b in ipairs(conf.buttons) do idx[b.name] = i end
@@ -535,9 +577,9 @@ function actions.mark(args, env)
         if idx[it.name] then conf.buttons[idx[it.name]] = rec; upd = upd + 1
         else conf.buttons[#conf.buttons + 1] = rec; idx[it.name] = #conf.buttons; added = added + 1 end
     end
-    assert(save_map(U, m))
+    local _, mp = save_map(U, app, conf)
     return string.format("marked %s: +%d new, %d updated -> %s (total %d)",
-        app, added, upd, U.map_path, #conf.buttons)
+        app, added, upd, tostring(mp), #conf.buttons)
 end
 
 function run(args, env)
@@ -549,7 +591,7 @@ end
 return {
     schema = {
         name = "uimap",
-        description = "视觉定位 + 真实点击确认的可点击按钮映射。action=discover 自动发现全部图标组（纯截图，不点）；learn 逐组 hover 取名 + 真点击 + diff 确认并落盘；probe 扫预置区域；verify 点击并 diff 确认；click 按名字点击；show 看映射；save 落盘 app_name_map.lua。",
+        description = "视觉定位 + 真实点击确认的可点击按钮映射。action=discover 自动发现全部图标组（纯截图，不点）；learn 逐组 hover 取名 + 真点击 + diff 确认并落盘；probe 扫预置区域；verify 点击并 diff 确认；click 按名字点击；show 看映射；save 落盘 app_<class>_map.lua（每 app 一文件）。",
         parameters = {
             type = "object",
             properties = {
@@ -575,4 +617,8 @@ return {
         },
     },
     run = run,
+    -- 生成脚本共用：apps/<class>.lua 里 tool.mapgen_args(arg, {class=...}) 解析 --app/--buttons/--learn
+    mapgen_args = function(argv, defaults, env)
+        return lib(env or { helper_dir = "helper" }).mapgen_args(argv, defaults)
+    end,
 }
