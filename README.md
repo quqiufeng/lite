@@ -260,7 +260,8 @@ lua({ code = "return #(args.text:gmatch('%S+'))", input = { text = "a b c" } })
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `DEEPSEEK_API_KEY` | — | 必需 |
+| `DEEPSEEK_API_KEY` | — | 必需；也可写在 `.env` 里由启动脚本注入 |
+| `LITE_ENV_FILE` | 自动探测 | `.env` 路径；`/dev/null` 全关。默认顺序：workspace 向上 12 级 → `~/.config/lite/.env` → `$ROOT/.env`，**已存在的环境变量优先** |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | API 地址 |
 | `DEEPSEEK_MODEL` | `deepseek-flash` | 模型 |
 | `LITE_CWD` | 当前目录 | workspace |

@@ -31,7 +31,7 @@ export LUA_CPATH="$ROOT/third_party/cjson/lua/5.1/?.so;$ROOT/build/?.so;$ROOT/li
 
 # 预加载只做「把调用方给的绝对路径列表 dlopen 成 RTLD_GLOBAL」，
 # 列表本身由 tools/lua.sh 计算；这里没有 workspace 概念的副作用。
-PRELUDE='local f = require("ffi") local l = os.getenv("LITE_PRELOAD") if l and l ~= "" then for p in l:gmatch("[^:]+") do pcall(f.load, p, true) end end'
+PRELUDE='local f = require("ffi") local l = os.getenv("LITE_PRELOAD") if l and l ~= "" then local w = os.getenv("LITE_PRELOAD_WARN") == "1" for p in l:gmatch("[^:]+") do local ok, e = pcall(f.load, p, true) if not ok and w then io.stderr:write("lite: preload failed: " .. p .. ": " .. tostring(e) .. "\n") end end end'
 case "${1:-}" in
     -v|--version|-h|--help|-b) exec "$LUA" "$@" ;;
 esac

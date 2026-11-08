@@ -2255,6 +2255,29 @@ do
     check(shrun("cd " .. shq(lroot) .. " && " .. shq(lua_sh) .. " -e "
         .. shq('print((os.getenv("LITE_PRELOAD") or "") == "" and "clean" or "dirty")'))
         == "dirty", "lua.sh preloads bundled so")
+    -- .env → 脚本环境：插件里直接 os.getenv("DEEPSEEK_API_KEY")，不用自己读文件
+    local envws = dir .. "/envws"
+    os.execute("mkdir -p " .. shq(envws))
+    put(envws .. "/.env", "# keys\nLITE_T_KEY=from-file\nLITE_T_QUOTED=\"a b\"\nLITE_T_KEEP=from-file\n")
+    check(shrun("cd " .. shq(envws) .. " && " .. shq(lua_sh) .. " -e "
+        .. shq('print(os.getenv("LITE_T_KEY"))')) == "from-file", "lua.sh exports .env keys")
+    check(shrun("cd " .. shq(envws) .. " && " .. shq(lua_sh) .. " -e "
+        .. shq('print(os.getenv("LITE_T_QUOTED"))')) == "a b", "lua.sh strips .env quotes")
+    check(shrun("cd " .. shq(envws) .. " && LITE_T_KEEP=from-env " .. shq(lua_sh) .. " -e "
+        .. shq('print(os.getenv("LITE_T_KEEP"))')) == "from-env", "real env beats .env")
+    check(shrun("cd " .. shq(envws) .. " && LITE_ENV_FILE=/dev/null " .. shq(lua_sh) .. " -e "
+        .. shq('print(tostring(os.getenv("LITE_T_KEY")))')) == "nil",
+        "LITE_ENV_FILE=/dev/null disables .env")
+    put(dir .. "/alt.env", "LITE_T_ALT=from-alt\n")
+    check(shrun("cd / && LITE_ENV_FILE=" .. shq(dir .. "/alt.env") .. " " .. shq(lua_sh) .. " -e "
+        .. shq('print(os.getenv("LITE_T_ALT"))')) == "from-alt", "LITE_ENV_FILE picks one file")
+    -- 预加载失败要吭声（缺依赖/架构不符），否则只看到 ffi.load 报错却不知为何
+    check(shrun("LITE_PRELOAD_WARN=1 LITE_PRELOAD=/nonexistent/liblite_zzz.so " .. shq(lroot .. "/tools/lite-lua") .. " -e "
+        .. shq('print("ran")')):find("preload failed", 1, true) ~= nil,
+        "preload failure is reported")
+    check(shrun("LITE_PRELOAD_WARN=0 LITE_PRELOAD=/nonexistent/liblite_zzz.so " .. shq(lroot .. "/tools/lite-lua")
+        .. " -e " .. shq('print("ran")')) == "ran", "LITE_PRELOAD_WARN=0 silences it")
+
     -- 仓库内部调用（run.sh/test.sh/check_deps.sh）保持精简，不带 workspace 路径与预加载
     check(shrun(shq(lroot .. "/tools/lite-lua") .. " -e "
         .. shq('print((os.getenv("LITE_PRELOAD") or "") == "" and "clean" or "dirty")')) == "clean",
@@ -3922,6 +3945,33 @@ do
 
     os.getenv = real_getenv
     package.loaded["core.http"] = real_http
+end
+
+-- 规范：密钥只走环境变量。仓库里出现字面量 key 就是事故（会跟 git 一起飞出去）
+do
+    local leaked = {}
+    local function scan(dir)
+        local p = io.popen("find " .. shq(dir) .. " -name '*.lua' -not -path '*/dist/*' 2>/dev/null")
+        for f in p:lines() do
+            local fh = io.open(f, "r")
+            if fh then
+                local n = 0
+                for line in fh:lines() do
+                    n = n + 1
+                    -- sk- 后跟 24+ 字符的 base62 才是真 key；sk-test / sk-... 这类占位放过
+                    if line:find("sk%-%w%w%w%w%w%w%w%w%w%w%w%w%w%w%w%w%w%w%w%w%w%w%w%w") then
+                        leaked[#leaked + 1] = f .. ":" .. n
+                    end
+                end
+                fh:close()
+            end
+        end
+        p:close()
+    end
+    scan(root .. "/helper")
+    scan(root .. "/lua")
+    check(#leaked == 0, "no hardcoded api key in helper/ or lua/ ("
+        .. (#leaked > 0 and table.concat(leaked, ", ") or "clean") .. ")")
 end
 
 -- entry

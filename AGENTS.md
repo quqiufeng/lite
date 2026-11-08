@@ -57,6 +57,12 @@ MUST NOT：不用 `python`/`sed -i` 改仓库文件（用 `edit`/`write`）；�
 Chrome/WebView/CEF/Electron；不起 `xdotool/wmctrl/import`；不用 `systemd --user`；
 不用 `pkill -f`；不把 API Key 或 `$ROOT/lib` 写进仓库/`LD_LIBRARY_PATH`。
 
+**密钥规范**：密钥只活在环境变量里。人写 `~/.config/lite/.env`（或 workspace `.env`），
+`tools/lua.sh` / `run.sh` 启动时注入进程环境，脚本和插件一律 `os.getenv` 读；
+仓库文件里不出现字面量 key、不 `print` key、不把 key 拼进命令行参数（`ps` 可见）。
+`tools/auto_unit.lua` 里有一条机械检查扫 `helper/` + `lua/` 的 `sk-` 字面量，
+占位符（`sk-test`、`sk-...`）放过。
+
 ## 5 命令
 
 ```bash
@@ -100,7 +106,10 @@ wrapper 返回 `{ run=function(args,env) ... end }`；重新 build 生成新 `.s
 但可按名调用，重启后进列表。运行时要试新代码走 `lua` 工具（进程外
 `tools/lua.sh -e`，`args` 走 `LITE_LUA_ARGS` JSON，默认 30s 超时，审批同 `bash`），
 **这是唯一动态出口**；改 C `.so` 或插件要生效都得重启。入口分两个：`tools/lua.sh`
-给插件/脚本（`LITE_CWD`、workspace `?.lua`/`?.so`、预加载 `liblite_*.so`），
+给插件/脚本（`LITE_CWD`、workspace `?.lua`/`?.so` + `helper/lib/?.lua`、预加载
+`liblite_*.so` 与 workspace `build|lib|helper/*.so`、自动读 `.env`：cwd 向上 12 级 →
+`~/.config/lite/.env` → 仓库 `.env`，已设变量优先；`LITE_ENV_FILE=路径` 只读该文件、
+`/dev/null` 全关；预加载失败写 stderr，`LITE_PRELOAD_WARN=0` 静音），
 `tools/lite-lua` 给仓库内部脚本（干净，不继承 workspace 状态）。
 
 **hook 插件**：只返回 `hooks`（`before_tool` / `after_tool` / `on_user_turn` /
@@ -130,6 +139,13 @@ hook 错误一律 fail-open（记 `_hook_errors`，不炸 agent）。`has_hooks(
    `pcall(mod.run, args, env)`。
 6. 回流 —— `nil`→`(helper returned nil)`；抛错→`error: helper <name>: ...`；
    否则 `truncate`(≤32KB) → `error_hint`（同调用失败计数）→ 回消息。
+
+**插件要密钥怎么办**：只读环境变量，不读文件、不内置。插件在 agent 进程里跑，
+`run.sh` 启动时已把 `.env`（`~/.config/lite/.env` / workspace `.env`）灌进环境，
+所以 `helper/*.lua` 里 `os.getenv("DEEPSEEK_API_KEY")` 直接可用；缺 key 时
+`error` 里写清变量名和"写进 `~/.config/lite/.env`"，别打印别的前缀/后缀片段。
+独立脚本走 `tools/lua.sh`，同样自动带 `.env`。共用逻辑（key 读取、错误表、
+重试）放 `helper/lib/<vendor>.lua`（见 `helper/lib/deepseek.lua`）。
 
 所以「不热插拔」只针对第 2 步的**工具清单**：改插件实现立刻生效（第 5 步重读），
 新建/删除 `.lua` 才需要重启；钩子走 `has_hooks`（`:1366`）旁路，与工具派发无关。

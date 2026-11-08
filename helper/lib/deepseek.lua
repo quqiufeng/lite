@@ -26,8 +26,9 @@ function M.key()
     if not key or key == "" then key = os.getenv("LITE_DEEPSEEK_API_KEY") end
     if not key or key == "" then
         return nil, "error: DeepSeek Search/Fetch need DEEPSEEK_API_KEY "
-            .. "(export DEEPSEEK_API_KEY=sk-... in the shell that starts lite, "
-            .. "or LITE_DEEPSEEK_API_KEY). Nothing else is required."
+            .. "(put DEEPSEEK_API_KEY=sk-... in ~/.config/lite/.env or the "
+            .. "workspace .env, or export it / LITE_DEEPSEEK_API_KEY in the "
+            .. "shell that starts lite). Nothing else is required."
     end
     return key
 end
