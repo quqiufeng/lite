@@ -369,13 +369,19 @@ function M.run(ctx, agent, memory, opts)
 
     local function cancel()
         if not busy then return end
+        -- 双 Esc 的语义是终止本轮。不要依赖 coroutine 再走一次错误收尾：
+        -- HTTP/工具阶段不同，resume 失败时 busy 会残留，输入框就像死了一样。
+        -- 先把所有在途资源取消，再无条件清 TUI 状态。
         if active_req and multi then
             http.cancel(multi, active_req)
             active_req = nil
-            resume_agent(nil, "cancelled")
-        else
-            transcript:add("info", "tool 执行中，无法中断")
         end
+        if active_proc then
+            active_proc:cancel()
+            active_proc = nil
+        end
+        finish_agent()
+        if start_next then start_next() end
     end
 
     local function load_diff()
