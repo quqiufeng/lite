@@ -8,16 +8,28 @@ local function env(k, d)
   return d
 end
 
+-- 分段是自适应的（VAD 在前台 bash 里逐帧做）：说完一段静音 LITE_VOICE_TAIL 秒
+-- 才收尾转写，所以一句话说完前不会被打断；LITE_VOICE_CHUNK 只是单段上限。
 function M.cfg()
-  return {
+  local c = {
     mic    = env("LITE_VOICE_MIC", env("VOICE_MIC_DEV", "default")),
     bin    = env("SENSEVOICE_BIN", "/opt/SenseVoice.cpp/bin/sense-voice-main"),
     model  = env("SENSEVOICE_MODEL", "/data/models/sense-voice-small-q4_k.gguf"),
     lang   = env("SENSEVOICE_LANG", "auto"),   -- auto 可辨 zh/en/yue/ja/ko
     thread = env("SENSEVOICE_THREADS", "4"),
-    secs   = tonumber(env("LITE_VOICE_CHUNK", "5")) or 5,
+    secs   = tonumber(env("LITE_VOICE_CHUNK", "20")) or 20,   -- 单段最长秒数
     gate   = tonumber(env("LITE_VOICE_GATE", "-38")) or -38,
+    tail   = tonumber(env("LITE_VOICE_TAIL", "1.5")) or 1.5,  -- 尾静音多少秒收一段
+    minlen = tonumber(env("LITE_VOICE_MIN", "2")) or 2,       -- 单段最短秒数
   }
+  local frame = 0.5                       -- 逐帧判定粒度：0.5s
+  c.frame = frame
+  c.tailf = math.max(1, math.ceil(c.tail / frame))
+  c.minf  = math.max(1, math.ceil(c.minlen / frame))
+  c.maxf  = math.max(c.minf + 1, math.ceil(c.secs / frame))
+  -- dB 门限换算成 s16 满量程 32768 下的 RMS 振幅
+  c.thr = math.max(1, math.floor(32768 * 10 ^ (c.gate / 20)))
+  return c
 end
 
 local function exists(p)
@@ -48,24 +60,61 @@ function M.clean(s)
   return s
 end
 
+-- 逐帧 VAD 分段：ffmpeg 持续出 16k/mono/s16le 裸流 → 每 0.5s 一帧算 RMS →
+-- 有声帧攒进 seg.pcm，尾静音满 tailf 帧才收尾；短于 minf 帧的碎片直接丢，
+-- 连续说到 maxf 帧强制切。转写在后台并发（最多 2 个），不堵录音管道。
 local function script(c, dir)
   return (string.format([==[
 #!/bin/bash
 cd "%s" || exit 1
-while [ ! -f stop ]; do
-  rm -f seg.wav
-  ffmpeg -hide_banner -loglevel error -f pulse -i "%s" -ar 16000 -ac 1 -t %d -y seg.wav 2>>ff.log
-  if [ ! -s seg.wav ]; then echo "rec-fail" >> err.log; sleep 0.3; continue; fi
-  rms=$(ffmpeg -hide_banner -i seg.wav -af volumedetect -f null - 2>&1 | awk '/mean_volume/{print $5}' | tail -1)
-  if [ -z "$rms" ]; then rms=-99; fi
-  if awk -v r="$rms" -v t="%s" 'BEGIN{exit !(r>t+0)}'; then
-    out=$("%s" -m "%s" -f seg.wav -l %s -t %s 2>>err.log)
-    if [ -n "$out" ]; then
-      printf '%%s\n' "$out" >> inbox.txt
+FR=16000            # 0.5s s16le 16k mono
+TAIL=%d
+MINF=%d
+MAXF=%d
+THR=%d
+n=0; active=0; len=0; sil=0
+rm -f seg.pcm frame.pcm seg.*.pcm seg.*.wav
+
+flush() {
+  local f="seg.$n"
+  active=0; len=0; sil=0
+  if [ ! -s seg.pcm ]; then return; fi
+  mv -f seg.pcm "$f.pcm"
+  n=$((n+1))
+  while [ "$(jobs -rp | wc -l)" -ge 2 ]; do wait -n 2>/dev/null || break; done
+  (
+    if ffmpeg -nostdin -hide_banner -loglevel error -f s16le -ar 16000 -ac 1 -i "$f.pcm" -y "$f.wav" 2>>err.log < /dev/null; then
+      out=$("%s" -m "%s" -f "$f.wav" -l %s -t %s 2>>err.log < /dev/null)
+      [ -n "$out" ] && printf '%%s\n' "$out" >> inbox.txt
+    else
+      echo "conv-fail" >> err.log
     fi
+    rm -f "$f.pcm" "$f.wav"
+  ) &
+}
+
+while [ ! -f stop ]; do
+  if ! dd of=frame.pcm bs=$FR count=1 iflag=fullblock 2>/dev/null; then break; fi
+  if [ "$(stat -c %%s frame.pcm)" -lt $FR ]; then break; fi
+  r=$(od -An -v -td2 frame.pcm | awk '{for(i=1;i<=NF;i++){v=$i; s+=v*v; k++}} END{printf "%%d", (k?sqrt(s/k):0)}')
+  if [ "${r:-0}" -lt $THR ]; then
+    if [ $active -eq 1 ]; then
+      cat frame.pcm >> seg.pcm
+      len=$((len+1)); sil=$((sil+1))
+      if [ $sil -ge $TAIL ]; then
+        if [ $len -ge $MINF ]; then flush; else active=0; len=0; sil=0; rm -f seg.pcm; fi
+      fi
+    fi
+  else
+    if [ $active -eq 0 ]; then active=1; len=0; sil=0; rm -f seg.pcm; fi
+    cat frame.pcm >> seg.pcm
+    len=$((len+1)); sil=0
+    if [ $len -ge $MAXF ]; then flush; fi
   fi
-done
-]==], dir, c.mic, c.secs, c.gate, c.bin, c.model, c.lang, c.thread))
+done < <(ffmpeg -nostdin -hide_banner -loglevel error -f pulse -i "%s" -ar 16000 -ac 1 -f s16le pipe:1 2>>ff.log)
+if [ $active -eq 1 ] && [ $len -ge $MINF ]; then flush; fi
+wait
+]==], dir, c.tailf, c.minf, c.maxf, c.thr, c.bin, c.model, c.lang, c.thread, c.mic))
 end
 
 -- 识别输入框里的语音指令：整行是标记，或标记跟在本轮转写文字后面
@@ -114,6 +163,8 @@ function M.stop()
   if f then f:write("1") f:close() end
   if M.pid then os.execute("kill " .. M.pid .. " 2>/dev/null") end
   M.handle, M.pid = nil, nil
+  -- 外部(插件等)停语音时通知 UI 同步状态,避免 TUI 以为还在听
+  if M.on_stop then pcall(M.on_stop) end
   return true
 end
 

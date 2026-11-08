@@ -344,6 +344,8 @@ function M.run(ctx, agent, memory, opts)
         if not voice then voice = require("core.voice") end
         return voice
     end
+    -- 外部(插件,例如 music 播放)停掉语音时同步 TUI 状态
+    vmod().on_stop = function() voice_on = false end
 
     local function submit()
         local text = composer:get_text()
