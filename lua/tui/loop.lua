@@ -716,8 +716,18 @@ function M.run(ctx, agent, memory, opts)
 
         if voice_on and voice then
             local got = voice.poll()
+            -- 默认转写即执行（等于替你按回车）；LITE_VOICE_AUTO_SEND=0 退回「只填入输入框」。
+            local auto = os.getenv("LITE_VOICE_AUTO_SEND") ~= "0"
             for _, t in ipairs(got) do
-                composer:insert(t .. " ")
+                if auto then
+                    t = (t:gsub("%s+$", ""))
+                    if t ~= "" then
+                        composer:insert(t)
+                        submit()
+                    end
+                else
+                    composer:insert(t .. " ")
+                end
             end
             if #got > 0 then draw() end
         end
