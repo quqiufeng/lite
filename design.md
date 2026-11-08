@@ -1137,7 +1137,7 @@ UI 侧按 `AGENTS.md` §4 的铁律用 `tmux capture-pane` 或 `--tui --snapshot
 **两个入口** —— `tools/lua.sh` 给插件/脚本用：`cd` 到 `LITE_CWD`（默认 `$PWD`），把
 workspace 的 `?.lua` / `?.so` 前置进 `package.path`/`cpath`，并扫 `build`/`lib`/`helper`
 下的 `liblite_*.so` 塞进 `LITE_PRELOAD` 预加载；`tools/lite-lua` 只给仓库内部
-（`run.sh`/`test.sh`/`check_deps.sh`）用：只认仓库自己的 `lua/`、`automation/`、`helper/`
+（`run.sh`/`test.sh`/`check_deps.sh`）用：只认仓库自己的 `lua/`、`helper/`
 和 cjson，不继承任何 workspace 状态 —— 否则在别人仓库里跑 lite 会把对方的 `.so` 拉进来。
 
 **为什么不做热插拔** —— schema 是 system prompt 之后的第一段，任何动态插入/

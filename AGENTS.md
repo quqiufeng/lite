@@ -28,7 +28,8 @@ AI-native harness：记忆、工具、FFI、X11。
 ## 2 代码地图
 
 - `lua/main.lua`：入口；`lua/core/`：agent/tools/memory/prompt/session/compact（含 web）
-- `lua/tui/`、`lua/ffi/`、`src/{cache,image,x11}/`、`automation/`、`helper/`、`tools/`
+- `lua/tui/`、`lua/ffi/`、`src/{cache,image,x11}/`、`helper/`、`tools/`
+- `lua/ffi/x11.lua` + `xdo.lua`：**自包含单文件**（只用 LuaJIT `ffi` + 系统 libX11/libxdo，不引用 lite 代码、不注册工具），可整对拷给别的项目；`x11.lua` 靠 `require("ffi.xdo")` 找同伴，换布局要同步改这一行
 - `lua/tui/mouse.lua` + `clipboard.lua`：拖选/剪贴板；选区在 `screen.lua`
 
 ## 3 记忆

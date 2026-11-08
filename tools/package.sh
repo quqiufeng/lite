@@ -6,10 +6,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DIST="$ROOT/dist/lite-linux-x64"
 
 rm -rf "$DIST"
-mkdir -p "$DIST/lua" "$DIST/tools" "$DIST/third_party" "$DIST/automation" "$DIST/build" "$DIST/lib" "$DIST/helper" "$DIST/models"
+mkdir -p "$DIST/lua" "$DIST/tools" "$DIST/third_party" "$DIST/build" "$DIST/lib" "$DIST/helper" "$DIST/models"
 
 cp -r "$ROOT/lua/." "$DIST/lua/"
-cp -r "$ROOT/automation/." "$DIST/automation/"
 if [ -d "$ROOT/helper" ]; then
     find "$ROOT/helper" -maxdepth 1 -type f ! -name '.gitkeep' -exec cp {} "$DIST/helper/" \;
 fi

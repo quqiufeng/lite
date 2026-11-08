@@ -26,7 +26,7 @@ export LITE_ROOT="$ROOT"
 #
 # LUA_PATH / LUA_CPATH：项目路径在前，`;;` 展开默认路径，外部传入的追加在最后
 # （tools/lua.sh 就是靠这一点把 workspace 条目挂上来的）。
-export LUA_PATH="$ROOT/lua/?.lua;$ROOT/lua/?/init.lua;$ROOT/automation/?.lua;$ROOT/helper/?.lua;;${LUA_PATH:-}"
+export LUA_PATH="$ROOT/lua/?.lua;$ROOT/lua/?/init.lua;$ROOT/helper/?.lua;;${LUA_PATH:-}"
 export LUA_CPATH="$ROOT/third_party/cjson/lua/5.1/?.so;$ROOT/build/?.so;$ROOT/lib/?.so;$ROOT/helper/?.so;;${LUA_CPATH:-}"
 
 # 预加载只做「把调用方给的绝对路径列表 dlopen 成 RTLD_GLOBAL」，

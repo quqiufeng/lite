@@ -3974,6 +3974,37 @@ do
         .. (#leaked > 0 and table.concat(leaked, ", ") or "clean") .. ")")
 end
 
+-- x11/xdo 归入 lua/ffi（与 cache/image/magick/ocr 同一层）
+do
+    check(loadfile(root .. "/lua/ffi/x11.lua") ~= nil, "load lua/ffi/x11.lua")
+    check(loadfile(root .. "/lua/ffi/xdo.lua") ~= nil, "load lua/ffi/xdo.lua")
+    local stale = {}
+    for _, f in ipairs({ "x11.lua", "xdo.lua" }) do
+        local fh = io.open(root .. "/automation/" .. f, "r")
+        if fh then fh:close(); stale[#stale + 1] = f end
+    end
+    check(#stale == 0, "automation/*.lua moved into lua/ffi ("
+        .. (#stale > 0 and table.concat(stale, ", ") or "clean") .. ")")
+    local seen = {}
+    for _, name in ipairs({ "tools/see.lua", "tools/lite-lua", "tools/package.sh",
+        "lua/core/prompt.lua", "AGENTS.md", "README.md", "design.md" }) do
+        local f = io.open(root .. "/" .. name, "r")
+        if f then
+            local body = f:read("*a"); f:close()
+            if body:find("automation/x", 1, true) or body:find("automation/?.lua", 1, true)
+                or body:find('"x11"', 1, true) or body:find("$ROOT/automation", 1, true) then
+                seen[#seen + 1] = name
+            end
+        end
+    end
+    check(#seen == 0, "no stale automation/x11 reference ("
+        .. (#seen > 0 and table.concat(seen, ", ") or "clean") .. ")")
+    local x11 = io.open(root .. "/lua/ffi/x11.lua", "r")
+    local x11body = x11 and x11:read("*a") or ""
+    if x11 then x11:close() end
+    check(x11body:find('require("ffi.xdo")', 1, true) ~= nil, "ffi/x11 requires ffi.xdo")
+end
+
 -- entry
 check(loadfile(root .. "/lua/main.lua") ~= nil, "load lua/main.lua")
 

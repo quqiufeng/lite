@@ -99,7 +99,7 @@ function M.sections(ctx, opts)
         capabilities = table.concat({
             "You can act on the user's machine, not just chat:",
             "- Inspect and change the workspace with bash/read/write/edit; bash runs on the host.",
-            "- Operate local processes and network; when DISPLAY is available, use automation/x11.lua and automation/xdo.lua (LuaJIT FFI to libX11/libxdo) for window focus, mouse, keyboard, and screenshots without xdotool/wmctrl.",
+            "- Operate local processes and network; when DISPLAY is available, use ffi/x11.lua and ffi/xdo.lua (LuaJIT FFI to libX11/libxdo) for window focus, mouse, keyboard, and screenshots without xdotool/wmctrl.",
             "- Read images (JPEG/PNG/GIF/WebP), OCR Chinese/English text with the ocr tool, and resize with the bundled native image library.",
             "- Extend yourself: bind any installed system .so with LuaJIT FFI, or use native to write C/C++, compile helper/<name>.so, write a Lua wrapper + schema, and immediately call the new tool.",
             "- Maintain a todo list and persist/recall durable facts in workspace memory.",

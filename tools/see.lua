@@ -15,10 +15,9 @@
 
 package.path = (arg[0]:match("^(.*)/[^/]+$") or ".") .. "/../lua/?.lua;"
     .. (arg[0]:match("^(.*)/[^/]+$") or ".") .. "/../lua/?/init.lua;"
-    .. (arg[0]:match("^(.*)/[^/]+$") or ".") .. "/../automation/?.lua;"
     .. package.path
 
-local x11 = require("x11")
+local x11 = require("ffi.x11")
 local Tools = require("core.tools")
 
 local opt = {}

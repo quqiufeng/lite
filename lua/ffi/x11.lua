@@ -3,8 +3,7 @@
 -- 原生自动化：不启动 xdotool / wmctrl 进程，
 -- 直接调 libxdo，因此在 luajit -e 里做动态测试非常快。
 --
---   package.path = "/home/quqiufeng/Desktop/reader/automation/?.lua;" .. package.path
---   local x11 = require("x11")
+--   local x11 = require("ffi.x11")
 --   local w = assert(x11.window("native-reader"))
 --   w:center(); w:capture("/tmp/opencode/native_reader.png")
 --   w:click(120, 240); w:key("ctrl+l"); w:type("hello")
@@ -13,7 +12,7 @@
 -- 注意：native_reader 优先使用应用自截图（SDL_RenderReadPixels），X11 截图仅作兜底。
 
 local ffi = require("ffi")
-local Xdo = require("xdo")
+local Xdo = require("ffi.xdo")
 
 local M = {}
 
@@ -273,8 +272,8 @@ function M.capture_screen(path)
 end
 
 -- 便于 luajit -e 的一行式：
---   luajit -e 'package.path=".../automation/?.lua;"..package.path;
---     require("x11").window("native-reader"):center():capture("/tmp/native_reader.png")'
+--   luajit -e 'package.path=".../lua/?.lua;"..package.path;
+--     require("ffi.x11").window("native-reader"):center():capture("/tmp/native_reader.png")'
 function M.once(title, path)
     local w = assert(M.window(title or "reader"))
     if path then w:capture(path) end

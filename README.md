@@ -192,7 +192,7 @@ local lib = ffi.load(os.getenv("LITE_ROOT") .. "/lib/liblite_image.so")
 
 约定：FFI 薄封装放 `lua/ffi/<feature>.lua`（`M.available()` + `M.<op>()` 返回 `true` 或 `false, err`），业务工具在 `lua/core/tools.lua` 暴露；复杂 ABI/热路径才写 `src/<feature>/` C shim。打包只复制非 libc 的 `.so` 到 `dist/lib/`，并用 `$ORIGIN` RPATH。参考 `src/image/image.c` + `lua/ffi/image.lua`。
 
-`automation/xdo.lua` + `automation/x11.lua` 已经用同样方式封装 libX11/libxdo（窗口、鼠标、键盘、截图），模型可以直接 `require("x11")` / `require("xdo")`，不必启动 xdotool/wmctrl。
+`lua/ffi/xdo.lua` + `lua/ffi/x11.lua` 已经用同样方式封装 libX11/libxdo（窗口、鼠标、键盘、截图），模型可以直接 `require("ffi.x11")` / `require("ffi.xdo")`，不必启动 xdotool/wmctrl。这两个文件都是自包含单文件：除了 LuaJIT 自带的 `ffi` 和系统 `libX11`/`libxdo`，不引用任何 lite 代码，也不注册工具，纯库。所以想拿去别的项目用，整对拷过去就行（`x11.lua` 里只有一行 `require("ffi.xdo")` 依赖同伴位置；平铺到 `?.lua` 根目录时同步改这一行）。反方向也成立：删掉 lite 的其余部分，这两个文件照样能 require。
 
 Lua 层（FFI 封装、tools、prompt）可以清 `package.loaded[...]` 后重新 `require` 热重载，不用重启；TUI 里输入 `/reload` 即可。已 `ffi.load` 的 C `.so` 不会卸载，C 代码改动需要重启。原生 FFI 在进程内执行，不经过 bwrap 沙箱，敏感操作仍应走审批/沙箱。
 
@@ -317,7 +317,7 @@ lua({ code = "return #(args.text:gmatch('%S+'))", input = { text = "a b c" } })
 | 项 | 说明 | 缺失后果 |
 |---|---|---|
 | `libcurl` | DeepSeek HTTP/SSE | 无法调用 API |
-| `libX11` / `libxdo` | 截图、窗口、鼠标键盘（`automation/*.lua` 走 FFI） | 无 `x11`/`xdo` 能力，其余照常 |
+| `libX11` / `libxdo` | 截图、窗口、鼠标键盘（`lua/ffi/*.lua` 走 FFI） | 无 `x11`/`xdo` 能力，其余照常 |
 | `libgomp`（OpenMP） | KV cache 并行 | 加载失败 |
 
 检查：`./tools/check_deps.sh`
