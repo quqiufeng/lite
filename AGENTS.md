@@ -87,27 +87,79 @@ Chrome/WebView/CEF/Electron；不起 `xdotool/wmctrl/import`；不用 `systemd -
 
 ## 6 原生扩展
 
+**两条通道，别混**：`tools/` 是**人设计实现的专业插件**——提前写、要过 `tools/test.sh`、
+进版本控制、接口稳定、必须有文档；`helper/` 是**大模型自己发挥的**——会话里临时起意就写，
+允许粗糙、允许下次删掉，按名即调、不承诺稳定，只受 `sk-` 字面量机械检查约束。
+判据：这东西「下个会话/下个用户也该有」→ 升级进 `tools/` 并补测试与文档；只有当前任务
+有价值 → 留在 `helper/` 用完即弃。
+
+注意发现机制：插件只扫 `<cwd>/helper` → `$LITE_ROOT/helper`（`lua/core/tools.lua:_helper_roots`），
+**`tools/` 里的 `.lua` 不会被当插件加载**（那是 build/test/run/release 这类仓库脚本）。
+现有 adb/wechat/music/search/fetch/tokens/uimap/usb 八个住 `helper/`，因为发现只认那里。
+
+**缺能力先造，别降级**（自我进化流程）。碰到「这个命令没装 / 这个库没有 / 内置工具缺这个
+动作」时，不许手工硬凑、更不许直接回「做不到」——按下表走一遍。整条链**会话内**可用，
+不需要重启：
+
+| 步 | 动作 | 怎么落 |
+|---|---|---|
+| 1 判 | 内置工具能覆盖？系统已有 `.so` 能 `ffi.load`？`helper/` 里已经有？（`lite plugins` / `ldconfig -p \| grep`） | 三者都不行才造 |
+| 2 估 | 只跑一次的用 `lua` 内联；会反复用的才落 `helper/` | 代价/收益判定见 `design.md:8.37` |
+| 3 写 | C/C++ 导出 `char *lite_helper(const char *input)` + `lite_helper_free`，输入输出 UTF-8/JSON | `native action=build name=x lang=c libs=["pthread"]` |
+| 4 验 | `native action=run` 喂真实输入，**先看返回串**再信它；空结果 / 非法输入 / 超限三种边界都跑 | 报错就改源码重 build |
+| 5 接 | `native action=wrap` 生成 `helper/<name>.lua` + schema，或手写 `{schema=...,run=...}` | 立刻按名可调 |
+| 6 记 | 用法与坑写进文件头注释 + `remember`；反复踩的补进本节 | 别让下个会话重踩 |
+
+三条真踩过的工程约束：
+
+- **JSON 键名不能和数组同名**：`{"hits":[...],"hits":3}` → cjson 取后者，数组被覆盖成数字。
+  计数器改叫 `count`。
+- **错误必须可自修**：缺参数时回 `required: pattern (string)`（原参数 + 缺哪个键），
+  别让调用方猜；退出码语义走 `tools.exit_note`。
+- **每次 build 出新 `.so`**：`helper/<name>-<epoch>.so`，下次调用自动用最新的；
+  旧版本留着无害，定位靠 `helper/<name>.lua`。
+
+**「清单冻结」≠ 能力封顶**：只有 API `tools` 的自动发现被冻结（保前缀缓存），
+`native run` / `lua`（`ffi.load` 最新 `.so`、`loadfile` 插件）都是会话内动态出口，
+新工具**按名调用立刻可用**，重启后才出现在模型可见清单里。所以发现能力缺口的正确
+反应是「写一个」，不是「等重启」或「做不到」。范例：`rg` 没装 → `helper/cgrep.c`
+（pthread + regex，59 个 lua 文件 1ms）→ `helper/cgrep.lua` 包一层 → 当场调用。
+
 系统有 `.so` 就直接 `ffi.cdef` + `ffi.load`，封装放 `lua/ffi/<feature>.lua`，
 工具在 `lua/core/tools.lua` 暴露；复杂 ABI/热路径才写 `src/<feature>/`。
 
 - C ABI：`int lite_<feature>_...` + `const char *lite_<feature>_error(void)`。
 - `.so` 用 `$ORIGIN` RPATH；打包只复制非 libc 依赖到 `dist/lib/`。
 - 大库/模型不随包：见 `README.md` 的 `ort_link.sh`、`cuda_provider.sh`、`LITE_DIST_WITH_*`。
-- 热重载：Lua 清 `package.loaded[...]` 后 require；TUI `/reload`。C `.so` 改完要重启。
-  `/reload` 只重载 `core.tools` / `core.prompt` / `ffi.*`，**不重扫插件快照**。
+- 热重载：Lua 清 `package.loaded[...]` 后 require；TUI `/reload` 只重载 `core.tools` /
+  `core.prompt` / `ffi.*`，**不重扫插件快照**。进程内 `ffi.load` 过的同路径 `.so` 换不掉，
+  但 `native build` 每次出新文件名（`<name>-<ts>.so` + `<name>.json` 清单），下一次
+  helper 调用按清单重新 `ffi.load` → **不用重启**。
 
 `native` 自造工具：`build` / `run` / `wrap`；ABI 为
 `char *lite_helper(const char *input)` + 可选 `lite_helper_free`（UTF-8/JSON）。
 插件发现 `<workspace>/helper` → `$LITE_ROOT/helper`；`scope=local|global` 控制写入侧。
 wrapper 返回 `{ run=function(args,env) ... end }`；重新 build 生成新 `.so`，免重启。
 
-**插件不热插拔**（`design.md:8.35`）：`helper/*.lua` 里返回
+**只有清单冻结，派发全是动态的**（`design.md:8.35`）：`helper/*.lua` 里返回
 `{ schema={...}, run=function(args,env) end }` 即可同时声明工具名和实现
-（`.tool.json` 写法仍可用、优先）。schema 只在会话启动扫一次并记忆化，之后每轮
-`schemas()` 用快照 —— 运行时新建/删除 `.lua` 不影响工具列表（避免打掉前缀缓存），
-但可按名调用，重启后进列表。运行时要试新代码走 `lua` 工具（进程外
-`tools/lua.sh -e`，`args` 走 `LITE_LUA_ARGS` JSON，默认 30s 超时，审批同 `bash`），
-**这是唯一动态出口**；改 C `.so` 或插件要生效都得重启。入口分两个：`tools/lua.sh`
+（`.tool.json` 写法仍可用、优先）。**冻结的只是 API `tools` 字段**：schema 在会话启动
+扫一次并 memo（`_helper_cache`），之后 `schemas()` 用快照 —— 保前缀缓存，新建/删除
+`.lua` 不会自己冒进清单。**执行侧每次调用都读盘**：`_run_helper_tool` →
+`_helper_find`（`file_size` 现查磁盘）→ `loadfile`（每次重读）→ `.so` 按
+`<name>.json` 清单重新 `ffi.load`。所以：
+
+| 动作 | 生效时机 |
+|---|---|
+| 改已存在插件的 `run` | 立刻，下次调用 |
+| 新建 `helper/x.lua` / `native wrap` | 立刻，**按名调用即可**（模型看不见描述，由 `native` 输出/你点名） |
+| `native build` 出新 `.so` | 立刻，下次调用换新句柄 |
+| 想让新工具**出现在 API 清单** | 新会话（或 system prompt 里点名） |
+| 删插件 | 立刻不可调用；清单里残留的 schema 会报 `helper not found` |
+
+所以「不热插拔」只指工具清单，不是能力。要试新代码而不想动进程，走 `lua` 工具（进程外
+`tools/lua.sh -e`，`args` 走 `LITE_LUA_ARGS` JSON，默认 30s 超时，审批同 `bash`）。
+入口分两个：`tools/lua.sh`
 给插件/脚本（`LITE_CWD`、workspace `?.lua`/`?.so` + `helper/lib/?.lua`、预加载
 `liblite_*.so` 与 workspace `build|lib|helper/*.so`、自动读 `.env`：cwd 向上 12 级 →
 `~/.config/lite/.env` → 仓库 `.env`，已设变量优先；`LITE_ENV_FILE=路径` 只读该文件、

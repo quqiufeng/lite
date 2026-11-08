@@ -1255,3 +1255,38 @@ field, which is authoritative:` 再跟纯名字（实测 `#sec.tools` 从 ~1.2k 
 **当前回归** —— `./tools/test.sh`：单元 662 项 + `cli.json` / `tui.smoke` /
 `serve.probe` / `serve.smoke` 全通过（`[verified]` 2026-11-07）。§8.30 / §8.33 里的
 "385 项"/"424 项"是各自落地时的历史数字，不再逐节回填。
+
+### 8.37 缺能力先造：自我进化流程（已落地，文档层面）
+
+**问题** —— 模型碰见"本机上没有的能力"会退化成"告警 + 给建议"，而不是自己补上。根因是
+AGENTS.md 只列了 `native` 的三个动作，没写**什么时候该造、造完怎么接**，能力上限变成暗知识。
+
+**落地** —— `AGENTS.md` §6 开头加 6 步表：判（内置工具 → 系统 `.so` → `helper/`，三者都不行
+才造）/ 估（一次性的走 `lua` 内联，反复用的才落盘）/ 写（`char *lite_helper(const char*)` +
+`lite_helper_free`）/ 验（`native run` 喂真实输入 + 空结果/非法输入/超限三边界）/ 接
+（`wrap` 或手写 `{schema,run}`，立刻按名可调）/ 记（坑写进 `knowledge`）。三条工程约束同步
+写进去：JSON 键名不能与数组同名（cgrep 的 `hits` × 计数器 → 计数器改名 `count`）、错误必须
+可自修（带 `required: key (type)`，同调用失败计数由 `error_hint` 追加）、每次 build 出新
+`.so` 免重启。
+
+**边界** —— 流程只保证"能造能立刻用"，不保证"进 API `tools` 清单"（§8.35 的快照冻结只冻结清单）。
+
+| 动作 | 立刻生效 | 进 API `tools`（模型自动发现/参数可靠性） |
+|---|---|---|
+| 改 `helper/x.lua` 的 `run` | 是（`M:execute` 每次 `loadfile`） | 已是工具，无需变更 |
+| 新建 `helper/x.lua` | 是（按名调用可用，实测 `[verified]`） | 需新会话/重启（`_scan_helper_schemas` 快照） |
+| `native build` 新 `.so` + `x.json` | 是（`_helper_so_abs` 现读 json，下次调用 `ffi.load`） | 同上 |
+| `native wrap` 生成 `x.lua` | 是（同上，按名调用） | 同上 |
+| 删插件文件 | 是（再调用 `unknown tool`，实测 `[verified]`） | 重启后消失 |
+
+代价：冻结清单只损失"模型自动想起这个工具、参数描述准确"这两点，前提是模型得靠显式点名
+（`lua` / `native` / 工具名直呼）走到它；所以新增工具仍建议下次会话再让模型自然使用。
+
+**验证** —— 用 cgrep（`helper/cgrep.c`，flat JSON + pthread + 跳过 `.git/build/dist`）走完整
+一轮：`native build` → `native run` → `native wrap` → 会话内 `lua` + `ffi.load` 最新 `.so`
+（`lock_busy` 5 命中 / `PROPFIND 失败` 1 命中 / `(((` 报 `required: pattern (string)`）
+`[verified]` 2026-11-08。派发动态性单独实测：构造 `Tools` 实例**之后**才写
+`helper/zzprobe.lua`，`t:execute("zzprobe")` 直接返回 `probe ok cwd=...`，删掉文件后同一实例
+再调用 → `error: unknown tool zzprobe`，而 `t:schemas()` 全程不含 `zzprobe` `[verified]`。
+
+代价判定沿用本文件 §4：加 C 模块 1.41% 收益不动手。
