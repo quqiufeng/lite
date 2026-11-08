@@ -24,7 +24,46 @@ function M.new(ctx, provider, tools, session, memory)
         memory = memory,
         session_id = ctx.session.id,
     })
+    -- [埋点] usage 第一站：包住 ctx 的回调，真 usage / 兜底估值都从这里流下来。
+    -- 下一站 agent.track_usage_day → memory:add_usage_day（按天账本）。
+    local settings = ctx.settings
+    if settings and type(settings.on_usage) == "function" then
+        local inner = settings.on_usage
+        settings.on_usage = function(u, ...)
+            inner(u, ...)
+            self:track_usage_day(u)
+        end
+    end
     return self
+end
+
+-- [埋点] usage 第二站：按本地日期累加到内存桶（不逐请求写盘）。
+function M:track_usage_day(u)
+    if type(u) ~= "table" then return false end
+    local day = os.date("%Y-%m-%d")
+    local acc = self._usage_day
+    if not acc or acc.day ~= day then
+        acc = { day = day, requests = 0, prompt = 0, completion = 0, cache_hit = 0, cache_miss = 0 }
+        self._usage_day = acc
+    end
+    for k in pairs(acc) do
+        if k ~= "day" then acc[k] = acc[k] + (tonumber(u[k]) or 0) end
+    end
+    acc.requests = acc.requests + 1
+    return true
+end
+
+-- [埋点] usage 第三站：把内存桶并进记忆（写成功后清零，失败留给下次，不丢账）。
+-- 把当日增量并进记忆桶；写成功后清零，失败留着下次重试（不丢账）。
+function M:flush_usage_day()
+    local acc = self._usage_day
+    if not acc or acc.requests <= 0 then return false end
+    if not (self.memory and self.memory.add_usage_day) then return false end
+    local ok = self.memory:add_usage_day(acc, acc.day)
+    if ok then
+        self._usage_day = { day = acc.day, requests = 0, prompt = 0, completion = 0, cache_hit = 0, cache_miss = 0 }
+    end
+    return ok
 end
 
 function M:system_prompt(active_tools)
@@ -184,7 +223,9 @@ function M:save_usage()
     if not (self.memory and self.memory.save_usage) then return false end
     local ctx = self.ctx
     if not ctx then return false end
-    return self.memory:save_usage(ctx.session.id, ctx.session.usage)
+    local ok = self.memory:save_usage(ctx.session.id, ctx.session.usage)
+    self:flush_usage_day()
+    return ok
 end
 
 function M:restore_usage()

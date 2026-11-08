@@ -337,6 +337,53 @@ function M:load_usage(session_id)
     return u
 end
 
+-- [埋点] usage 落点：`/agent/usage/day/<YYYY-MM-DD>` 是每日账本的唯一真身。
+-- 每日用量桶：`/agent/usage` 下 `day/<YYYY-MM-DD>`，跨会话累加。
+-- 会话级 usage 是"这个会话的账本"，覆盖写、跟着会话走；跨天/跨会话问
+-- "今天比昨天烧得多不多"它答不了，所以另记一条按天累加的。
+local USAGE_DAY_FIELDS = {
+    "requests", "prompt", "completion", "cache_hit", "cache_miss",
+}
+
+function M:usage_daykey(day)
+    return "day/" .. tostring(day or os.date("%Y-%m-%d"))
+end
+
+function M:add_usage_day(delta, day)
+    if type(delta) ~= "table" then return false end
+    local key = self:usage_daykey(day)
+    local cur = self:get("/agent/usage", key)
+    if type(cur) ~= "table" then cur = {} end
+    cur.day = key:sub(5)
+    for _, k in ipairs(USAGE_DAY_FIELDS) do
+        cur[k] = math.floor((tonumber(cur[k]) or 0) + (tonumber(delta[k]) or 0))
+    end
+    cur.updated = os.time()
+    return self:put("/agent/usage", key, cur, TTL.permanent)
+end
+
+function M:usage_day(day)
+    local v = self:get("/agent/usage", self:usage_daykey(day))
+    if type(v) ~= "table" then return nil end
+    return v
+end
+
+-- 最近 n 天（含今天），日期升序；没账的天跳过。
+function M:usage_days(n, now)
+    n = math.max(1, math.floor(tonumber(n) or 7))
+    now = now or os.time()
+    local out = {}
+    for i = n - 1, 0, -1 do
+        local day = os.date("%Y-%m-%d", now - i * 86400)
+        local v = self:usage_day(day)
+        if v then
+            v.day = day
+            out[#out + 1] = v
+        end
+    end
+    return out
+end
+
 local function utf8_chars(s)
     local out = {}
     local i = 1

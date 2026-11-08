@@ -1450,6 +1450,8 @@ function M:_helper_env(p)
         cwd = normalize(self.cwd):gsub("/+$", ""),
         helper_dir = p.dir or "",
         scope = p.scope,
+        -- [埋点] usage 读侧入口：插件（如 helper/tokens.lua）经 env.memory 读每日账本。
+        memory = self.memory,   -- 插件读会话/每日账本用（只读用 get/usage_day）
         ffi = ffi,
         load = function(n)
             local so, serr = self:_helper_so_abs(n)

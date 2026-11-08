@@ -215,6 +215,60 @@ function M.context_overflow(err)
         or (s:find("http 400", 1, true) ~= nil and s:find("context", 1, true) ~= nil)
 end
 
+-- provider 的 usage 是"它给才有"：include_usage 是对的，但网关改写、流被中断、
+-- 有些兼容端点根本不返回最后一个 usage chunk，账本就会开天窗。本地其实一直握着
+-- [埋点] usage 采集总入口：provider 是唯一同时看得到「发出去的 payload」和
+-- 「收回来的回复」的地方，插件拿不到，所以 token 估算只能落在这里。
+-- 下游链路：estimate_usage → opts.on_usage → agent.track_usage_day
+--          → memory:add_usage_day（/agent/usage/day/<date>）→ helper/tokens.lua 读。
+--
+-- 两个便宜的数 —— 发出去的 payload 字节数、收回来的回复字节数 —— 按 DeepSeek 的
+-- 口径（英文 ~0.3 token/字节，中文 ~0.6 token/字 ≈ 0.2 token/字节）折一下即可兜底。
+-- 标记 estimated=true，别跟真实值混着当准确账看。
+local function count_nonascii(s)
+    local _, n = tostring(s or ""):gsub("[\128-\255]", "")
+    return n
+end
+
+function M.estimate_tokens(bytes, nonascii)
+    bytes = tonumber(bytes) or 0
+    nonascii = tonumber(nonascii) or 0
+    if nonascii > bytes then nonascii = bytes end
+    -- DeepSeek 官方口径：1 个英文字符 ≈ 0.3 token，1 个中文字符 ≈ 0.6 token
+    -- （https://api-docs.deepseek.com/zh-cn/quick_start/token_usage）。
+    -- 中文 UTF-8 占 3 字节：3*0.3 - 3*0.1 = 0.6 token/字，正好对上；
+    -- 纯 ASCII 时退化为 0.3/字符。实际用量以接口返回的 usage 为准，这里只是兜底。
+    local t = 0.3 * bytes - 0.1 * nonascii
+    if t < 1 and bytes > 0 then t = 1 end
+    return math.floor(t + 0.5)
+end
+
+local function result_text(res)
+    if type(res) ~= "table" then return "" end
+    local parts = { tostring(res.content or "") }
+    for _, t in ipairs(res.tool_calls or {}) do
+        local f = type(t) == "table" and t["function"] or nil
+        if type(f) == "table" then
+            parts[#parts + 1] = tostring(f.name or "")
+            parts[#parts + 1] = tostring(f.arguments or "")
+        end
+    end
+    return table.concat(parts)
+end
+
+-- [埋点] usage 兜底估值：接口没回 usage 时用它，结果带 estimated=true。
+function M.estimate_usage(payload, res)
+    local pin = tostring(payload or "")
+    local out = result_text(res)
+    return {
+        prompt = M.estimate_tokens(#pin, count_nonascii(pin)),
+        completion = M.estimate_tokens(#out, count_nonascii(out)),
+        prompt_bytes = #pin,
+        completion_bytes = #out,
+        estimated = true,
+    }
+end
+
 local function build_request(messages, tools, opts)
     if not opts.api_key or opts.api_key == "" then
         return nil, nil, nil, "missing DEEPSEEK_API_KEY"
@@ -322,8 +376,14 @@ function M.stream(messages, tools, opts, on_delta, on_reasoning)
         if not url then return nil, err end
 
         local parser = M.new_parser()
+        -- [埋点] 流式：真 usage 与兜底估值都从这一个上报口出去（且只出去一次）。
+        local usage_seen = false
+        local function u(usage)
+            if type(usage) == "table" then usage_seen = true end
+            if opts.on_usage then opts.on_usage(usage) end
+        end
         local rc, status, raw = http.post_stream(url, headers, payload, function(chunk)
-            feed_parser(parser, chunk, d, r, opts.on_usage)
+            feed_parser(parser, chunk, d, r, u)
         end)
 
         if opts.debug then
@@ -337,7 +397,15 @@ function M.stream(messages, tools, opts, on_delta, on_reasoning)
             })
         end
 
-        if rc == 0 and status == 200 then return M.finish(parser) end
+        if rc == 0 and status == 200 then
+            local res = M.finish(parser)
+            if not usage_seen then
+                -- [埋点] 流式兜底：接口没给 usage，用 payload/回复字节数估一份补上。
+                if opts.debug then opts.debug:log("usage_estimated", M.estimate_usage(payload, res)) end
+                u(M.estimate_usage(payload, res))
+            end
+            return res
+        end
         if rc ~= 0 then
             last_err = "http error: " .. tostring(raw)
         else
@@ -359,12 +427,19 @@ function M.start(multi, messages, tools, opts, on_delta, on_reasoning)
     if not url then return nil, err end
 
     local parser = M.new_parser()
+    local seen = { hit = false }
     local req, rerr = http.request(multi, url, headers, payload, function(chunk)
-        feed_parser(parser, chunk, on_delta, on_reasoning, opts.on_usage)
+        feed_parser(parser, chunk, on_delta, on_reasoning, function(usage)
+            if type(usage) == "table" then seen.hit = true end
+            if opts.on_usage then opts.on_usage(usage) end
+        end)
     end)
     if not req then return nil, rerr end
     req.parser = parser
     req.debug = opts.debug
+    req.payload = payload
+    req.opts = opts
+    req.seen = seen
     return req
 end
 
@@ -384,7 +459,14 @@ function M.finish_request(req)
     if req.status ~= 200 then
         return nil, string.format("HTTP %d: %s", req.status, tostring(req.body or ""):sub(1, 800))
     end
-    return M.finish(req.parser)
+    local res = M.finish(req.parser)
+    if not (req.seen and req.seen.hit) then
+        -- [埋点] 非流式（TUI multi 路径）兜底：同上，没有 usage 就估一份。
+        local est = M.estimate_usage(req.payload, res)
+        if req.debug then req.debug:log("usage_estimated", est) end
+        if req.opts and type(req.opts.on_usage) == "function" then req.opts.on_usage(est) end
+    end
+    return res
 end
 
 -- 协程入口：yield {kind="http", req=...}；可重试时重新发起请求。
