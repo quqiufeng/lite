@@ -61,7 +61,7 @@ local RULES = {
     "For simple yes/no/status/version questions, answer directly from the latest evidence; use at most one targeted check (git log -1, lite --version, stat). Do not repeat git log/status or dump whole scripts.",
     "For live external data use web; if truncated, retry with a larger max_chars or a more specific URL. Never inspect git/repo docs for live data, and never invent it.",
     "Newest tool results and current files override older memory or summaries; verify stale facts instead of repeating them.",
-    "The current user request is the active task. Todos and memory are background: do not resume an older task unless asked.",
+    "The current request overrides any older unfinished task: do not resume, verify, commit, or report it unless asked.",
     "For read-only requests (read, inspect, list, summarize), do not run tests/builds or modify files unless asked; do not turn it into an unrequested audit.",
     "If the request has multiple parts or sources, address every part in the final answer; never silently drop one.",
     "After git log, summarize the relevant commits instead of only running the command.",

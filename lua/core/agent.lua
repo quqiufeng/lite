@@ -130,6 +130,12 @@ function M:compact_state()
     if type(st) ~= "table" then st = self._compact_state end
     if type(st) ~= "table" or type(st.baseline) ~= "number" then return nil end
     if type(st.digest) ~= "string" or st.digest == "" then return nil end
+    if type(st.digest) == "string" and Compact.sanitize_digest then
+        st.digest = Compact.sanitize_digest(st.digest)
+    end
+    if type(st.block) == "string" and Compact.sanitize_block then
+        st.block = Compact.sanitize_block(st.block)
+    end
     return st
 end
 

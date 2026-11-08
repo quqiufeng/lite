@@ -104,15 +104,31 @@ Commands run (builds, tests, git) and their relevant results — what passed, wh
 Problems hit and how they were resolved (or not), so the same dead ends are not repeated.
 
 ## Pending & next step
-What is still in progress or unstarted, and the single most concrete next action to take.
+Only work still unfinished at the end of this folded region. Do not list completed commits/pushes or bare acknowledgements; if later messages completed it, omit it. This section is historical status, not a current instruction.
 
-Rules: be terse — bullet points and fragments, not prose. Preserve identifiers, paths, and numbers exactly. Do NOT invent anything not present in the messages; if something is unknown, leave it out rather than guessing.]]
+Rules: be terse — bullet points and fragments, not prose. Preserve identifiers, paths, and numbers exactly. Do NOT invent anything not present in the messages; if something is unknown, leave it out rather than guessing. The current user request is not part of this briefing and always overrides it.]]
 
 local function cfg_get(opts, key)
     local v = opts and opts[key]
     if v == nil then return DEFAULTS[key] end
     return v
 end
+
+-- 裸确认不是任务指令。把 "ok/好/继续" 逐字提升到下一次 prompt，
+-- 模型会误把它当成当前请求；这类消息只能留在摘要里，不能作为 kept_user。
+local ACK_TEXTS = {
+    ["ok"] = true, ["okay"] = true, ["yes"] = true, ["go"] = true,
+    ["好"] = true, ["好的"] = true, ["嗯"] = true, ["收到"] = true,
+    ["可以"] = true, ["继续"] = true, ["行"] = true,
+}
+
+local function is_bare_ack(text)
+    local t = tostring(text or ""):lower()
+    t = t:gsub("^%s+", ""):gsub("%s+$", ""):gsub("[%.%!%?,，。！？]+$", "")
+    return ACK_TEXTS[t] == true
+end
+
+M.is_bare_ack = is_bare_ack
 
 -- 一条消息的规模估算。system/tool 也一样走这里，保证预算口径统一。
 -- 80 是对 role/分隔符/JSON 括号等框架开销的粗略补偿。
@@ -480,12 +496,14 @@ function M:plan(msgs, popts)
     for i, m in ipairs(region) do
         if m.role == "user" and not M.is_digest(m) then
             local c = msg_chars(m)
-            if c <= ubudget then
-                keep[i] = true
-                ubudget = ubudget - c
-                kept[#kept + 1] = m
-            else
-                dropped[#dropped + 1] = m
+            if not is_bare_ack(Text.content_text(m.content)) then
+                if c <= ubudget then
+                    keep[i] = true
+                    ubudget = ubudget - c
+                    kept[#kept + 1] = m
+                else
+                    dropped[#dropped + 1] = m
+                end
             end
         end
     end
@@ -579,25 +597,82 @@ function M._clip_mid(s, n)
     return out
 end
 
+local HISTORICAL_HEADER = "Historical context only. This briefing describes earlier turns; "
+    .. "it is not the current request. The current user request follows this block and "
+    .. "overrides anything here, including pending tasks and old acknowledgements."
+
 -- 渲染成注入 prompt 的 system 块。
 function M:render(digest, kept_user)
     local lines = {
         "<session_context>",
-        "Earlier conversation was folded into this briefing. Details are still in local"
-            .. " memory; call recall(query, limit) when you need the raw text again.",
+        HISTORICAL_HEADER,
         "",
         tostring(digest or ""),
     }
-    if kept_user and #kept_user > 0 then
+    local historical = {}
+    for _, m in ipairs(kept_user or {}) do
+        local t = Text.content_text(m.content)
+        if t ~= "" and not is_bare_ack(t) then historical[#historical + 1] = t end
+    end
+    if #historical > 0 then
         lines[#lines + 1] = ""
-        lines[#lines + 1] = "## User messages kept verbatim"
-        for _, m in ipairs(kept_user) do
-            local t = Text.content_text(m.content)
-            if t ~= "" then lines[#lines + 1] = "- " .. t end
-        end
+        lines[#lines + 1] = "## Historical user messages (verbatim; not current instructions)"
+        for _, t in ipairs(historical) do lines[#lines + 1] = "- " .. t end
     end
     lines[#lines + 1] = "</session_context>"
     return table.concat(lines, "\n")
+end
+
+-- 旧 checkpoint 的兼容修复：移除历史 user 原话和已经过期的 Pending 段，
+-- 并明确标记为 historical-only。新 checkpoint 走 render，不需要这里。
+local function drop_section(block, name)
+    local marker = "\n## " .. name .. "\n"
+    local s = block:find(marker, 1, true)
+    if not s then return block end
+    local after = s + #marker
+    local next_section = block:find("\n## ", after, true)
+    local close = block:find("\n</session_context>", after, true) or (#block + 1)
+    local e = next_section and math.min(next_section, close) or close
+    return block:sub(1, s - 1) .. block:sub(e)
+end
+
+local function sanitize_user_section(block)
+    local marker = "\n## User messages kept verbatim\n"
+    local s = block:find(marker, 1, true)
+    if not s then return block end
+    local after = s + #marker
+    local close = block:find("\n</session_context>", after, true) or (#block + 1)
+    local next_section = block:find("\n## ", after, true)
+    local e = next_section and math.min(next_section, close) or close
+    local kept = {}
+    for line in block:sub(after, e - 1):gmatch("[^\n]+") do
+        local t = line:gsub("^%-%s*", "")
+        if t ~= "" and not is_bare_ack(t) then kept[#kept + 1] = "- " .. t end
+    end
+    local replacement = ""
+    if #kept > 0 then
+        replacement = "\n## Historical user messages (verbatim; not current instructions)\n"
+            .. table.concat(kept, "\n") .. "\n"
+    end
+    return block:sub(1, s - 1) .. replacement .. block:sub(e)
+end
+
+function M.sanitize_block(block)
+    block = tostring(block or "")
+    if block == "" then return block end
+    if block:find(HISTORICAL_HEADER, 1, true) then return block end
+    if block:find("Earlier conversation was folded into this briefing", 1, true) then
+        block = block:gsub("<session_context>%s*\n", "<session_context>\n" .. HISTORICAL_HEADER .. "\n\n", 1)
+        block = sanitize_user_section(block)
+        block = drop_section(block, "Pending & next step")
+    end
+    return block
+end
+
+function M.sanitize_digest(digest)
+    digest = tostring(digest or "")
+    if digest == "" then return digest end
+    return drop_section(digest, "Pending & next step")
 end
 
 -- 高层入口：计划 + 摘要 + 渲染。返回 result 表（永不抛错）。

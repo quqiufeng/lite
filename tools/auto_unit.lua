@@ -161,8 +161,10 @@ do
     local full_sp = Prompt.system_prompt(ictx, { tools = tools })
     check(full_sp:find("PROJECT-MARKER", 1, true) ~= nil,
         "prompt includes project instructions")
-    check(full_sp:find("current user request is the active task", 1, true) ~= nil,
+    check(full_sp:find("current request overrides any older unfinished task", 1, true) ~= nil,
         "prompt gives the current request priority")
+    check(full_sp:find("do not resume, verify, commit, or report it", 1, true) ~= nil,
+        "prompt does not resume an older task")
     check(full_sp:find("read-only requests", 1, true) ~= nil,
         "prompt guards read-only work")
     check(full_sp:find("multiple parts or sources", 1, true) ~= nil,
@@ -222,6 +224,46 @@ do
     check(q:find("previous question", 1, true) ~= nil, "prompt recall query")
 end
 
+-- compact：历史摘要只能当背景，旧 user ack/pending 不能伪装成当前任务
+do
+    local Compact = require("core.compact")
+    local c = Compact.new({ budget_chars = 8000 })
+    local block = c:render("DIGEST-MARKER", {
+        { role = "user", content = "ok" },
+        { role = "user", content = "KEEP-CONSTRAINT" },
+    })
+    check(block:find("Historical context only", 1, true) ~= nil,
+        "compact marks context historical")
+    check(block:find("Historical user messages", 1, true) ~= nil,
+        "compact labels kept user turns historical")
+    check(block:find("KEEP-CONSTRAINT", 1, true) ~= nil,
+        "compact keeps real user constraints")
+    check(block:find("- ok", 1, true) == nil, "compact drops bare acknowledgements")
+    check(Compact.is_bare_ack("ok。") and Compact.is_bare_ack("OK")
+        and not Compact.is_bare_ack("push the fix"), "compact ack detection")
+
+    local old = "<session_context>\n"
+        .. "Earlier conversation was folded into this briefing. Details are still in local\n"
+        .. "memory; call recall(query, limit) when you need the raw text again.\n\n"
+        .. "## Goal\nG\n\n## Pending & next step\ncommit and push\n\n"
+        .. "## User messages kept verbatim\n- ok\n- REAL-CONSTRAINT\n"
+        .. "</session_context>"
+    local upgraded = Compact.sanitize_block(old)
+    check(upgraded:find("Historical context only", 1, true) ~= nil,
+        "compact upgrades old checkpoint header")
+    check(upgraded:find("## Pending & next step", 1, true) == nil,
+        "compact drops stale pending section")
+    check(upgraded:find("## User messages kept verbatim", 1, true) == nil,
+        "compact drops stale verbatim-user section")
+    check(upgraded:find("REAL-CONSTRAINT", 1, true) ~= nil,
+        "compact keeps real historical user constraints")
+    check(upgraded:find("## Goal", 1, true) ~= nil, "compact keeps digest sections")
+    local clean_digest = Compact.sanitize_digest("## Goal\nG\n\n## Pending & next step\ncommit\n\n## Files\nF")
+    check(clean_digest:find("## Pending & next step", 1, true) == nil
+        and clean_digest:find("## Files", 1, true) ~= nil,
+        "compact sanitizes stale digest pending")
+end
+
 -- tools
 do
     local dir = os.tmpname()
@@ -229,6 +271,9 @@ do
     os.execute("mkdir -p " .. shq(dir))
     local Tools = require("core.tools")
     local t = Tools.new({ cwd = dir })
+    local encoded_schemas = require("cjson").encode(t:schemas())
+    check(not encoded_schemas:find('"required":{}', 1, true),
+        "tool schemas omit empty required objects")
     local okw = t:execute("write", { path = "a.txt", content = "hello\nworld\n" })
     check(okw:find("wrote", 1, true) ~= nil, "tools write")
     local r = t:execute("read", { path = "a.txt" })

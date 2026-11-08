@@ -346,7 +346,6 @@ function M:schemas()
                         offset = { type = "integer" },
                         limit = { type = "integer" },
                     },
-                    required = {},
                 },
             },
         },
