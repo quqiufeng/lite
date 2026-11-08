@@ -117,6 +117,16 @@ function M.load(env)
         context_turns = tonumber(getv("LITE_CONTEXT_TURNS") or file.context_turns) or 16,
         context_window = tonumber(getv("LITE_CONTEXT_WINDOW") or file.context_window) or 64000,
         reserve_tokens = tonumber(getv("LITE_RESERVE_TOKENS") or file.reserve_tokens) or 8192,
+        -- compact=true 恢复「先摘要」的老策略；默认 false = 丢弃优先（超线就从
+        -- 最新往回装，更老的消息直接丢，需要时靠 recall）。
+        compact = (function()
+            local v = getv("LITE_COMPACT")
+            if v == nil then v = file.compact end
+            if v == nil then return false end
+            if type(v) == "boolean" then return v end
+            v = tostring(v):lower()
+            return v == "1" or v == "true" or v == "on" or v == "yes"
+        end)(),
         max_output_tokens = tonumber(getv("LITE_MAX_OUTPUT_TOKENS") or file.max_output_tokens) or 8192,
         token_budget = tonumber(getv("LITE_TOKEN_BUDGET") or file.token_budget) or 0,
         thinking = (function()

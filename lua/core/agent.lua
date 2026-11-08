@@ -396,8 +396,27 @@ function M:estimate_tokens(chars)
     return math.floor((chars or 0) * r)
 end
 
+-- 丢弃优先（默认）：不摘要，靠 hard_window 从最新往回装，更老的整条丢，
+-- 需要时让模型自己 recall。settings.compact=true（LITE_COMPACT=1）恢复旧策略。
+function M:drop_first()
+    if self._drop_first ~= nil then return self._drop_first end
+    local v = (self.ctx.settings or {}).compact
+    if v == nil then
+        local e = os.getenv("LITE_COMPACT")
+        if e == nil then
+            v = false
+        else
+            e = tostring(e):lower()
+            v = (e == "1" or e == "true" or e == "on" or e == "yes")
+        end
+    end
+    self._drop_first = (v ~= true)
+    return self._drop_first
+end
+
 -- 超阈值才压一次。返回 true 表示这次真的压了（调用方应重建视图）。
 function M:maybe_compact(stream, reserve, force)
+    if not force and self:drop_first() then return false end
     local c = self:compactor()
     local st = self:compact_state()
     local view = self:view_messages()
@@ -509,10 +528,10 @@ function M:hard_window(msgs, budget)
     for i = 1, lead do out[#out + 1] = msgs[i] end
     out[#out + 1] = {
         role = "system",
-        content = string.format(
-            "<session_context>\nPrompt hit the hard size ceiling; %d older message(s) were"
-                .. " dropped without being summarized. Use recall(query, limit) if you need them.\n"
-                .. "</session_context>", dropped),
+        -- 文案不带条数：同一丢弃窗口内字节稳定，前缀缓存不至于每轮全失效。
+        content = "<session_context>\nPrompt hit the hard size ceiling; older message(s) were"
+            .. " dropped without being summarized. Use recall(query, limit) if you need them.\n"
+            .. "</session_context>",
     }
     for i = start, n do out[#out + 1] = msgs[i] end
     return repair_tool_pairs(out), true, dropped
@@ -549,9 +568,13 @@ function M:request_messages(text, stream, opts)
     local c = self:compactor()
     local msgs = self:view_messages({ budget = c.budget, reserve = reserve })
     local used = Compact.total(msgs) + reserve
-    if used > math.floor(c.budget * 2) then
+    local drop_first = self:drop_first()
+    -- 丢弃优先时硬线就设在触发线：不做有损摘要，超了直接从最新往回装。
+    local ceiling = drop_first and c:trigger() or math.floor(c.budget * 2)
+    if used > ceiling then
         local trimmed, dropped
-        msgs, trimmed, dropped = self:hard_window(msgs, math.floor(c.budget * 0.8))
+        msgs, trimmed, dropped = self:hard_window(msgs,
+            math.floor(c.budget * (drop_first and 0.6 or 0.8)))
         if trimmed then
             self.ctx:emit("compact", {
                 ok = false, reason = "hard ceiling", dropped = dropped,

@@ -44,6 +44,8 @@ function M.new(opts)
             context_turns = opts.context_turns or 2,
             context_window = opts.context_window or 64000,
             reserve_tokens = opts.reserve_tokens or 8192,
+            -- nil = 没显式配置，M:drop_first() 再回退 LITE_COMPACT → 默认丢弃优先
+            compact = opts.compact,
             max_output_tokens = opts.max_output_tokens or 8192,
             token_budget = opts.token_budget or 0,
             input_tokens = nil,

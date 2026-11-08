@@ -2533,7 +2533,8 @@ do
     local Memory = require("core.memory")
 
     local mem = assert(Memory.new({ dir = dir, max_mb = 16 }))
-    local ctx = Context.new({ cwd = "/tmp", context_chars = 8000, max_turns = 1 })
+    -- 摘要策略是可选开关：测试里显式打开，默认（丢弃优先）走 hard_window
+    local ctx = Context.new({ cwd = "/tmp", context_chars = 8000, max_turns = 1, compact = true })
     -- 20 条 500 字的往返，折叠区必然超过 min_fold_chars
     for i = 1, 20 do
         ctx.session.messages[#ctx.session.messages + 1] = {
@@ -2687,6 +2688,62 @@ do
     local users = 0
     for _, m in ipairs(msgs) do if m.role == "user" then users = users + 1 end end
     check(users >= 6, "budget floor: history preserved")
+end
+
+-- 默认策略是丢弃优先：不摘要，直接按窗口从最新回装，老消息交给 recall
+do
+    local Context = require("context")
+    local Agent = require("core.agent")
+    local ctx = Context.new({ cwd = "/tmp", context_chars = 8000, max_turns = 1 })
+    local agent = Agent.new(ctx, { stream = function() error("should not summarize") end },
+        { schemas = function() return {} end }, { append = function() end })
+    agent:ensure_system()
+
+    check(agent:drop_first() == true, "drop_first is the default")
+    check(agent:maybe_compact() == false, "drop_first skips summarization")
+
+    for i = 1, 20 do
+        ctx.session.messages[#ctx.session.messages + 1] = {
+            role = "user", content = "question " .. i .. " " .. string.rep("x", 480),
+        }
+    end
+    local view = agent:view_messages()
+    local used, has_digest = 0, false
+    for _, m in ipairs(view) do
+        used = used + #(type(m.content) == "string" and m.content or "")
+        if type(m.content) == "string" and m.content:find("<session_context>", 1, true) then
+            has_digest = true
+        end
+    end
+    check(has_digest == false, "drop_first writes no digest")
+    check(view[1].role == "system", "drop_first keeps system first")
+
+    -- 丢弃发生在组装阶段（request_messages），view_messages 只给视图：
+    -- 超线就从最新往回装，最老的问题丢掉，最新的必须保住。
+    local out = agent:request_messages("question 21", function() error("no summarize") end,
+        { inject_context = false, turn = 1, max_turns = 1 })
+    local c = agent:compactor()
+    local in_win, oldest = 0, false
+    for _, m in ipairs(out) do
+        if m.role ~= "system" then
+            in_win = in_win + #(type(m.content) == "string" and m.content or "")
+        end
+        if type(m.content) == "string" and m.content:find("question 1 ", 1, true) then
+            oldest = true
+        end
+    end
+    check(in_win <= c.budget, "drop_first fits the window")
+    check(oldest == false, "drop_first drops the oldest turn")
+    local tail = out[#out]
+    local found_newest = false
+    for i = #out, 1, -1 do
+        if type(out[i].content) == "string" and out[i].content:find("question 20", 1, true) then
+            found_newest = true
+            break
+        end
+    end
+    check(found_newest, "drop_first keeps the newest turn")
+    check(type(tail.content) == "string", "drop_first tail is text")
 end
 
 -- 硬上限兜底：压缩救不回来时才丢最老消息，但**必须保住已有 digest**

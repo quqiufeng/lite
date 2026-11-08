@@ -81,6 +81,7 @@ function M.run(opts)
         context_turns = config.context_turns,
         context_window = config.context_window,
         reserve_tokens = config.reserve_tokens,
+        compact = config.compact,
         max_output_tokens = config.max_output_tokens,
         token_budget = config.token_budget,
         thinking = config.thinking,
