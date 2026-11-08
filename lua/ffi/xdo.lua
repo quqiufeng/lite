@@ -29,6 +29,7 @@ int XTranslateCoordinates(Display *display, Window src, Window dst,
     int src_x, int src_y, int *dest_x, int *dest_y, Window *child);
 int XMapWindow(Display *display, Window w);
 int XUnmapWindow(Display *display, Window w);
+int XIconifyWindow(Display *display, Window w, int screen);
 int XGetClassHint(Display *display, Window w, XClassHint *class_hints);
 
 /* 只用到 map_state（0=IsUnmapped 1=IsUnviewable 2=IsViewable）与 override_redirect。
@@ -102,6 +103,9 @@ int xdo_activate_window(const xdo_t *xdo, Window wid);
 int xdo_focus_window(const xdo_t *xdo, Window wid);
 int xdo_raise_window(const xdo_t *xdo, Window wid);
 int xdo_minimize_window(const xdo_t *xdo, Window wid);
+int xdo_map_window(const xdo_t *xdo, Window wid, int x, int y);
+int xdo_wait_for_window_map_state(const xdo_t *xdo, Window wid, int map_state);
+int xdo_wait_for_window_active(const xdo_t *xdo, Window wid, int activate);
 int xdo_move_mouse(const xdo_t *xdo, int x, int y, int screen);
 int xdo_get_mouse_location(const xdo_t *xdo, int *x, int *y, int *screen_num);
 int xdo_get_window_at_mouse(const xdo_t *xdo, Window *window_ret);
@@ -283,6 +287,8 @@ function Xdo:resolve(query)
         if ok then hits[#hits + 1] = w end
     end
     if #hits == 1 then return hits[1] end
+    -- 多命中时只有调用方显式 pick 才取第 N 个（不静默选，但要让 pick 生效）
+    if query.pick and hits[query.pick] then return hits[query.pick] end
     return nil, hits
 end
 
@@ -321,28 +327,76 @@ function Xdo:active()
     return tonumber(win[0])
 end
 
--- 用 _NET_ACTIVE_WINDOW 激活（不切工作区、不碰 _NET_WM_DESKTOP，无 stderr 噪声）
-function Xdo:activate(win)
+-- IsViewable=2 / IsUnmapped=0（X11 map_state 常量）
+local IS_VIEWABLE, IS_UNMAPPED = 2, 0
+
+-- 给 root 发 ICCCM WM_CHANGE_STATE：1 = Normal（deiconify），3 = Iconic（最小化）
+-- 这条路径只改 WM_STATE，不碰输入焦点 —— openbox 不会把它当"抢焦点"再打回 Iconic
+function Xdo:_change_state(win, state)
     local root = X11.XDefaultRootWindow(self.dpy)
     local ev = ffi.new("XAnyEvent")
-    ev.xclient.type = 33                      -- ClientMessage
-    ev.xclient.send_event = 1                 -- True
+    ev.xclient.type = 33
+    ev.xclient.send_event = 1
     ev.xclient.display = self.dpy
     ev.xclient.window = win
-    ev.xclient.message_type = X11.XInternAtom(self.dpy, "_NET_ACTIVE_WINDOW", 0)
+    ev.xclient.message_type = X11.XInternAtom(self.dpy, "WM_CHANGE_STATE", 0)
     ev.xclient.format = 32
-    ev.xclient.data.l[0] = 2                  -- source: pager（WM 不会拒绝）
-    ev.xclient.data.l[1] = 0                  -- timestamp: 0 = 现在
-    ev.xclient.data.l[2] = 0
+    ev.xclient.data.l[0] = state
     -- SubstructureRedirectMask(0x100000) | SubstructureNotifyMask(0x80000)
     X11.XSendEvent(self.dpy, root, 0, 0x180000, ev)
-    X11.XRaiseWindow(self.dpy, win)
     X11.XSync(self.dpy, 0)
-    return true
+end
+
+-- 显示 = xdo_map_window（等价 `xdotool windowmap --sync`）+ 抬栈序。
+-- 实测 openbox 下对 Iconic 窗口调用即可 deiconify 并稳定可见（300ms×30 采样全 IsViewable）[verified p68]
+function Xdo:map(win, w, h)
+    return lib.xdo_map_window(self.handle, win, w or 0, h or 0) == 0
+end
+
+-- 窗口可见 ≠ 窗口有焦点：只 map+raise 时 openbox 把焦点留给原窗口，
+-- 之后 key(0,...)（XTEST 真键盘）和整屏截图都打到别的窗口上。
+-- xdo_activate_window ≡ `xdotool windowactivate`，是真正发出 _NET_ACTIVE_WINDOW 的那一步；
+-- 它在没有 _NET_WM_DESKTOP 的窗口上会返回非 0，所以用 pcall 兜住，map+raise 仍是基底。
+local function take_focus(self, win)
+    pcall(function() lib.xdo_wait_for_window_map_state(self.handle, win, IS_VIEWABLE) end)
+    lib.xdo_raise_window(self.handle, win)
+    pcall(function() lib.xdo_activate_window(self.handle, win) end)
+    pcall(function() lib.xdo_wait_for_window_active(self.handle, win, 1) end)
+end
+
+function Xdo:activate(win)
+    if self:map(win) then
+        take_focus(self, win)
+        if self:_is_viewable(win) then return true end
+    end
+    self:_change_state(win, 1)
+    local ok = pcall(function()
+        lib.xdo_wait_for_window_map_state(self.handle, win, IS_VIEWABLE)
+    end)
+    if not ok then return false end
+    take_focus(self, win)
+    return self:_is_viewable(win)
+end
+
+function Xdo:_is_viewable(win)
+    local a = self:_attrs(win)
+    return (a and a.viewable) and true or false
 end
 function Xdo:focus(win) return lib.xdo_focus_window(self.handle, win) == 0 end
 function Xdo:raise(win) return lib.xdo_raise_window(self.handle, win) == 0 end
-function Xdo:minimize(win) return lib.xdo_minimize_window(self.handle, win) == 0 end
+function Xdo:minimize(win)
+    -- libxdo 的 xdo_minimize_window 在 openbox 上静默失效（返回 0 但窗口不 unmapped），
+    -- 走 XIconifyWindow（WM_CHANGE_STATE → IconicState）才真进后台
+    local ok = X11.XIconifyWindow(self.dpy, win, 0) ~= 0
+    X11.XSync(self.dpy, 0)
+    if ok then
+        lib.xdo_wait_for_window_map_state(self.handle, win, IS_UNMAPPED)
+        return true
+    end
+    if lib.xdo_minimize_window(self.handle, win) ~= 0 then return false end
+    lib.xdo_wait_for_window_map_state(self.handle, win, IS_UNMAPPED)
+    return true
+end
 function Xdo:hide(win)
     local ok = X11.XUnmapWindow(self.dpy, win) ~= 0
     X11.XSync(self.dpy, 0)
