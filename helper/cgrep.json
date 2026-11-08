@@ -1,0 +1,1 @@
+{"source":"cgrep.c","name":"cgrep","lang":"c","so":"cgrep-1794133783.so","abi":"char *lite_helper(const char *input); void lite_helper_free(char *out);","built_at":1794133784,"scope":"local"}

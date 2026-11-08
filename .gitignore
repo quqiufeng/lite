@@ -61,7 +61,9 @@ mem.lock
 !third_party/ocr/lib/libocr_simple.so
 third_party/ocr/lib/libonnxruntime*
 
-# generated native helpers
-helper/*.so
-helper/*.json
+# native helpers: 编出来的 .so 和 <name>.json 清单只有几 KB，随仓库提交，
+# clone 下来直接能调（不用本机有 cc）。只有 <name>-<ts>.so 旧版本会被
+# `native remove` 清掉，别手删清单——`_helper_so_abs` 靠它找 .so。
+# （上面全局 `*.so` 忽略，这里给 helper/ 开口子。）
+!helper/*.so
 
