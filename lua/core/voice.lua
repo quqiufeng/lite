@@ -63,10 +63,11 @@ end
 -- 逐帧 VAD 分段：ffmpeg 持续出 16k/mono/s16le 裸流 → 每 0.5s 一帧算 RMS →
 -- 有声帧攒进 seg.pcm，尾静音满 tailf 帧才收尾；短于 minf 帧的碎片直接丢，
 -- 连续说到 maxf 帧强制切。转写在后台并发（最多 2 个），不堵录音管道。
-local function script(c, dir)
+local function script(c, dir, asr)
   return (string.format([==[
 #!/bin/bash
 cd "%s" || exit 1
+%s                  # ASR：每段起一次 SenseVoice CLI（CPU）
 FR=16000            # 0.5s s16le 16k mono
 TAIL=%d
 MINF=%d
@@ -84,7 +85,7 @@ flush() {
   while [ "$(jobs -rp | wc -l)" -ge 2 ]; do wait -n 2>/dev/null || break; done
   (
     if ffmpeg -nostdin -hide_banner -loglevel error -f s16le -ar 16000 -ac 1 -i "$f.pcm" -y "$f.wav" 2>>err.log < /dev/null; then
-      out=$("%s" -m "%s" -f "$f.wav" -l %s -t %s 2>>err.log < /dev/null)
+      out=$(asr "$f.wav" 2>>err.log < /dev/null)
       [ -n "$out" ] && printf '%%s\n' "$out" >> inbox.txt
     else
       echo "conv-fail" >> err.log
@@ -114,7 +115,7 @@ while [ ! -f stop ]; do
 done < <(ffmpeg -nostdin -hide_banner -loglevel error -f pulse -i "%s" -ar 16000 -ac 1 -f s16le pipe:1 2>>ff.log)
 if [ $active -eq 1 ] && [ $len -ge $MINF ]; then flush; fi
 wait
-]==], dir, c.tailf, c.minf, c.maxf, c.thr, c.bin, c.model, c.lang, c.thread, c.mic))
+]==], dir, asr, c.tailf, c.minf, c.maxf, c.thr, c.mic))
 end
 
 -- 识别输入框里的语音指令：整行是标记，或标记跟在本轮转写文字后面
@@ -127,6 +128,13 @@ function M.command(s)
   return nil
 end
 
+-- 写进 loop.sh 的 asr() 函数体：每段起一次 CLI。
+-- 固定 -ng（CPU 推理）：0.35s/段，不吃显存。
+local function asr_cmd(c)
+  return string.format("asr() { %q -m %q -f \"$1\" -l %s -t %s -ng; }",
+    c.bin, c.model, c.lang, c.thread)
+end
+
 -- 起常驻循环；重复 start 幂等
 function M.start()
   if M.handle then return true end
@@ -137,9 +145,10 @@ function M.start()
   os.execute("mkdir -p " .. dir)
   M.dir = dir
   M.offset = 0
+  local asr = asr_cmd(c)
   local sp = dir .. "/loop.sh"
   local f = assert(io.open(sp, "w"))
-  f:write(script(c, dir))
+  f:write(script(c, dir, asr))
   f:close()
   os.remove(dir .. "/stop")
   local cmd = string.format(

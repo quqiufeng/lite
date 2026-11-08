@@ -310,6 +310,8 @@ lua({ code = "return #(args.text:gmatch('%S+'))", input = { text = "a b c" } })
 | `SENSEVOICE_LANG` | `auto` | 识别语言：`auto` / `zh` / `en` / `yue` / `ja` / `ko` |
 | `SENSEVOICE_THREADS` | `4` | ASR 线程数 |
 
+推理固定走 CPU（`-ng`）：实测 0.35s/段、不占显存；GPU 反而更慢（0.48s）还多吃 ~435MB 显存。
+
 ---
 
 ## 依赖
@@ -423,6 +425,8 @@ LITE_DIST_WITH_OCR=1 LITE_DIST_WITH_ORT=1 ./tools/package.sh
 
 **不需要 GPU**：SenseVoice.cpp 的 CPU 版就能跑（q4_k 量化模型在小麦/笔记本上实时），不依赖 CUDA / onnxruntime GPU provider，
 这与仓库里 OCR 的 `ort_link.sh` / `cuda_provider.sh` 那套 GPU 接入完全无关，互不影响。
+默认就是 CPU（`voice.lua` 传 `-ng`）：实测单段 CPU 0.35s / RSS 337MB / **显存 0 增长**，
+GPU 反而更慢（0.48s）还多吃 ~435MB 显存，所以 GPU 那条路已经去掉，不再提供开关。
 
 ```bash
 # 1) 系统依赖
