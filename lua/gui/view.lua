@@ -45,29 +45,19 @@ M.styles = {
   sel = {"text", "sel"},
 }
 
--- 与同级 reader 一致:仓耳今楷 W04(正文)/W05(粗);LITE_GUI_FONT 可覆盖
+-- 字体只走系统:Noto Sans CJK SC。仓耳今楷在 22px 下细笔必然发虚(实心像素 16%),
+-- 已弃用(assets/ 里的 37MB ttf 删除)。LITE_GUI_FONT 可覆盖。
 local HOME = os.getenv("HOME") or ""
--- 仓库自带 assets/fonts 优先(与 reader 同位置),再从系统字体目录回退
-local ROOT = (debug.getinfo(1, "S").source or ""):match("^@(.*)/lua/gui/[^/]*$") or "."
--- 每项 {路径, ttc 子字体序号};22px 下仓耳楷书细笔必然发虚(实心像素 16%),
--- 正文用 Noto Sans CJK SC(笔画实、字形稳),\ttc 里 SC 在 index 2
--- (fc-match -f "%{file}:%{index}" "Noto Sans CJK SC")。LITE_GUI_FONT 可覆盖。
+-- 每项 {路径, ttc 子字体序号};正文用 Noto Sans CJK SC(笔画实、字形稳),
+-- ttc 里 SC 在 index 2(fc-match -f "%{file}:%{index}" "Noto Sans CJK SC")。
 local FONT_CANDIDATES = {
   { "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 2 },
-  { ROOT .. "/assets/fonts/NotoSansCJK-Regular.ttc", 2 },
-  { ROOT .. "/assets/fonts/TsangerJinKai02-W04.ttf", 0 },
-  { HOME .. "/.local/share/fonts/TsangerJinKai/TsangerJinKai02-W04.ttf", 0 },
-  { HOME .. "/Desktop/reader/assets/fonts/TsangerJinKai02-W04.ttf", 0 },
   { "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", 0 },
   { "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 0 },
 }
 
 local BOLD_CANDIDATES = {
   { "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc", 2 },
-  { ROOT .. "/assets/fonts/NotoSansCJK-Bold.ttc", 2 },
-  { ROOT .. "/assets/fonts/TsangerJinKai02-W05.ttf", 0 },
-  { HOME .. "/.local/share/fonts/TsangerJinKai/TsangerJinKai02-W05.ttf", 0 },
-  { HOME .. "/Desktop/reader/assets/fonts/TsangerJinKai02-W05.ttf", 0 },
 }
 
 -- 等宽体(代码/tool 行):Maple Mono NF CN 带连字 + Nerd 图标,

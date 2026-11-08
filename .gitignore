@@ -65,6 +65,3 @@ third_party/ocr/lib/libonnxruntime*
 helper/*.so
 helper/*.json
 
-
-# GUI: 本地字体（37MB，可选兜底；默认用系统 Noto）
-assets/
