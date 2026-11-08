@@ -59,6 +59,22 @@ for p in sdl2 SDL2_ttf; do
     fi
 done
 
+# 语音输入（仅 TUI，可选）：ffmpeg + SenseVoice CLI + gguf 模型，全都不打包
+SV_BIN="${SENSEVOICE_BIN:-/opt/SenseVoice.cpp/bin/sense-voice-main}"
+SV_MODEL="${SENSEVOICE_MODEL:-/data/models/sense-voice-small-q4_k.gguf}"
+if command -v ffmpeg >/dev/null 2>&1; then
+    echo "[OK]   ffmpeg   $(ffmpeg -version 2>/dev/null | head -1 | cut -d' ' -f1-3) (voice, optional)"
+else
+    echo "[WARN] ffmpeg   missing (optional, 语音模式不可用：sudo apt install ffmpeg)"
+fi
+if [ -x "$SV_BIN" ] && [ -f "$SV_MODEL" ]; then
+    echo "[OK]   ASR      $(basename "$SV_BIN") + $(basename "$SV_MODEL") (voice, cpu, optional)"
+elif [ -x "$SV_BIN" ]; then
+    echo "[INFO] ASR      CLI 就绪，缺模型 (optional, 设 SENSEVOICE_MODEL，当前 $SV_MODEL)"
+else
+    echo "[INFO] ASR      not installed (optional, 语音模式关闭；见 README「可选 · 语音输入」)"
+fi
+
 for c in cc c++; do
     if command -v "$c" >/dev/null 2>&1; then
         echo "[OK]   $c"

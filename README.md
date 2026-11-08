@@ -50,6 +50,7 @@ TUI 完成后，“看见”会进一步包含对话界面与截图，形成完�
 - **用量与缓存可观测**：解析流末尾的 `usage`（`prompt_cache_hit/miss_tokens`），按会话累积；TUI 状态栏 `cache:N%` 显示前缀缓存命中率，`--once --json` 输出 `{"type":"usage"}` 事件。命中率是判断"prompt 前缀是否稳定"的唯一硬指标。**输出 token 按剩余窗口动态限制**；provider 报上下文过长时自动强制 compact 后重试一次。
 - **上下文压力可见**：状态栏 `ctx:N%` 显示当前 prompt 占压缩触发线的比例（≥60% 才出现），数字来自真实 `usage` 校准的 chars→tokens 比例（实测误差 2%），不是纯字符猜测。预算小于固定前缀的 3 倍时会自动抬高并提示，避免"预算比 system prompt 还小"导致压缩永远失败、只能丢历史。
 - **TUI + diff**：`--tui` 交互；assistant Markdown/代码块渲染、`Tab` 文件路径补全、鼠标滚轮/`PgUp`/`PgDn` 上翻历史、**左键拖选 transcript 选中文本，松开即复制到剪贴板**（`xclip`/`wl-copy`/`xsel`/`pbcopy`，都没有时退化为 OSC 52，走 ssh 也能用）、`?` 帮助、`Esc×2` 终止当前回复、忙时继续输入排队（`queue:N` / `⏳` 待发送）、`quit` + Enter 退出、启动时自动恢复同 cwd 最近会话；`/session` 选择/新建会话；`Ctrl+G` 打开 `git diff`，支持 split/unified、hunk 跳转、单文件、大 diff 虚拟滚动。
+- **语音输入（仅 TUI）**：输入框里发 `#语音模式` 回车开启，之后对着麦克风说话——后台 bash 循环每 `LITE_VOICE_CHUNK` 秒切一段录音，先看 `volumedetect` 的 `mean_volume` 是否过 `LITE_VOICE_GATE`（默认 -38 dB，静音直接丢，不烧 ASR），过门限才调 SenseVoice CLI 转写，清洗时间戳/语言标记后把文字追加进输入框（不自动发送，你自己改完再回车）；发 `#退出` 关闭（只关语音，不退出 lite）。识别结果追加行也接受「转写错了就发命令」——整行或文字后面带标记都能识别成 toggle/off。ASR 走外部 CLI，不内嵌 FFI；**CPU 版即可，依赖全部可选**（不装就不开语音，其它功能不受影响，见「依赖 · 可选 · 语音输入」）。
 - **Todo list**：`todo` 工具维护多步任务；状态栏 `todo:done/total`，`Ctrl+T` 打开列表；持久化到本地记忆并随 serve/attach 广播。
 - **serve / attach**：`lite serve --port 8765` 启动 headless 服务端；`lite attach --port 8765` 在任意终端或 tmux tab 实时显示并交互，所有客户端共享同一会话与事件流。待处理 prompt 持久化在 KV，重启可恢复；attach 连接时回放会话历史；SIGINT/SIGTERM 优雅退出。
 - **定时唤醒**：`serve --wake 300 --task "检查 CI"`（或 `--task-file` / `.lite/wake.md`）；空闲时自动提交，记录上次结果并随 attach 广播。无人值守仍需先补工具审批/沙箱。
@@ -73,6 +74,8 @@ export DEEPSEEK_API_KEY="sk-..."
 
 # 交互式 TUI（Ctrl+G 查看 git diff）
 ./tools/run.sh --tui
+#   输入框里发 #语音模式 开启语音输入（说话→转写填进输入框），发 #退出 关闭
+#   可选外部依赖（ffmpeg + SenseVoice CPU 版 CLI/模型），见「依赖 · 可选 · 语音输入」
 
 # 启用 thinking 模式
 ./tools/run.sh --tui --thinking --reasoning-effort high
@@ -296,6 +299,13 @@ lua({ code = "return #(args.text:gmatch('%S+'))", input = { text = "a b c" } })
 | `LITE_WAKE_TASK` | — | 唤醒任务 prompt |
 | `LITE_WAKE_TASK_FILE` | `.lite/wake.md` | 唤醒任务文件 |
 | `LITE_WAKE_MAX` | `0` | 最大唤醒次数（0 不限） |
+| `LITE_VOICE_MIC` | `default` | 语音模式录音源（pulse 设备名，`default` 走系统默认麦） |
+| `LITE_VOICE_CHUNK` | `5` | 每段录音秒数（切段越短越灵敏，越长越省 ASR） |
+| `LITE_VOICE_GATE` | `-38` | 静音门限（dB，ffmpeg `mean_volume`）；低于它直接丢，不调 ASR |
+| `SENSEVOICE_BIN` | `/opt/SenseVoice.cpp/bin/sense-voice-main` | SenseVoice CLI 路径 |
+| `SENSEVOICE_MODEL` | `/data/models/sense-voice-small-q4_k.gguf` | gguf 模型路径 |
+| `SENSEVOICE_LANG` | `auto` | 识别语言：`auto` / `zh` / `en` / `yue` / `ja` / `ko` |
+| `SENSEVOICE_THREADS` | `4` | ASR 线程数 |
 
 ---
 
@@ -395,6 +405,37 @@ LITE_DIST_WITH_OCR=1 LITE_DIST_WITH_ORT=1 ./tools/package.sh
 ```
 
 `package.sh` 有 16MB 单文件闸门（`LITE_DIST_MAX_FILE_MB`），误打包系统库会直接报错。
+
+### 可选 · 语音输入（ASR，CPU 版即可，不在包里）
+
+**全部可选**：不装这一节的东西，lite 其它功能一行都不少；语音模式只是不可用（`voice.available()` 为 false，TUI 打印缺哪一项并保持静音）。
+语音模式不内嵌任何推理代码，只调外部 CLI，所以包体不变。
+
+| 依赖（均可选） | 用途 | 缺了会怎样 | 体积参考 |
+|---|---|---|---|
+| `ffmpeg` | 录 16k 单声道片段 + `volumedetect` 静音门限 | `voice.available()` 返回 false | 系统包 |
+| SenseVoice.cpp CLI（`sense-voice-main`，**CPU 构建**） | 本地转写（中/英/粤/日/韩） | 同上 | ~360M（含构建） |
+| gguf 模型（如 `sense-voice-small-q4_k.gguf`） | CLI 的权重 | 同上 | ~174M（q4_k） |
+| PulseAudio/PipeWire（`pactl`、默认 source） | 抓麦克风 | 录音为空，无转写 | 系统包 |
+
+**不需要 GPU**：SenseVoice.cpp 的 CPU 版就能跑（q4_k 量化模型在小麦/笔记本上实时），不依赖 CUDA / onnxruntime GPU provider，
+这与仓库里 OCR 的 `ort_link.sh` / `cuda_provider.sh` 那套 GPU 接入完全无关，互不影响。
+
+```bash
+# 1) 系统依赖
+sudo apt install ffmpeg pulseaudio-utils
+
+# 2) SenseVoice.cpp（CPU 即可，q4_k 模型很轻）
+git clone https://github.com/lovemefan/SenseVoice.cpp /opt/SenseVoice.cpp
+#   按仓库 README 编译出 /opt/SenseVoice.cpp/bin/sense-voice-main
+#   下载 gguf 模型到 /data/models/sense-voice-small-q4_k.gguf
+
+# 3) 验收：只测语音栈，不进 TUI
+./tools/lua.sh -e 'local v=require("core.voice"); print(v.available())'
+```
+
+路径不同就改 `SENSEVOICE_BIN` / `SENSEVOICE_MODEL`（见环境变量表）；换模型（比如更大的 `sense-voice`）只改 `SENSEVOICE_MODEL`。
+`LITE_VOICE_GATE` 调高（如 `-30`）更严格地丢静音，环境吵就调低到 `-45`。
 
 ### 构建期依赖
 

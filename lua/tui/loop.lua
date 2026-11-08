@@ -339,9 +339,40 @@ function M.run(ctx, agent, memory, opts)
         return true
     end
 
+    local voice, voice_on = nil, false
+    local function vmod()
+        if not voice then voice = require("core.voice") end
+        return voice
+    end
+
     local function submit()
         local text = composer:get_text()
         if text == "" then return end
+        local vcmd = vmod().command(text)
+        if vcmd == "toggle" then
+            composer:clear()
+            local vm = vmod()
+            if voice_on then
+                voice_on = false
+                vm.stop()
+                transcript:add("system", "语音模式已关闭")
+            else
+                local ok, e = vm.start()
+                voice_on = ok and true or false
+                transcript:add("system", ok and "语音模式已开启:说话即转文字,再输入 #退出 关闭"
+                    or ("语音不可用: " .. tostring(e)))
+            end
+            if draw then draw() end
+            return
+        end
+        if vcmd == "off" and voice_on then                -- 退出语音模式(不退出 lite)
+            composer:clear()
+            voice_on = false
+            vmod().stop()
+            transcript:add("system", "语音模式已关闭")
+            if draw then draw() end
+            return
+        end
         local word = text:lower()
         if word == "quit" or word == "exit" or word == ":q" then
             composer:clear()
@@ -681,6 +712,14 @@ function M.run(ctx, agent, memory, opts)
                 end
                 resume_agent(out)
             end
+        end
+
+        if voice_on and voice then
+            local got = voice.poll()
+            for _, t in ipairs(got) do
+                composer:insert(t .. " ")
+            end
+            if #got > 0 then draw() end
         end
 
         if memory then memory:tick() end
