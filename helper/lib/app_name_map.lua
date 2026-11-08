@@ -1,4 +1,4 @@
--- 自动生成：helper/lib/uimap.lua learn/hover 产出。
+-- 自动生成：helper/lib/uimap.lua learn 产出，勿手改坐标注释以外内容。
 return {
   apps = {
     wechat = {
@@ -141,6 +141,16 @@ return {
           w = 26,
           x = 37,
           y = 473,
+        },
+        [14] = {
+          h = 35,
+          name = "搜索框",
+          region = "search",
+          source = "manual",
+          verified = true,
+          w = 392,
+          x = 287,
+          y = 51,
         },
       },
       regions = {

@@ -29,6 +29,10 @@
 -- 无反馈的槽位保留 verified=false，不当作按钮使用。hover_text 保留 OCR 原始串，
 -- 便于回溯 name 被人工订正前的识别结果。
 --
+-- 特殊控件（大输入框、无 tooltip 的面板入口）不走 hover：它们悬停没反应，
+-- 只能 mark 手工补坐标 + click 一次 + 截图 read 看结果（如搜索框点完出现
+-- 绿框和下拉），确认后 verified=true。走像素投影只会把它当一片色块，别硬套。
+--
 -- map 文件由 learn/hover 整份重写（serialize 规整格式），重跑即覆盖，属预期行为；
 -- 认错的名字直接改 map 或改 clean_name 规则，历史版本交给 git。
 local M = {}
