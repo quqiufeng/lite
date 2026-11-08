@@ -116,7 +116,16 @@ actions.play = function(M, args, env)
         label = hit.name
     elseif is_url and src:match("^davs?://") then
         -- dav://host:port/路径 → 列目录 → 直接流播（不下载；默认整库随机）
+        -- 只写 dav://host:port（不带路径）→ 回退 WEBDAV_MUSIC，整库随机
         local wd = wdlib(env)
+        if src:match("^dav%a*://[^/]+/*$") then
+            local music_dir = wd.env("WEBDAV_MUSIC")
+            if not music_dir or music_dir == "" then
+                error("dav:// 只给了主机，没给路径，且环境里没有 WEBDAV_MUSIC — " ..
+                    "写成 dav://host:port/目录 或把 WEBDAV_MUSIC 写进 ~/.env")
+            end
+            src = src:gsub("/+$", "") .. "/" .. music_dir:gsub("^/+", ""):gsub("/+$", "")
+        end
         local entries, lerr = wd.list_at(src)
         if not entries then error(tostring(lerr)) end
         local dirname = src:gsub("/+$", ""):match("([^/]+)$") or src
@@ -305,7 +314,7 @@ return {
                     enum = { "play", "pause", "resume", "toggle", "next", "prev", "stop", "status", "volume", "seek", "playlist", "quit", "devices", "search" },
                     description = "play=播放(本地路径/URL或曲库关键词); pause/resume/toggle; next/prev=切歌; stop=停止; status=状态; volume=音量; seek=跳转; playlist=队列; search=搜曲库; quit=关播放器; devices=列输出设备",
                 },
-                source = { type = "string", description = "play: 文件路径 / 目录（递归找音频）/ http(s) URL 或广播流 / 曲库关键词（如「九月九」）；search: 关键词" },
+                source = { type = "string", description = "play: 文件路径 / 目录（递归找音频）/ http(s) URL 或广播流 / dav://host:port/目录（WebDAV 直接流播，只写 dav://host:port 则整库随机）/ 曲库关键词（如「九月九」）；search: 关键词" },
                 index = { type = "integer", description = "play: 关键词命中多首时选第几首（先不带 index 看列表）" },
                 append = { type = "boolean", description = "play: true=追加到现有队列（默认替换）" },
                 shuffle = { type = "boolean", description = "play: 目录/多文件时是否打乱（dav:// 目录默认 true）" },

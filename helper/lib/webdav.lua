@@ -65,6 +65,7 @@ end
 
 -- 进程环境缺变量时回退读 dotenv（进程环境优先，与 tools/lua.sh 顺序一致）
 local dotenv
+-- 环境变量优先，缺失时回退 ~/.env → ~/.config/lite/.env（插件进程未必带全 env）
 local function env(key)
     local v = os.getenv(key)
     if v and v ~= "" then return v end
@@ -96,6 +97,9 @@ local function split_dav(u)
     if not host then return proto .. "://" .. rest end
     return proto .. "://" .. host, (path:gsub("/+$", ""))
 end
+
+-- 给插件复用：进程环境 → ~/.env → ~/.config/lite/.env
+M.env = env
 
 -- 任意 URL 里的 dav:// 转 http(s)://
 function M.http(u)
