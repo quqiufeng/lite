@@ -60,9 +60,15 @@ function M.new(opts)
         return nil, "cannot open " .. base .. "/mem.lock"
     end
     -- 写进程持独占锁；只读诊断命令不加锁，允许在 TUI/serve 运行时读取。
-    if not opts.readonly and ffi.C.flock(lock_fd, bit.bor(LOCK_EX, LOCK_NB)) ~= 0 then
+    local readonly = opts.readonly and true or false
+    local lock_busy = false
+    if not readonly and ffi.C.flock(lock_fd, bit.bor(LOCK_EX, LOCK_NB)) ~= 0 then
+        -- 抢不到锁：降级为只读实例，进程继续跑（不写记忆、不刷盘）。
+        ffi.C.flock(lock_fd, LOCK_UN)
         net.close(lock_fd)
-        return nil, "memory already in use: " .. base
+        lock_fd = nil
+        readonly = true
+        lock_busy = true
     end
 
     local h = cache.open(base, (opts.max_mb or 100) * 1024 * 1024)
@@ -75,6 +81,8 @@ function M.new(opts)
         h = h,
         dir = base,
         lock_fd = lock_fd,
+        readonly = readonly,
+        lock_busy = lock_busy,
         flush_ms = (tonumber(opts.flush_sec) or 30) * 1000,
         last_sync = os.time() * 1000,
     }, M)
@@ -95,6 +103,7 @@ end
 
 function M:sync()
     if not self.h then return nil end
+    if self.readonly then return nil end
     self.last_sync = os.time() * 1000
     return cache.sync(self.h)
 end
@@ -111,6 +120,7 @@ function M:tick(now_ms)
 end
 
 function M:put(ns, key, value, ttl)
+    if self.readonly then return false, "readonly memory" end
     local full = join(ns, key)
     local ok, s = pcall(cjson.encode, value)
     if not ok then return false, s end
@@ -125,6 +135,7 @@ function M:get(ns, key)
 end
 
 function M:del(ns, key)
+    if self.readonly then return false end
     return cache.del(self.h, join(ns, key)) == 0
 end
 

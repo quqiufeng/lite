@@ -1187,7 +1187,12 @@ do
     check(mem ~= nil, "memory open: " .. tostring(merr))
     if mem then
         local locked, lerr = Memory.new({ dir = dir, max_mb = 32 })
-        check(locked == nil and lerr ~= nil, "memory lock")
+        check(locked ~= nil and locked.lock_busy == true and locked.readonly == true,
+            "memory lock degrade readonly: " .. tostring(lerr))
+        if locked then
+            check(locked:put("/agent/knowledge", "x", { c = 1 }) == false, "memory readonly no write")
+            locked:close()
+        end
         local reader = Memory.new({ dir = dir, max_mb = 32, readonly = true })
         check(reader ~= nil, "memory readonly lock")
         if reader then reader:close() end

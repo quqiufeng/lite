@@ -384,14 +384,20 @@ elseif cmd == "--tui" or cmd == "--gui" then
     local Debug = require("core.debug")
     local logger = Debug.new(config.debug_log)
     if logger then ctx.settings.debug = logger end
+    -- 快照只读不写记忆，也就没必要抢写锁。
+    local snapshot_only = flags.snapshot or flags.snapshot_text or flags.snapshot_todo or flags.snapshot_diff
     local memory, merr = Memory.new({
         dir = config.memory_dir or config.cwd,
         max_mb = config.memory_mb,
         flush_sec = config.memory_flush,
+        readonly = snapshot_only and true or false,
     })
     if not memory then
         io.stderr:write("lite: " .. tostring(merr) .. "\n")
         os.exit(2)
+    end
+    if memory.lock_busy and not snapshot_only then
+        io.stderr:write("lite: memory busy, read-only this run: " .. tostring(config.memory_dir or config.cwd) .. "\n")
     end
 
     local multi, mlerr = http.multi_new()
@@ -540,6 +546,9 @@ elseif cmd == "--once" then
         if json then emit({ type = "error", error = tostring(merr) })
         else io.stderr:write("lite: " .. tostring(merr) .. "\n") end
         os.exit(2)
+    end
+    if memory.lock_busy then
+        io.stderr:write("lite: memory busy, read-only this run: " .. tostring(config.memory_dir or config.cwd) .. "\n")
     end
 
     local tools = Tools.new({
