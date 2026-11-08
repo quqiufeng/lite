@@ -115,23 +115,25 @@ actions.play = function(M, args, env)
         files = { p }
         label = hit.name
     elseif is_url and src:match("^davs?://") then
-        -- dav://host:port/路径 → 列目录 → 按需下载（index=N 只取第 N 首）
+        -- dav://host:port/路径 → 列目录 → 直接流播（不下载；默认整库随机）
         local wd = wdlib(env)
         local entries, lerr = wd.list_at(src)
         if not entries then error(tostring(lerr)) end
+        local dirname = src:gsub("/+$", ""):match("([^/]+)$") or src
         if args.index then
             local hit = entries[args.index]
             if not hit then error("index 超出范围（1.." .. #entries .. "）") end
-            entries = { hit }
+            files = { wd.auth_url(hit.url) }
+            label = hit.name
+        else
+            files = {}
+            for i, e in ipairs(entries) do
+                if args.limit and i > args.limit then break end
+                files[#files + 1] = wd.auth_url(e.url)
+            end
+            if args.shuffle == nil then args.shuffle = true end
+            label = dirname .. "（流播）"
         end
-        files = {}
-        for _, e in ipairs(entries) do
-            local p, derr = wd.fetch_url(e.url)
-            if not p then error("下载「" .. e.name .. "」失败: " .. tostring(derr)) end
-            files[#files + 1] = p
-        end
-        label = src:gsub("/+$", ""):match("[^/]+/?$") or src
-        label = label .. " 目录"
     else
         files = { src }
     end
@@ -306,7 +308,8 @@ return {
                 source = { type = "string", description = "play: 文件路径 / 目录（递归找音频）/ http(s) URL 或广播流 / 曲库关键词（如「九月九」）；search: 关键词" },
                 index = { type = "integer", description = "play: 关键词命中多首时选第几首（先不带 index 看列表）" },
                 append = { type = "boolean", description = "play: true=追加到现有队列（默认替换）" },
-                shuffle = { type = "boolean", description = "play: 目录/多文件时是否打乱" },
+                shuffle = { type = "boolean", description = "play: 目录/多文件时是否打乱（dav:// 目录默认 true）" },
+                limit = { type = "integer", description = "play: dav:// 目录最多取几首（默认整个目录，边播边取不下载）" },
                 level = { type = "integer", description = "volume: 直接设为 0..150" },
                 delta = { type = "integer", description = "volume: 相对调整（如 +10 / -10）；seek: 相对秒数（如 30 / -15）" },
                 seconds = { type = "integer", description = "seek: 同 delta" },

@@ -144,6 +144,27 @@ local function urldec(s)
     end))
 end
 
+-- 把 basic auth 直接拼进 http(s) URL（VLC 流播用，不落盘到 m3u 之外）
+local function authenc(s)
+    return (tostring(s):gsub("[^%w%-%._~]", function(c)
+        return string.format("%%%02X", c:byte())
+    end))
+end
+
+function M.auth_url(u, auth)
+    u = tostring(u)
+    if not auth then
+        local c = M.cfg()
+        auth = c and c.auth
+    end
+    if not auth or u:match("^%a+://[^/]*@") then return u end
+    local user, pass = auth:match("^([^:]*):(.*)$")
+    if not user then return u end
+    local cred = authenc(user) .. ":" .. authenc(pass) .. "@"
+    -- 函数替换：cred 里的 %XX 不能被当成捕获引用
+    return (u:gsub("^(%a+://)", function(m) return m .. cred end, 1))
+end
+
 -- 一次 curl easy 请求；out_file 给了就写文件，否则返回 body
 local function request(url, auth, headers, method, timeout, out_file)
     global_init()

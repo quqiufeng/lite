@@ -20,6 +20,19 @@ local EXT = {
 local function q(s) return "'" .. tostring(s):gsub("'", "'\\''") .. "'" end
 M.q = q
 
+-- URL → 可读名：去掉 basic auth 凭据、取末段、解 %XX、去扩展名。
+-- 流播 URL 里带密码，任何展示都不能把原文吐出去。
+function M.pretty(s)
+    s = tostring(s or "")
+    if s:match("^%a[%w+.-]*://") then
+        s = s:gsub("^%a[%w+.-]*://", ""):gsub("^[^/]*@", "")
+        s = s:match("([^/]+)/*$") or s
+        s = s:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end)
+        s = s:gsub("%.[%w]+$", "")
+    end
+    return s
+end
+
 function M.sh(cmd, timeout)
     local f = io.popen(cmd .. " 2>&1", "r")
     if not f then return { ok = false, output = "popen failed: " .. cmd } end
@@ -120,7 +133,7 @@ function M.tracks()
     local f = io.open(M.queuelog(), "r")
     if not f then return list end
     for line in f:lines() do
-        if line ~= "" then list[#list + 1] = line:match("([^/]+)$") or line end
+        if line ~= "" then list[#list + 1] = M.pretty(line) end
     end
     f:close()
     return list
@@ -152,8 +165,15 @@ local function flush()
     local f = io.open(path, "w")
     if not f then return nil, "写不了播放列表: " .. path end
     f:write("#EXTM3U\n")
-    for _, p in ipairs(list) do f:write(p, "\n") end
+    for _, p in ipairs(list) do
+        -- 带标题：VLC 的 $t 才有名字（流播 URL 不会把密码显示到界面上）
+        f:write("#EXTINF:-1,", M.pretty(p), "\n", p, "\n")
+    end
     f:close()
+    -- url 里可能带 basic auth（dav 流播），两份文件都收紧权限
+    if list[1] and list[1]:match("^%a+://[^/]*@") then
+        M.sh("chmod 600 " .. q(path) .. " " .. q(qlog))
+    end
     call(PL, "Stop")
     local out, err = call(PL, "OpenUri", "string:file://" .. path)
     return out and true or nil, err
@@ -241,7 +261,7 @@ end
 function M.describe(v)
     if not v then return "播放器未运行" end
     if v["idle-active"] then return "空闲（队列已空，VLC 在跑）" end
-    local parts = { string.format("♪ %s", tostring(v["media-title"] or "?")) }
+    local parts = { string.format("♪ %s", M.pretty(v["media-title"] or "?")) }
     parts[#parts + 1] = string.format("%s / %s", M.time(v["time-pos"]), M.time(v.duration))
     if v.pause then parts[#parts + 1] = "已暂停" end
     if v.volume then parts[#parts + 1] = string.format("音量 %d%%", math.floor(v.volume + 0.5)) end
