@@ -6,35 +6,70 @@
 local ffi = require("ffi")
 if not pcall(ffi.cdef, "void usleep(unsigned int);") then end
 
-local D = {
-    title_pt  = { 100, 20 },                 -- 标题栏（先点它，搜索框才会拿到焦点）
-    search_pt = { 287, 51 },                 -- 搜索输入框
-    panel     = { 160, 105, 950, 400 },      -- 搜索候选面板 crop (x0,y0,x1,y1)
-    input_pt  = { 1540, 1150 },              -- 输入框
-    chat      = { 520, 100, 2500, 1040 },    -- 消息区 crop
-    min_sim   = 0.5,                         -- OCR 模糊匹配阈值（拍照常把手认成丰）
-}
+-- 坐标 100% 来自 helper/lib/app_wechat_map.lua（产物，由 helper/lib/apps/wechat.lua 生成）。
+-- 本文件不含任何屏幕坐标：map 缺失或缺 region 时直接报错，不给写死的兜底值。
+local MAP_REQUIRED = { "titlebar", "search", "title", "candidates", "input", "bubble" }
 
--- 固定区域以 helper/lib/app_name_map.lua 的 regions 为准（微信全屏，坐标不变），
--- map 缺失/读不到时才退回上面的常量。
-do
-    local ok, map = pcall(dofile, (os.getenv("LITE_CWD") or ".") .. "/helper/lib/app_name_map.lua")
-    local app = ok and map and map.apps and map.apps.wechat
-    local r = app and app.regions
-    if r then
-        local function box(name)
-            local g = r[name]
-            if g and g.x0 then return { g.x0, g.y0, g.x1, g.y1 } end
+local function map_candidates()
+    local here = (debug.getinfo(1, "S") or {}).source or ""
+    here = here:gsub("^@", "")
+    local dir = here:match("^(.*)[/\\][^/\\]*$") or "."
+    local cwd = os.getenv("LITE_CWD") or "."
+    return { dir .. "/lib/app_wechat_map.lua", cwd .. "/helper/lib/app_wechat_map.lua" }
+end
+
+local D = { min_sim = 0.5 }   -- min_sim 是 OCR 阈值，不是坐标（拍照常把手认成丰）
+
+local function load_map()
+    local tried = map_candidates()
+    for _, p in ipairs(tried) do
+        local ok, m = pcall(dofile, p)
+        if ok and type(m) == "table" and type(m.regions) == "table" then
+            D.map_path, D.map = p, m
+            return m
         end
-        local b = box("panel")
-        if b then D.panel = { b[1], b[2], math.min(b[3], 950), math.min(b[4], 460) } end
-        local c = box("bubble") or box("chat")
-        if c then D.chat = c end
-        local i = box("input")
-        if i then D.input_pt = { math.floor((i[1] + i[3]) / 2), math.floor((i[2] + i[4]) / 2) } end
-        local s = box("search")
-        if s then D.search_pt = { math.floor((s[1] + s[3]) / 2), math.floor((s[2] + s[4]) / 2) } end
     end
+    D.map_error = string.format(
+        "wechat map 读不到： %s\n重新生成： ./tools/lua.sh helper/lib/apps/wechat.lua",
+        table.concat(tried, " | "))
+    return nil
+end
+
+local function region(name)
+    local m = D.map or load_map()
+    if not m then error(D.map_error) end
+    local g = m.regions[name]
+    if type(g) ~= "table" or not g.x0 then
+        error(string.format("wechat map 缺 region %q（%s）；把坐标写进 helper/lib/apps/wechat.lua 后重跑生成脚本",
+            name, D.map_path))
+    end
+    return g
+end
+
+local function crop(name)
+    local g = region(name)
+    return { g.x0, g.y0, g.x1, g.y1 }
+end
+
+local function point(name)
+    local g = region(name)
+    return math.floor((g.x0 + g.x1) / 2), math.floor((g.y0 + g.y1) / 2)
+end
+
+-- 开跑前一次性把需要的 region 全查一遍，缺哪个直接列名字（fail fast，不半途炸）
+local function check()
+    local m = D.map or load_map()
+    if not m then return nil, D.map_error end
+    local miss = {}
+    for _, n in ipairs(MAP_REQUIRED) do
+        local g = m.regions[n]
+        if type(g) ~= "table" or not g.x0 then miss[#miss + 1] = n end
+    end
+    if #miss > 0 then
+        return nil, string.format("wechat map 缺 region: %s（%s）；坐标写进 helper/lib/apps/wechat.lua 后重跑生成脚本",
+            table.concat(miss, ","), D.map_path)
+    end
+    return m
 end
 
 local M = {}
@@ -152,12 +187,12 @@ end
 
 local function do_search(name, index)
     ensure()
-    click(D.title_pt[1], D.title_pt[2])        -- 关键：ctrl+f 无效，必须先点标题栏
-    click(D.search_pt[1], D.search_pt[2])
+    click(point("titlebar"))                   -- 关键：ctrl+f 无效，必须先点标题栏
+    click(point("search"))
     key("ctrl+a"); key("BackSpace")
     paste(name); sleep(600)
 
-    local boxes, text = ocr_area("panel", D.panel)
+    local boxes, text = ocr_area("candidates", crop("candidates"))
     local want, k = {}, tonumber(index) or 1
     for _, b in ipairs(boxes) do
         if sim(b.text, name) >= D.min_sim and norm(b.text) ~= "" then want[#want + 1] = b end
@@ -173,7 +208,7 @@ local function do_open(name, index)
     local b = do_search(name, index)
     click(math.floor(b.cx), math.floor(b.cy)); sleep(900)
     for i = 1, 8 do
-        local _, text = ocr_area("title", { 300, 20, 1200, 80 })
+        local _, text = ocr_area("title", crop("title"))
         if sim(text, name) >= D.min_sim then return true end
         sleep(300)
     end
@@ -182,12 +217,13 @@ end
 
 local function do_send(text, name)
     ensure()
-    click(D.input_pt[1], D.input_pt[2])
+    click(point("input"))
     key("ctrl+a"); key("BackSpace")
     paste(text); sleep(300)
     key("Return"); sleep(1200)
     -- 只 OCR 聊天区底部条带：整块聊天区太大，det 会漏掉最新那条小气泡
-    local strip = { D.chat[1], D.chat[4] - 420, D.chat[3], D.chat[4] }
+    local strip = crop("bubble")
+    strip[2] = strip[4] - 420
     local seen = ""
     for _ = 1, 3 do
         seen = select(2, ocr_area("bubble", strip))
@@ -207,6 +243,8 @@ function M.run(args, env)
     win = find_win()
     local action = args.action or "run"
     local bg = args.background
+    local ok, err = check()
+    if not ok then return "error: " .. err end
     if action == "search" then
         local b = do_search(assert(args.name, "required: name"), args.index)
         leave(bg)
@@ -229,7 +267,7 @@ function M.run(args, env)
         click(math.floor(b.cx), math.floor(b.cy)); sleep(900)
         local opened = false
         for _ = 1, 8 do
-            local _, t = ocr_area("title", { 300, 20, 1200, 80 })
+            local _, t = ocr_area("title", crop("title"))
             if sim(t, name) >= D.min_sim then opened = true break end
             sleep(300)
         end
