@@ -124,6 +124,23 @@ hook 错误一律 fail-open（记 `_hook_errors`，不炸 agent）。`has_hooks(
 `name/path/scope/tool/hooks` 与错误（`--json` 给脚本）；启动时只打印错误
 （`plugin <name> failed: ...`），清单不打扰。别靠翻 `helper/` 猜加载了啥。
 
+**现有插件做什么**（`helper/*.lua`，实现细节看文件头注释；共享逻辑在 `helper/lib/`）：
+
+| 插件 | 作用 | 关键用法/坑 |
+|---|---|---|
+| `adb` | Android 设备：screenshot/tap/swipe/text/open/shell/push | 坐标是**设备像素**，先截图再换算；中文走 AdbKeyboard |
+| `wechat` | 微信：搜索联系人/群 → 进会话 → 发消息/文件 | libxdo 直驱 + 每步 OCR 验收；坐标是 2560x1440 屏幕像素 |
+| `uimap` | 视觉定位按钮：discover/learn/click/save | 结果落 `helper/lib/app_<class>_map.lua`，每 app 一文件 |
+| `usb` | 本机麦/音箱/摄像头：record/play/photo/video/volume | 设备可用名字子串；缺 arecord/ffmpeg 只对应 action 报错 |
+| `music` | 后台常驻 VLC 放歌：play/pause/next/volume/seek/playlist | 源可为本地路径、关键词（WebDAV 搜）、`dav://host:port/路径`（流播不下载） |
+| `search` | DeepSeek Search：关键词→rerank 结果+摘要 | 需要 `DEEPSEEK_API_KEY` |
+| `fetch` | DeepSeek Fetch：URL→Markdown 正文 | 同上；替代原始 HTTP 抓页面 |
+| `tokens` | 每日 token 账本查询 | 数据源 `/agent/usage`，跨会话同一本账 |
+
+`music` 的 `dav://` 语义：`dav://host:port/路径` 列目录**直接流播**（默认整库随机，
+`limit=N` 限首数，`index=N` 选第几首）；**只写 `dav://` 不带路径会 PROPFIND 失败**，
+因为 host 拆不出来——要整库就带上 `WEBDAV_MUSIC` 的路径（`~/.env` 里有）。
+
 **调一次插件工具的完整链路**（`lua/core/tools.lua`）：
 
 1. 发现 —— `_scan_helper_schemas`（`:1173`）遍历 `_helper_roots()`：`<cwd>/helper`
