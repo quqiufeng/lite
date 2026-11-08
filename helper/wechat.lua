@@ -57,11 +57,14 @@ local function point(name)
 end
 
 -- 开跑前一次性把需要的 region 全查一遍，缺哪个直接列名字（fail fast，不半途炸）
-local function check()
+local function check(extra)
     local m = D.map or load_map()
     if not m then return nil, D.map_error end
+    local names = {}
+    for _, n in ipairs(MAP_REQUIRED) do names[#names + 1] = n end
+    for _, n in ipairs(extra or {}) do names[#names + 1] = n end
     local miss = {}
-    for _, n in ipairs(MAP_REQUIRED) do
+    for _, n in ipairs(names) do
         local g = m.regions[n]
         if type(g) ~= "table" or not g.x0 then miss[#miss + 1] = n end
     end
@@ -75,13 +78,16 @@ end
 local M = {}
 M.schema = {
     name = "wechat",
-    description = "操作微信：搜索联系人/群、进入会话、输入并发送消息（动态 libxdo 驱动，每步 OCR 验收）",
+    description = "操作微信：搜索联系人/群、进入会话、输入并发送消息、发送文件（动态 libxdo 驱动，每步 OCR 验收）",
     parameters = {
         type = "object",
         properties = {
-            action = { type = "string", enum = { "run", "search", "open", "send" } },
-            name = { type = "string", description = "联系人/群名（search/open/run 必填）" },
+            action = { type = "string", enum = { "run", "search", "open", "send", "sendfile", "screenshot" } },
+            name = { type = "string", description = "联系人/群名（search/open/run/sendfile/screenshot 可选，给了就先搜索进入）" },
             text = { type = "string", description = "要发送的消息" },
+            path = { type = "string", description = "sendfile 必填：要发送的文件的绝对路径" },
+            rect = { type = "array", items = { type = "integer" },
+                     description = "screenshot 必填：[x0,y0,x1,y1] 屏幕坐标；先最小化微信，alt+a 拖拽选区，双击入剪贴板" },
             index = { type = "integer", description = "第几行候选，默认 1" },
             background = { type = "boolean", description = "做完最小化微信，默认 true" },
         },
@@ -233,6 +239,112 @@ local function do_send(text, name)
     error(string.format("发送后气泡里没看到 %q（OCR=%q）", text, norm(seen):sub(1, 120)))
 end
 
+-- 文件选择框是独立窗口：不能用 click()/key()（它们会 ensure() 抢回微信主窗口）
+local function dclick(x, y)
+    xdo:move_abs(x, y); sleep(160); xdo:click_abs(x, y, 1); sleep(420)
+end
+local function dkey(seq) xdo:key(0, seq, 15000); sleep(200) end
+
+local function dialog_id()
+    local ok, r = pcall(W.resolve, { name = "打开", class = "wechat", pick = 1 })
+    if ok and r then return r.id or r.win end
+    return nil
+end
+
+local function bubble_has(needle)
+    local strip = crop("bubble"); strip[2] = strip[4] - 420
+    local seen = ""
+    for _ = 1, 4 do
+        seen = select(2, ocr_area("bubble", strip)) or ""
+        if seen:lower():find(needle:lower(), 1, true) then return true end
+        sleep(900)
+    end
+    return false, seen
+end
+
+local function do_sendfile(path, name, index)
+    local base = tostring(path):match("([^/\\]+)$") or tostring(path)
+    if name then do_open(name, index) else ensure() end
+    click(point("sendfile")); sleep(900)
+    local id
+    for _ = 1, 12 do id = dialog_id(); if id then break end; sleep(400) end
+    if not id then error("点了「发送文件」但没弹出「打开」对话框（region sendfile 可能偏了）") end
+    -- 弹窗默认焦点就在「文件名称」输入框：只激活窗口，不点（点会写脏 fileinput 坐标依赖）
+    pcall(function() xdo:activate(id) end); sleep(400)
+    dkey("ctrl+a"); dkey("BackSpace")
+    local f = assert(io.open("/tmp/wechat-clip.txt", "w")); f:write(path); f:close()
+    local okc = os.execute("xclip -selection clipboard -i /tmp/wechat-clip.txt >/dev/null 2>&1")
+    if okc ~= 0 and okc ~= true then error("写剪贴板失败：xclip 不可用") end
+    sleep(250); dkey("ctrl+v"); sleep(700)
+    dkey("Return"); sleep(1200)
+    for _ = 1, 6 do
+        if not dialog_id() then break end
+        local ox, oy = point("fileopen"); dclick(ox, oy); sleep(800)
+    end
+    if dialog_id() then error("文件选择框没关掉（路径可能没粘进「文件名称」输入框）") end
+    ensure(); sleep(300)
+    dkey("Return"); sleep(1500)          -- 主窗口回车 = 发送
+    ensure()
+    local seen, txt = bubble_has(base)
+    if not seen then
+        error(string.format("发送后气泡里没看到 %q（OCR=%q）", base, norm(txt or ""):sub(1, 120)))
+    end
+    return string.format("sendfile: %s -> %s (bubble_seen=true)", path, name or "当前会话")
+end
+
+-- 剪贴板里是否有 PNG（微信截图器/xfce 都会给 image/png target）
+local function clip_png()
+    local h = io.popen("xclip -selection clipboard -t image/png -o 2>/dev/null | head -c 8 | od -An -tx1 | tr -d ' \\n'")
+    local s = h and (h:read("*a") or "") or ""
+    if h then h:close() end
+    return s:sub(1, 16) == "89504e470d0a1a0a"
+end
+
+-- alt+a 桌面截图 → 拖拽矩形 → 双击入剪贴板 → 回微信输入框 ctrl+v → 回车发送。
+-- 铁律：截图前必须先最小化微信。否则 alt+a 的选区遮罩压在微信上，剪贴板会被
+-- 微信自己抢回，ctrl+v 表面成功但输入框永远是空的（踩过 6 次）。
+local function do_screenshot(a, name, index)
+    local x0, y0, x1, y1 = a[1], a[2], a[3], a[4]
+    local cx, cy = math.floor((x0 + x1) / 2), math.floor((y0 + y1) / 2)
+    -- 顺序铁律：先 open 会话（搜索要用剪贴板贴文字），再截图。
+    -- 反了的话 do_open 的文本 xclip 会把刚进剪贴板的图覆盖掉，
+    -- ctrl+v 贴进去的是「文件传输助手」四个字，回车发出去的也是文字。
+    if name then do_open(name, index) else ensure() end
+    sleep(400)
+    pcall(function() xdo:minimize(win) end); sleep(900)
+    local cur = xdo.active and xdo:active() or nil
+    if cur == win then error("微信没最小化成功，alt+a 会被微信抢走剪贴板") end
+    xdo:move_abs(40, 1400); sleep(250)                 -- 鼠标先离开待截区域
+    xdo:key(0, "alt+a", 15000); sleep(1900)            -- XTEST 全局热键
+    xdo:move_abs(x0, y0); sleep(300)
+    xdo:mouse_down(1); sleep(150)
+    for i = 1, 20 do
+        local t = i / 20
+        xdo:move_abs(math.floor(x0 + (x1 - x0) * t), math.floor(y0 + (y1 - y0) * t)); sleep(30)
+    end
+    sleep(150); xdo:mouse_up(1); sleep(800)
+    xdo:click_abs(cx, cy, 1, 2, 90); sleep(1400)       -- 双击：图才进剪贴板（无需 Ctrl+C）
+    if not clip_png() then error("截图没进剪贴板（没有 image/png）：alt+a 可能没生效或被别的窗口吃掉") end
+    ensure(); sleep(500)                                -- 会话已在截图前打开，这里只把焦点抢回微信
+    local ix, iy = point("input")
+    click(ix, iy); sleep(400)
+    xdo:key(0, "ctrl+v", 20000); sleep(2600)
+    ensure(); sleep(200)
+    key("Return"); sleep(1800)                          -- 主窗口回车 = 发送
+    ensure()
+    -- 图片气泡没有文字：验左栏会话预览里的「[图片]」
+    local seen = ""
+    for _ = 1, 4 do
+        seen = (select(2, ocr_area("panel", crop("panel"))) or "")
+        if seen:find("图片", 1, true) then
+            return string.format("screenshot: %dx%d -> %s (preview=图片)",
+                x1 - x0, y1 - y0, name or "当前会话")
+        end
+        sleep(900)
+    end
+    error(string.format("发图后左栏没看到「图片」预览（OCR=%q）", norm(seen):sub(1, 120)))
+end
+
 local function leave(bg)
     if bg == false then return end
     pcall(function() xdo:minimize(win) end); sleep(200)
@@ -243,8 +355,27 @@ function M.run(args, env)
     win = find_win()
     local action = args.action or "run"
     local bg = args.background
-    local ok, err = check()
+    local needs = (action == "sendfile" and { "sendfile" })
+        or (action == "screenshot" and { "shotbtn" }) or nil
+    local ok, err = check(needs)
     if not ok then return "error: " .. err end
+    if action == "screenshot" then
+        local rect = assert(args.rect, "required: rect")
+        for i = 1, 4 do
+            if type(rect[i]) ~= "number" then
+                return "error: rect must be [x0,y0,x1,y1] integers, got " .. tostring(rect[1]) .. "..."
+            end
+        end
+        local okk, r = pcall(do_screenshot, rect, args.name, args.index)
+        leave(bg)
+        if not okk then error(r) end
+        return r
+    end
+    if action == "sendfile" then
+        local r = do_sendfile(assert(args.path, "required: path"), args.name, args.index)
+        leave(bg)
+        return r
+    end
     if action == "search" then
         local b = do_search(assert(args.name, "required: name"), args.index)
         leave(bg)
@@ -276,7 +407,7 @@ function M.run(args, env)
         leave(bg)
         return head .. "\nopened: " .. name .. "\nsent: " .. text .. " (bubble_seen=true)"
     end
-    error("未知 action: " .. tostring(action) .. "（run|search|open|send）")
+    error("未知 action: " .. tostring(action) .. "（run|search|open|send|sendfile）")
 end
 
 return M
