@@ -96,3 +96,96 @@ do_read_cache_folio()   mm/filemap.c:4098   callers: read_cache_folio / mapping_
 1. **写回路径**（`writepages` → `iomap_writepages` / `block_write_full_folio`）：与读路径共用 `address_space`，扇入同样高。
 2. **readahead 窗口逻辑**（`page_cache_ra_unbounded` / `page_cache_async_ra`，均在 available_filter_functions）：可直接 function_graph 抓窗口演进。
 3. **补 dataflow vars 键**：`import --only_dataflow` 重跑。
+
+---
+
+## 8. 补充：四条主线的静态巡览（全部 `[static]`）
+
+> 第 1–7 节是**页缓存读路径**，带真机 function_graph 的 `[verified]` 链条。
+> 本节是另一次**横向巡览**（VFS / MM / 调度 / 块层），只走 `codesearch` 工具、**未做 Phase 5 断点**，
+> 所以每条结论都标 `[static]`，与上文的 `[verified]` 不能混读。
+
+### 8.1 横向全景
+
+```
+syscall 入口 (arch/*/entry)
+  ├─ VFS       fs/namei.c:4872 path_openat → fs/namei.c:4433 lookup_open
+  │                                             → fs/open.c:885 do_dentry_open → a_ops/f_op 回调
+  ├─ MM        arch/*/mm/fault.c: do_page_fault（每架构一份）
+  │             → mm/memory.c:6651 handle_mm_fault → __handle_mm_fault | hugetlb_fault
+  ├─ SCHED     kernel/sched/core.c:6717 pick_next_task → __pick_next_task
+  │             → sched/rt.c:1701 _pick_next_task_rt | sched/idle.c:504 pick_task_idle
+  │             kernel/sched/core.c:7107 __schedule（切换本体）
+  └─ BLK       block/blk-core.c:952 submit_bio → :817 submit_bio_noacct → :670 __submit_bio
+                → block/blk-mq.c:3108 blk_mq_submit_bio → plug | blk_mq_run_hw_queue
+```
+
+### 8.2 扇入/扇出（只用 `context` 取，不读原始 JSON）
+
+| 接口 | callers | callees | 判读 |
+|---|---|---|---|
+| `mm/memory.c:handle_mm_fault` | 30 | 6 | 扇入高但**失真**：30 个里大半是同名各架构 `do_page_fault`；真实上游只有 `faultin_page` / `fixup_user_fault` / `do_user_addr_fault` |
+| `fs/open.c:do_dentry_open` | 5 | 10 | VFS → 具体 fs 的唯一收紧点，纵读价值最高 |
+| `block/blk-core.c:submit_bio` | 3 | 1 | 偏低：真实上游主要走 `submit_bio_noacct` / `submit_bh` |
+| `kernel/sched/core.c:__schedule` | 3 | — | 失真：`schedule()` 未连边 |
+| `fs/namei.c:path_openat` | — | — | `context` 只回 `paths: path_openat`，**无边** |
+
+### 8.3 黑盒（有意不展开）
+
+| 接口 | 为何不开 |
+|---|---|
+| `open(struct inode *, struct file *)` 回调 | 指针调用，纵深是「每个 fs 一份」，只记锚点 |
+| `sched_class->pick_task_*` 族 | 调用图在此断链 |
+| `blk_mq_*` 硬件队列分配 | 属驱动边界，超 Scope |
+| `security_file_open`（LSM） | 命中 `security/smack/smack_lsm.c:2364`，与主线弱相关 |
+| `ksmbd_*`（`fs/smb/server/vfs_cache.c`） | 支线，只记接口 |
+
+### 8.4 与第 4 节互证的数据流
+
+`dataflow bi_bdev` → 28 处 / 10 函数，形状是「创建 → 持有 → 改」：
+
+- 创建：`bio_init`、`bio_reset`
+- 持有：`submit_bio` 链一路带到 `blk_mq_submit_bio`
+- 改：`bio_endio`、`guard_bio_eod`、`bio_await`、trace 点
+
+这与第 3 节 `address_space` / `i_pages` 是**两条独立契约**：`i_pages` 管「页在不在内存」，
+`bio` 管「一次 IO 怎么下去」。读路径 miss 时第 2 节的 `read_pages → ext4_mpage_readpages`
+正是从前者跨到后者的接口。
+
+### 8.5 判读与可疑点
+
+- **同一抽象按架构复制**是内核有意的 arch 边界，不是重复代码，但它**污染语义搜索**：
+  查 fault 问题必须加 `--file arch/` 或反选，否则结果被 `do_page_fault` 刷屏。
+- **扇入只能当相对排序，不能当绝对事实**：上表 4 个入口里 3 个扇入失真或缺失
+  （回调、间接调用、内联三类断链，与第 6 节列的内联/间接调用缺口同源）。
+  承重结论仍需 `[verified]`——这也是本节只做地图、不下机制结论的原因。
+- **`--kind struct` 排不到核心类型**：查 `task_struct` 只回 `bpf.h` 匿名 struct 与
+  `sound/pci/cs46xx` 的 `dsp_task_descriptor`；另一条 struct 查询 0 命中。
+  与第 6 节「dataflow vars 键缺结构字段」是同类缺口：**结构体侧整体偏弱**。
+
+### 8.6 后续
+
+1. Phase 5 补 `[verified]`：`make defconfig` 后断 `handle_mm_fault` / `submit_bio` 取 backtrace，
+   逐帧 `context --depth 2`——本节唯一的大缺口。
+2. Phase 6 用测试当场景：`tools/testing/selftests/mm/`（`gup_test` / `hmm-tests`）直接充当 fault 入口。
+3. 补结构体：显式定位 `include/linux/sched.h` 的 `task_struct`，再对其字段跑 `dataflow` 做
+   「谁创建/持有/改」表，与本文件第 3 节的写法对齐。
+4. 未探索：`net/`（`sk_buff`）、`kernel/printk`、中断子系统（`irq_desc`）。
+
+### 8.7 本节实际执行的调用（可复现）
+
+```
+search   "system call entry table sys_call_table"
+search   "virtual filesystem inode dentry path walk lookup open"
+search   "page fault handler handle_mm_fault map pages"
+search   "scheduler pick next task run queue context switch"
+search   "block layer submit_bio request queue elevator dispatch"
+context  handle_mm_fault --depth 2
+context  submit_bio      --depth 2
+context  path_openat     --depth 2
+context  __schedule      --depth 2
+context  do_dentry_open  --depth 2
+dataflow bi_bdev
+search   --kind struct "block IO request bio structure device queue"   # 0 hit
+search   --kind struct "task_struct process descriptor"                # 只回词面近邻
+```
