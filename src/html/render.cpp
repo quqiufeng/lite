@@ -447,7 +447,8 @@ int lite_html_render(const char* html, const char* out_png, int w, int h, double
 {
     g_error.clear();
     if (!html || !out_png) { g_error = "html/out_png is null"; return 1; }
-    if (w <= 0 || h <= 0) { g_error = "invalid size"; return 2; }
+    // h <= 0 表示自动测高：先按 w 布局，出图高度 = 内容实际高度（不裁剪、不留空白）
+    if (w <= 0 || h < 0) { g_error = "invalid size"; return 2; }
     if (scale <= 0) scale = 1.0;
 
     // 项目自带字体（helper/assets）：cairo toy font 只认族名，靠 fontconfig 兜底。
@@ -468,7 +469,9 @@ int lite_html_render(const char* html, const char* out_png, int w, int h, double
 
     cairo_container container;
     container.m_width  = w;
-    container.m_height = h;
+    // 自动测高时先用一个足够大的视口布局：m_height 是媒体/DOM 视口高度，
+    // 给 0 会让 litehtml 按 0 高视口算，content_h 偏小、最后几行被裁掉。
+    container.m_height = (h > 0) ? h : 100000;
 
     document::ptr doc;
     try {
@@ -482,13 +485,21 @@ int lite_html_render(const char* html, const char* out_png, int w, int h, double
     }
     if (!doc) { g_error = "createFromString returned null"; return 3; }
 
+    // 注意：document::render() 的返回值不是内容高度（render_item 的返回值），
+    // 文档真实高度在 m_size 里，要靠 doc->height() 取 —— 否则自动测高恒等于视口高。
     pixel_t content_h = 0;
     try {
-        content_h = doc->render(w);
+        doc->render(w);
+        content_h = doc->height();
     } catch (...) {
         g_error = "layout failed";
         return 4;
     }
+    if (h <= 0) {
+        int auto_h = static_cast<int>(std::ceil(content_h.value()));
+        h = auto_h > 0 ? auto_h : 800;
+    }
+    container.m_height = h;   // 出图按最终高度，clip/draw 都对齐
     if (content_h.value() <= 0) content_h = pixel_t(static_cast<float>(h));
 
     cairo_surface_t* surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32,

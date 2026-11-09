@@ -24,7 +24,7 @@ local M = { schema = {
     path  = { type = "string",  description = "Markdown 文件路径（必填）" },
     out   = { type = "string",  description = "PNG 输出路径，默认 ~/<name>.png（同名 .html 一起写）" },
     width = { type = "number",  description = "视口宽度，默认 820" },
-    height= { type = "number",  description = "视口高度，默认 1400（内容超出会被裁掉，调大即可）" },
+    height= { type = "number",  description = "图像高度，默认 0 = 自动测高（按内容撑满）；给正数则固定高度、超出裁掉" },
     scale = { type = "number",  description = "device scale factor，默认 2" },
     gfm   = { type = "boolean", description = "GitHub 方言（表格/任务列表/删除线），默认 true" },
   }, required = { "path" } },
@@ -178,12 +178,23 @@ local function render_png(html, out, w, h, scale, env)
   end
 end
 
+-- 读 PNG IHDR 拿真实像素尺寸（h=0 自动测高时才知道最终高度）
+local function png_size(path)
+  local f = io.open(path, "rb")
+  if not f then return 0, 0 end
+  local d = f:read(24) f:close()
+  if not d or #d < 24 then return 0, 0 end
+  local b = { d:byte(17, 24) }
+  local function be(i) return ((b[i] * 256 + b[i+1]) * 256 + b[i+2]) * 256 + b[i+3] end
+  return be(1), be(5)
+end
+
 function M.run(args, env)
   if not args.path then error("md2png: required: path (string)") end
   local f = assert(io.open(args.path, "rb"), "读不到 " .. args.path)
   local src = f:read("*a") f:close()
   local width  = tonumber(args.width)  or 820
-  local height = tonumber(args.height) or 1400
+  local height = tonumber(args.height) or 0 -- 0 = 自动测高
   local scale  = tonumber(args.scale)  or 2
   local body, rc = md_to_html(src)
   if rc < 0 then error("md_parse 失败 rc=" .. rc) end
@@ -199,8 +210,9 @@ function M.run(args, env)
   -- 工具返回值必须是字符串（返回 table 会被 tostring 成 "table: 0x..."）
   local size = (function() local s = io.open(out, "rb") if not s then return 0 end
     local n = s:seek("end") s:close() return n end)()
+  local pw, ph = png_size(out)
   return string.format("PNG %dx%d (%d 字节) → %s\nHTML → %s",
-    width * scale, height * scale, size, out, hp)
+    pw, ph, size, out, hp)
 end
 
 return M

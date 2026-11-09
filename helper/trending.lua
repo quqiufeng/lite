@@ -67,7 +67,7 @@ local M = { schema = {
   parameters = { type = "object", properties = {
     out    = { type = "string",  description = "PNG 输出路径，默认 ~/trending.png（同名 .html 一起写）" },
     width  = { type = "number",  description = "视口宽度，默认 820（低于 780 仓库名会折行）" },
-    height = { type = "number",  description = "视口高度，默认 1420（9 条够用；加 limit 要同步加高）" },
+    height = { type = "number",  description = "图像高度，默认 0 = 自动测高（按条目数量撑满，加 limit 不用手动调高）" },
     scale  = { type = "number",  description = "device scale factor，默认 2（retina）" },
     limit  = { type = "number",  description = "取前 N 条，默认 9" },
     since  = { type = "string",  description = "daily | weekly | monthly，默认 daily" },
@@ -203,7 +203,7 @@ function M.run(args, env)
   local out   = args.out or (home .. "/trending.png")
   if not out:match("%.png$") then error("out 必须以 .png 结尾: " .. out) end
   local width  = tonumber(args.width)  or 820
-  local height = tonumber(args.height) or 1420
+  local height = tonumber(args.height) or 0 -- 0 = 自动测高
   local scale  = tonumber(args.scale)  or 2
   local limit  = tonumber(args.limit)  or 9
   if width < 780 then error("width 太小（" .. width .. "），19px 仓库名会折行；required: width >= 780") end
@@ -228,8 +228,19 @@ function M.run(args, env)
   local sz = pf:seek("end"); pf:close()
   if sz < 10000 then error("出图过小（" .. sz .. " bytes），可能空白: " .. out) end
 
-  return ("%d 条 · %.1fx%d @%dx · litehtml\nPNG: %s (%d KB)\nHTML: %s"):format(
-    #items, width, height, scale, out, math.floor(sz / 1024), html_path)
+  -- 读 PNG IHDR 拿真实像素尺寸（h=0 自动测高时才知道最终高度）
+  local pw, ph = (function()
+    local f2 = io.open(out, "rb")
+    if not f2 then return width * scale, 0 end
+    local d = f2:read(24) f2:close()
+    if not d or #d < 24 then return width * scale, 0 end
+    local b = { d:byte(17, 24) }
+    local function be(i) return ((b[i] * 256 + b[i+1]) * 256 + b[i+2]) * 256 + b[i+3] end
+    return be(1), be(5)
+  end)()
+
+  return ("%d 条 · %dx%d @%dx · litehtml\nPNG: %s (%d KB)\nHTML: %s"):format(
+    #items, pw, ph, scale, out, math.floor(sz / 1024), html_path)
 end
 
 return M
