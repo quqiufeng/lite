@@ -51,6 +51,14 @@ fi
 rm -rf "$TMPD"
 echo "OK cli.json"
 
+echo "== plugins =="
+OUT="$("$ROOT/tools/run.sh" plugins --json || true)"
+if ! echo "$OUT" | grep -q '"name":"codesearch"'; then
+    echo "FAIL plugins.codesearch (helper/codesearch.lua not loaded)" >&2
+    exit 1
+fi
+echo "OK plugins.json"
+
 echo "== tui =="
 "$ROOT/tools/tui_smoke.sh"
 

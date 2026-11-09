@@ -53,6 +53,9 @@ mem.bin
 mem.idx
 mem.lock
 
+# codesearch: tokenizers-cpp 静态库随仓库自带（构建 liblite_codesearch.so 需要）
+!third_party/codesearch/lib/tokenizers-cpp/*.a
+
 # keep vendored cjson shared object
 !third_party/cjson/lua/5.1/cjson.so
 # ocr: 只跟 libocr_simple.so（76KB，仓库自带）。

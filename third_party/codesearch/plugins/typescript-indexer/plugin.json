@@ -1,0 +1,17 @@
+{
+  "$schema": "https://opencode.ai/coding-indexer-plugin-schema.json",
+  "name": "typescript",
+  "version": "1.0.0",
+  "description": "Enhanced TypeScript/JavaScript parser plugin using tree-sitter (C implementation)",
+  "extensions": [".ts", ".tsx", ".js", ".jsx"],
+  "languages": ["typescript", "tsx", "javascript", "jsx"],
+  "command": ["bin/typescript-indexer"],
+  "args": [
+    "--file", "{file}",
+    "--project", "{project}"
+  ],
+  "env": {
+    "TS_PARSER_MAX_FILE_SIZE": "1048576"
+  },
+  "priority": 100
+}

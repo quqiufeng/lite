@@ -16,6 +16,9 @@ cp "$ROOT/AGENTS.md" "$ROOT/design.md" "$DIST/"
 if [ -f "$ROOT/build/liblite_cache.so" ]; then
     cp "$ROOT/build/liblite_cache.so" "$DIST/build/"
 fi
+if [ -f "$ROOT/build/liblite_codesearch.so" ]; then
+    cp "$ROOT/build/liblite_codesearch.so" "$DIST/build/"
+fi
 
 if [ -f "$ROOT/build/liblite_capture.so" ]; then
     cp "$ROOT/build/liblite_capture.so" "$DIST/lib/"

@@ -168,8 +168,8 @@ KV，重启可恢复，连接时回放历史，SIGINT/SIGTERM 优雅退出。`--
 
 ## 附录 A 外部项目参考
 
-`[static]` 基于 `/opt/pi-mono`、`/opt/reasonix`、`/opt/opencode` 源码（code search 索引位于
-`/opt/my_db` 与 `/opt/code_caches/*`）。
+`[static]` 基于 `/opt/pi-mono`、`/opt/reasonix`、`/opt/opencode` 源码（code search 索引已迁入
+`src/codesearch/`，原 `/opt/my_db` 不再作为依赖）。
 
 | 维度 | Pi (TS) | Reasonix (Go) | opencode |
 |---|---|---|---|

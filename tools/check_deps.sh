@@ -170,6 +170,41 @@ for f in DroidSansFallbackFull.ttf DejaVuSansMono.ttf; do
     fi
 done
 
+# codesearch（可选）：语义搜索需要 tokenizers-cpp 静态库、ONNX Runtime、Jina 模型。
+# 词法/符号/调用图/数据流只需要 ctags + jansson；缺 tokenizers 时 CMake 会跳过
+# lite_codesearch target，helper/codesearch.lua 不可用但其余功能不受影响。
+CS_TOK="${LITE_CS_TOKENIZERS_DIR:-$ROOT/third_party/codesearch/lib/tokenizers-cpp}"
+if [ -f "$CS_TOK/libtokenizers_c.a" ]; then
+    echo "[OK]   codesearch tokenizers $CS_TOK"
+else
+    echo "[INFO] codesearch tokenizers missing ($CS_TOK/libtokenizers_c.a) → lite_codesearch 不构建"
+fi
+if [ -f /usr/include/jansson.h ] || pkg-config --exists jansson 2>/dev/null; then
+    echo "[OK]   jansson  $(pkg-config --modversion jansson 2>/dev/null || echo present)"
+else
+    echo "[WARN] jansson missing (codesearch import/query 链接失败)"
+fi
+if command -v ctags >/dev/null 2>&1; then
+    echo "[OK]   ctags    $(ctags --version 2>/dev/null | head -1)"
+else
+    echo "[WARN] ctags missing (codesearch index 不可用)"
+fi
+CS_MD="${LITE_CS_MODEL_DIR:-/opt/models}"
+if [ -f "$CS_MD/jina-embeddings-v2-base-code/model.onnx" ]; then
+    echo "[OK]   codesearch model $CS_MD/jina-embeddings-v2-base-code"
+else
+    echo "[INFO] codesearch model missing (语义搜索跳过；词法/符号仍可用)"
+fi
+CS_ORT="${LITE_ORT_LIB:-/data/venv/onnxruntime-linux-x64-gpu-1.20.1/lib/libonnxruntime.so.1}"
+if [ -f "$CS_ORT" ]; then
+    echo "[OK]   codesearch onnxruntime $CS_ORT"
+else
+    echo "[INFO] codesearch onnxruntime missing（设 LITE_ORT_LIB 指向 libonnxruntime.so.1）"
+fi
+if [ -f "$ROOT/build/liblite_codesearch.so" ]; then
+    echo "[OK]   codesearch lib build/liblite_codesearch.so"
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "== dependencies missing =="
     exit 1

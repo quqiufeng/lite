@@ -28,7 +28,10 @@ AI-native harness：记忆、工具、FFI、X11。
 ## 2 代码地图
 
 - `lua/main.lua`：入口；`lua/core/`：agent/tools/memory/prompt/session/compact（含 web）/reboot
-- `lua/tui/`、`lua/ffi/`、`src/{cache,image,x11}/`、`helper/`、`tools/`
+- `lua/tui/`、`lua/ffi/`、`src/{cache,image,x11,codesearch}/`、`helper/`、`tools/`
+- `src/codesearch/`：从 `/opt/my_db` 全量迁移的代码索引/调用图/数据流/向量检索；
+  `api.c` 是 JSON-in/JSON-out 公共入口，其余 `.c` 来自原 CLI（main 改名、日志走 stderr）。
+  `lua/ffi/codesearch.lua` 包 FFI，`helper/codesearch.lua` 做 action 编排。
 - `lua/ffi/x11.lua` + `xdo.lua`：**自包含单文件**（只用 LuaJIT `ffi` + 系统 libX11/libxdo，不引用 lite 代码、不注册工具），可整对拷给别的项目；`x11.lua` 靠 `require("ffi.xdo")` 找同伴，换布局要同步改这一行
 - `lua/tui/mouse.lua` + `clipboard.lua`：拖选/剪贴板；选区在 `screen.lua`
 
@@ -165,6 +168,11 @@ tool 结果在盘上是截断版（`LITE_TOOL_RESULT_CHARS`，默认 8192，`ses
 - C ABI：`int lite_<feature>_...` + `const char *lite_<feature>_error(void)`。
 - `.so` 用 `$ORIGIN` RPATH；打包只复制非 libc 依赖到 `dist/lib/`。
 - 大库/模型不随包：见 `README.md` 的 `ort_link.sh`、`cuda_provider.sh`、`LITE_DIST_WITH_*`。
+- `lite_codesearch` 的 tokenizers 静态库随仓库自带：
+  `third_party/codesearch/lib/tokenizers-cpp/`（`-DLITE_CS_TOKENIZERS_DIR=...` 覆盖）；
+  缺失时 CMake 跳过该 target，索引/查询功能不可用但其余构建正常。
+  ONNX Runtime 运行期 `dlopen`（`LITE_ORT_LIB`），模型用 `LITE_CS_MODEL_DIR`；TensorRT 默认关
+  （`LITE_CS_ENABLE_TRT=1` 才开，本机 1.20.1/TRT 10.16 engine 反序列化不兼容）。
 - 热重载：Lua 清 `package.loaded[...]` 后 require；TUI `/reload` 只重载 `core.tools` /
   `core.prompt` / `ffi.*`，**不重扫插件快照**。进程内 `ffi.load` 过的同路径 `.so` 换不掉，
   但 `native build` 每次出新文件名（`<name>-<ts>.so` + `<name>.json` 清单），下一次
@@ -223,10 +231,19 @@ hook 错误一律 fail-open（记 `_hook_errors`，不炸 agent）。`has_hooks(
 | `fetch` | DeepSeek Fetch：URL→Markdown 正文 | 同上；替代原始 HTTP 抓页面 |
 | `tokens` | 每日 token 账本查询 | 数据源 `/agent/usage`，跨会话同一本账 |
 | `cgrep` | 代码搜索：正则/字面串扫目录，输出 `path:line: text` | 本体是 `helper/cgrep.c`（pthread + POSIX regex）编出的 `.so`，Lua 层只做 JSON→文本；本机没 `rg`/`ugrep`，搜代码就靠它。`ext`/`fixed`/`per_file`/`threads` 可省，输出自身封顶 8000 字 |
+| `codesearch` | 建索引（ctags 切块）→ 调用图/数据流 → KV → 语义向量；查符号/上下文/语义 | 本体 `build/liblite_codesearch.so`（`src/codesearch/`，从 `/opt/my_db` 迁移）。数据在 `$LITE_CS_HOME`（默认 `~/.local/share/lite/codesearch/<project>`）；KV 直接写 lite 自带 kvcache（`src/cache/`，落 `kv/mem.bin`），与 lite 会话记忆同实现、不同目录；`action=build` 一次跑全流程，`workers` 默认 1（`fork=true` 时默认 CPU 核数；库内默认不 fork，`LITE_CS_FORK=1` 或 `fork=true` 才并行），`vector=false` 跳过语义。语义需 `LITE_CS_MODEL_DIR`（默认 `/opt/models`）+ `LITE_ORT_LIB`；ORT 运行期 `dlopen`，不随包 |
 | `pdftext` | 抽 PDF 文本（`path/first/last/max_chars`） | 纯 Lua FFI 直连 `libpoppler-glib.so.8`，零编译零子进程；本机无 poppler 头文件，cdef 手写（导出符号 `poppler_document_get_page`/`poppler_page_get_text`），释放用 `g_object_unref`（`poppler_page_free`/`poppler_document_free` 已不在 134 里）；缺库报装 `libpoppler-glib8` |
 | `md2png` | Markdown 文件 → HTML → 长图 PNG（`path/out/width/height/scale/gfm`） | 全 FFI 无子进程无 Chrome：`libmd4c.so.0` 解析（**无 md4c.h，cdef 手写**，`abi_version` 必须 = 0、结构体字段顺序不能错否则崩在回调里）→ `build/liblite_html.so` 出图 → `src/html/render.cpp` 的字体。同名 `.html` 一起落盘便于调试；`height` 默认 **0 = 自动测高**（`render.cpp` 先布局取 `doc->height()` 再定高），给正数才是固定视口、超出裁掉 |
 | `trending` | GitHub Trending → Kami 排版 → 长图 PNG（`lang/since/limit/width/height/scale/out`） | `curl` 抓页面（`io.popen`）+ 文件内 `parse()` 的 `gmatch` 逐字段抽（**无 dom 库**，页面结构一变就返回空表）；出图复用 `liblite_html.so`。坑：HTML 必须一次成型（追加 `<style>` 会让内容溢出被裁）；`.page{width:auto}` 铺满、`width` 别低于 780（19px 仓库名会折行）；`os.date` 里 `"%%m"` 是字面量；`height` 默认 0 = 自动测高，加 `limit` 不用手动调高 |
 | `web2png` | URL → 正文 → 资料卡片长图 PNG（`url/out/width/scale/title/max_chars`） | 三段链路：`helper/lib/deepseek.lua` 的 `/v1/tools/fetch` 取干净 Markdown（无 `DEEPSEEK_API_KEY` 则降级 `core.http` 抓 HTML 去标签）→ `helper/lib/md4c.lua` 转 HTML 片段 → `liblite_html.so` 出图（`h=0` 自动测高）。样式全内联，cairo toy font 只认单族名，**禁止写字体栈** |
+
+`codesearch` 提速：`fork=true` + `workers=N`（fresh 进程；或 `LITE_CS_FORK=1`）并行切块；
+`fp16=true`（或 `LITE_CS_FP16=1`）用 `model_fp16.onnx`（自动沿 `model.onnx` 软链到真实目录找），GPU 约 1.5x；
+`batch`（默认 128，`LITE_CS_BATCH`）控制向量化批大小；`LITE_CS_HNSW_EF`（默认 200，
+降到 100 建图约快一倍、召回略降）。向量化带**增量缓存**：`vectors/*.jina.hash` 记录每条
+name+文本哈希，源文件没变时第二次 `build` 跳过模型加载和 HNSW 重建（55k chunk 从 ~90s 到
+<1s），只对改动 chunk 重新嵌入。换模型/fp16 会因 model tag 不同自动全量重算；中断写临时
+文件，不会破坏旧索引。
 
 `music` 的 `dav://` 语义：`dav://host:port/路径` 列目录**直接流播**（默认整库随机，
 `limit=N` 限首数，`index=N` 选第几首）；**只写 `dav://` 不带路径会 PROPFIND 失败**，
@@ -269,5 +286,6 @@ libcurl `CURLOPT_USERPWD`，凭据不进 argv/m3u）、`app_<class>_map.lua`（`
 ## 7 参考实现（新功能先查）
 
 参考：Pi `/opt/pi-mono`、Reasonix `/opt/reasonix`、opencode `/opt/opencode`；缓存
-`/opt/code_caches/<name>_cache`；工具 `/opt/my_db`。逐项目查，不 cross-search，只借鉴思路。
+`/opt/code_caches/<name>_cache`。逐项目查，不 cross-search，只借鉴思路。
+原 my_db 的 code search 已迁入 `src/codesearch/`，不再依赖 `/opt/my_db`。
 符号：Go `pkg::Func`、C++ `Class::method`、TS 导出名。

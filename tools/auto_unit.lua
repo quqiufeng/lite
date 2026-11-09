@@ -4243,6 +4243,95 @@ do
     check(x11body:find('require("ffi.xdo")', 1, true) ~= nil, "ffi/x11 requires ffi.xdo")
 end
 
+-- codesearch：从 /opt/my_db 迁移的索引/调用图/数据流/语义检索。
+-- 缺 liblite_codesearch.so（没装 tokenizers 静态库）时整块跳过。
+do
+    local okc, CS = pcall(require, "ffi.codesearch")
+    check(okc, "codesearch ffi loads")
+    if okc and CS.available then
+        local base = os.tmpname()
+        os.remove(base)
+        os.execute("mkdir -p " .. shq(base .. "/repo/sub"))
+        local function put(path, body)
+            local f = assert(io.open(path, "w"))
+            f:write(body); f:close()
+        end
+        -- 多行函数：chunk 才会带函数体，调用图/数据流/向量内容才有意义。
+        put(base .. "/repo/a.c", [[
+#include <stdio.h>
+static int helper_add(int a, int b) {
+    return a + b;
+}
+int compute_total(int x) {
+    int y = helper_add(x, 3);
+    return y * 2;
+}
+int main(void) {
+    return compute_total(4);
+}
+]])
+        put(base .. "/repo/sub/b.c", [[
+int scale(int v) {
+    return v * 10;
+}
+]])
+
+        local dir = base .. "/analysis"
+        local kv = base .. "/kv"
+        local ns = "/code/unit_cs"
+
+        local r = CS.index({ repo = base .. "/repo", analysis_dir = dir, workers = 1 })
+        check(r and r.ok, "codesearch index")
+        local st = CS.check(dir)
+        check(st and st.files["chunks_meta.jsonl"].exists
+            and st.files["chunks_meta.jsonl"].lines >= 4, "codesearch chunks")
+
+        check((CS.word_freq(dir) or {}).ok, "codesearch word_freq")
+        check((CS.callgraph(dir) or {}).ok, "codesearch callgraph")
+        check((CS.dataflow(dir) or {}).ok, "codesearch dataflow")
+        check((CS.import(dir, ns, kv, false) or {}).ok, "codesearch import")
+
+        local sym = CS.query({ query = "compute_total", repo = ns, type = "symbol",
+            kv_dir = kv, analysis_dir = dir })
+        check(sym and sym.results and #sym.results >= 1
+            and sym.results[1].name == "compute_total", "codesearch symbol")
+        check(sym and sym.results[1].content and
+            sym.results[1].content:find("helper_add", 1, true) ~= nil,
+            "codesearch symbol returns chunk content")
+
+        local ctx = CS.query({ query = "compute_total", repo = ns, type = "context",
+            kv_dir = kv, analysis_dir = dir, depth = 2 })
+        local callers = ctx and ctx.context and ctx.context.callers or {}
+        local callees = ctx and ctx.context and ctx.context.callees or {}
+        local caller_hit, callee_hit = false, false
+        for _, v in ipairs(callers) do if v.name == "main" then caller_hit = true end end
+        for _, v in ipairs(callees) do if v.name == "helper_add" then callee_hit = true end end
+        check(caller_hit and callee_hit, "codesearch context callers/callees")
+
+        local caps = CS.check(dir)
+        if caps and caps.models and caps.models.jina_onnx and caps.models.onnxruntime then
+            local v = CS.vectorize(dir, "jina", "unit_cs")
+            check(v and v.ok, "codesearch vectorize")
+            local hf = io.open(dir .. "/vectors/code_local_unit_cs.jina.hash", "rb")
+            check(hf ~= nil, "codesearch incremental hash sidecar")
+            if hf then hf:close() end
+            local v2 = CS.vectorize(dir, "jina", "unit_cs")
+            check(v2 and v2.ok, "codesearch vectorize incremental reuse")
+            local s = CS.query({ query = "add two numbers", repo = ns, type = "search",
+                kv_dir = kv, analysis_dir = dir, max_results = 5 })
+            local hit = false
+            for _, item in ipairs(s and s.results or {}) do
+                if item.name == "helper_add" then hit = true end
+            end
+            check(hit, "codesearch semantic search")
+        else
+            check(true, "codesearch semantic search skipped (model missing)")
+        end
+
+        os.execute("rm -rf " .. shq(base))
+    end
+end
+
 -- entry
 check(loadfile(root .. "/lua/main.lua") ~= nil, "load lua/main.lua")
 
