@@ -20,7 +20,8 @@
 --
 -- ① 插件依赖（本文件自身的运行时）
 --    · curl            抓 https://github.com/trending（走 io.popen，零 FFI）
---    · helper/lib/dom  解析文章列表（纯 Lua，和仓库一起走）
+--    · 解析器是本文件内的 parse()（纯 Lua gmatch，无外部库；页面结构一变就
+--      返回空表，由调用方报错）
 --    无 key、无网络代理配置；GitHub 挂了就直接报 curl 错误。
 --
 -- ② 编译依赖（出图后端 liblite_html.so，不进 helper/）
@@ -51,7 +52,7 @@
 --                        写多值会静默落回 Sans（★ 变空心框就是这么来的）。
 --
 -- 实现原理（一条直线，零子进程截图）
---    curl 抓 HTML → dom 抠出 repo/desc/lang/star/today → 拼成一整份 HTML 字符串
+--    curl 抓 HTML → parse() 抠出 repo/desc/lang/star/today → 拼成一整份 HTML 字符串
 --    （CSS 内联进 <style>，必须一次成型，见上文坑 1）→ render_png() 用 FFI 调
 --    lite_html_render(html, out, w, h, scale)：litehtml 解析布局 → cairo 画到 image surface
 --    → cairo_surface_write_to_png 直出 PNG。同一份 HTML 顺手写到同名 .html 便于调试。
