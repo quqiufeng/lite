@@ -1,4 +1,12 @@
 -- wechat 插件：动态 libxdo / libX11 直驱（不依赖 xdotool/wmctrl/import）。
+--
+-- ⚠ 用前必须确认**虚拟桌面只有一个**：多桌面模式下，滚轮/后台动作会切换桌面，
+--   微信窗口连同后续截图一起"跑掉"，OCR 与点击坐标全部错位（表现为点了没反应、
+--   或点到了别的东西上）。检查：xprop -root _NET_NUMBER_OF_DESKTOPS 必须是 1；
+--   openbox 改 ~/.config/openbox/rc.xml 的 <desktops><number>1</number>，
+--   lxqt 面板删掉 desktopswitch 插件。窗口管理器的滚轮换桌面（Desktop 上下文
+--   button Up/Down）也要清掉。不是 1 就别往下跑，先修桌面再操作。
+--
 -- 流程：activate → 点标题栏拿焦点 → 点搜索框 → 粘贴关键词 → OCR 候选面板
 --      → 点候选 → OCR 会话标题验收 → 点输入框 → ctrl+a/BS → 粘贴 → Return
 --      → OCR 气泡验收。坐标全部是真实屏幕像素（2560x1440）；

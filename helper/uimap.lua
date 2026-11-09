@@ -1,5 +1,9 @@
 -- uimap 工具：视觉定位 → 真实点击 → 截图 diff 确认 → 写入 app_<class>_map.lua（每 app 一文件）。
 -- 与 agent 同进程，窗口操作走 lua/ffi/x11.lua + xdo。
+--
+-- ⚠ 标定/点击都假设**虚拟桌面只有一个**。多桌面时鼠标滚轮或后台动作会切桌面，
+--   窗口跟着"跑掉"，随后截图与点击坐标全错位，标出来的 x/y 也是废的。
+--   先确认 xprop -root _NET_NUMBER_OF_DESKTOPS = 1 再 discover/learn。
 local U, X, seen = nil, nil, {}
 
 local function lib(env)
