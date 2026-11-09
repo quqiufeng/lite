@@ -39,6 +39,47 @@ struct font_entry {
 inline cairo_t* cr_of(uint_ptr hdc) { return reinterpret_cast<cairo_t*>(hdc); }
 inline font_entry* fe_of(uint_ptr f) { return reinterpret_cast<font_entry*>(f); }
 
+// 缺字回退顺序：注册进 fontconfig 的 Droid Sans Fallback 覆盖 CJK + 全角标点，
+// DejaVu 兜西文/数学符号，Symbola / FreeSerif 兜 emoji 与装饰符号（✅❌⏳𝄞），
+// 最后 Noto Color Emoji（彩色位图，cairo 有时画不出，仅当兜底）。族不存在时
+// scaled_has_glyph 直接判 miss，所以这份清单跨机器多写几个也不出错。
+const char* const kFallbackFamilies[] = {
+    "Droid Sans Fallback", "Noto Sans CJK SC", "DejaVu Sans",
+    "Symbola", "FreeSerif", "Noto Sans Symbols2", "Noto Color Emoji", nullptr
+};
+
+// 切一个 UTF-8 字符（非法/截断字节当成单字节）
+size_t utf8_next(const char* s, size_t len, size_t i)
+{
+    unsigned char c = (unsigned char)s[i];
+    size_t n = 1;
+    if (c >= 0xF0) n = 4;
+    else if (c >= 0xE0) n = 3;
+    else if (c >= 0xC0) n = 2;
+    if (i + n > len) n = 1;
+    return i + n;
+}
+
+// 这个 scaled font 能否画出这段字节：任一字形 index==0 即缺字。
+// 纯空白返回的 glyph 数为 0，不算缺字。
+bool scaled_has_glyph(cairo_scaled_font_t* sf, const char* s, int len)
+{
+    if (!sf) return false;
+    cairo_glyph_t* glyphs = nullptr;
+    cairo_text_cluster_t* clusters = nullptr;
+    int ng = 0, nc = 0;
+    cairo_text_cluster_flags_t cf = (cairo_text_cluster_flags_t)0;
+    cairo_status_t st = cairo_scaled_font_text_to_glyphs(
+        sf, 0, 0, s, len, &glyphs, &ng, &clusters, &nc, &cf);
+    bool ok = (st == CAIRO_STATUS_SUCCESS);
+    if (ok)
+        for (int i = 0; i < ng; ++i)
+            if (glyphs[i].index == 0) { ok = false; break; }
+    if (glyphs) cairo_glyph_free(glyphs);
+    if (clusters) cairo_text_cluster_free(clusters);
+    return ok;
+}
+
 void rect_fill(cairo_t* cr, const web_color& c, double x, double y, double w, double h)
 {
     if (!cr || w <= 0 || h <= 0) return;
@@ -68,6 +109,70 @@ public:
     int m_height = 600;
     std::string m_base_url;
     std::string m_font_name = "Sans";
+    // key: family|slant|weight|size → cairo_scaled_font_t*（只用于查缺字）
+    std::map<std::string, cairo_scaled_font_t*> m_sf_cache;
+
+    struct text_run {
+        std::string text;
+        std::string family;
+    };
+
+    // 取（并缓存）某个族的 scaled font；用临时 ctx 再 reference，绕开本机
+    // cairo_scaled_font_create 直接建 toy face 返回 NULL_POINTER 的坑。
+    cairo_scaled_font_t* scaled_get(const std::string& family, int slant, int weight, double size)
+    {
+        char key[300];
+        snprintf(key, sizeof key, "%s|%d|%d|%.2f", family.c_str(), slant, weight, size);
+        auto it = m_sf_cache.find(key);
+        if (it != m_sf_cache.end()) return it->second;
+
+        cairo_surface_t* scratch = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
+        cairo_t* tmp = cairo_create(scratch);
+        cairo_select_font_face(tmp, family.c_str(), (cairo_font_slant_t)slant,
+                               (cairo_font_weight_t)weight);
+        cairo_set_font_size(tmp, size);
+        cairo_scaled_font_t* sf = cairo_get_scaled_font(tmp);
+        if (cairo_scaled_font_status(sf) != CAIRO_STATUS_SUCCESS) sf = nullptr;
+        else sf = cairo_scaled_font_reference(sf);
+        cairo_destroy(tmp);
+        cairo_surface_destroy(scratch);
+
+        m_sf_cache[key] = sf;
+        return sf;
+    }
+
+    // 按「当前字体有没有这个字形」切 run：cairo toy font API 没有自动 fallback，
+    // 代码块用 DejaVu Sans Mono 时全角：）等会画成豆腐块。
+    void build_runs(const char* text, font_entry* fe, std::vector<text_run>& runs)
+    {
+        size_t n = strlen(text);
+        cairo_scaled_font_t* primary = scaled_get(fe->family, fe->slant, fe->weight, fe->size);
+        std::string cur_family = fe->family;
+        std::string cur;
+        size_t i = 0;
+        while (i < n) {
+            size_t j = utf8_next(text, n, i);
+            std::string fam = fe->family;
+            if (!scaled_has_glyph(primary, text + i, (int)(j - i))) {
+                for (int k = 0; kFallbackFamilies[k]; ++k) {
+                    cairo_scaled_font_t* cs = scaled_get(kFallbackFamilies[k], fe->slant,
+                                                         fe->weight, fe->size);
+                    if (scaled_has_glyph(cs, text + i, (int)(j - i))) {
+                        fam = kFallbackFamilies[k];
+                        break;
+                    }
+                }
+            }
+            if (!cur.empty() && fam != cur_family) {
+                runs.push_back(text_run{cur, cur_family});
+                cur.clear();
+            }
+            cur_family = fam;
+            cur.append(text + i, j - i);
+            i = j;
+        }
+        if (!cur.empty()) runs.push_back(text_run{cur, cur_family});
+    }
 
     ~cairo_container() override
     {
@@ -77,6 +182,8 @@ public:
                 delete kv.second;
             }
         }
+        for (auto& kv : m_sf_cache)
+            if (kv.second) cairo_scaled_font_destroy(kv.second);
     }
 
     uint_ptr create_font(const font_description& d, const document* /*doc*/, font_metrics* fm) override
@@ -149,16 +256,23 @@ public:
     {
         auto* fe = fe_of(hFont);
         if (!fe || !text) return 0;
+        std::vector<text_run> runs;
+        build_runs(text, fe, runs);
+
         cairo_surface_t* scratch = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
         cairo_t* tmp = cairo_create(scratch);
-        cairo_select_font_face(tmp, fe->family.c_str(), (cairo_font_slant_t)fe->slant,
-                               (cairo_font_weight_t)fe->weight);
-        cairo_set_font_size(tmp, fe->size);
-        cairo_text_extents_t te;
-        cairo_text_extents(tmp, text, &te);
+        double total = 0;
+        for (auto& r : runs) {
+            cairo_select_font_face(tmp, r.family.c_str(), (cairo_font_slant_t)fe->slant,
+                                   (cairo_font_weight_t)fe->weight);
+            cairo_set_font_size(tmp, fe->size);
+            cairo_text_extents_t te;
+            cairo_text_extents(tmp, r.text.c_str(), &te);
+            total += te.x_advance;
+        }
         cairo_destroy(tmp);
         cairo_surface_destroy(scratch);
-        return pixel_t(static_cast<float>(std::ceil(te.x_advance)));
+        return pixel_t(static_cast<float>(std::ceil(total)));
     }
 
     void draw_text(uint_ptr hdc, const char* text, uint_ptr hFont, web_color color,
@@ -167,14 +281,24 @@ public:
         auto* cr = cr_of(hdc);
         auto* fe = fe_of(hFont);
         if (!cr || !fe || !text) return;
+        std::vector<text_run> runs;
+        build_runs(text, fe, runs);
+
         cairo_save(cr);
-        cairo_select_font_face(cr, fe->family.c_str(), (cairo_font_slant_t)fe->slant,
-                               (cairo_font_weight_t)fe->weight);
-        cairo_set_font_size(cr, fe->size);
         cairo_set_source_rgba(cr, color.red / 255.0, color.green / 255.0, color.blue / 255.0,
                               color.alpha / 255.0);
-        cairo_move_to(cr, pos.x.value(), static_cast<double>(pos.y.value()) + fe->ascent);
-        cairo_show_text(cr, text);
+        const double y = static_cast<double>(pos.y.value()) + fe->ascent;
+        double x = pos.x.value();
+        for (auto& r : runs) {
+            cairo_select_font_face(cr, r.family.c_str(), (cairo_font_slant_t)fe->slant,
+                                   (cairo_font_weight_t)fe->weight);
+            cairo_set_font_size(cr, fe->size);
+            cairo_move_to(cr, x, y);
+            cairo_show_text(cr, r.text.c_str());
+            cairo_text_extents_t te;
+            cairo_text_extents(cr, r.text.c_str(), &te);
+            x += te.x_advance;
+        }
         cairo_restore(cr);
     }
 
