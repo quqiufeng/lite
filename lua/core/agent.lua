@@ -573,8 +573,13 @@ function M:request_messages(text, stream, opts)
     local ceiling = drop_first and c:trigger() or math.floor(c.budget * 2)
     if used > ceiling then
         local trimmed, dropped
+        -- 保留比例：LITE_KEEP_RATIO（0.3~0.95），默认丢弃优先 0.6（丢约 40% 历史）。
+        local keep = tonumber(os.getenv("LITE_KEEP_RATIO") or "")
+        if not keep or keep < 0.3 or keep > 0.95 then
+            keep = drop_first and 0.6 or 0.8
+        end
         msgs, trimmed, dropped = self:hard_window(msgs,
-            math.floor(c.budget * (drop_first and 0.6 or 0.8)))
+            math.floor(c.budget * keep))
         if trimmed then
             self.ctx:emit("compact", {
                 ok = false, reason = "hard ceiling", dropped = dropped,

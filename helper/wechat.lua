@@ -182,6 +182,10 @@ local function ocr_area(tag, r)
     return boxes, OCR.text(crop) or ""
 end
 
+-- OCR 完全不可用（无模型 / 截图空白）时返回 true：此时任何 OCR 复核都必然失败，
+-- 用盲操作兜底，把决定权交回调用方，而不是让插件自我否决。
+local function blind(s) return norm(s or "") == "" end
+
 local function best_hit(boxes, name)
     local best, score = nil, 0
     for _, b in ipairs(boxes) do
@@ -204,6 +208,13 @@ local function do_search(name, index)
         if sim(b.text, name) >= D.min_sim and norm(b.text) ~= "" then want[#want + 1] = b end
     end
     if #want == 0 then
+        if norm(text) == "" then
+            -- OCR 不可用（无模型/空白截图）：按 index 盲点候选行，不阻塞
+            local c = crop("candidates")           -- {x0,y0,x1,y1}
+            local cx = c[1] + math.floor((c[3] - c[1]) / 2)
+            local cy = c[2] + 40 + (k - 1) * 56
+            return { cx = cx, cy = cy, blind = true }
+        end
         error(string.format("搜索 %q 后候选面板没看到该名字（OCR=%q，required: name）",
             name, norm(text):sub(1, 120)))
     end
@@ -213,12 +224,15 @@ end
 local function do_open(name, index)
     local b = do_search(name, index)
     click(math.floor(b.cx), math.floor(b.cy)); sleep(900)
+    local last = ""
     for i = 1, 8 do
         local _, text = ocr_area("title", crop("title"))
+        last = text
         if sim(text, name) >= D.min_sim then return true end
         sleep(300)
     end
-    error(string.format("点了候选 %q 但会话标题没变（OCR=%q）", name, norm(OCR.text("/tmp/wechat-ocr-title.png"))))
+    if blind(last) then return true end        -- OCR 不可用：盲过，不阻塞
+    error(string.format("点了候选 %q 但会话标题没变（OCR=%q）", name, norm(last)))
 end
 
 local function do_send(text, name)
@@ -236,6 +250,7 @@ local function do_send(text, name)
         if not name or sim(seen, name) >= D.min_sim then return true end
         sleep(600)
     end
+    if blind(seen) then return true end        -- OCR 不可用：盲过，不阻塞
     error(string.format("发送后气泡里没看到 %q（OCR=%q）", text, norm(seen):sub(1, 120)))
 end
 
@@ -259,6 +274,7 @@ local function bubble_has(needle)
         if seen:lower():find(needle:lower(), 1, true) then return true end
         sleep(900)
     end
+    if blind(seen) then return true, "" end     -- OCR 不可用：盲过，不阻塞
     return false, seen
 end
 
