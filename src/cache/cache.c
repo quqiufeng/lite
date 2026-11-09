@@ -299,7 +299,7 @@ static int cache_backup_corrupt(const char* dir, const char* name) {
     return 1;
 }
 
-cache_t* cache_open(const char* db_dir, size_t max_memory) {
+cache_t* cache_open_ex(const char* db_dir, size_t max_memory, unsigned flags) {
     if (!db_dir) return NULL;
     
     struct timespec t_start, t_now;
@@ -313,6 +313,7 @@ cache_t* cache_open(const char* db_dir, size_t max_memory) {
     
     strncpy(cache->db_dir, db_dir, sizeof(cache->db_dir) - 1);
     cache->memory_max = max_memory > 0 ? max_memory : CACHE_MAX_MEMORY_DEFAULT;
+    cache->open_flags = flags;
     
     // 构建 cache.bin 路径
     char path[512];
@@ -401,7 +402,8 @@ cache_t* cache_open(const char* db_dir, size_t max_memory) {
         if (index_loaded) {
             CACHE_LOG( "[CACHE] Loaded persisted indexes, skipping rebuild\n");
             // 如果持久化索引中已包含 vector_index 数据，跳过耗时重建
-            if (cache->vector_index.count == 0) {
+            if (cache->vector_index.count == 0 &&
+                !(flags & CACHE_OPEN_NO_VECTOR_INDEX)) {
                 cache_vector_index_rebuild(cache);
             }
             clock_gettime(CLOCK_MONOTONIC, &t_now);
@@ -454,14 +456,17 @@ cache_t* cache_open(const char* db_dir, size_t max_memory) {
             cache->entry_count = valid_count;
             
             // 重建向量索引
-            cache_vector_index_rebuild(cache);
+            if (!(flags & CACHE_OPEN_NO_VECTOR_INDEX)) {
+                cache_vector_index_rebuild(cache);
+            }
         }
     }
 
     // tag 索引是内存态、不持久化；重启后重建显式 tags，保证 recall 的
-    // tag 检索在重启前后一致。extract_tags 只认 JSON 里的 "tags" 字段，
-    // 绝大多数 entry 直接返回 NULL，代价很小。
-    {
+    // tag 检索在重启前后一致。extract_tags 只认 JSON 里的 "tags" 字段。
+    // 只做普通 get 的库（codesearch）可跳过：否则会遍历 mem.bin 全部 entry，
+    // 大库的 RSS 会直接涨到整个数据文件大小。
+    if (!(flags & CACHE_OPEN_NO_TAG_INDEX)) {
         size_t offset = CACHE_HEADER_SIZE;
         while (offset + sizeof(cache_entry_header_t) <= cache->pool.used) {
             cache_entry_header_t* header = (cache_entry_header_t*)CACHE_PTR(cache, offset);
@@ -482,6 +487,10 @@ cache_t* cache_open(const char* db_dir, size_t max_memory) {
     }
 
     return cache;
+}
+
+cache_t* cache_open(const char* db_dir, size_t max_memory) {
+    return cache_open_ex(db_dir, max_memory, 0);
 }
 
 void cache_close(cache_t* cache) {

@@ -26,8 +26,8 @@ extern "C" {
 #define VE_DIM 768
 #define VE_MAX_NAME_LEN 256
 #define VE_MAX_FILE_LEN 512
-#define VE_MAX_CONTENT_LEN 4096
-#define VE_MAX_SIGNATURE_LEN 512
+#define VE_MAX_CONTENT_LEN 512
+#define VE_MAX_SIGNATURE_LEN 256
 
 // Search result
 typedef struct {

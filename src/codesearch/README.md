@@ -483,10 +483,11 @@ print(H.run({ action = "search", query = "scheduler pick next task", max_results
 - `search "scheduler pick next task"` → `pick_next_task`、`__pick_next_task`、
   `pick_next_pushable_task`；冷启动 4–10s，后续 0.2–1.1s
 
-首次查询加载约 3.6GB KV + 1.1GB vectors + 1.2GB HNSW；
-同一进程内 KV / vector engine / HNSW 现在都会复用，后续 query 约 0.2–1.1s。
-跨进程仍然是冷启动。探索报告见
-`src/codesearch/CODE_READING_REPORT.md`。
+内存：`symbol/context` 冷启动约 **215MB**；`search` 稳态约 **3GB**（1.2GB HNSW +
+metadata），峰值约 **4.2GB**。之前 KV 打开会扫描整个 mem.bin，内核查询能到 10GB；
+现在 query 走 `CACHE_OPEN_FAST_READ`，跳过 tag/vector 重建和全量 offset/usage 校验。
+同一进程内 KV / vector engine / HNSW 都会复用，后续 query 约 0.2–1.1s。
+跨进程仍然是冷启动。探索报告见 `src/codesearch/CODE_READING_REPORT.md`。
 
 #### 复现命令
 

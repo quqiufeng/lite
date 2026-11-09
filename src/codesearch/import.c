@@ -21,6 +21,9 @@
 #define MAX_VALUE_LEN (1024 * 1024)
 
 // Cache API from libmydb.so
+#define CACHE_OPEN_NO_TAG_INDEX (1u << 0)
+#define CACHE_OPEN_NO_VECTOR_INDEX (1u << 1)
+extern void* cache_open_ex(const char* dir, size_t max_size, unsigned flags);
 extern void* cache_open(const char* dir, size_t max_size);
 extern void cache_close(void* cache);
 extern int cache_sync(void* cache);
@@ -641,7 +644,8 @@ int lite_cs_import_main(int argc, char** argv) {
         long g = atol(kv_max_env);
         if (g > 0 && g <= 64) max_gb = (unsigned long long)g;
     }
-    g_cache = cache_open(cache_dir, (size_t)(max_gb * 1024ULL * 1024ULL * 1024ULL));
+    g_cache = cache_open_ex(cache_dir, (size_t)(max_gb * 1024ULL * 1024ULL * 1024ULL),
+                            CACHE_OPEN_NO_TAG_INDEX | CACHE_OPEN_NO_VECTOR_INDEX);
     if (!g_cache) {
         fprintf(stderr, "[ERROR] Failed to open cache: %s\n", cache_dir);
         return 1;

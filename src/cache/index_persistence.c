@@ -495,6 +495,7 @@ static size_t rebuild_usage_from_pool(cache_t* cache) {
 
 int cache_index_load(cache_t* cache) {
     if (!cache) return -1;
+    int fast_read = (cache->open_flags & CACHE_OPEN_FAST_READ) != 0;
     
     // 清理旧索引数据，防止内存泄漏
     if (cache->sorted.offsets) {
@@ -585,8 +586,9 @@ int cache_index_load(cache_t* cache) {
                     // 落盘内容必须先自洽：容量合法、字节数不超过本条索引的数据区
                     if (bucket_count == 0 || buckets_data_size / sizeof(cache_hash_bucket_t) != bucket_count ||
                         buckets_data_size > entry->data_size - 16 ||
-                        !loaded_hash_valid(cache, (const cache_hash_bucket_t*)((char*)data + 16),
-                                           bucket_count, hash_size)) {
+                        (!fast_read &&
+                         !loaded_hash_valid(cache, (const cache_hash_bucket_t*)((char*)data + 16),
+                                            bucket_count, hash_size))) {
                         CACHE_LOG( "[CACHE] persisted hash index is stale/unusable, discarding\n");
                         munmap(base, file_size);
                         discard_loaded_index(cache);
@@ -666,23 +668,29 @@ int cache_index_load(cache_t* cache) {
         }
     }
     
-    // 校验加载的偏移，非法则回滚并让上层重建
-    if (!loaded_offsets_valid(cache)) {
-        CACHE_LOG( "[CACHE] persisted index references invalid offsets, discarding\n");
-        munmap(base, file_size);
-        discard_loaded_index(cache);
-        return -1;
-    }
-    
-    // 重算 memory_used / entry_count（见 rebuild_usage_from_pool 注释），
-    // 并核对 hash 节点数：活 entry 比索引多 → 有数据查不到，弃用索引交给扫描重建。
-    size_t live = rebuild_usage_from_pool(cache);
-    if (live != cache->hash.size) {
-        CACHE_LOG("[CACHE] hash index covers %zu of %zu live entries, discarding\n",
-                  cache->hash.size, live);
-        munmap(base, file_size);
-        discard_loaded_index(cache);
-        return -1;
+    if (!fast_read) {
+        // 校验加载的偏移，非法则回滚并让上层重建
+        if (!loaded_offsets_valid(cache)) {
+            CACHE_LOG( "[CACHE] persisted index references invalid offsets, discarding\n");
+            munmap(base, file_size);
+            discard_loaded_index(cache);
+            return -1;
+        }
+
+        // 重算 memory_used / entry_count（见 rebuild_usage_from_pool 注释），
+        // 并核对 hash 节点数：活 entry 比索引多 → 有数据查不到，弃用索引交给扫描重建。
+        size_t live = rebuild_usage_from_pool(cache);
+        if (live != cache->hash.size) {
+            CACHE_LOG("[CACHE] hash index covers %zu of %zu live entries, discarding\n",
+                      cache->hash.size, live);
+            munmap(base, file_size);
+            discard_loaded_index(cache);
+            return -1;
+        }
+    } else {
+        // 只读快速路径：不扫描 mem.bin；内存统计用索引里的数量即可。
+        cache->memory_used = cache->pool.used;
+        cache->entry_count = cache->hash.size;
     }
 
     // Store mmap info for cleanup

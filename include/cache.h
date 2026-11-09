@@ -51,6 +51,14 @@ static inline cache_search_options_t cache_search_options_default(void) {
 }
 
 // ====== 生命周期 ======
+// 打开选项：跳过 tag 索引重建（codesearch 等只做普通 get 的只读库使用）。
+// tag 重建会遍历 mem.bin 全部 entry，大库（Linux 内核）会常驻数 GB。
+#define CACHE_OPEN_NO_TAG_INDEX     (1u << 0)
+#define CACHE_OPEN_NO_VECTOR_INDEX  (1u << 1)
+// 只读快速打开：跳过对 mem.bin 的全量 offset/hash 校验和 usage 重算。
+// 会常驻整个数据文件的 RSS；只给信任索引的只读库（codesearch）用。
+#define CACHE_OPEN_FAST_READ        (1u << 2)
+cache_t* cache_open_ex(const char* db_dir, size_t max_memory, unsigned flags);
 cache_t* cache_open(const char* db_dir, size_t max_memory);
 void cache_close(cache_t* cache);
 int cache_sync(cache_t* cache);

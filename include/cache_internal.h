@@ -176,6 +176,7 @@ struct cache {
     size_t deleted_count;       // 已删除条目数
     size_t memory_used;         // 已用内存（估算）
     size_t memory_max;          // 最大内存限制
+    unsigned open_flags;        // CACHE_OPEN_* 打开选项
     
     // 状态
     char db_dir[256];           // 数据库目录

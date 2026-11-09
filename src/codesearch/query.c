@@ -21,14 +21,10 @@
 #include <time.h>
 #include <getopt.h>
 #include <jansson.h>
+#include "cache.h"
 #include "vector_engine.h"
 
-// Cache API from libmydb.so
-extern void* cache_open(const char* dir, size_t max_size);
-extern void cache_close(void* cache);
-extern const char* cache_get(void* cache, const char* key);
-
-static void* g_cache = NULL;
+static cache_t* g_cache = NULL;
 static vector_engine_t* g_ve = NULL;
 // 进程内复用：同一项目连续 query（TUI/agent）不再反复加载 2GB KV 和数 GB HNSW。
 // 反复 create/destroy ORT session 还会偶发段错误；保持 engine 常驻更稳。
@@ -502,7 +498,9 @@ int lite_cs_query_main(int argc, char** argv) {
             long g = atol(kv_max_env);
             if (g > 0 && g <= 64) max_gb = (unsigned long long)g;
         }
-        g_cache = cache_open(cache_dir, (size_t)(max_gb * 1024ULL * 1024ULL * 1024ULL));
+        g_cache = cache_open_ex(cache_dir, (size_t)(max_gb * 1024ULL * 1024ULL * 1024ULL),
+                                CACHE_OPEN_NO_TAG_INDEX | CACHE_OPEN_NO_VECTOR_INDEX |
+                                CACHE_OPEN_FAST_READ);
         if (!g_cache) {
             fprintf(stderr, "[ERROR] Failed to open cache: %s\n", cache_dir);
             return 1;
