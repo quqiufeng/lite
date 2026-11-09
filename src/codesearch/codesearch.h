@@ -24,6 +24,8 @@ char* lite_cs_vectorize_ex(const char* analysis_dir, const char* model, const ch
                            int batch, int fp16);
 char* lite_cs_callgraph(const char* analysis_dir);
 char* lite_cs_dataflow(const char* analysis_dir);
+char* lite_cs_dataflow_query(const char* query, const char* kv_dir, const char* ns,
+                             int max_results);
 char* lite_cs_import(const char* analysis_dir, const char* ns,
                      const char* kv_dir, int only_dataflow);
 

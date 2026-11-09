@@ -499,6 +499,16 @@ static void import_dataflow(const char* analysis_dir, const char* namespace) {
                 arr = json_array();
                 json_object_set_new(func_index, func, arr);
             }
+            // 同一函数里同一个变量会出现多次（每个 use 一条 occurrence），
+            // 索引只保留首次声明行，否则 funcs/<func> 里全是重复项。
+            int dup = 0;
+            size_t ei;
+            json_t* e;
+            json_array_foreach(arr, ei, e) {
+                const char* ev = json_string_value(json_object_get(e, "var"));
+                if (ev && strcmp(ev, var_name) == 0) { dup = 1; break; }
+            }
+            if (dup) continue;
             json_t* entry = json_object();
             json_object_set_new(entry, "var", json_string(var_name));
             json_object_set_new(entry, "line", json_integer(
@@ -514,6 +524,34 @@ static void import_dataflow(const char* analysis_dir, const char* namespace) {
     if (fstr) {
         safe_set_json(fkey, fstr);
         free(fstr);
+    }
+
+    // 每函数一条 `dataflow/funcs/<func>`：查某个函数碰了哪些变量时直接
+    // cache_get O(1)，不用把几百 MB 的 _func_index 整块读进来反序列化。
+    const char* fname;
+    json_t* fvars;
+    int stored_funcs = 0;
+    json_object_foreach(func_index, fname, fvars) {
+        if (!fname || !*fname || strcmp(fname, "unknown") == 0) continue;
+        if (strlen(fname) > 200) continue;
+        json_t* val = json_object();
+        json_object_set_new(val, "func", json_string(fname));
+        json_object_set_new(val, "count", json_integer(json_array_size(fvars)));
+        json_object_set_new(val, "vars", json_incref(fvars));
+        char* vstr = json_dumps(val, JSON_COMPACT);
+        if (vstr) {
+            char vkey[640];
+            snprintf(vkey, sizeof(vkey), "%s/dataflow/funcs/%s", namespace, fname);
+            safe_set_json(vkey, vstr);
+            free(vstr);
+            stored_funcs++;
+        }
+        json_decref(val);
+    }
+    if (stored_funcs > 0) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Phase 3: indexed %d functions for dataflow", stored_funcs);
+        log_info(msg);
     }
     json_decref(func_index);
     

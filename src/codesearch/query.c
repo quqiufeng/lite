@@ -286,6 +286,163 @@ static json_t* do_context(const char* name, const char* repo, int depth) {
     return result;
 }
 
+// Dataflow query: 一个函数碰了哪些变量、一个变量流过哪些函数。
+// 走 import 写好的 `dataflow/funcs/<func>`（每函数一条，cache_get O(1)）和
+// `dataflow/vars/<var>`；都 miss 时用前缀搜索给候选函数名，不去读 _func_index
+// 那个整块大 JSON（内核索引能到几百 MB）。
+static json_t* do_dataflow(const char* query, const char* repo, int max_results) {
+    json_t* results = json_array();
+    if (!query || !*query || !repo || !*repo) return results;
+    if (max_results <= 0) max_results = 10;
+
+    char key[1024];
+    json_error_t error;
+
+    // 1) 函数精确命中：列出它读写的变量，每个变量补前 N 条 occurrence
+    snprintf(key, sizeof(key), "%s/dataflow/funcs/%s", repo, query);
+    const char* value = cache_get(g_cache, key);
+    if (value) {
+        json_t* data = json_loads(value, 0, &error);
+        if (data) {
+            json_t* vars = json_object_get(data, "vars");
+            json_t* entry = json_object();
+            json_object_set_new(entry, "kind", json_string("function"));
+            json_object_set_new(entry, "func", json_string(query));
+            json_object_set_new(entry, "var_count",
+                                json_integer(vars ? (json_int_t)json_array_size(vars) : 0));
+            json_t* out_vars = json_array();
+            if (vars) {
+                size_t idx;
+                json_t* v;
+                json_array_foreach(vars, idx, v) {
+                    if (json_array_size(out_vars) >= (size_t)max_results) break;
+                    const char* var = json_string_value(json_object_get(v, "var"));
+                    json_t* item = json_object();
+                    if (var) json_object_set_new(item, "var", json_string(var));
+                    json_t* line = json_object_get(v, "line");
+                    if (line) json_object_set_new(item, "line", json_incref(line));
+
+                    // 变量的流向：occurrences 里只留本函数的那几条，其余给计数
+                    if (var) {
+                        char vkey[1024];
+                        snprintf(vkey, sizeof(vkey), "%s/dataflow/vars/%s", repo, var);
+                        const char* vvalue = cache_get(g_cache, vkey);
+                        json_t* vdata = vvalue ? json_loads(vvalue, 0, &error) : NULL;
+                        if (vdata) {
+                            json_t* occ = json_object_get(vdata, "occurrences");
+                            json_t* hits = json_array();
+                            size_t oi;
+                            json_t* o;
+                            int same_func = 0;
+                            if (occ) json_array_foreach(occ, oi, o) {
+                                const char* f = json_string_value(json_object_get(o, "func"));
+                                if (!f || strcmp(f, query) != 0) continue;
+                                same_func++;
+                                if (json_array_size(hits) >= 12) continue;
+                                json_array_append(hits, o);
+                            }
+                            json_object_set_new(item, "occurrences", hits);
+                            json_object_set_new(item, "occurrences_in_func",
+                                                json_integer(same_func));
+                            json_decref(vdata);
+                        }
+                    }
+                    json_array_append_new(out_vars, item);
+                }
+            }
+            json_object_set_new(entry, "vars", out_vars);
+            json_array_append_new(results, entry);
+            json_decref(data);
+        }
+        return results;
+    }
+
+    // 2) 变量命中：这个变量在哪些函数里出现（按函数聚合，取前 max_results 个）
+    snprintf(key, sizeof(key), "%s/dataflow/vars/%s", repo, query);
+    value = cache_get(g_cache, key);
+    if (value) {
+        json_t* data = json_loads(value, 0, &error);
+        if (data) {
+            json_t* occ = json_object_get(data, "occurrences");
+            json_t* entry = json_object();
+            json_object_set_new(entry, "kind", json_string("variable"));
+            json_object_set_new(entry, "var", json_string(query));
+            json_object_set_new(entry, "occurrence_count",
+                                json_integer(occ ? (json_int_t)json_array_size(occ) : 0));
+            json_t* funcs = json_object();
+            json_t* order = json_array();
+            if (occ) {
+                size_t oi;
+                json_t* o;
+                json_array_foreach(occ, oi, o) {
+                    const char* f = json_string_value(json_object_get(o, "func"));
+                    if (!f || !*f) f = "unknown";
+                    json_t* agg = json_object_get(funcs, f);
+                    if (!agg) {
+                        if (json_object_size(funcs) >= (size_t)max_results) continue;
+                        agg = json_object();
+                        json_object_set_new(agg, "func", json_string(f));
+                        json_object_set_new(agg, "count", json_integer(0));
+                        json_object_set_new(agg, "lines", json_array());
+                        json_object_set_new(funcs, f, agg);
+                        json_array_append_new(order, json_string(f));
+                    }
+                    json_object_set_new(agg, "count",
+                        json_integer(json_integer_value(json_object_get(agg, "count")) + 1));
+                    json_t* lines = json_object_get(agg, "lines");
+                    if (lines && json_array_size(lines) < 8) {
+                        json_t* l = json_object_get(o, "line");
+                        if (l) json_array_append(lines, l);
+                    }
+                }
+            }
+            json_t* arr = json_array();
+            size_t fi;
+            json_t* fname;
+            json_array_foreach(order, fi, fname) {
+                json_t* agg = json_object_get(funcs, json_string_value(fname));
+                if (agg) json_array_append(arr, agg);
+            }
+            json_object_set_new(entry, "funcs", arr);
+            json_array_append_new(results, entry);
+            json_decref(order);
+            json_decref(funcs);
+            json_decref(data);
+        }
+        return results;
+    }
+
+    // 3) 都没命中：给候选函数名（前缀搜索，不扫大 JSON）
+    char prefix[1024];
+    snprintf(prefix, sizeof(prefix), "%s/dataflow/funcs/%s", repo, query);
+    cache_search_options_t opts = cache_search_options_default();
+    opts.max_results = max_results;
+    cache_result_t* found = NULL;
+    size_t count = 0;
+    if (cache_search_prefix(g_cache, prefix, &opts, &found, &count) == 0 && found) {
+        json_t* cands = json_array();
+        size_t plen = strlen(prefix);
+        for (size_t i = 0; i < count && json_array_size(cands) < (size_t)max_results; i++) {
+            const char* k = found[i].key;
+            if (!k || strlen(k) <= plen) continue;
+            json_array_append_new(cands, json_string(k + plen));
+        }
+        if (json_array_size(cands) > 0) {
+            json_t* entry = json_object();
+            json_object_set_new(entry, "kind", json_string("candidates"));
+            json_object_set_new(entry, "query", json_string(query));
+            json_object_set_new(entry, "functions", cands);
+            json_object_set_new(entry, "hint",
+                json_string("no exact function/variable; these functions share the prefix"));
+            json_array_append_new(results, entry);
+        } else {
+            json_decref(cands);
+        }
+        cache_results_free(found);
+    }
+    return results;
+}
+
 // Search query using vector engine (semantic search) with advanced options
 static json_t* do_search(const char* query, const char* repo, 
                          const vector_search_opts_t* opts, int max_results) {
@@ -325,7 +482,7 @@ static json_t* do_search(const char* query, const char* repo,
 
 static void print_usage(const char* prog) {
     printf("Usage: %s <query> [OPTIONS]\n", prog);
-    printf("\nQuery types: auto, exact, symbol, context, search\n");
+    printf("\nQuery types: auto, exact, symbol, context, search, dataflow\n");
     printf("\nOptions:\n");
     printf("  --repo <namespace>       Repository namespace (e.g., /code/nginx)\n");
     printf("  --type <type>            Query type: exact, symbol, context, search, auto\n");
@@ -561,6 +718,11 @@ int lite_cs_query_main(int argc, char** argv) {
         if (ctx) json_object_set(response, "context", ctx);
         if (stats) json_object_set(response, "stats", stats);
         json_decref(result);
+    } else if (strcmp(type, "dataflow") == 0) {
+        json_t* results = do_dataflow(query, repo, max_results);
+        json_object_set_new(response, "results", results);
+        json_object_set_new(response, "context", json_object());
+        json_object_set_new(response, "stats", json_object());
     } else {
         // Search type: use vector engine with advanced options
         json_t* results = do_search(query, repo, &opts, max_results);

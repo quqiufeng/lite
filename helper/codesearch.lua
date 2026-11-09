@@ -195,6 +195,51 @@ local function fmt_context(d, max_chars)
     return s
 end
 
+local function fmt_dataflow(d)
+    local rs = d.results or {}
+    if #rs == 0 then
+        return string.format('dataflow "%s" not found (run action=import to rebuild ' ..
+            'dataflow funcs index, or check the spelling)', d.query or "")
+    end
+    local out = {}
+    for _, entry in ipairs(rs) do
+        if entry.kind == "function" then
+            out[#out + 1] = string.format("func %s — %d var(s)", entry.func or "?",
+                tonumber(entry.var_count) or 0)
+            for _, v in ipairs(entry.vars or {}) do
+                local occ = v.occurrences or {}
+                local lines = {}
+                for i, o in ipairs(occ) do
+                    if i > 6 then lines[#lines + 1] = "..."; break end
+                    lines[#lines + 1] = string.format("%s:%s %s", o.file or "?",
+                        tostring(o.line or "?"), o.type or "")
+                end
+                out[#out + 1] = string.format("  %s line %s  occ_in_func=%s  %s",
+                    v.var or "?", tostring(v.line or "?"),
+                    tostring(v.occurrences_in_func or #occ), table.concat(lines, "; "))
+            end
+        elseif entry.kind == "variable" then
+            out[#out + 1] = string.format("var %s — %s occurrence(s) across %d func(s)",
+                entry.var or "?", tostring(entry.occurrence_count or 0), #(entry.funcs or {}))
+            for _, f in ipairs(entry.funcs or {}) do
+                local lines = {}
+                for i, l in ipairs(f.lines or {}) do
+                    if i > 8 then lines[#lines + 1] = "..."; break end
+                    lines[#lines + 1] = tostring(l)
+                end
+                out[#out + 1] = string.format("  %s (%s) lines %s", f.func or "?",
+                    tostring(f.count or 0), table.concat(lines, ","))
+            end
+        elseif entry.kind == "candidates" then
+            out[#out + 1] = string.format('"%s" not found; similar functions: %s',
+                entry.query or "?", table.concat(entry.functions or {}, ", "))
+        end
+    end
+    local s = table.concat(out, "\n")
+    if #s > 8000 then s = s:sub(1, 8000) .. "\n... (capped)" end
+    return s
+end
+
 local function fmt_symbols(d)
     local rs = d.results or {}
     if #rs == 0 then return string.format('symbol "%s" not found', d.query or "") end
@@ -279,8 +324,8 @@ return {
         parameters = {
             type = "object",
             properties = {
-                action = { type = "string", enum = { "build", "index", "import", "search", "symbol", "context", "exact", "status" },
-                           description = "build=全流程；index=只切块；import=analysis 导入 KV；search=语义+关键词；symbol/context/exact=结构化查询；status=看产物" },
+                action = { type = "string", enum = { "build", "index", "import", "search", "symbol", "context", "exact", "dataflow", "status" },
+                           description = "build=全流程；index=只切块；import=analysis 导入 KV；search=语义+关键词；symbol/context/exact=结构化查询；dataflow=函数读写了哪些变量 / 变量流过哪些函数；status=看产物" },
                 query = { type = "string", description = "符号名、标识符、自然语言查询，或 exact 的完整 KV key" },
                 path = { type = "string", description = "仓库路径（index/build，默认 cwd）" },
                 project = { type = "string", description = "项目名（默认取仓库目录名），决定 analysis/KV 目录与 namespace" },
@@ -336,6 +381,17 @@ return {
             if not d then error("codesearch: status failed", 0) end
             if args.json then return cjson.encode(d) end
             return fmt_status(d)
+        elseif action == "dataflow" then
+            if not args.query or args.query == "" then
+                error("codesearch: query required for dataflow (function or variable name)", 0)
+            end
+            local d0 = CS.check(analysis)
+            if not d0 then error("codesearch: cannot read analysis dir " .. analysis, 0) end
+            need_built(d0, "kv")
+            local d, err = CS.dataflow_query(args.query, kv, ns, args.max_results or 10)
+            if not d then error("codesearch: dataflow query failed: " .. tostring(err), 0) end
+            if args.json then return cjson.encode(d) end
+            return fmt_dataflow(d)
         elseif action == "search" or action == "symbol" or action == "context" or action == "exact" then
             if not args.query or args.query == "" then
                 error("codesearch: query required for " .. action, 0)

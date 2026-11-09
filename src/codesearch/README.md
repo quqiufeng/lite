@@ -476,6 +476,7 @@ RTX 3080 20GB / 6 核：
 - 源码：`/opt/linux/src/linux-7.2.12`（Linux 7.2.12）
 - 旧索引：`/opt/code_caches/linux_723_cache`（7.2.3，5.2GB，不含 drivers）已删除
 - 新索引：`/opt/code_caches/linux_7212_cache`
+- 实测报告：`src/codesearch/kernel-7.2.12.md`（用该索引 + 真机 function_graph 走通页缓存读路径）
 - 机器：RTX 3080 20GB / 6 核 / 23GB 内存 / CUDA 12.6
 - 模型：Jina v2 code，FP16；batch 128；HNSW `ef_construction=100`、6 线程
 - KV：`LITE_CS_KV_MAX_GB=8`
@@ -638,7 +639,6 @@ fork = true, workers = 6, batch = 128
 实测：Pi 全量 build ~40s；Reasonix index 8s、callgraph 3s、dataflow 0.7s、
 import 1.8s、vectorize+HNSW 142s；opencode index 3s、vectorize+HNSW 58s。
 命名空间分别为 `/code/pi-mono`、`/code/reasonix`、`/code/opencode`。
-按最佳实践探索后的报告：`pi-mono.md`、`reasonix.md`、`opencode.md`（同目录）。
 
 ---
 
@@ -721,7 +721,29 @@ codesearch action=context query=compute_total depth=3
 - `call_paths`：调用路径
 - `dataflow`：变量/字段的 def/use
 
-### 5.5 精确 KV key：`exact`
+### 5.5 数据流：`dataflow`
+
+问「这个函数读写了哪些变量」「这个变量流过哪些函数」。走 import 时写好的
+`dataflow/funcs/<func>`（每函数一条）和 `dataflow/vars/<var>`，`cache_get` 直取，
+不会去读几百 MB 的 `dataflow.json` / `_func_index`：
+
+```text
+codesearch action=dataflow query=import_dataflow max_results=20
+codesearch action=dataflow query=namespace
+```
+
+输出三种 `kind`：
+
+| kind | 含义 |
+|---|---|
+| `function` | 函数精确命中：`vars` 里每个变量的行号 + 本函数内的 occurrence（`occurrences_in_func` 是总数） |
+| `variable` | 变量命中：按函数聚合的出现次数与行号 |
+| `candidates` | 都没命中时给前缀相近的函数名，免得凭空猜拼写 |
+
+注意：查询只能命中**重新 import 过**的 KV —— 旧索引里没有 `funcs/` 键，
+先跑一次 `codesearch action=import`（或 `build`）。
+
+### 5.6 精确 KV key：`exact`
 
 高级用法，按完整 KV key 取原始记录：
 
@@ -729,7 +751,7 @@ codesearch action=context query=compute_total depth=3
 codesearch action=exact query=/code/nginx/chunks/ngx_http_init_connection
 ```
 
-### 5.6 推荐探索流程
+### 5.7 推荐探索流程
 
 1. **摸底**：`status` 确认索引完整。
 2. **架构扫描**：用几条自然语言 `search` 找子系统入口（调度器、VFS、网络、配置、缓存……）。
@@ -802,6 +824,8 @@ char* lite_cs_index_ex(const char* repo, const char* out_dir, int workers,
 char* lite_cs_word_freq(const char* analysis_dir);
 char* lite_cs_callgraph(const char* analysis_dir);
 char* lite_cs_dataflow(const char* analysis_dir);
+char* lite_cs_dataflow_query(const char* query, const char* kv_dir, const char* ns,
+                             int max_results);
 char* lite_cs_import(const char* analysis_dir, const char* ns,
                      const char* kv_dir, int only_dataflow);
 char* lite_cs_vectorize_ex(const char* analysis_dir, const char* model,

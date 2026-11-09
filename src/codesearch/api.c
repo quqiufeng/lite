@@ -293,6 +293,36 @@ char* lite_cs_query(const char* query, const char* repo, const char* type,
     return out;
 }
 
+char* lite_cs_dataflow_query(const char* query, const char* kv_dir, const char* ns,
+                             int max_results) {
+    if (!query || !*query) return json_fail("query required");
+    if (!kv_dir || !*kv_dir) return json_fail("kv_dir required");
+    if (!ns || !*ns) return json_fail("namespace required");
+    if (max_results <= 0) max_results = 10;
+    if (max_results > 100) max_results = 100;
+
+    char mbuf[32];
+    snprintf(mbuf, sizeof(mbuf), "%d", max_results);
+    char* argv[16];
+    int argc = 0;
+    argv[argc++] = (char*)"cache_query";
+    argv[argc++] = (char*)query;
+    argv[argc++] = (char*)"--repo"; argv[argc++] = (char*)ns;
+    argv[argc++] = (char*)"--type"; argv[argc++] = (char*)"dataflow";
+    argv[argc++] = (char*)"--cache-dir"; argv[argc++] = (char*)kv_dir;
+    argv[argc++] = (char*)"--max-results"; argv[argc++] = mbuf;
+    argv[argc] = NULL;
+
+    int rc = 0;
+    char* out = run_capture(lite_cs_query_main, argc, argv, &rc);
+    if (!out) {
+        if (rc == 0) return strdup("{\"ok\":true,\"results\":[]}");
+        set_error("dataflow query failed");
+        return json_fail("dataflow query failed");
+    }
+    return out;
+}
+
 // ---------------- 状态检查 ----------------
 
 static long file_size(const char* path) {

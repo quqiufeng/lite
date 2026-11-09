@@ -20,6 +20,8 @@ char* lite_cs_vectorize_ex(const char* analysis_dir, const char* model, const ch
                            int batch, int fp16);
 char* lite_cs_callgraph(const char* analysis_dir);
 char* lite_cs_dataflow(const char* analysis_dir);
+char* lite_cs_dataflow_query(const char* query, const char* kv_dir, const char* ns,
+                             int max_results);
 char* lite_cs_import(const char* analysis_dir, const char* ns,
                      const char* kv_dir, int only_dataflow);
 char* lite_cs_query(const char* query, const char* repo, const char* type,
@@ -131,6 +133,9 @@ function M.vectorize(dir, model, name, opts)
 end
 function M.callgraph(dir) return call("lite_cs_callgraph", dir) end
 function M.dataflow(dir) return call("lite_cs_dataflow", dir) end
+function M.dataflow_query(query, kv_dir, ns, max_results)
+    return call("lite_cs_dataflow_query", query, kv_dir, ns, max_results or 10)
+end
 function M.import(dir, ns, kv_dir, only_dataflow)
     return call("lite_cs_import", dir, ns, kv_dir, only_dataflow and 1 or 0)
 end

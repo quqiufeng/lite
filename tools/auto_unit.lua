@@ -4308,6 +4308,15 @@ int scale(int v) {
         for _, v in ipairs(callees) do if v.name == "helper_add" then callee_hit = true end end
         check(caller_hit and callee_hit, "codesearch context callers/callees")
 
+        local df = CS.dataflow_query("compute_total", kv, ns, 10)
+        local dfv = df and df.results and df.results[1] or {}
+        check(dfv.kind == "function" and (dfv.var_count or 0) > 0,
+            "codesearch dataflow function vars")
+        local dfvar = CS.dataflow_query("y", kv, ns, 10)
+        local dfvv = dfvar and dfvar.results and dfvar.results[1] or {}
+        check(dfvv.kind == "variable" and #(dfvv.funcs or {}) > 0,
+            "codesearch dataflow variable flow")
+
         local caps = CS.check(dir)
         if caps and caps.models and caps.models.jina_onnx and caps.models.onnxruntime then
             local v = CS.vectorize(dir, "jina", "unit_cs")

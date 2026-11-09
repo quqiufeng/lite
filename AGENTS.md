@@ -32,6 +32,9 @@ AI-native harness：记忆、工具、FFI、X11。
 - `src/codesearch/`：从 `/opt/my_db` 全量迁移的代码索引/调用图/数据流/向量检索；
   `api.c` 是 JSON-in/JSON-out 公共入口，其余 `.c` 来自原 CLI（main 改名、日志走 stderr）。
   `lua/ffi/codesearch.lua` 包 FFI，`helper/codesearch.lua` 做 action 编排。
+  `action=dataflow`（`lite_cs_dataflow_query`）走 import 写的 `dataflow/funcs/<func>`
+  与 `dataflow/vars/<var>` 两条键，`cache_get` 直取，不读几百 MB 的 `dataflow.json`
+  / `_func_index`；旧 KV 没这两类键，要重跑一次 `import`。
 - `lua/ffi/x11.lua` + `xdo.lua`：**自包含单文件**（只用 LuaJIT `ffi` + 系统 libX11/libxdo，不引用 lite 代码、不注册工具），可整对拷给别的项目；`x11.lua` 靠 `require("ffi.xdo")` 找同伴，换布局要同步改这一行
 - `lua/tui/mouse.lua` + `clipboard.lua`：拖选/剪贴板；选区在 `screen.lua`
 
