@@ -519,6 +519,30 @@ print(H.run({
 - 大仓库一定保留 `vectors/*.hash`；增量复跑从 55 分钟降到 **2.8s**。
 - 本次 HNSW 用 `ef=100`（默认 200 更慢、召回略高）；对代码搜索足够。
 
+### 4.7 参考项目索引（Pi / Reasonix / opencode）
+
+旧索引已删除，用 lite 新流程重建（TS/JS 走 tree-sitter 插件，Go 走 ctags）：
+
+| 项目 | 源码 | 索引目录 | chunks | 大小 |
+|---|---|---|---|---|
+| Pi | `/opt/pi-mono` | `/opt/code_caches/pi-mono_cache` | 16,977 | 245MB |
+| Reasonix | `/opt/reasonix` | `/opt/code_caches/reasonix_cache` | 58,356 | 580MB |
+| opencode | `/opt/opencode` | `/opt/code_caches/opencode_cache` | 27,111 | 361MB |
+
+统一参数：
+
+```text
+excludes = node_modules,dist,build,.next,out
+skip_kinds = header,file,enumerator,macro,package,unknown
+plugins = third_party/codesearch/plugins/typescript-indexer/plugin.json
+fork = true, workers = 6, batch = 128
+```
+
+实测：Pi 全量 build ~40s；Reasonix index 8s、callgraph 3s、dataflow 0.7s、
+import 1.8s、vectorize+HNSW 142s；opencode index 3s、vectorize+HNSW 58s。
+命名空间分别为 `/code/pi-mono`、`/code/reasonix`、`/code/opencode`。
+按最佳实践探索后的报告：`pi-mono.md`、`reasonix.md`、`opencode.md`（同目录）。
+
 ---
 
 ## 5. 探索项目

@@ -432,7 +432,27 @@ static int is_source_file(const char* filename) {
 static const char** g_exclude_dirs = NULL;
 static int g_exclude_count = 0;
 
+// --include-dirs：把默认 noise 列表里的目录重新放回来（例如 src/core/tools）。
+static char g_include_dirs[512] = {0};
+
+static int dir_is_included(const char* name) {
+    if (!name || !name[0] || !g_include_dirs[0]) return 0;
+    size_t n = strlen(name);
+    const char* p = g_include_dirs;
+    while (*p) {
+        while (*p == ',' || *p == ' ') p++;
+        const char* e = strchr(p, ',');
+        size_t len = e ? (size_t)(e - p) : strlen(p);
+        while (len > 0 && p[len - 1] == ' ') len--;
+        if (len == n && strncmp(p, name, n) == 0) return 1;
+        if (!e) break;
+        p = e + 1;
+    }
+    return 0;
+}
+
 static int is_noise_dir(const char* name) {
+    if (dir_is_included(name)) return 0;
     static const char* noise[] = {
         "thirdparty", "3rdparty", "third_party", "third-party",
         "external", "deps", "dependencies", "vendor",
@@ -1230,6 +1250,7 @@ int lite_cs_index_main(int argc, char** argv) {
         printf("  --exclude-dir dir1,dir2,...  Directories to skip\n");
         printf("  --plugins path/to/plugin.json  Plugin registry JSON\n");
         printf("  --skip-kinds header,file,macro  Skip selected ctags kinds\n");
+        printf("  --include-dirs tools,utils     Re-include dirs from default noise list\n");
         printf("\nExample:\n");
         printf("  %s /opt/linux /memory 8\n", argv[0]);
         printf("  %s /opt/opencode /memory 8 --plugins third_party/codesearch/plugins/typescript-indexer/plugin.json\n", argv[0]);
@@ -1265,6 +1286,11 @@ int lite_cs_index_main(int argc, char** argv) {
             arg_pos++;
             strncpy(g_skip_kinds, argv[arg_pos], sizeof(g_skip_kinds) - 1);
             g_skip_kinds[sizeof(g_skip_kinds) - 1] = '\0';
+            arg_pos++;
+        } else if (strcmp(argv[arg_pos], "--include-dirs") == 0 && arg_pos + 1 < argc) {
+            arg_pos++;
+            strncpy(g_include_dirs, argv[arg_pos], sizeof(g_include_dirs) - 1);
+            g_include_dirs[sizeof(g_include_dirs) - 1] = '\0';
             arg_pos++;
         } else if (strcmp(argv[arg_pos], "--fork") == 0) {
             fork_opt = 1;

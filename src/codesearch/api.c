@@ -115,9 +115,9 @@ static char* run_capture(int (*fn)(int, char**), int argc, char** argv, int* out
 
 // ---------------- index / analysis pipeline ----------------
 
-char* lite_cs_index_ext(const char* repo, const char* out_dir, int workers,
-                        const char* excludes, const char* plugins, int use_fork,
-                        const char* skip_kinds) {
+char* lite_cs_index_full(const char* repo, const char* out_dir, int workers,
+                         const char* excludes, const char* plugins, int use_fork,
+                         const char* skip_kinds, const char* include_dirs) {
     if (!repo || !*repo) return json_fail("repo required");
     if (!out_dir || !*out_dir) return json_fail("out_dir required");
     if (mkdir_p(out_dir) != 0) {
@@ -129,7 +129,7 @@ char* lite_cs_index_ext(const char* repo, const char* out_dir, int workers,
     if (workers > 64) workers = 64;
     snprintf(wbuf, sizeof(wbuf), "%d", workers);
 
-    char* argv[14];
+    char* argv[16];
     int argc = 0;
     argv[argc++] = (char*)"code_indexer";
     argv[argc++] = (char*)repo;
@@ -147,12 +147,23 @@ char* lite_cs_index_ext(const char* repo, const char* out_dir, int workers,
         argv[argc++] = (char*)"--skip-kinds";
         argv[argc++] = (char*)skip_kinds;
     }
+    if (include_dirs && *include_dirs) {
+        argv[argc++] = (char*)"--include-dirs";
+        argv[argc++] = (char*)include_dirs;
+    }
     if (use_fork > 0) argv[argc++] = (char*)"--fork";
     else if (use_fork == 0) argv[argc++] = (char*)"--no-fork";
     argv[argc] = NULL;
 
     int rc = lite_cs_index_main(argc, argv);
     return json_ok(rc);
+}
+
+char* lite_cs_index_ext(const char* repo, const char* out_dir, int workers,
+                        const char* excludes, const char* plugins, int use_fork,
+                        const char* skip_kinds) {
+    return lite_cs_index_full(repo, out_dir, workers, excludes, plugins, use_fork,
+                              skip_kinds, NULL);
 }
 
 char* lite_cs_index_ex(const char* repo, const char* out_dir, int workers,
