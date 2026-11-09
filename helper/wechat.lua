@@ -7,6 +7,23 @@
 --   lxqt 面板删掉 desktopswitch 插件。窗口管理器的滚轮换桌面（Desktop 上下文
 --   button Up/Down）也要清掉。不是 1 就别往下跑，先修桌面再操作。
 --
+-- ⚠ 输入法（本机 ibus + libpinyin，实测命令见下）：**不管打中文还是英文，
+--   点输入框动手之前先把输入法切对**。切错的表现是"字没进去/进去的是拼音串"：
+--   拼音引擎开着敲英文 → 输入框里是候选框里的中文或干脆被吞；
+--   英文引擎开着打中文 → 贴出来是空格。机器环境：GTK_IM_MODULE=ibus、
+--   QT_IM_MODULE=ibus、XMODIFIERS=@im=ibus，预加载引擎只有 libpinyin，
+--   引擎切换键是 <Super>space。
+--     查当前引擎： ibus engine                       # libpinyin | xkb:us::eng
+--     切中文拼音： ibus engine libpinyin
+--     切英文：     ibus engine xkb:us::eng            # = English (US)
+--     键盘切法：   Super+space 换引擎（libpinyin ↔ xkb:us::eng）
+--   libpinyin 内部还认 **单按 Shift** 切中/英，但那只是引擎内部状态，
+--   `ibus engine` 照样显示 libpinyin —— 别拿它当"已经切到英文"的判据，
+--   拿不准就直接 `ibus engine xkb:us::eng`，别靠猜。
+--   顺带：本插件的 paste() 走剪贴板 ctrl+v，不经 IME，中英文都能原样进去；
+--   真正怕 IME 的是 xdo:type 那种逐字符输入（拼音引擎会弹候选框吞字符），
+--   所以要么先切法再用 type，要么一律走 paste。切完统一按上面的命令复核一遍。
+--
 -- 流程：activate → 点标题栏拿焦点 → 点搜索框 → 粘贴关键词 → OCR 候选面板
 --      → 回车进会话（第一行即目标时；否则点候选行）→ OCR 会话标题验收
 --      → 点输入框 → ctrl+a/BS → 粘贴 → Return → OCR 气泡验收。
@@ -396,9 +413,21 @@ local function do_screenshot(a, name, index)
     error(string.format("发图后左栏没看到「图片」预览（OCR=%q）", norm(seen):sub(1, 120)))
 end
 
+-- 收尾必做：把微信放回后台。
+-- 坑：XIconifyWindow 偶尔被 WM 吃掉（刚抢过焦点时），一次 minimize 窗口还在前台；
+-- 所以重试到 `_is_viewable == false` 为止，最多 3 次，每次等 300ms 让 WM 回执。
+-- 而且**出错也要走这里**（见 M.run 的 pcall 包装）：动作抛错后微信留在最前面
+-- 挡住用户桌面，是踩过的投诉点。
 local function leave(bg)
     if bg == false then return end
-    pcall(function() xdo:minimize(win) end); sleep(200)
+    for _ = 1, 3 do
+        pcall(function() xdo:minimize(win) end)
+        sleep(300)
+        local visible = true
+        pcall(function() visible = xdo:_is_viewable(win) end)
+        if not visible then return true end
+    end
+    return false
 end
 
 function M.run(args, env)
@@ -410,54 +439,58 @@ function M.run(args, env)
         or (action == "screenshot" and { "shotbtn" }) or nil
     local ok, err = check(needs)
     if not ok then return "error: " .. err end
-    if action == "screenshot" then
-        local rect = assert(args.rect, "required: rect")
-        for i = 1, 4 do
-            if type(rect[i]) ~= "number" then
-                return "error: rect must be [x0,y0,x1,y1] integers, got " .. tostring(rect[1]) .. "..."
+    -- 所有动作都在这层 pcall 里跑：成功 or 抛错，收尾都 leave(bg) 把微信放回后台。
+    -- 原来「出错就直接 error()」的写法会让一次失败的 send 把微信留在前台挡桌面。
+    local function dispatch()
+        if action == "screenshot" then
+            local rect = assert(args.rect, "required: rect")
+            for i = 1, 4 do
+                if type(rect[i]) ~= "number" then
+                    return "error: rect must be [x0,y0,x1,y1] integers, got "
+                        .. tostring(rect[1]) .. "..."
+                end
             end
+            return do_screenshot(rect, args.name, args.index)
         end
-        local okk, r = pcall(do_screenshot, rect, args.name, args.index)
-        leave(bg)
-        if not okk then error(r) end
-        return r
-    end
-    if action == "sendfile" then
-        local r = do_sendfile(assert(args.path, "required: path"), args.name, args.index)
-        leave(bg)
-        return r
-    end
-    if action == "search" then
-        local b = do_search(assert(args.name, "required: name"), args.index)
-        leave(bg)
-        if b.enter then
-            return string.format("searched: %s (%s)", args.name,
-                b.blind and "回车进会话，OCR 不可用" or "第一行即目标，回车进会话")
+        if action == "sendfile" then
+            return do_sendfile(assert(args.path, "required: path"), args.name, args.index)
         end
-        return string.format("searched: %s (candidate %q @ %d,%d)",
-            args.name, norm(b.text), math.floor(b.cx), math.floor(b.cy))
-    elseif action == "open" then
-        local how = do_open(assert(args.name, "required: name"), args.index)
-        leave(bg)
-        return "opened: " .. args.name .. " (" .. tostring(how) .. ")"
-    elseif action == "send" then
-        do_send(assert(args.text, "required: text"), args.name)
-        leave(bg)
-        return "sent: " .. args.text
-    elseif action == "run" then
-        local name = assert(args.name, "required: name")
-        local text = assert(args.text, "required: text")
-        local b = do_search(name, args.index)
-        local head = string.format("searched: %s (%s)", name,
-            b.enter and "enter" or string.format("%q @ %d,%d", norm(b.text),
-                math.floor(b.cx), math.floor(b.cy)))
-        local how = open_hit(b, name)
-        do_send(text, text)
-        leave(bg)
-        return head .. "\nopened: " .. name .. " (" .. tostring(how) .. ")"
-            .. "\nsent: " .. text .. " (bubble_seen=true)"
+        if action == "search" then
+            local b = do_search(assert(args.name, "required: name"), args.index)
+            if b.enter then
+                return string.format("searched: %s (%s)", args.name,
+                    b.blind and "回车进会话，OCR 不可用" or "第一行即目标，回车进会话")
+            end
+            return string.format("searched: %s (candidate %q @ %d,%d)",
+                args.name, norm(b.text), math.floor(b.cx), math.floor(b.cy))
+        elseif action == "open" then
+            local how = do_open(assert(args.name, "required: name"), args.index)
+            return "opened: " .. args.name .. " (" .. tostring(how) .. ")"
+        elseif action == "send" then
+            do_send(assert(args.text, "required: text"), args.name)
+            return "sent: " .. args.text
+        elseif action == "run" then
+            local name = assert(args.name, "required: name")
+            local text = assert(args.text, "required: text")
+            local b = do_search(name, args.index)
+            local head = string.format("searched: %s (%s)", name,
+                b.enter and "enter" or string.format("%q @ %d,%d", norm(b.text),
+                    math.floor(b.cx), math.floor(b.cy)))
+            local how = open_hit(b, name)
+            do_send(text, text)
+            return head .. "\nopened: " .. name .. " (" .. tostring(how) .. ")"
+                .. "\nsent: " .. text .. " (bubble_seen=true)"
+        end
+        error("未知 action: " .. tostring(action) .. "（run|search|open|send|sendfile）")
     end
-    error("未知 action: " .. tostring(action) .. "（run|search|open|send|sendfile）")
+
+    local okd, res = pcall(dispatch)
+    local bg_ok = leave(bg)
+    if not okd then error(res, 0) end
+    if bg_ok == false then
+        return tostring(res) .. "\n(警告：微信没能收回后台，minimize 重试 3 次仍可见)"
+    end
+    return res
 end
 
 return M
