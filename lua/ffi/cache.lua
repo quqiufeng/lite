@@ -16,6 +16,7 @@ typedef struct {
 } cache_search_options_t;
 
 cache_t* cache_open(const char* db_dir, size_t max_memory);
+cache_t* cache_open_ex(const char* db_dir, size_t max_memory, unsigned flags);
 void cache_close(cache_t* cache);
 int cache_sync(cache_t* cache);
 int cache_set(cache_t* cache, const char* key, const char* value, uint64_t ttl_ms);
@@ -66,8 +67,16 @@ end
 
 local M = {}
 
+-- lite 记忆只用 prefix/range/tag 搜索，不用 cache 内置 vector_index；
+-- 跳过它的重建可少一次全量 entry 扫描（大 mem.bin 启动更快）。
+local CACHE_OPEN_NO_VECTOR_INDEX = 2
+
 function M.open(dir, max_memory)
-    local h = lib.cache_open(dir, max_memory or 100 * 1024 * 1024)
+    local max = max_memory or 100 * 1024 * 1024
+    local ok, h = pcall(function()
+        return lib.cache_open_ex(dir, max, CACHE_OPEN_NO_VECTOR_INDEX)
+    end)
+    if not ok then h = lib.cache_open(dir, max) end
     if h == nil then return nil, "cache_open failed" end
     return h
 end
