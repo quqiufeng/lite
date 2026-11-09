@@ -47,13 +47,6 @@ void rect_fill(cairo_t* cr, const web_color& c, double x, double y, double w, do
     cairo_fill(cr);
 }
 
-void clip_fill(cairo_t* cr, const web_color& c)
-{
-    double x1 = 0, y1 = 0, x2 = 0, y2 = 0;
-    cairo_clip_extents(cr, &x1, &y1, &x2, &y2);
-    rect_fill(cr, c, x1, y1, x2 - x1, y2 - y1);
-}
-
 // 按 background_layer 的 border_box 填充（litehtml 要求一切画在 border_box 内）
 void layer_fill(cairo_t* cr, const background_layer& layer, const web_color& c)
 {
@@ -189,11 +182,43 @@ public:
     pixel_t get_default_font_size() const override { return 14; }
     const char* get_default_font_name() const override { return m_font_name.c_str(); }
 
-    void draw_list_marker(uint_ptr hdc, const list_marker& /*marker*/) override
+    // 列表符号（bullet）：litehtml 只为 none/circle/disc/square 回调这里，
+    // 数字/字母序号的文字它自己用 draw_text 画。以前这里 clip_fill(黑) 会把
+    // 整个 clip 区涂黑（从 corner 到整页全黑），必须按 marker_type 画形状。
+    void draw_list_marker(uint_ptr hdc, const list_marker& marker) override
     {
         auto* cr = cr_of(hdc);
         if (!cr) return;
-        clip_fill(cr, web_color(0, 0, 0));
+        if (marker.marker_type == list_style_type_none) return;
+
+        const double w = marker.pos.width.value(), h = marker.pos.height.value();
+        if (w <= 0 || h <= 0) return;
+        const double cx = marker.pos.x.value() + w / 2;
+        const double cy = marker.pos.y.value() + h / 2;
+        const double r  = (w < h ? w : h) / 2;
+
+        web_color c = marker.color;
+        if (c.alpha == 0) c = web_color(0, 0, 0);
+
+        cairo_save(cr);
+        cairo_set_source_rgba(cr, c.red / 255.0, c.green / 255.0, c.blue / 255.0, c.alpha / 255.0);
+        switch (marker.marker_type) {
+        case list_style_type_circle:
+            cairo_set_line_width(cr, 1.0);
+            cairo_arc(cr, cx, cy, r - 0.5, 0, 2 * M_PI);
+            cairo_stroke(cr);
+            break;
+        case list_style_type_square:
+            cairo_rectangle(cr, cx - r, cy - r, 2 * r, 2 * r);
+            cairo_fill(cr);
+            break;
+        case list_style_type_disc:
+        default:
+            cairo_arc(cr, cx, cy, r, 0, 2 * M_PI);
+            cairo_fill(cr);
+            break;
+        }
+        cairo_restore(cr);
     }
 
     void load_image(const char* /*src*/, const char* /*base*/, bool /*redraw*/) override {}
