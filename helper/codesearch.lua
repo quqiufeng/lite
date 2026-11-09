@@ -81,8 +81,11 @@ local function fmt_status(d)
     for _, name in ipairs({ "chunks_meta.jsonl", "chunks_text.txt", "word_freq.json",
                             "call_graph.json", "dataflow.json" }) do
         local x = f[name] or {}
-        out[#out + 1] = string.format("  %-20s %s  %d lines", name,
-            x.exists and (tostring(x.bytes) .. "B") or "missing", x.lines or 0)
+        local info = x.exists and (tostring(x.bytes) .. "B") or "missing"
+        local lines = x.lines
+        if lines and lines >= 0 then info = info .. "  " .. lines .. " lines"
+        elseif x.exists then info = info .. "  large" end
+        out[#out + 1] = string.format("  %-20s %s", name, info)
     end
     local vs = d.vectors or {}
     if #vs == 0 then
@@ -241,7 +244,7 @@ local function do_build(args, repo, project, analysis, kv, ns)
     stage("index", function()
         return CS.index({ repo = repo, analysis_dir = analysis,
                           workers = worker_count(args),
-                          fork = args.fork,
+                          fork = args.fork, skip_kinds = args.skip_kinds,
                           excludes = args.excludes, plugins = args.plugins })
     end)
     stage("word_freq", function() return CS.word_freq(analysis) end)
@@ -294,6 +297,7 @@ return {
                 batch = { type = "integer", description = "向量化 batch，默认 128；长 chunk 多时降到 64" },
                 fp16 = { type = "boolean", description = "用 model_fp16.onnx 推理（默认开；GPU 约快 1.5-2x）" },
                 excludes = { type = "string", description = "index 跳过目录，逗号分隔" },
+                skip_kinds = { type = "string", description = "按 ctags kind 过滤，逗号分隔，如 header,file,enumerator,macro（内核推荐）" },
                 plugins = { type = "string", description = "index 插件 registry JSON 路径" },
                 only_dataflow = { type = "boolean", description = "import 只导入 dataflow（增量更新时用）" },
                 analysis_dir = { type = "string", description = "覆盖 analysis 目录（高级）" },
@@ -317,7 +321,7 @@ return {
             local r = check_stage("index", CS.index({
                 repo = repo, analysis_dir = analysis,
                 workers = worker_count(args),
-                fork = args.fork,
+                fork = args.fork, skip_kinds = args.skip_kinds,
                 excludes = args.excludes, plugins = args.plugins }))
             if args.json then return cjson.encode(r) end
             return fmt_status(CS.check(analysis))

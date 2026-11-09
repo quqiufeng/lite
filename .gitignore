@@ -55,6 +55,8 @@ mem.lock
 
 # codesearch: tokenizers-cpp 静态库随仓库自带（构建 liblite_codesearch.so 需要）
 !third_party/codesearch/lib/tokenizers-cpp/*.a
+# tokenizers 源码按需拉取构建，不随仓库
+third_party/codesearch/.build/
 
 # keep vendored cjson shared object
 !third_party/cjson/lua/5.1/cjson.so

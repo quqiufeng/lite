@@ -8,6 +8,9 @@ char* lite_cs_index(const char* repo, const char* out_dir, int workers,
                     const char* excludes, const char* plugins);
 char* lite_cs_index_ex(const char* repo, const char* out_dir, int workers,
                        const char* excludes, const char* plugins, int use_fork);
+char* lite_cs_index_ext(const char* repo, const char* out_dir, int workers,
+                        const char* excludes, const char* plugins, int use_fork,
+                        const char* skip_kinds);
 char* lite_cs_word_freq(const char* analysis_dir);
 char* lite_cs_vectorize(const char* analysis_dir, const char* model, const char* name);
 char* lite_cs_vectorize_ex(const char* analysis_dir, const char* model, const char* name,
@@ -94,6 +97,11 @@ function M.index(opts)
     opts = opts or {}
     local fork = -1
     if opts.fork == true then fork = 1 elseif opts.fork == false then fork = 0 end
+    local skip = opts.skip_kinds or env("LITE_CS_SKIP_KINDS") or ""
+    if LIB.lite_cs_index_ext ~= nil then
+        return call("lite_cs_index_ext", opts.repo, opts.analysis_dir,
+                    opts.workers or 1, opts.excludes or "", opts.plugins or "", fork, skip)
+    end
     if LIB.lite_cs_index_ex ~= nil then
         return call("lite_cs_index_ex", opts.repo, opts.analysis_dir,
                     opts.workers or 1, opts.excludes or "", opts.plugins or "", fork)

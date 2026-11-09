@@ -115,8 +115,9 @@ static char* run_capture(int (*fn)(int, char**), int argc, char** argv, int* out
 
 // ---------------- index / analysis pipeline ----------------
 
-char* lite_cs_index_ex(const char* repo, const char* out_dir, int workers,
-                       const char* excludes, const char* plugins, int use_fork) {
+char* lite_cs_index_ext(const char* repo, const char* out_dir, int workers,
+                        const char* excludes, const char* plugins, int use_fork,
+                        const char* skip_kinds) {
     if (!repo || !*repo) return json_fail("repo required");
     if (!out_dir || !*out_dir) return json_fail("out_dir required");
     if (mkdir_p(out_dir) != 0) {
@@ -128,7 +129,7 @@ char* lite_cs_index_ex(const char* repo, const char* out_dir, int workers,
     if (workers > 64) workers = 64;
     snprintf(wbuf, sizeof(wbuf), "%d", workers);
 
-    char* argv[12];
+    char* argv[14];
     int argc = 0;
     argv[argc++] = (char*)"code_indexer";
     argv[argc++] = (char*)repo;
@@ -142,12 +143,21 @@ char* lite_cs_index_ex(const char* repo, const char* out_dir, int workers,
         argv[argc++] = (char*)"--plugins";
         argv[argc++] = (char*)plugins;
     }
+    if (skip_kinds && *skip_kinds) {
+        argv[argc++] = (char*)"--skip-kinds";
+        argv[argc++] = (char*)skip_kinds;
+    }
     if (use_fork > 0) argv[argc++] = (char*)"--fork";
     else if (use_fork == 0) argv[argc++] = (char*)"--no-fork";
     argv[argc] = NULL;
 
     int rc = lite_cs_index_main(argc, argv);
     return json_ok(rc);
+}
+
+char* lite_cs_index_ex(const char* repo, const char* out_dir, int workers,
+                       const char* excludes, const char* plugins, int use_fork) {
+    return lite_cs_index_ext(repo, out_dir, workers, excludes, plugins, use_fork, NULL);
 }
 
 char* lite_cs_index(const char* repo, const char* out_dir, int workers,
@@ -313,7 +323,12 @@ char* lite_cs_check(const char* analysis_dir) {
         json_t* f = json_object();
         json_object_set_new(f, "exists", sz >= 0 ? json_true() : json_false());
         json_object_set_new(f, "bytes", json_integer(sz > 0 ? sz : 0));
-        json_object_set_new(f, "lines", json_integer(sz > 0 ? count_lines(path) : 0));
+        // 大文件（内核 chunks_meta/dataflow 可达数百 MB）逐字节统计行数会让
+        // 每次 query 前的 status 多花十几秒；只对小文件计数，大文件给 -1。
+        long lines = 0;
+        if (sz > 0 && sz <= 64L * 1024 * 1024) lines = count_lines(path);
+        else if (sz > 0) lines = -1;
+        json_object_set_new(f, "lines", json_integer(lines));
         json_object_set_new(files, names[i], f);
     }
     json_object_set_new(root, "files", files);

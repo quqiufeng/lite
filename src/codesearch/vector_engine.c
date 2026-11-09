@@ -19,6 +19,7 @@
 #include <string.h>
 #include <math.h>
 #include <ctype.h>
+#include <time.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
@@ -51,6 +52,7 @@ typedef struct {
     float* vec_data;
     char** names;
     size_t* offsets;
+    hnsw_index_t* hnsw;   // lazy-loaded once; HNSW 文件很大，不能每次 query 重读
 } ve_source_t;
 
 static int discover_sources(const char* cache_dir, ve_source_t* sources, int max_sources) {
@@ -213,6 +215,10 @@ static void munmap_source(ve_source_t* s) {
     if (s->offsets) {
         free(s->offsets);
         s->offsets = NULL;
+    }
+    if (s->hnsw) {
+        hnsw_destroy(s->hnsw);
+        s->hnsw = NULL;
     }
 }
 
@@ -672,28 +678,40 @@ static int search_hnsw(ve_source_t* source, const float* query_vec, int top_k,
                        const char* query_text, ve_search_result_t* results,
                        const vector_search_opts_t* opts) {
     if (!source->hnsw_file[0]) return 0;
-    
-    FILE* fp = fopen(source->hnsw_file, "rb");
-    if (!fp) return 0;
-    
-    fseek(fp, 0, SEEK_END);
-    long size = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    
-    void* buf = malloc(size);
-    if (!buf) { fclose(fp); return 0; }
-    
-    fread(buf, 1, size, fp);
-    fclose(fp);
-    
-    hnsw_index_t* hnsw = hnsw_deserialize(buf, size);
-    free(buf);
-    if (!hnsw) return 0;
-    
+
+    // HNSW 文件可能有数 GB；只在第一次 query 时加载并常驻，避免每次 query
+    // 都 malloc/read/deserialize 几 GB（内核索引下这是 20s+ 和 OOM 的主要来源）。
+    int debug = getenv("LITE_CS_DEBUG") != NULL;
+    clock_t load_t0 = clock();
+    if (!source->hnsw) {
+        FILE* fp = fopen(source->hnsw_file, "rb");
+        if (!fp) return 0;
+
+        fseek(fp, 0, SEEK_END);
+        long size = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+
+        void* buf = malloc(size);
+        if (!buf) { fclose(fp); return 0; }
+        if (fread(buf, 1, size, fp) != (size_t)size) {
+            free(buf); fclose(fp); return 0;
+        }
+        fclose(fp);
+
+        source->hnsw = hnsw_deserialize(buf, size);
+        free(buf);
+        if (!source->hnsw) return 0;
+    }
+
+    double load_ms = (double)(clock() - load_t0) * 1000.0 / CLOCKS_PER_SEC;
+    hnsw_index_t* hnsw = source->hnsw;
     size_t* ids = NULL;
     float* scores = NULL;
+    clock_t search_t0 = clock();
     size_t found = hnsw_search(hnsw, query_vec, top_k * 4, &ids, &scores);
-    hnsw_destroy(hnsw);
+    double search_ms = (double)(clock() - search_t0) * 1000.0 / CLOCKS_PER_SEC;
+    if (debug) fprintf(stderr, "[ve] hnsw load=%.0fms search=%.0fms found=%zu\n",
+                       load_ms, search_ms, found);
     
     if (!source->names && mmap_source(source) < 0) {
         free(ids); free(scores);
@@ -777,11 +795,18 @@ static int search_hnsw(ve_source_t* source, const float* query_vec, int top_k,
         }
     }
     
-    int count = (temp_count < top_k) ? temp_count : top_k;
-    for (int i = 0; i < count; i++) {
-        strncpy(results[i].name, temp[i].name, VE_MAX_NAME_LEN - 1);
-        results[i].name[VE_MAX_NAME_LEN - 1] = '\0';
-        results[i].score = temp[i].score;
+    int count = 0;
+    for (int i = 0; i < temp_count && count < top_k; i++) {
+        // 同一 name 的 Part 2..5 / 多个同名定义只保留最高分的一条。
+        int duplicate = 0;
+        for (int j = 0; j < count; j++) {
+            if (strcmp(results[j].name, temp[i].name) == 0) { duplicate = 1; break; }
+        }
+        if (duplicate) continue;
+        strncpy(results[count].name, temp[i].name, VE_MAX_NAME_LEN - 1);
+        results[count].name[VE_MAX_NAME_LEN - 1] = '\0';
+        results[count].score = temp[i].score;
+        count++;
     }
     
     free(temp);

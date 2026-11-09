@@ -139,6 +139,10 @@ static int import_chunk_raw(const char* namespace, const char* line) {
 
     if (!name[0] || !filepath[0]) return 0;
 
+    // 长函数会被切成 "// Part N" 窗口；KV 里只保留首个完整 chunk，
+    // 否则同一个 key 被后几个 Part 覆盖，symbol/exact 永远拿到 Part 4/5。
+    if (strstr(line, " // Part ")) return 0;
+
     // cache_query 查 chunk 时会把 file 的前导 '/' 去掉，这里统一键格式，
     // 否则绝对路径会生成 ".../chunks//tmp/..." 与查询侧对不上。
     const char* rel = filepath;
@@ -210,6 +214,19 @@ static int raw_field(const char* line, const char* key, char* out, int cap) {
     return 1;
 }
 
+// 同名符号可能有多个定义（内核 arch/* 尤其多）。rank 越小越优先：
+// .c 里的 function/method → 浅路径 → 头文件/深路径，避免 start_kernel 先命中 arch/alpha。
+static int symbol_rank(const char* file, const char* kind) {
+    int depth = 0;
+    for (const char* p = file; *p; p++) if (*p == '/') depth++;
+    size_t n = file ? strlen(file) : 0;
+    int is_header = (n >= 2 && strcmp(file + n - 2, ".h") == 0);
+    int is_func = (strcmp(kind, "function") == 0 || strcmp(kind, "method") == 0);
+    if (is_func && !is_header) return depth;
+    if (!is_header) return 10 + depth;
+    return 100 + depth;
+}
+
 // 导入 symbol 反向索引：/code/<ns>/symbols/<name> = [{name,kind,file,line}, ...]
 // 供 cache_query --type symbol/context 使用（旧版为提速跳过了此步，导致 context 恒空）。
 static void import_symbols(const char* analysis_dir, const char* namespace) {
@@ -246,23 +263,37 @@ static void import_symbols(const char* analysis_dir, const char* namespace) {
             arr = json_array();
             json_object_set_new(map, name, arr);
         }
+        // 同一 name/file/line/kind 只保留一条（长函数 Part 会重复登记）。
+        size_t si;
+        json_t* old;
+        int duplicate = 0;
+        json_array_foreach(arr, si, old) {
+            const char* of = json_string_value(json_object_get(old, "file"));
+            const char* ok = json_string_value(json_object_get(old, "kind"));
+            json_int_t ol = json_integer_value(json_object_get(old, "line"));
+            if (of && ok && strcmp(of, file) == 0 && strcmp(ok, kind) == 0 && ol == ln) {
+                duplicate = 1;
+                break;
+            }
+        }
+        if (duplicate) continue;
+
         json_t* obj = json_object();
         json_object_set_new(obj, "name", json_string(name));
         json_object_set_new(obj, "kind", json_string(kind));
         json_object_set_new(obj, "file", json_string(file));
         json_object_set_new(obj, "line", json_integer(ln));
 
-        // 优先级：.c 里的 function/method 排在前面（do_symbol 取首个），
-        // 避免 handle_mm_fault 之类解析到头文件内联包装而定位不到真实实现。
-        size_t flen = strlen(file);
-        int is_header = (flen >= 2 && strcmp(file + flen - 2, ".h") == 0);
-        int preferred = (strcmp(kind, "function") == 0 || strcmp(kind, "method") == 0)
-                        && !is_header;
-        if (preferred && json_array_size(arr) > 0) {
-            json_array_insert_new(arr, 0, obj);
-        } else {
-            json_array_append_new(arr, obj);
+        // 按 symbol_rank 排序插入；do_symbol 取首个，因此 canonical 定义优先。
+        int rank = symbol_rank(file, kind);
+        size_t pos = json_array_size(arr);
+        for (size_t ri = 0; ri < json_array_size(arr); ri++) {
+            json_t* old = json_array_get(arr, ri);
+            const char* of = json_string_value(json_object_get(old, "file"));
+            const char* ok = json_string_value(json_object_get(old, "kind"));
+            if (of && ok && rank < symbol_rank(of, ok)) { pos = ri; break; }
         }
+        json_array_insert_new(arr, pos, obj);
         added++;
     }
 

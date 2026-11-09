@@ -280,20 +280,30 @@ static void resolve_callee(const char* caller, const char* tok, char* out, size_
     snprintf(out, outsz, "%s", tok);
 }
 
+// 旧实现每次 add_call_edge 都线性扫全部 call graph 节点（O(edges×functions)，
+// 内核这种百万 chunk 规模会拖到 10 分钟）。用和 g_name_hash 同尺寸的开放寻址表。
+static func_node_t** g_node_hash = NULL;
+
 static func_node_t* get_func_node(const char* name, int create) {
-    func_node_t* n = g_func_nodes;
-    while (n) {
-        if (strcmp(n->name, name) == 0) return n;
-        n = n->next;
+    if (!g_node_hash) {
+        g_node_hash = calloc(HASH_SIZE, sizeof(func_node_t*));
+        if (!g_node_hash) return NULL;
     }
+    unsigned int h = hash_str(name) % HASH_SIZE;
+    while (g_node_hash[h] && strcmp(g_node_hash[h]->name, name) != 0) {
+        h = (h + 1) % HASH_SIZE;
+    }
+    if (g_node_hash[h]) return g_node_hash[h];
     if (!create) return NULL;
-    n = malloc(sizeof(func_node_t));
+
+    func_node_t* n = malloc(sizeof(func_node_t));
     if (!n) return NULL;
     strncpy(n->name, name, MAX_NAME_LEN - 1);
     n->name[MAX_NAME_LEN - 1] = '\0';
     n->calls = NULL;
     n->next = g_func_nodes;
     g_func_nodes = n;
+    g_node_hash[h] = n;
     return n;
 }
 
@@ -413,7 +423,7 @@ static int json_extract_int(const char* json, const char* key) {
 }
 
 // 在内容中查找函数调用，并提取参数
-static int find_call_with_args(const char* content, const char* func_name,
+static int __attribute__((unused)) find_call_with_args(const char* content, const char* func_name,
                                 char* args_out, int args_out_size) {
     int len = (int)strlen(func_name);
     const char* p = content;
@@ -510,6 +520,71 @@ static int find_call_with_args(const char* content, const char* func_name,
     }
 
     return 0;
+}
+
+// 从当前调用点的 '(' 之后解析参数，避免为每个 callee 重新 strstr 整个 body。
+static void extract_call_args(const char* after, char* args_out, int args_out_size) {
+    int depth = 1;
+    int arg_idx = 0;
+    int arg_len = 0;
+    int in_string = 0;
+    char string_char = 0;
+    char arg[MAX_ARGS][128];
+    args_out[0] = '\0';
+
+    while (*after && depth > 0 && arg_idx < MAX_ARGS) {
+        if (!in_string && (*after == '"' || *after == '\'')) {
+            in_string = 1;
+            string_char = *after;
+            after++;
+            continue;
+        }
+        if (in_string && *after == string_char) {
+            in_string = 0;
+            after++;
+            continue;
+        }
+        if (in_string) { after++; continue; }
+
+        if (*after == '(') {
+            depth++;
+        } else if (*after == ')') {
+            depth--;
+            if (depth == 0) break;
+        } else if (*after == ',' && depth == 1) {
+            if (arg_len > 0) {
+                arg[arg_idx][arg_len] = '\0';
+                arg_idx++;
+                arg_len = 0;
+            }
+            after++;
+            continue;
+        }
+
+        if (arg_len < 127 && depth == 1) arg[arg_idx][arg_len++] = *after;
+        after++;
+    }
+
+    if (arg_len > 0 && arg_idx < MAX_ARGS) {
+        arg[arg_idx][arg_len] = '\0';
+        arg_idx++;
+    }
+
+    int pos = 0;
+    for (int i = 0; i < arg_idx && pos < args_out_size - 1; i++) {
+        char* start = arg[i];
+        while (*start && isspace((unsigned char)*start)) start++;
+        char* end = start + strlen(start) - 1;
+        while (end > start && isspace((unsigned char)*end)) *end-- = '\0';
+        int alen = (int)strlen(start);
+        if (alen == 0) continue;
+        if (pos + alen + 3 < args_out_size) {
+            if (pos > 0) { args_out[pos++] = ','; args_out[pos++] = ' '; }
+            strcpy(args_out + pos, start);
+            pos += alen;
+        }
+    }
+    args_out[pos] = '\0';
 }
 
 static void load_plugin_edges(const char* plugin_file) {
@@ -747,9 +822,8 @@ int lite_cs_callgraph_main(int argc, char** argv) {
                             if (!dup) {
                                 seen[sh] = hash_str(callee);
                                 char args[1024];
-                                if (find_call_with_args(b->content, tok, args, sizeof(args))) {
-                                    add_call_edge(callee, b->name, b->file, b->line_start, args);
-                                }
+                                extract_call_args(q + 1, args, sizeof(args));
+                                add_call_edge(callee, b->name, b->file, b->line_start, args);
                             }
                         }
                     }

@@ -56,6 +56,24 @@ typedef struct {
 static plugin_t g_plugins[MAX_PLUGINS];
 static int g_plugin_count = 0;
 static char g_plugin_registry[MAX_PATH_LEN] = {0};
+// --skip-kinds：逗号分隔，按 ctags kind 过滤（header/file/enumerator/macro...）。
+static char g_skip_kinds[256] = {0};
+
+static int kind_is_skipped(const char* kind) {
+    if (!kind || !kind[0] || !g_skip_kinds[0]) return 0;
+    size_t n = strlen(kind);
+    const char* p = g_skip_kinds;
+    while (*p) {
+        while (*p == ',' || *p == ' ') p++;
+        const char* e = strchr(p, ',');
+        size_t len = e ? (size_t)(e - p) : strlen(p);
+        while (len > 0 && p[len - 1] == ' ') len--;
+        if (len == n && strncmp(p, kind, n) == 0) return 1;
+        if (!e) break;
+        p = e + 1;
+    }
+    return 0;
+}
 
 // 源文件信息
 typedef struct {
@@ -934,6 +952,7 @@ static int worker_process(worker_t* worker, int worker_id) {
                     int end_line = json_extract_int(line, "end");
 
                     if (!name[0] || !filepath[0] || !line_num) continue;
+                    if (kind_is_skipped(kind)) continue;
 
                     if (filepath[0] == '/') {
                         strncpy(fullpath, filepath, sizeof(fullpath) - 1);
@@ -1210,6 +1229,7 @@ int lite_cs_index_main(int argc, char** argv) {
         printf("\nOptions:\n");
         printf("  --exclude-dir dir1,dir2,...  Directories to skip\n");
         printf("  --plugins path/to/plugin.json  Plugin registry JSON\n");
+        printf("  --skip-kinds header,file,macro  Skip selected ctags kinds\n");
         printf("\nExample:\n");
         printf("  %s /opt/linux /memory 8\n", argv[0]);
         printf("  %s /opt/opencode /memory 8 --plugins third_party/codesearch/plugins/typescript-indexer/plugin.json\n", argv[0]);
@@ -1240,6 +1260,11 @@ int lite_cs_index_main(int argc, char** argv) {
             arg_pos++;
             strncpy(g_plugin_registry, argv[arg_pos], sizeof(g_plugin_registry) - 1);
             g_plugin_registry[sizeof(g_plugin_registry) - 1] = '\0';
+            arg_pos++;
+        } else if (strcmp(argv[arg_pos], "--skip-kinds") == 0 && arg_pos + 1 < argc) {
+            arg_pos++;
+            strncpy(g_skip_kinds, argv[arg_pos], sizeof(g_skip_kinds) - 1);
+            g_skip_kinds[sizeof(g_skip_kinds) - 1] = '\0';
             arg_pos++;
         } else if (strcmp(argv[arg_pos], "--fork") == 0) {
             fork_opt = 1;

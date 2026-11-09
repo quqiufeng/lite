@@ -417,28 +417,34 @@ excludes = drivers,Documentation
 - 1,286,106 chunks
 - index（fork 6）：8s
 
-#### 分阶段执行
+但其中 669,410 个 macro、139,554 个 header、99,950 个 enumerator、24,898 个 file，
+对语义探索价值很低，还让向量化/HNSW 慢了数倍。
 
-实际没有重复走 `build` 的 index，而是复用已生成的 chunks，依次执行：
-
-| 阶段 | 耗时 | 产物 |
-|---|---|---|
-| index（fork 6） | 8s | `chunks_meta.jsonl` 513MB / `chunks_text.txt` 228MB |
-| word_freq | 4s | `word_freq.json` 23MB |
-| callgraph | 613s | `call_graph.json` 52MB |
-| dataflow | 17s | `dataflow.json` 796MB |
-| import KV | 48s | `kv/mem.bin` 2.0GB + `mem.idx` 119MB |
-| vectorize（FP16） | 1131s | `.bin` 3.8GB + `.idx` 43MB + `.hash` 41MB；1137 items/s |
-| HNSW（ef=100） | 1492s | `.bin.hnsw` 4.1GB |
-
-总耗时约 **55 分钟**，数据约 **13GB**。其中 callgraph 约 10 分钟，是当前 CPU 侧的
-最大瓶颈；向量化和 HNSW 是 GPU/CPU 各占一半左右。
-
-HNSW 构建期间加了进度输出，每 1 万条打印一次：
+#### 第三次：过滤低价值 kind（最终索引）
 
 ```text
-  HNSW 1280000/1286106 (99.5%, 1484s)
-  HNSW 1286106/1286106 (100.0%, 1492s)
+excludes  = drivers,Documentation
+skip_kinds = header,file,enumerator,macro
+```
+
+结果：
+
+- **352,294 chunks**
+- 数据约 **7.7GB**（旧索引 17GB）
+- index 6s、word_freq 2s、callgraph 5s、dataflow 16s、import 34s、
+  vectorize+HNSW 1067s
+- 总耗时约 **19 分钟**（旧流程 55 分钟）
+
+callgraph 从 509–613s 降到 **5s**：`get_func_node` 原来是线性扫全部函数节点
+（O(edges×functions)），现在改成开放寻址哈希表；参数解析也从“每个 callee 重扫
+整个 body”改成从当前调用点直接解析。
+
+HNSW 构建期间每 1 万条打印一次：
+
+```text
+  HNSW 352294/352294 (100.0%, 435s)
+  Inserted 352294/352294
+  Saved HNSW index: .../code_local_linux_7212.jina.bin.hnsw (1.2GB)
 ```
 
 #### 增量复跑
@@ -446,11 +452,11 @@ HNSW 构建期间加了进度输出，每 1 万条打印一次：
 同一份源码、同一模型再跑一次 `vectorize`：
 
 ```text
-Incremental cache: 1286106 vectors available
-Unchanged: 1286106 vectors reused; skip rewrite and HNSW rebuild
+Incremental cache: 352294 vectors available
+Unchanged: 352294 vectors reused; skip rewrite and HNSW rebuild
 ```
 
-约 9s（CPU 时间；含 41MB hash 读盘约 26s wall），**不加载模型、不重建 HNSW**。
+约 **2.8s**，**不加载模型、不重建 HNSW**。
 
 #### 验证
 
@@ -471,14 +477,16 @@ print(H.run({ action = "search", query = "scheduler pick next task", max_results
 
 实测：
 
-- `symbol vfs_read` → `fs/read_write.c:554`，约 12s
+- `symbol vfs_read` → `fs/read_write.c:554`；首次约 6s（加载 KV），后续 0.2s
 - `context vfs_read depth=2` → callers `ksys_read/ksys_pread64`，callees
-  `new_sync_read/access_ok/read/rw_verify_area`，约 12s
+  `new_sync_read/access_ok/read/rw_verify_area`，后续约 0.2s
 - `search "scheduler pick next task"` → `pick_next_task`、`__pick_next_task`、
-  `pick_next_pushable_task`，约 22s
+  `pick_next_pushable_task`；冷启动 4–10s，后续 0.2–1.1s
 
-每次查询都会重新加载约 2GB KV + 3.8GB vectors + 4.1GB HNSW（RSS 峰值约 11GB），
-所以单次查询 12–22s；后续可考虑在进程内复用 vector engine / KV。
+首次查询加载约 3.6GB KV + 1.1GB vectors + 1.2GB HNSW；
+同一进程内 KV / vector engine / HNSW 现在都会复用，后续 query 约 0.2–1.1s。
+跨进程仍然是冷启动。探索报告见
+`src/codesearch/CODE_READING_REPORT.md`。
 
 #### 复现命令
 
@@ -493,6 +501,7 @@ print(H.run({
   project = "linux_7212",
   analysis_dir = "/opt/code_caches/linux_7212_cache",
   excludes = "drivers,Documentation",
+  skip_kinds = "header,file,enumerator,macro",
   fork = true, workers = 6, batch = 128,
 }, { cwd = "/opt" }))
 '
@@ -504,8 +513,10 @@ print(H.run({
 #### 经验
 
 - 内核只索引 `drivers` 之外的代码；需要驱动时单独按子系统索引，并排除 `asic_reg`。
-- 百万 chunk 级别先确认 `callgraph` 时间，再决定是否继续；它比 dataflow/import 慢得多。
-- 大仓库一定保留 `vectors/*.hash`；增量复跑能把重复构建从 55 分钟降到秒级。
+- 内核这种仓库用 `skip_kinds=header,file,enumerator,macro`：chunks 1.29M → 352k，
+  数据 17G → 7.7G，构建 55min → 约 19min。需要查宏时再单独索引。
+- callgraph 已从 O(edges×functions) 改成哈希查找节点，内核从 ~10 分钟降到 **5s**。
+- 大仓库一定保留 `vectors/*.hash`；增量复跑从 55 分钟降到 **2.8s**。
 - 本次 HNSW 用 `ef=100`（默认 200 更慢、召回略高）；对代码搜索足够。
 
 ---

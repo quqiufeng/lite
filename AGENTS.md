@@ -244,9 +244,10 @@ FP16 默认开（`LITE_CS_FP16=0` 或 `fp16=false` 关），用 `model_fp16.onnx
 降到 100 建图约快一倍、召回略降）。向量化带**增量缓存**：`vectors/*.jina.hash` 记录每条
 name+文本哈希，源文件没变时第二次 `build` 跳过模型加载和 HNSW 重建（55k chunk 从 ~90s 到
 <1s），只对改动 chunk 重新嵌入。换模型/fp16 会因 model tag 不同自动全量重算；中断写临时
-文件，不会破坏旧索引。Linux 内核（7.2.12）实测：排除 `drivers,Documentation` 后
-24,898 files / 1,286,106 chunks；index 8s、callgraph 613s、vectorize 1131s、HNSW 1492s。
-drivers 里的 `asic_reg/*_sh_mask.h` 会自动生成十几万 macro chunk，别索引。
+文件，不会破坏旧索引。Linux 内核（7.2.12）实测：排除 `drivers,Documentation` 并
+`skip_kinds=header,file,enumerator,macro` 后 352,294 chunks；index 6s、callgraph 5s、
+vectorize+HNSW 1067s，总约 19min、数据 7.7G。drivers 里的 `asic_reg/*_sh_mask.h`
+会自动生成十几万 macro chunk，别索引；需要宏时单独建索引。
 
 `music` 的 `dav://` 语义：`dav://host:port/路径` 列目录**直接流播**（默认整库随机，
 `limit=N` 限首数，`index=N` 选第几首）；**只写 `dav://` 不带路径会 PROPFIND 失败**，

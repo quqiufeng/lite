@@ -30,6 +30,11 @@ extern const char* cache_get(void* cache, const char* key);
 
 static void* g_cache = NULL;
 static vector_engine_t* g_ve = NULL;
+// 进程内复用：同一项目连续 query（TUI/agent）不再反复加载 2GB KV 和数 GB HNSW。
+// 反复 create/destroy ORT session 还会偶发段错误；保持 engine 常驻更稳。
+static char g_cache_dir[512] = {0};
+static char g_ve_dir[512] = {0};
+static char g_ve_model[32] = {0};
 
 static int is_identifier(const char* s) {
     if (!s || !*s) return 0;
@@ -482,21 +487,54 @@ int lite_cs_query_main(int argc, char** argv) {
         type = detect_query_type(query, repo);
     }
     
-    // Open cache
-    g_cache = cache_open(cache_dir, 2ULL * 1024 * 1024 * 1024);
-    if (!g_cache) {
-        fprintf(stderr, "[ERROR] Failed to open cache: %s\n", cache_dir);
-        return 1;
+    // Open cache (reuse if same project)
+    if (!g_cache || strcmp(g_cache_dir, cache_dir) != 0) {
+        if (g_cache) {
+            cache_close(g_cache);
+            g_cache = NULL;
+            g_cache_dir[0] = '\0';
+        }
+        // 与 import 使用同一上限；query 若用更小的 max_memory 而 KV 已超过，
+        // cache 内部淘汰/索引路径会出问题（内核索引曾因此偶发段错误）。
+        unsigned long long max_gb = 8;
+        const char* kv_max_env = getenv("LITE_CS_KV_MAX_GB");
+        if (kv_max_env && *kv_max_env) {
+            long g = atol(kv_max_env);
+            if (g > 0 && g <= 64) max_gb = (unsigned long long)g;
+        }
+        g_cache = cache_open(cache_dir, (size_t)(max_gb * 1024ULL * 1024ULL * 1024ULL));
+        if (!g_cache) {
+            fprintf(stderr, "[ERROR] Failed to open cache: %s\n", cache_dir);
+            return 1;
+        }
+        snprintf(g_cache_dir, sizeof(g_cache_dir), "%s", cache_dir);
     }
-    
-    // Initialize vector engine for semantic search
-    if (analysis_dir) {
-        g_ve = vector_engine_open(analysis_dir, model_type);
-        if (!g_ve) {
-            fprintf(stderr, "[WARN] Failed to open vector engine: %s\n", vector_engine_error());
+
+    // Initialize vector engine for semantic search (reuse if same project/model)
+    if (analysis_dir && *analysis_dir) {
+        const char* mt = (model_type && *model_type) ? model_type : "jina";
+        if (!g_ve || strcmp(g_ve_dir, analysis_dir) != 0 || strcmp(g_ve_model, mt) != 0) {
+            if (g_ve) {
+                vector_engine_close(g_ve);
+                g_ve = NULL;
+                g_ve_dir[0] = '\0';
+                g_ve_model[0] = '\0';
+            }
+            g_ve = vector_engine_open(analysis_dir, mt);
+            if (!g_ve) {
+                fprintf(stderr, "[WARN] Failed to open vector engine: %s\n", vector_engine_error());
+            } else {
+                snprintf(g_ve_dir, sizeof(g_ve_dir), "%s", analysis_dir);
+                snprintf(g_ve_model, sizeof(g_ve_model), "%s", mt);
+            }
         }
     }
     
+    if (getenv("LITE_CS_DEBUG")) {
+        fprintf(stderr, "[query] cache=%s analysis=%s engine=%s\n",
+                g_cache ? "hit" : "miss", cache_dir, g_ve ? "hit" : "miss");
+    }
+
     // Build response
     struct timespec ts_start, ts_end;
     clock_gettime(CLOCK_MONOTONIC, &ts_start);
@@ -552,7 +590,6 @@ int lite_cs_query_main(int argc, char** argv) {
     }
     
     json_decref(response);
-    if (g_ve) vector_engine_close(g_ve);
-    cache_close(g_cache);
+    // 故意不关闭：g_cache/g_ve 留在进程内给后续 query 复用。
     return 0;
 }

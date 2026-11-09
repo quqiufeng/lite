@@ -12,6 +12,9 @@ char* lite_cs_index(const char* repo, const char* out_dir, int workers,
                     const char* excludes, const char* plugins);
 char* lite_cs_index_ex(const char* repo, const char* out_dir, int workers,
                        const char* excludes, const char* plugins, int use_fork);
+char* lite_cs_index_ext(const char* repo, const char* out_dir, int workers,
+                        const char* excludes, const char* plugins, int use_fork,
+                        const char* skip_kinds);
 char* lite_cs_word_freq(const char* analysis_dir);
 char* lite_cs_vectorize(const char* analysis_dir, const char* model, const char* name);
 char* lite_cs_vectorize_ex(const char* analysis_dir, const char* model, const char* name,
