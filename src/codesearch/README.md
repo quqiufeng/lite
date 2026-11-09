@@ -476,7 +476,6 @@ RTX 3080 20GB / 6 核：
 - 源码：`/opt/linux/src/linux-7.2.12`（Linux 7.2.12）
 - 旧索引：`/opt/code_caches/linux_723_cache`（7.2.3，5.2GB，不含 drivers）已删除
 - 新索引：`/opt/code_caches/linux_7212_cache`
-- 实测报告：`src/codesearch/kernel-7.2.12.md`（用该索引 + 真机 function_graph 走通页缓存读路径）
 - 机器：RTX 3080 20GB / 6 核 / 23GB 内存 / CUDA 12.6
 - 模型：Jina v2 code，FP16；batch 128；HNSW `ef_construction=100`、6 线程
 - KV：`LITE_CS_KV_MAX_GB=8`
