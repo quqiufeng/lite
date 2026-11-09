@@ -8,7 +8,10 @@ static int pool_init_internal(db_pool_t* pool, const char* path, size_t initial_
                                 const char* magic, uint32_t version, size_t* out_used) {
     memset(pool, 0, sizeof(db_pool_t));
     
-    int fd = open(path, O_RDWR | O_CREAT, 0644);
+    // O_CLOEXEC：pool fd 活到进程结束，不能漏给 exec 出去的长命子进程
+    // （ffmpeg/vlc/voice loop）——否则父进程退出后目标 inode 一直被钉住，
+    // mem.bin 轮换/备份的旧文件也不释放。锁文件 mem.lock 同理，见 memory.lua。
+    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     if (fd < 0) return -1;
     
     struct stat st;
