@@ -868,6 +868,8 @@ CS.query({ query = "epoll", repo = "/code/project", type = "search",
 | KV 实现 | my_db 自己的 cache | **lite 自带 kvcache（`src/cache/`）**，落在 `kv/mem.bin` |
 | 数据目录 | `/memory` / `$LITE_CS_HOME` | `$LITE_CS_HOME/<project>`，KV 在子目录 |
 
-更完整的原始方法论（证据分级、报告模板、大项目分治）见
-`src/codesearch/code_search_best_practices.md`；
-其中部分命令是 my_db 时代写法，实际使用以本文件为准。
+更完整的方法论（证据分级、报告模板、大项目分治）见
+`src/codesearch/code_search_best_practices.md`；其中的命令已全部改写成 lite 的
+`codesearch action=...` 写法（`cs` 一行封装见该文件 §2）——旧 my_db 时代的
+`ai_code_search.sh` / `tools/cache_query` / `tools/ctx.py` / `tests/validate_tools.sh`
+在 lite 里**不存在**，不要去调。
