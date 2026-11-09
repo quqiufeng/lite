@@ -45,6 +45,21 @@ AI-native harness：记忆、工具、FFI、X11。
 最近 `LITE_SESSION_RAW_KEEP`（默认 200）条非 user 原文 + user 永久；tool 结果入库截到
 `LITE_TOOL_RESULT_CHARS`（默认 8192），旧内容靠 turn 摘要/`recall`。写实例持 `mem.lock`。
 
+**取**（下面这些在代码里，别靠猜）：
+
+- 自动注入：每个用户轮**首次请求**注入一次（`lua/core/agent.lua:568`），工具循环的后续
+  请求不注入（模型已看过，重复注入破坏前缀缓存）。查询 = 最新 user 文本；不足 80 字接上
+  一条 user 的前 200 字，总截 600（`prompt.recall_query`）。上限 8 条 / 2400 字，作为
+  **末尾**一条 `system` 的 `<retrieved_memory>` 块。
+- 白名单 + 权重（`memory.lua:recall`）：只收 `/agent/knowledge/`(1.0)、会话 `working/`
+  (0.9)、`msg/` 里的 user 原文(0.8)、`turn/` 摘要(0.6)；`/agent/working` 永不注入。
+  `hits>0` 才留，按 IDF + 长度惩罚 + 30 天半衰打分，最多 2 条 turn / 4 条 user。
+- 主动 `recall`：看到 `hard_window` 的丢弃提示且需要那段；用户提"上次/之前"而窗口里
+  没有；动手前核对旧结论。**字面匹配、无向量**，换个说法可能一条不中，且召回失败模型
+  自己看不见（`stats()` 不进 prompt）。
+- `remember` 判据：跨会话仍成立 + 重踩成本 > 记录成本。存"`excludes` 不持久化"这类坑，
+  不存"某文件在第几行"。
+
 system prompt 必须**字节稳定**（时钟/轮次/预算都追加在消息末尾的同一个尾部块，走
 `prompt.runtime_block` / `prompt.budget_block`），否则前缀缓存全丢；工具清单在 system 里
 只列名字，schema 以 API `tools` 字段为准。会话结束 `session_end` 把"反复失败未恢复"
