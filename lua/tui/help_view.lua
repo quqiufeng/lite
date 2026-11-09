@@ -18,6 +18,7 @@ local ITEMS = {
     { "quit + Enter", "quit the TUI" },
     { "/session", "pick / new session" },
     { "/new", "start a new session" },
+    { "/compact [pct]", "slide window to pct% of budget (history kept)" },
     { "/reload", "reload lua tools/ffi" },
     { "?", "toggle this help" },
 }

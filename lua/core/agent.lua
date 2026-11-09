@@ -414,6 +414,26 @@ function M:drop_first()
     return self._drop_first
 end
 
+-- /compact：手动把窗口滑到 budget*keep（默认 0.6），返回收缩统计。
+-- 只影响发出去的请求，session.messages 与记忆一条不删 —— 这是和其他 agent 的区别：
+-- 我们「压缩」= 只读缩小的窗口，老的还在记忆里，recall 就能捞回来。
+-- keep=nil 表示解除，回到自动策略。
+function M:manual_window(keep)
+    local c = self:compactor()
+    if keep == nil then
+        self._window_keep = nil
+        return { keep = nil, before = 0, after = 0, dropped = 0 }
+    end
+    keep = math.max(0.1, math.min(1, tonumber(keep) or 0.6))
+    self._window_keep = keep
+    local msgs = self:view_messages({ budget = c.budget })
+    local before = Compact.total(msgs)
+    local kept, _, dropped = self:hard_window(msgs, math.floor(c.budget * keep))
+    local after = Compact.total(kept)
+    return { keep = keep, before = before, after = after, dropped = dropped,
+        budget = c.budget, total = #self.ctx.session.messages }
+end
+
 -- 超阈值才压一次。返回 true 表示这次真的压了（调用方应重建视图）。
 function M:maybe_compact(stream, reserve, force)
     if not force and self:drop_first() then return false end
@@ -578,6 +598,12 @@ function M:request_messages(text, stream, opts)
         if not keep or keep < 0.3 or keep > 0.95 then
             keep = drop_first and 0.6 or 0.8
         end
+        -- /compact 手动窗口：窗口从最新往回只装 budget*keep，且**每个请求都滑动**，
+        -- 老消息不删不摘要，留在 session/记忆里靠 recall 取回。
+        if self._window_keep then
+            keep = self._window_keep
+            ceiling = math.floor(c.budget * keep)
+        end
         msgs, trimmed, dropped = self:hard_window(msgs,
             math.floor(c.budget * keep))
         if trimmed then
@@ -602,8 +628,12 @@ function M:request_messages(text, stream, opts)
     -- 时钟 + 剩余轮次：同一套理由，只能追加在末尾；模型每轮都能看到自己还剩几次工具调用。
     -- 上下文预算同理（用组装后的真实规模算），拼在同一块里，保证每轮只有一个尾部 system。
     if rt ~= "" then
-        local bd = self.prompt.budget_block(self.ctx, { used = Compact.total(out), budget = c.budget })
-        if bd ~= "" then rt = rt .. "\n" .. bd end
+        -- 不再播报上下文预算：丢窗口优先时它是纯噪声（模型每轮看到 100% 只会浪费 tokens）。
+        -- 需要时设 LITE_BUDGET_HINT=1 恢复。
+        if os.getenv("LITE_BUDGET_HINT") == "1" then
+            local bd = self.prompt.budget_block(self.ctx, { used = Compact.total(out), budget = c.budget })
+            if bd ~= "" then rt = rt .. "\n" .. bd end
+        end
         out[#out + 1] = { role = "system", content = rt }
     end
     -- 本次真正发出去的规模，供下一轮用真实 usage 反推 chars→tokens。

@@ -176,6 +176,21 @@ function M.run(ctx, agent, memory, opts)
             switch_new()
         elseif name == "help" then
             help_view = HelpView.new({ width = w, height = h })
+        elseif name == "compact" or name == "compat" then
+            -- 窗口滑动压缩：只缩小发出去的窗口，历史仍在 session/记忆里。
+            if busy then
+                transcript:add("info", "无法压缩：当前正在执行")
+            elseif arg == "off" or arg == "reset" then
+                agent:manual_window(nil)
+                transcript:add("info", "窗口已恢复自动策略")
+            else
+                local pct = tonumber(arg)
+                local r = agent:manual_window(pct and (pct / 100) or 0.6)
+                transcript:add("info", string.format(
+                    "窗口滑到 %d%%（%d chars → %d chars，丢 %d 条只影响本次请求；"
+                        .. "历史 %d 条仍在记忆里，需要时 recall）",
+                    math.floor(r.keep * 100), r.before, r.after, r.dropped, r.total))
+            end
         elseif name == "reload" then
             if busy then
                 transcript:add("info", "无法重载：当前正在执行")

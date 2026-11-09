@@ -2637,6 +2637,37 @@ do
     os.execute("rm -rf " .. shq(dir))
 end
 
+-- /compact：手动窗口滑动，只缩请求窗口，session 一条不删
+do
+    local Compact = require("core.compact")
+    local Context = require("context")
+    local Agent = require("core.agent")
+    local ctx = Context.new({ cwd = "/tmp", context_chars = 8000, max_turns = 1 })
+    if ctx.ensure_session then ctx:ensure_session() end
+    for i = 1, 20 do
+        ctx.session.messages[#ctx.session.messages + 1] = {
+            role = "user", content = "m" .. i .. string.rep("z", 480),
+        }
+    end
+    local before_n = #ctx.session.messages
+    local provider = { stream = function() return { role = "assistant", content = "ok" } end }
+    local agent = Agent.new(ctx, provider, { schemas = function() return {} end }, {
+        append = function() end,
+    })
+    agent:ensure_system()
+    local r = agent:manual_window(0.6)
+    check(r.dropped > 0, "manual window drops messages")
+    check(r.keep == 0.6 and r.after < r.before, "manual window keeps the ratio")
+    check(r.after < r.before, "manual window shrinks the request window")
+    check(#ctx.session.messages >= before_n, "manual window keeps the session history")
+    local msgs = agent:request_messages("hi", provider.stream)
+    local oldest = (msgs[2] or {}).content or ""
+    check(not oldest:find("zzz", 1, true),
+        "manual window still applies on the next request")
+    agent:manual_window(nil)
+    check(agent._window_keep == nil, "manual window can be reset")
+end
+
 -- 预算地板：预算小于固定前缀的若干倍时自动抬高
 -- 否则可分配空间连"折叠区 + 尾巴"都不够，每次压缩都 "nothing to fold"，
 -- 一路滑到硬上限丢历史 —— 实测 budget 9000 时 prompt 8195 → 1231。
@@ -2668,9 +2699,12 @@ do
     check(agent:compactor().budget >= fixed * 3, "budget floor: budget raised above fixed prefix")
 
     local tail = msgs[#msgs]
-    check(tail.role == "system" and tail.content:find("Context budget:", 1, true) ~= nil,
-        "request tail carries the context budget")
-    check(tail.content:find(tostring(agent:compactor().budget), 1, true) ~= nil,
+    -- 丢弃优先下预算播报是噪声（每轮都是 100%），默认不再拼进尾部 system；
+    -- LITE_BUDGET_HINT=1 才恢复，函数本身仍由 budget_block 单测覆盖。
+    check(tail.role == "system" and tail.content:find("Context budget:", 1, true) == nil,
+        "request tail omits the context budget by default")
+    local hint = require("core.prompt").budget_block(ctx, { used = 1, budget = agent:compactor().budget })
+    check(hint:find(tostring(agent:compactor().budget), 1, true) ~= nil,
         "context budget uses the effective (raised) budget")
 
     local raised = false
