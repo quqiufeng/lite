@@ -141,6 +141,17 @@ else
     echo "[WARN] tmux missing (tui.smoke skipped)"
 fi
 
+# litehtml（可选）：HTML→PNG 渲染后端 liblite_html.so 的外部依赖，不随包
+LI_HEAD="${LITEHTML_INC:-/opt/litehtml/include}"
+LI_LIB="${LITEHTML_LIB:-/opt/litehtml/build-pic/liblitehtml.so}"
+if [ -f "$LI_HEAD/litehtml.h" ] && [ -f "$LI_LIB" ]; then
+    echo "[OK]   litehtml $LI_LIB"
+elif pkg-config --exists cairo 2>/dev/null && [ -f "$LI_LIB" ]; then
+    echo "[OK]   litehtml $LI_LIB (headers under $LI_HEAD)"
+else
+    echo "[INFO] litehtml missing (html->png needs /opt/litehtml; LITEHTML_INC/LITEHTML_LIB)"
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "== dependencies missing =="
     exit 1
