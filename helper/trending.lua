@@ -14,7 +14,51 @@
 --   6. 字号 = kami 原字号 ×1.2（h1 34→41, repo 16→19, desc 13.5→16, lede 17→20, 小字 12→14.5）。
 --   7. os.date 里写 "%%m" 会输出字面量 "%m"，日期要用 "%Y-%m-%d"。
 --
--- 依赖：curl（抓页面）、google-chrome --headless（出图）。都缺就报错，不降级。
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 依赖全景（四层，缺哪层报哪层，不降级；不用 Chrome/WebView/Node）
+-- ═══════════════════════════════════════════════════════════════════════════
+--
+-- ① 插件依赖（本文件自身的运行时）
+--    · curl            抓 https://github.com/trending（走 io.popen，零 FFI）
+--    · helper/lib/dom  解析文章列表（纯 Lua，和仓库一起走）
+--    无 key、无网络代理配置；GitHub 挂了就直接报 curl 错误。
+--
+-- ② 编译依赖（出图后端 liblite_html.so，不进 helper/）
+--    src/html/render.cpp → build/liblite_html.so，由 ./tools/build.sh 产出：
+--      cmake + cc + /opt/litehtml/{include/litehtml.h, build-pic/liblitehtml.so}
+--      /opt/litehtml/build-pic/src/gumbo/libgumbo.so.0   ← litehtml 靠它解析 HTML，dlopen 依赖
+--      libcairo.so、libfontconfig.so                     ← CMakeLists.txt:62 显式链接
+--    缺 .so 时本文件 error("缺 build/liblite_html.so，先跑 ./tools/build.sh")。
+--    验收：./tools/check_deps.sh 会逐项 [OK]/[WARN] litehtml / libgumbo。
+--
+-- ③ 字体依赖（中文与 ★ 不出方框的唯一原因）
+--    cairo "toy font API" 只按**族名**找字，不做字形回退 —— 一个族没有的字直接画 □。
+--    所以 render.cpp 在 lite_html_render() 入口用 FcConfigAppFontAddFile 把仓库自带字体
+--    塞进进程 fontconfig（只做一次，目录可用 LITE_HTML_FONT_DIR 覆盖，默认 helper/assets）：
+--      helper/assets/DroidSansFallbackFull.ttf  族名 "Droid Sans Fallback"  中文全集兜底
+--      helper/assets/DejaVuSansMono.ttf         族名 "DejaVu Sans Mono"     ★(U+2605) 等符号
+--    族名可用 fc-scan --format '%{family}\n' <ttf> 查。换机器缺字体 → 中文/★ 静默变方框，
+--    不会报错，所以 ./tools/check_deps.sh 里对这两个文件有专门检查。
+--
+-- ④ 样式依赖（排版底）
+--    helper/assets/kami.css 是 Kami 模板（暖纸色、细线、字距）。本文件按相对路径找它
+--    （helper_dir/assets/kami.css），读不到就退到内联 CSS_FALLBACK —— 仍能出图，只是不像 Kami。
+--    两套 CSS 的族名写法不同，别搞混：
+--      · kami.css        --serif/--mono 是**多值回退栈**，末尾兜 "Droid Sans Fallback" /
+--                        首选取 "DejaVu Sans Mono" —— 依赖 ③ 把这两个族注册进 fontconfig，
+--                        任一族存在即可出字。
+--      · CSS_FALLBACK    只能写**单族名**：那是崩到兜底样式时的最小集合，没有注册保证，
+--                        写多值会静默落回 Sans（★ 变空心框就是这么来的）。
+--
+-- 实现原理（一条直线，零子进程截图）
+--    curl 抓 HTML → dom 抠出 repo/desc/lang/star/today → 拼成一整份 HTML 字符串
+--    （CSS 内联进 <style>，必须一次成型，见上文坑 1）→ render_png() 用 FFI 调
+--    lite_html_render(html, out, w, h, scale)：litehtml 解析布局 → cairo 画到 image surface
+--    → cairo_surface_write_to_png 直出 PNG。同一份 HTML 顺手写到同名 .html 便于调试。
+--    scale=2 表示先按 2 倍像素画（retina），所以 PNG 实际是 w*2 × h*2。
+--
+-- 排查顺序：出方框 → 查 ③（字体+check_deps）；整张空白/右半截 → 查 ④（CSS 多值族名、
+-- .page 宽度）；error 缺 .so → 查 ②（./tools/build.sh）；报 curl → 查 ①（网络）。
 
 local M = { schema = {
   name = "trending",

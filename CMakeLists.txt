@@ -59,7 +59,7 @@ set_target_properties(lite_capture PROPERTIES
 
 add_library(lite_html SHARED src/html/render.cpp)
 target_include_directories(lite_html PRIVATE /opt/litehtml/include)
-target_link_libraries(lite_html PRIVATE /opt/litehtml/build-pic/liblitehtml.so cairo)
+target_link_libraries(lite_html PRIVATE /opt/litehtml/build-pic/liblitehtml.so cairo fontconfig)
 target_compile_options(lite_html PRIVATE -O2 -Wall)
 set_target_properties(lite_html PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}

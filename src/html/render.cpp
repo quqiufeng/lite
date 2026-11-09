@@ -7,6 +7,7 @@
 #include <litehtml/document_container.h>
 
 #include <cairo/cairo.h>
+#include <fontconfig/fontconfig.h>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -299,6 +300,22 @@ int lite_html_render(const char* html, const char* out_png, int w, int h, double
     if (!html || !out_png) { g_error = "html/out_png is null"; return 1; }
     if (w <= 0 || h <= 0) { g_error = "invalid size"; return 2; }
     if (scale <= 0) scale = 1.0;
+
+    // 项目自带字体（helper/assets）：cairo toy font 只认族名，靠 fontconfig 兜底。
+    // 进程级注册一次即可；LITE_HTML_FONT_DIR 可覆盖目录。
+    static bool fc_fonts_loaded = false;
+    if (!fc_fonts_loaded) {
+        fc_fonts_loaded = true;
+        const char* fdir = getenv("LITE_HTML_FONT_DIR");
+        if (!fdir || !*fdir) fdir = "helper/assets";
+        FcConfig* cfg = FcConfigGetCurrent();
+        const char* fnames[] = { "DroidSansFallbackFull.ttf", "DejaVuSansMono.ttf" };
+        for (const char* fn : fnames) {
+            std::string fp = std::string(fdir) + "/" + fn;
+            if (FcConfigAppFontAddFile(cfg, (const FcChar8*)fp.c_str()))
+                FcConfigBuildFonts(cfg);
+        }
+    }
 
     cairo_container container;
     container.m_width  = w;

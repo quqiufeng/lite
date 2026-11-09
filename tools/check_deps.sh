@@ -151,6 +151,24 @@ elif pkg-config --exists cairo 2>/dev/null && [ -f "$LI_LIB" ]; then
 else
     echo "[INFO] litehtml missing (html->png needs /opt/litehtml; LITEHTML_INC/LITEHTML_LIB)"
 fi
+# litehtml 的 HTML 解析器（dlopen 依赖，缺了渲染起不来）
+LI_GUMBO="${LITEHTML_GUMBO:-/opt/litehtml/build-pic/src/gumbo/libgumbo.so.0}"
+if [ -f "$LI_LIB" ]; then
+    if [ -f "$LI_GUMBO" ]; then
+        echo "[OK]   libgumbo  $LI_GUMBO"
+    else
+        echo "[WARN] libgumbo missing ($LI_GUMBO) → liblite_html.so 加载失败"
+    fi
+fi
+# 随包字体（helper/assets）：cairo 无回退，缺了中文/★ 静默出方框
+for f in DroidSansFallbackFull.ttf DejaVuSansMono.ttf; do
+    FP="$ROOT/helper/assets/$f"
+    if [ -f "$FP" ]; then
+        echo "[OK]   font     $f"
+    else
+        echo "[WARN] font missing helper/assets/$f → 中文/★ 渲染成方框"
+    fi
+done
 
 if [ "$fail" -ne 0 ]; then
     echo "== dependencies missing =="

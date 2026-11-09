@@ -10,8 +10,8 @@
   --stone:#9a948a;       /* 更弱：元信息/页脚 */
   --hairline:#e4dfd3;    /* 细线（仅用于分隔） */
   --tint:#f1efe6;        /* 浅暖底 */
-  --serif:"TsangerJinKai02","仓耳今楷02","Source Han Serif SC","Noto Serif CJK SC",Georgia,serif;
-  --mono:"Maple Mono NF CN","JetBrains Mono","SF Mono",Consolas,monospace;
+  --serif:"TsangerJinKai02","仓耳今楷02","Source Han Serif SC","Noto Serif CJK SC","Droid Sans Fallback",Georgia,serif;
+  --mono:"DejaVu Sans Mono","Maple Mono NF CN","JetBrains Mono","SF Mono",Consolas,monospace;
 }
 *{box-sizing:border-box}
 html,body{margin:0;background:var(--parchment);color:var(--ink);
