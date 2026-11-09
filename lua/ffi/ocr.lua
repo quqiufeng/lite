@@ -22,7 +22,35 @@ local function env(name)
     return nil
 end
 
-local ROOT = (os.getenv("LITE_ROOT") or "."):gsub("/+$", "")
+-- 找模型/lib 别只看 cwd 和 LITE_ROOT：插件进程（helper/*.lua，会话里动态起的）
+-- 里 LITE_ROOT 未必指向仓库，cwd 也可能是任意 workspace，于是 OCR 在插件里恒
+-- "models not found" → 插件全走 blind 盲点分支。本文件固定住在
+-- <root>/lua/ffi/ocr.lua（安装后 dist/lite-linux-x64/lua/ffi/ocr.lua 同理），
+-- 从自身路径反推 <root> 最可靠。
+-- 顺序：LITE_ROOT（显式覆盖）→ 自身路径推出来的根 → cwd。
+local function self_root()
+    local src = (debug.getinfo(1, "S") or {}).source or ""
+    local path = src:match("^@(.+)$")
+    local dir = path and path:match("^(.*)/[^/]+$")
+    local root = dir and dir:match("^(.*)/[^/]+/[^/]+$")  -- lua/ffi/x.lua
+    if root and root ~= "" then return root end
+end
+
+local ROOTS = {}
+for _, r in ipairs({ env("LITE_ROOT"), self_root(), "." }) do
+    r = (r or ""):gsub("/+$", "")
+    if r ~= "" and r ~= "/" then ROOTS[#ROOTS + 1] = r end
+end
+local ROOT = ROOTS[1] or "."
+
+-- 每个候选都按所有已知根展开，谁先命中用谁
+local function under(subs)
+    local out = {}
+    for _, base in ipairs(ROOTS) do
+        for _, sub in ipairs(subs) do out[#out + 1] = base .. sub end
+    end
+    return out
+end
 
 local function first_file(paths)
     for _, path in ipairs(paths) do
@@ -34,29 +62,33 @@ local function first_file(paths)
     return nil
 end
 
-local LIB = env("LITE_OCR_LIB") or first_file({
-    ROOT .. "/lib/libocr_simple.so",
-    ROOT .. "/third_party/ocr/lib/libocr_simple.so",
-    "/usr/lib/libocr_simple.so",
-    "/usr/local/lib/libocr_simple.so",
-})
+local LIB = env("LITE_OCR_LIB") or first_file(under({
+    "/lib/libocr_simple.so",
+    "/third_party/ocr/lib/libocr_simple.so",
+}))
+
+if not LIB then
+    LIB = first_file({ "/usr/lib/libocr_simple.so", "/usr/local/lib/libocr_simple.so" })
+end
 
 local MODELS = env("LITE_OCR_MODELS")
 if not MODELS then
-    MODELS = first_file({
-        ROOT .. "/models/ocr/ch_PP-OCRv4_det_infer.onnx",
-        ROOT .. "/third_party/ocr/models/ocr/ch_PP-OCRv4_det_infer.onnx",
-    })
+    MODELS = first_file(under({
+        "/models/ocr/ch_PP-OCRv4_det_infer.onnx",
+        "/third_party/ocr/models/ocr/ch_PP-OCRv4_det_infer.onnx",
+    }))
     if MODELS then MODELS = MODELS:match("^(.*)/[^/]+$") .. "/" end
 end
 
-local ORT_CANDIDATES = {
-    env("LITE_ORT") or "",
-    ROOT .. "/lib/libonnxruntime.so.1",
-    ROOT .. "/third_party/ocr/lib/libonnxruntime.so.1",
-    "/usr/local/lib/libonnxruntime.so.1",
-    "/usr/lib/libonnxruntime.so.1",
-}
+local ORT_CANDIDATES = { env("LITE_ORT") or "" }
+for _, p in ipairs(under({
+    "/lib/libonnxruntime.so.1",
+    "/third_party/ocr/lib/libonnxruntime.so.1",
+})) do
+    ORT_CANDIDATES[#ORT_CANDIDATES + 1] = p
+end
+ORT_CANDIDATES[#ORT_CANDIDATES + 1] = "/usr/local/lib/libonnxruntime.so.1"
+ORT_CANDIDATES[#ORT_CANDIDATES + 1] = "/usr/lib/libonnxruntime.so.1"
 
 local M = {}
 local lib, handle, load_err, tried
