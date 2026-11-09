@@ -603,7 +603,14 @@ int lite_cs_import_main(int argc, char** argv) {
            skip_chunks && skip_callgraph && skip_dataflow ? "register only" :
            "full import");
     
-    g_cache = cache_open(cache_dir, 4ULL * 1024 * 1024 * 1024);
+    // Linux 内核这种百万级 chunks 的导入会超过 4GiB；默认放宽到 8GiB。
+    unsigned long long max_gb = 8;
+    const char* kv_max_env = getenv("LITE_CS_KV_MAX_GB");
+    if (kv_max_env && *kv_max_env) {
+        long g = atol(kv_max_env);
+        if (g > 0 && g <= 64) max_gb = (unsigned long long)g;
+    }
+    g_cache = cache_open(cache_dir, (size_t)(max_gb * 1024ULL * 1024ULL * 1024ULL));
     if (!g_cache) {
         fprintf(stderr, "[ERROR] Failed to open cache: %s\n", cache_dir);
         return 1;

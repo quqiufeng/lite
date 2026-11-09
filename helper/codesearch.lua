@@ -292,7 +292,7 @@ return {
                 workers = { type = "integer", description = "index 进程数；默认 1，fork=true 时默认 CPU 核数" },
                 fork = { type = "boolean", description = "index 用 fork 多进程并行（fresh 进程更快；已加载 ORT 的会话慎用）" },
                 batch = { type = "integer", description = "向量化 batch，默认 128；长 chunk 多时降到 64" },
-                fp16 = { type = "boolean", description = "用 model_fp16.onnx 推理（GPU 约快 1.5-2x）" },
+                fp16 = { type = "boolean", description = "用 model_fp16.onnx 推理（默认开；GPU 约快 1.5-2x）" },
                 excludes = { type = "string", description = "index 跳过目录，逗号分隔" },
                 plugins = { type = "string", description = "index 插件 registry JSON 路径" },
                 only_dataflow = { type = "boolean", description = "import 只导入 dataflow（增量更新时用）" },

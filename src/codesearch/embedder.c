@@ -90,6 +90,12 @@ static void preload_dir(const char* dir) {
     while ((e = readdir(d)) != NULL) {
         if (strncmp(e->d_name, "lib", 3) != 0) continue;
         if (!strstr(e->d_name, ".so")) continue;
+        // 不要 RTLD_GLOBAL 预加载 TensorRT 的 dispatch/lean/构建资源库：
+        // 它们也导出 createInferRuntime_INTERNAL，会抢在 libnvinfer.so 前面
+        // 造成 ORT TRT EP 拿到 dispatch-only runtime，deserialize 直接是 stub。
+        if (strstr(e->d_name, "libnvinfer_dispatch") ||
+            strstr(e->d_name, "libnvinfer_lean") ||
+            strstr(e->d_name, "libnvinfer_builder_resource")) continue;
         char path[4096];
         snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
         dlopen(path, RTLD_NOW | RTLD_GLOBAL);
@@ -704,6 +710,8 @@ onnx_embedder_t* onnx_embedder_init(const char* model_path, const char* vocab_pa
 
     OrtTensorRTProviderOptionsV2* trt_options_v2 = NULL;
     int use_tensorrt = 0;
+    const char* trt_fp16_env = getenv("LITE_CS_TRT_FP16");
+    int trt_fp16 = (trt_fp16_env && trt_fp16_env[0] && trt_fp16_env[0] != '0') || !is_jina;
     
     // 尝试 V2 API（支持动态 shape profile）
     if (!disable_trt && g_ort->CreateTensorRTProviderOptions) {
@@ -724,7 +732,7 @@ onnx_embedder_t* onnx_embedder_init(const char* model_path, const char* vocab_pa
             const char* values[] = {
                 "0",
                 "12884901888",
-                is_jina ? "0" : "1",
+                trt_fp16 ? "1" : "0",
                 "0",
                 "1",
                 trt_cache_path,
@@ -761,7 +769,7 @@ onnx_embedder_t* onnx_embedder_init(const char* model_path, const char* vocab_pa
         trt_options.trt_max_partition_iterations = 1000;
         trt_options.trt_min_subgraph_size = 1;
         trt_options.trt_max_workspace_size = 12ULL * 1024 * 1024 * 1024;
-        trt_options.trt_fp16_enable = is_jina ? 0 : 1;
+        trt_options.trt_fp16_enable = trt_fp16;
         trt_options.trt_int8_enable = 0;
         trt_options.trt_engine_cache_enable = 1;
         trt_options.trt_engine_cache_path = trt_cache_path;

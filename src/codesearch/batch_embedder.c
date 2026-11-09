@@ -356,7 +356,11 @@ int lite_cs_vectorize_main(int argc, char** argv) {
     const char* model_type = "jina";
     const char* custom_name = NULL;
     int batch_size = BATCH_SIZE;
-    int use_fp16 = env_flag("LITE_CS_FP16");
+    // Jina 有 model_fp16.onnx 时默认用它：GPU 上明显快于 FP32，向量差异可忽略。
+    // 显式 LITE_CS_FP16=0 / --no-fp16 可关；模型缺失时自动回退 model.onnx。
+    int use_fp16 = 1;
+    const char* fp16_env = getenv("LITE_CS_FP16");
+    if (fp16_env && *fp16_env) use_fp16 = env_flag("LITE_CS_FP16");
 
     const char* env_batch = getenv("LITE_CS_BATCH");
     if (env_batch && *env_batch) {

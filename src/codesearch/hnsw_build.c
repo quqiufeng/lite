@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <time.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -133,7 +134,10 @@ int lite_cs_hnsw_main(int argc, char** argv) {
     }
     
     printf("Inserting vectors...\n");
-    
+    fflush(stdout);
+    time_t build_t0 = time(NULL);
+    uint32_t done_count = 0;
+
     #ifdef _OPENMP
     if (num_threads > 0) {
         omp_set_num_threads(num_threads);
@@ -143,6 +147,22 @@ int lite_cs_hnsw_main(int argc, char** argv) {
     for (uint32_t i = 0; i < count; i++) {
         if (hnsw_insert_parallel(hnsw, i, vectors[i]) != 0) {
             fprintf(stderr, "Failed to insert vector %u\n", i);
+        }
+        uint32_t done_now;
+        #ifdef _OPENMP
+        #pragma omp atomic capture
+        #endif
+        done_now = ++done_count;
+        if (done_now == count || done_now % 10000 == 0) {
+            #ifdef _OPENMP
+            #pragma omp critical(hnsw_progress)
+            #endif
+            {
+                long secs = (long)(time(NULL) - build_t0);
+                printf("  HNSW %u/%u (%.1f%%, %lds)\n",
+                       done_now, count, 100.0 * done_now / (count ? count : 1), secs);
+                fflush(stdout);
+            }
         }
     }
     printf("  Inserted %u/%u\n", count, count);

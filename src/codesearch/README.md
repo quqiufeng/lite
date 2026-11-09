@@ -70,7 +70,8 @@ namespace 默认是 `/code/<project>`。
 `import.c` 的 `cache_open/cache_batch_set/cache_get` 全部链接仓库里的 `lite_cache`
 （`src/cache/`），所以 `kv/` 就是 lite kvcache 的一个普通数据库目录，
 和 lite 会话记忆用的是同一套存储实现，只是目录和 namespace 不同。
-每次 import 以 4 GiB 逻辑内存上限 `cache_open`，批量写入后 `cache_sync` 落盘。
+每次 import 默认以 8 GiB 逻辑内存上限 `cache_open`（`LITE_CS_KV_MAX_GB` 可调），
+批量写入后 `cache_sync` 落盘。
 
 ---
 
@@ -176,10 +177,10 @@ cuDNN 与 TensorRT 库由 embedder 自己预加载，一般不需要再写进 `L
 | `model_fp16.onnx` | ~320 MB | FP16；GPU 约快 1.5x，向量与 FP32 cosine ≈ 0.999998 |
 | `model_quantized.onnx` | ~160 MB | INT8；在 CUDA 上大量算子回落 CPU，实测比 FP32 慢几十倍，**不推荐** |
 
-`fp16=true`（或 `LITE_CS_FP16=1`）时，代码先找
+**FP16 默认开启**（`LITE_CS_FP16=0` 或 `fp16=false` 关闭）。代码先找
 `<model_dir>/jina-embeddings-v2-base-code/model_fp16.onnx`；若不存在，会沿
 `model.onnx` 的软链 `realpath` 到真实目录，再找同目录的 `model_fp16.onnx`。
-所以本机不用手工建软链。
+所以本机不用手工建软链；模型缺失时自动回退 `model.onnx`。
 
 **MPNet（可选）**
 
@@ -191,12 +192,20 @@ cuDNN 与 TensorRT 库由 embedder 自己预加载，一般不需要再写进 `L
 
 ### 2.5 TensorRT / flash-attention 说明
 
-- **TensorRT 默认关闭**：本机 ORT 1.20.1 / 1.26.0 配 TensorRT 10.16 会在
-  `deserializeCudaEngine` 报
-  `Unexpected call to stub deserializeEngine`。显式设置 `LITE_CS_ENABLE_TRT=1` 会尝试，
-  失败后现在会**先回退 CUDA**，不会再直接掉到 CPU；但 TRT 本身仍不可用。
-- 想真正启用 TRT，需要版本匹配（例如 ORT 对应支持的 TRT 10.0–10.4），并删除
-  `$HOME/trt_cache` 重建 engine。
+- **TensorRT 默认关闭**：原因是**性能不划算**，不是加载不了。
+- 早期用 ORT 1.20.1 / 1.26.0 配 TensorRT 10.16 会在 `deserializeCudaEngine` 报
+  `Unexpected call to stub deserializeEngine`。根因是预加载 `/opt/TensorRT-10/lib`
+  时把 `libnvinfer_dispatch` / `libnvinfer_lean` 也 `RTLD_GLOBAL` 了，它们的
+  `createInferRuntime_INTERNAL` 抢在 `libnvinfer.so` 前面，ORT 拿到的是
+  dispatch-only runtime。现在 `preload_dir` 跳过这些库和
+  `libnvinfer_builder_resource*`，TRT 10.16 可以正常建/载 engine，
+  **不再要求 TRT 10.4**。
+- 但实测在 Jina + 动态 batch/seq 下，ORT 的 TensorRT EP 反而很慢：
+  920 chunks 约 **46 items/s**；同进程 CUDA + FP16 约 **1600 items/s**。
+  `trtexec` 单独跑 32×512 也要约 60 ms（约 533 chunks/s）。因此仍推荐
+  `fp16=true` 走 CUDA，TRT 保持关闭。
+- 想自己试：`LITE_CS_ENABLE_TRT=1 LITE_CS_TRT_FP16=1`，先删
+  `$HOME/trt_cache` 重建 engine；engine 在**当前 TensorRT 版本**下生成。
 - `/opt/flash-attention` 与 `/data/venv` 里的 PyTorch 扩展是另一条链路；
   **codesearch 不加载 flash-attention**，ONNX Runtime 也不会用它。
   它对这里的索引/向量化速度没有影响，不要把它当成本模块的依赖。
@@ -208,15 +217,17 @@ cuDNN 与 TensorRT 库由 embedder 自己预加载，一般不需要再写进 `L
 | `LITE_CS_HOME` | `~/.local/share/lite/codesearch` | 项目数据根目录（helper 使用） |
 | `LITE_CS_MODEL_DIR` | `/opt/models` | 模型根目录 |
 | `LITE_CS_MODEL_FILE` | 空 | 覆盖模型文件名；绝对路径可直接指定 |
-| `LITE_CS_FP16` | 关 | `1` = 用 `model_fp16.onnx` |
+| `LITE_CS_FP16` | 开 | `0` = 关闭 FP16，用 `model.onnx` |
 | `LITE_CS_BATCH` | `128` | 向量化 batch 大小 |
 | `LITE_CS_FORK` | 关 | `1` = index 用 fork 多进程 |
 | `LITE_CS_HNSW_THREADS` | `8` | HNSW 建图线程数 |
 | `LITE_CS_HNSW_EF` | `200` | HNSW `ef_construction`；降到 100 建图约快一倍 |
 | `LITE_CS_HNSW_M` | `16` | HNSW `M` |
 | `LITE_CS_DISABLE_VECTOR` | 关 | helper `build` 时跳过向量化 |
+| `LITE_CS_KV_MAX_GB` | `8` | import 时 KV 逻辑内存上限（大仓库可调） |
 | `LITE_ORT_LIB` | ORT 1.20.1 路径 | 指定 ONNX Runtime `.so.1` |
-| `LITE_CS_ENABLE_TRT` | 关 | `1` = 尝试 TensorRT（当前版本不兼容） |
+| `LITE_CS_ENABLE_TRT` | 关 | `1` = 尝试 TensorRT（能跑，但本工作负载比 CUDA 慢） |
+| `LITE_CS_TRT_FP16` | 非 Jina 为开 | TRT FP16；Jina 显式设 `1` 才开 |
 | `LITE_CS_PRELOAD_DIRS` | 空 | 额外预加载目录，冒号分隔 |
 
 ---
@@ -281,7 +292,7 @@ print(H.run({ action = "build", path = "." }, { cwd = os.getenv("PWD") }))
 | `excludes` | 追加跳过目录，逗号分隔 |
 | `plugins` | ctags 插件 registry JSON 路径（可选） |
 | `model` | `jina`（默认）或 `mpnet` |
-| `fp16` | 用 `model_fp16.onnx` |
+| `fp16` | 用 `model_fp16.onnx`；默认开，`false` 关闭 |
 | `batch` | 向量化 batch，默认 128 |
 | `vector` | `false` = 只建索引/调用图/数据流，不向量化 |
 | `analysis_dir` / `kv_dir` | 覆盖数据目录 |
@@ -361,6 +372,141 @@ RTX 3080 20GB / 6 核：
 | 920 chunks，完整 build 首次 / 再次 | 2.1s / 0.03s |
 
 首次大项目的主要成本通常在 HNSW 建图；可用 `LITE_CS_HNSW_EF=100` 换速度。
+
+### 4.6 Linux 内核 7.2.12 索引过程记录
+
+#### 目标与环境
+
+- 源码：`/opt/linux/src/linux-7.2.12`（Linux 7.2.12）
+- 旧索引：`/opt/code_caches/linux_723_cache`（7.2.3，5.2GB，不含 drivers）已删除
+- 新索引：`/opt/code_caches/linux_7212_cache`
+- 机器：RTX 3080 20GB / 6 核 / 23GB 内存 / CUDA 12.6
+- 模型：Jina v2 code，FP16；batch 128；HNSW `ef_construction=100`、6 线程
+- KV：`LITE_CS_KV_MAX_GB=8`
+
+#### 第一次尝试：不要索引 drivers
+
+先按完整源码索引，结果：
+
+- 58,832 files
+- **7,975,692 chunks**
+- index 1472s（约 24.5 分钟）
+- callgraph 跑了很久仍未结束，最终中止
+
+原因是 `drivers/gpu/drm/amd/include/asic_reg/*_sh_mask.h` 这类自动生成的寄存器头，
+单个文件就能产生十几万 chunk：
+
+```text
+194,933  dcn_3_2_0_sh_mask.h
+137,502  nbio_7_7_0_sh_mask.h
+134,340  nbio_7_2_0_sh_mask.h
+...
+```
+
+这些内容对代码探索几乎没有价值，**内核索引必须排除 `drivers`**（至少排除 `asic_reg`）。
+
+#### 第二次：排除 drivers + Documentation
+
+```text
+excludes = drivers,Documentation
+```
+
+结果：
+
+- 24,898 files
+- 1,286,106 chunks
+- index（fork 6）：8s
+
+#### 分阶段执行
+
+实际没有重复走 `build` 的 index，而是复用已生成的 chunks，依次执行：
+
+| 阶段 | 耗时 | 产物 |
+|---|---|---|
+| index（fork 6） | 8s | `chunks_meta.jsonl` 513MB / `chunks_text.txt` 228MB |
+| word_freq | 4s | `word_freq.json` 23MB |
+| callgraph | 613s | `call_graph.json` 52MB |
+| dataflow | 17s | `dataflow.json` 796MB |
+| import KV | 48s | `kv/mem.bin` 2.0GB + `mem.idx` 119MB |
+| vectorize（FP16） | 1131s | `.bin` 3.8GB + `.idx` 43MB + `.hash` 41MB；1137 items/s |
+| HNSW（ef=100） | 1492s | `.bin.hnsw` 4.1GB |
+
+总耗时约 **55 分钟**，数据约 **13GB**。其中 callgraph 约 10 分钟，是当前 CPU 侧的
+最大瓶颈；向量化和 HNSW 是 GPU/CPU 各占一半左右。
+
+HNSW 构建期间加了进度输出，每 1 万条打印一次：
+
+```text
+  HNSW 1280000/1286106 (99.5%, 1484s)
+  HNSW 1286106/1286106 (100.0%, 1492s)
+```
+
+#### 增量复跑
+
+同一份源码、同一模型再跑一次 `vectorize`：
+
+```text
+Incremental cache: 1286106 vectors available
+Unchanged: 1286106 vectors reused; skip rewrite and HNSW rebuild
+```
+
+约 9s（CPU 时间；含 41MB hash 读盘约 26s wall），**不加载模型、不重建 HNSW**。
+
+#### 验证
+
+```bash
+R=/home/quqiufeng/Desktop/lite
+$R/tools/lua.sh -e '
+local H = dofile(os.getenv("LITE_ROOT") .. "/helper/codesearch.lua")
+local base = { project = "linux_7212",
+               analysis_dir = "/opt/code_caches/linux_7212_cache" }
+print(H.run({ action = "symbol", query = "vfs_read", max_results = 1,
+              project = base.project, analysis_dir = base.analysis_dir }, { cwd = "/opt" }))
+print(H.run({ action = "context", query = "vfs_read", depth = 2,
+              project = base.project, analysis_dir = base.analysis_dir }, { cwd = "/opt" }))
+print(H.run({ action = "search", query = "scheduler pick next task", max_results = 5,
+              project = base.project, analysis_dir = base.analysis_dir }, { cwd = "/opt" }))
+'
+```
+
+实测：
+
+- `symbol vfs_read` → `fs/read_write.c:554`，约 12s
+- `context vfs_read depth=2` → callers `ksys_read/ksys_pread64`，callees
+  `new_sync_read/access_ok/read/rw_verify_area`，约 12s
+- `search "scheduler pick next task"` → `pick_next_task`、`__pick_next_task`、
+  `pick_next_pushable_task`，约 22s
+
+每次查询都会重新加载约 2GB KV + 3.8GB vectors + 4.1GB HNSW（RSS 峰值约 11GB），
+所以单次查询 12–22s；后续可考虑在进程内复用 vector engine / KV。
+
+#### 复现命令
+
+```bash
+R=/home/quqiufeng/Desktop/lite
+LITE_CS_KV_MAX_GB=8 LITE_CS_HNSW_THREADS=6 LITE_CS_HNSW_EF=100 \
+$R/tools/lua.sh -e '
+local H = dofile(os.getenv("LITE_ROOT") .. "/helper/codesearch.lua")
+print(H.run({
+  action = "build",
+  path = "/opt/linux/src/linux-7.2.12",
+  project = "linux_7212",
+  analysis_dir = "/opt/code_caches/linux_7212_cache",
+  excludes = "drivers,Documentation",
+  fork = true, workers = 6, batch = 128,
+}, { cwd = "/opt" }))
+'
+```
+
+之后查询要带 `project=linux_7212` 和 `analysis_dir=/opt/code_caches/linux_7212_cache`；
+也可以把该目录软链到 `~/.local/share/lite/codesearch/linux_7212` 使用默认路径。
+
+#### 经验
+
+- 内核只索引 `drivers` 之外的代码；需要驱动时单独按子系统索引，并排除 `asic_reg`。
+- 百万 chunk 级别先确认 `callgraph` 时间，再决定是否继续；它比 dataflow/import 慢得多。
+- 大仓库一定保留 `vectors/*.hash`；增量复跑能把重复构建从 55 分钟降到秒级。
+- 本次 HNSW 用 `ef=100`（默认 200 更慢、召回略高）；对代码搜索足够。
 
 ---
 
@@ -495,7 +641,7 @@ print(H.run({
 | `liblite_codesearch.so not found` | tokenizers 静态库或 jansson 缺失；看 `./tools/check_deps.sh`，用 `-DLITE_CS_TOKENIZERS_DIR=` 重配 |
 | `cannot dlopen libonnxruntime.so.1` | 设 `LITE_ORT_LIB` 指向真实 `libonnxruntime.so.1` |
 | `CUDA not available, falling back to CPU` | 检查 `/data/cuda/lib64`、cuDNN 目录、`nvidia-smi`；CPU 会慢几十倍 |
-| `TensorRT session failed, retrying on CUDA` | 当前 TRT 10.16 与 ORT 不兼容；保持 `LITE_CS_ENABLE_TRT` 关闭即可 |
+| `TensorRT session failed, retrying on CUDA` | 当前默认关闭 TRT；若手动开过，删 `$HOME/trt_cache` 重建 engine，或继续用 CUDA + FP16 |
 | `ctags: command not found` | 安装 Universal Ctags；语义/符号仍可用，但无法建索引 |
 | `index not found for this project` | 先 `action=build` |
 | `KV import missing` | 跑 `action=build` 或 `action=import` |
