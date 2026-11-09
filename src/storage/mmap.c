@@ -4,6 +4,17 @@
 // 文件头格式：[魔数:4][版本:4][used:8]
 #define POOL_HEADER_SIZE 16
 
+// 只同步真正写过的部分：pool->size 会随扩容翻倍，全量 msync 会把大片
+// 未使用/零页也刷一遍，文件越大阻塞越明显。
+static size_t pool_sync_len(const db_pool_t* pool) {
+    long ps = sysconf(_SC_PAGESIZE);
+    size_t page = ps > 0 ? (size_t)ps : 4096;
+    size_t len = (pool->used + page - 1) & ~(page - 1);
+    if (len > pool->size) len = pool->size;
+    if (len < POOL_HEADER_SIZE) len = POOL_HEADER_SIZE;
+    return len;
+}
+
 static int pool_init_internal(db_pool_t* pool, const char* path, size_t initial_size,
                                 const char* magic, uint32_t version, size_t* out_used) {
     memset(pool, 0, sizeof(db_pool_t));
@@ -87,7 +98,7 @@ int pool_init_with_header(db_pool_t* pool, const char* path, size_t initial_size
 
 void pool_close(db_pool_t* pool) {
     if (!pool || !pool->base) return;
-    msync(pool->base, pool->size, MS_SYNC);
+    msync(pool->base, pool_sync_len(pool), MS_SYNC);
     munmap(pool->base, pool->size);
     close(pool->fd);
     memset(pool, 0, sizeof(db_pool_t));
@@ -95,8 +106,8 @@ void pool_close(db_pool_t* pool) {
 
 int pool_sync(db_pool_t* pool) {
     if (!pool || !pool->base) return -1;
-    // MS_SYNC: 等待数据真正写入磁盘（同步刷盘）
-    return msync(pool->base, pool->size, MS_SYNC);
+    // MS_SYNC: 等待数据真正写入磁盘（同步刷盘）；只刷 [0, used) 的页。
+    return msync(pool->base, pool_sync_len(pool), MS_SYNC);
 }
 
 void* pool_alloc(db_pool_t* pool, size_t size) {
@@ -126,8 +137,8 @@ void* pool_alloc(db_pool_t* pool, size_t size) {
 int pool_resize(db_pool_t* pool, size_t new_size) {
     if (!pool || !pool->base) return -1;
     
-    // 先同步数据
-    msync(pool->base, pool->size, MS_SYNC);
+    // 先同步数据（只刷已用页，未用部分不需要落盘）
+    msync(pool->base, pool_sync_len(pool), MS_SYNC);
     
     // 扩展文件
     if (ftruncate(pool->fd, new_size) < 0) {

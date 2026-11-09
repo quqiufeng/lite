@@ -75,6 +75,7 @@ int cache_batch_set(cache_t* cache, const cache_batch_item_t* items, size_t coun
 size_t cache_count(cache_t* cache);
 size_t cache_memory_used(cache_t* cache);
 size_t cache_memory_max(cache_t* cache);
+size_t cache_pool_used(cache_t* cache);
 
 // ====== 搜索（核心功能）======
 // 前缀搜索：key 以 prefix 开头

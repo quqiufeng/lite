@@ -191,6 +191,7 @@ struct cache {
 // Hash 索引操作
 uint64_t cache_hash_fnv1a(const void* data, size_t len);
 int cache_hash_init(cache_t* cache);
+int cache_hash_init_capacity(cache_t* cache, size_t min_buckets);
 int cache_hash_insert(cache_t* cache, size_t entry_offset, const char* key, size_t key_len);
 int cache_hash_remove(cache_t* cache, const char* key, size_t key_len);
 size_t cache_hash_lookup(cache_t* cache, const char* key, size_t key_len);

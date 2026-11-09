@@ -29,15 +29,27 @@ static size_t alloc_buckets(cache_t* cache, size_t count) {
     return (size_t)((char*)ptr - (char*)cache->pool.base);
 }
 
+// 初始化 hash 索引（至少 min_buckets 个，向上取 2 的幂）
+int cache_hash_init_capacity(cache_t* cache, size_t min_buckets) {
+    if (!cache) return -1;
+
+    size_t count = 64;
+    while (count < min_buckets) {
+        size_t next = count * 2;
+        if (next < count) break;  // 溢出
+        count = next;
+    }
+
+    cache->hash.bucket_count = count;
+    cache->hash.size = 0;
+    cache->hash.buckets_offset = alloc_buckets(cache, count);
+
+    return cache->hash.buckets_offset ? 0 : -1;
+}
+
 // 初始化 hash 索引
 int cache_hash_init(cache_t* cache) {
-    if (!cache) return -1;
-    
-    cache->hash.bucket_count = 64;  // 初始 64 个 bucket
-    cache->hash.size = 0;
-    cache->hash.buckets_offset = alloc_buckets(cache, 64);
-    
-    return cache->hash.buckets_offset ? 0 : -1;
+    return cache_hash_init_capacity(cache, 64);
 }
 
 // 扩容 hash 表（负载因子 > 0.75）

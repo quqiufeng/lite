@@ -457,7 +457,30 @@ cache_t* cache_open(const char* db_dir, size_t max_memory) {
             cache_vector_index_rebuild(cache);
         }
     }
-    
+
+    // tag 索引是内存态、不持久化；重启后重建显式 tags，保证 recall 的
+    // tag 检索在重启前后一致。extract_tags 只认 JSON 里的 "tags" 字段，
+    // 绝大多数 entry 直接返回 NULL，代价很小。
+    {
+        size_t offset = CACHE_HEADER_SIZE;
+        while (offset + sizeof(cache_entry_header_t) <= cache->pool.used) {
+            cache_entry_header_t* header = (cache_entry_header_t*)CACHE_PTR(cache, offset);
+            if (header->key_len == 0 || header->key_len > CACHE_MAX_KEY_LEN ||
+                header->value_len > CACHE_MAX_VALUE_LEN) {
+                offset += MYDB_ALIGN;
+                continue;
+            }
+            size_t total_size = cache_entry_total_size(header);
+            if (offset + total_size > cache->pool.used) break;
+            if (!(header->flags & CACHE_ENTRY_DELETED)) {
+                const char* value = (const char*)CACHE_PTR(cache,
+                    offset + sizeof(cache_entry_header_t) + header->key_len + 1);
+                cache_tag_index_add(cache, offset, value, header->value_len);
+            }
+            offset += total_size;
+        }
+    }
+
     return cache;
 }
 
@@ -961,36 +984,143 @@ size_t cache_memory_max(cache_t* cache) {
     return cache->memory_max;
 }
 
+// 物理占用（含已删除条目、索引桶等）。与 memory_used 一起用于判断碎片率。
+size_t cache_pool_used(cache_t* cache) {
+    if (!cache) return 0;
+    return cache->pool.used;
+}
+
+// 原地重排：把存活 entry 依次下移，回收 deleted/淘汰/旧版本留下的洞，
+// 然后重建全部索引。memmove 按源偏移升序执行，目标位置始终 <= 源位置，
+// 因此不需要额外缓冲区。回收后 pool.used 回到紧凑大小，后续写入复用空间，
+// 避免 mem.bin 在长期 churn 下单调增长（逻辑内存没满、物理文件却一直涨）。
+static int cmp_offset_asc(const void* a, const void* b) {
+    size_t x = *(const size_t*)a, y = *(const size_t*)b;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+
 size_t cache_compact(cache_t* cache) {
     if (!cache) return 0;
-    
-    size_t removed = 0;
+
     uint64_t now = cache_now_ms();
-    
-    // 清理 sorted array 中的已删除/过期条目
-    size_t write = 0;
-    for (size_t i = 0; i < cache->sorted.count; i++) {
-        size_t offset = cache->sorted.offsets[i];
-        cache_entry_header_t* h = (cache_entry_header_t*)CACHE_PTR(cache, offset);
-        
-        if ((h->flags & CACHE_ENTRY_DELETED) || 
-            (h->expire_at > 0 && h->expire_at < now)) {
-            removed++;
-            continue;
+    size_t n = cache->sorted.count;
+    if (n == 0) return 0;
+
+    size_t* live = (size_t*)malloc(sizeof(size_t) * n);
+    if (!live) return 0;
+
+    size_t live_count = 0;
+    size_t live_bytes = 0;
+    for (size_t i = 0; i < n; i++) {
+        size_t off = cache->sorted.offsets[i];
+        if (off < CACHE_HEADER_SIZE || off + CACHE_ENTRY_HEADER_ALIGNED > cache->pool.used) continue;
+        cache_entry_header_t* h = (cache_entry_header_t*)CACHE_PTR(cache, off);
+        if (h->key_len == 0 || h->key_len > CACHE_MAX_KEY_LEN ||
+            h->value_len > CACHE_MAX_VALUE_LEN) continue;
+        size_t total = cache_entry_total_size(h);
+        if (off + total > cache->pool.used) continue;
+        if ((h->flags & CACHE_ENTRY_DELETED) ||
+            (h->expire_at > 0 && h->expire_at < now)) continue;
+        live[live_count++] = off;
+        live_bytes += total;
+    }
+
+    size_t old_count = cache->entry_count > live_count ? cache->entry_count - live_count : 0;
+    if (live_count == 0 && cache->pool.used <= CACHE_HEADER_SIZE) {
+        free(live);
+        return 0;
+    }
+
+    size_t pad = (CACHE_MAX_KEY_LEN + MYDB_ALIGN - 1) & ~(MYDB_ALIGN - 1);
+    size_t start = CACHE_HEADER_SIZE + pad;
+    size_t cursor = CACHE_HEADER_SIZE;
+    // 源偏移升序，保证原地下移不会覆盖尚未搬运的 entry。
+    qsort(live, live_count, sizeof(size_t), cmp_offset_asc);
+    if (live_count > 0 && live[0] >= start) {
+        // 所有 entry 都在 padding 之后：统一搬回 start（dest <= src），
+        // 再清零 padding，扫描时不会把旧数据当成 entry。
+        cursor = start;
+        memset(CACHE_PTR(cache, CACHE_HEADER_SIZE), 0, pad);
+        for (size_t i = 0; i < live_count; i++) {
+            size_t src = live[i];
+            cache_entry_header_t* h = (cache_entry_header_t*)CACHE_PTR(cache, src);
+            size_t total = cache_entry_total_size(h);
+            if (src != cursor) {
+                memmove(CACHE_PTR(cache, cursor), CACHE_PTR(cache, src), total);
+            }
+            cursor += total;
         }
-        
-        cache->sorted.offsets[write++] = offset;
+    } else if (live_count > 0) {
+        // entry 落在 padding 区内：先拷到临时缓冲再写回 start 之后。
+        char* tmp = (char*)malloc(live_bytes);
+        if (!tmp) {
+            free(live);
+            return 0;
+        }
+        size_t t = 0;
+        for (size_t i = 0; i < live_count; i++) {
+            size_t src = live[i];
+            cache_entry_header_t* h = (cache_entry_header_t*)CACHE_PTR(cache, src);
+            size_t total = cache_entry_total_size(h);
+            memcpy(tmp + t, CACHE_PTR(cache, src), total);
+            live[i] = t;
+            t += total;
+        }
+        memset(CACHE_PTR(cache, CACHE_HEADER_SIZE), 0, pad);
+        size_t w = start;
+        for (size_t i = 0; i < live_count; i++) {
+            cache_entry_header_t* h = (cache_entry_header_t*)(tmp + live[i]);
+            size_t total = cache_entry_total_size(h);
+            memcpy(CACHE_PTR(cache, w), h, total);
+            w += total;
+        }
+        free(tmp);
+        cursor = w;
     }
-    
-    if (removed > 0) {
-        cache->sorted.count = write;
-        cache->sorted.dirty = 1;
-    }
-    
-    // 重置 hot cache
+    free(live);
+
+    // 重建索引（旧索引里的偏移全部失效）
+    cache_sorted_destroy(cache);
+    cache_ns_destroy(cache);
+    cache_tag_index_destroy(cache);
+    cache_vector_index_destroy(cache);
     cache->hot_count = 0;
-    
-    return removed;
+
+    cache->pool.used = cursor;
+    *(size_t*)((char*)cache->pool.base + 8) = cursor;
+
+    // 预分配足够 bucket，避免重建过程中触发 hash_resize：resize 会 pool_alloc
+    // 触发 mremap，而 cache_hash_insert 的 key 指针指在旧映射里。
+    cache_hash_init_capacity(cache, live_count * 2 + 16);
+    cache_sorted_init(cache);
+    cache_ns_init(cache);
+    cache_tag_index_init(cache);
+    cache_vector_index_init(cache);
+
+    size_t off = CACHE_HEADER_SIZE;
+    while (off < cursor) {
+        cache_entry_header_t* h = (cache_entry_header_t*)CACHE_PTR(cache, off);
+        size_t total = cache_entry_total_size(h);
+        cache_hash_insert(cache, off,
+            (const char*)CACHE_PTR(cache, off + sizeof(cache_entry_header_t)), h->key_len);
+        // hash_insert 可能 pool_alloc 触发 mremap，指针要重新取。
+        h = (cache_entry_header_t*)CACHE_PTR(cache, off);
+        const char* key = (const char*)CACHE_PTR(cache, off + sizeof(cache_entry_header_t));
+        const char* value = key + h->key_len + 1;
+        cache_sorted_insert(cache, off);
+        cache_ns_add(cache, key, off);
+        cache_tag_index_add(cache, off, value, h->value_len);
+        off += total;
+    }
+
+    cache->entry_count = live_count;
+    cache->deleted_count = 0;
+    cache->memory_used = live_bytes;
+
+    cache_header_save(cache);
+    cache_index_save(cache);
+    cache_vector_index_rebuild(cache);
+    return old_count;
 }
 
 size_t cache_purge_expired(cache_t* cache) {

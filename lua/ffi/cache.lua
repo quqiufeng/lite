@@ -29,6 +29,7 @@ int cache_del_namespace(cache_t* cache, const char* ns);
 size_t cache_count(cache_t* cache);
 size_t cache_memory_used(cache_t* cache);
 size_t cache_memory_max(cache_t* cache);
+size_t cache_pool_used(cache_t* cache);
 int cache_search_prefix(cache_t* cache, const char* prefix,
     const cache_search_options_t* options, cache_result_t** out_results, size_t* out_count);
 int cache_search_range(cache_t* cache, const char* start_key, const char* end_key,
@@ -100,6 +101,7 @@ function M.del_namespace(h, ns) return tonumber(lib.cache_del_namespace(h, ns)) 
 function M.count(h) return tonumber(lib.cache_count(h)) end
 function M.memory_used(h) return tonumber(lib.cache_memory_used(h)) end
 function M.memory_max(h) return tonumber(lib.cache_memory_max(h)) end
+function M.pool_used(h) return tonumber(lib.cache_pool_used(h)) end
 function M.expire(h, key) return tonumber(lib.cache_expire(h, key)) end
 function M.touch(h, key) return tonumber(lib.cache_touch(h, key)) end
 function M.compact(h) return tonumber(lib.cache_compact(h)) end

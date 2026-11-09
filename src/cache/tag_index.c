@@ -16,119 +16,87 @@ static uint64_t tag_hash(const char* tag, size_t len) {
 }
 
 // ====== Tag 提取（从 value 中）======
-// 简单启发式：按非 alnum 字符分割，提取长度 >= 2 的 token
-// 对中文文本，连续的中文字符视为一个 token
+// 只索引显式 `"tags": [...]` 字段。旧实现把整个 value（JSON 键名、消息正文）
+// 按 token 全量切分，导致每条消息都要建几百个 tag：既费 CPU/内存，又因为
+// tag 索引不持久化而与重启后的行为不一致。lite 的事实/笔记本来就写显式 tags，
+// 其余内容由 recall 的前缀扫描覆盖。
 
-static int is_tag_char(unsigned char c) {
-    // ASCII 字母数字和下划线
-    if (isalnum(c) || c == '_') return 1;
-    // UTF-8 多字节字符的首字节 (>= 0xC0)
-    if (c >= 0xC0) return 1;
-    return 0;
+// 在 JSON 文本里定位 "tags" 字段的值起点（冒号之后）。
+static const char* find_tags_value(const char* v, size_t n) {
+    for (size_t i = 0; i + 5 < n; i++) {
+        if (v[i] != '"' || v[i + 5] != '"') continue;
+        if (memcmp(v + i + 1, "tags", 4) != 0) continue;
+        size_t j = i + 6;
+        while (j < n) {
+            char c = v[j];
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { j++; continue; }
+            break;
+        }
+        if (j < n && v[j] == ':') return v + j + 1;
+    }
+    return NULL;
 }
 
-// 获取 UTF-8 字符的字节长度（从首字节判断）
-static int utf8_seq_len(unsigned char c) {
-    if ((c & 0x80) == 0) return 1;
-    if ((c & 0xE0) == 0xC0) return 2;
-    if ((c & 0xF0) == 0xE0) return 3;
-    if ((c & 0xF8) == 0xF0) return 4;
-    return 1; // Invalid, treat as single byte
-}
+#define TAG_MAX_COUNT 64
+#define TAG_MAX_LEN   128
 
-// 从 value 中提取所有 tag，返回 tag 字符串数组
+// 从 value 中提取显式 tags 数组，返回 tag 字符串数组
 // 调用者负责释放返回的字符串数组和每个字符串
 static char** extract_tags(const char* value, size_t value_len, size_t* out_count) {
     *out_count = 0;
     if (!value || value_len == 0) return NULL;
-    
-    // 先扫描一遍，统计 tag 数量
-    size_t tag_count = 0;
-    size_t i = 0;
-    while (i < value_len) {
-        unsigned char c = (unsigned char)value[i];
-        // 跳过非 tag 字符（包括 whitespace、标点、UTF-8 continuation bytes）
-        if (!is_tag_char(c)) {
-            i++;
-            continue;
-        }
-        
-        // 找到 tag 起始
-        size_t start = i;
-        if (c < 0x80) {
-            // ASCII: 连续读取 alnum/underscore
-            while (i < value_len && (isalnum((unsigned char)value[i]) || value[i] == '_')) i++;
-        } else {
-            // UTF-8: 按完整字符读取
-            while (i < value_len) {
-                unsigned char ch = (unsigned char)value[i];
-                if (ch < 0x80) {
-                    // ASCII 中断 UTF-8 序列
-                    if (!isalnum(ch) && ch != '_') break;
-                    i++;
-                } else if (ch >= 0xC0) {
-                    // 新的 UTF-8 字符首字节
-                    int seq_len = utf8_seq_len(ch);
-                    if (i + seq_len > value_len) break;
-                    i += seq_len;
-                } else {
-                    // continuation byte (0x80-0xBF): should not happen as start of char
-                    break;
-                }
-            }
-        }
-        size_t len = i - start;
-        
-        if (len >= 2) tag_count++;
-    }
-    
-    if (tag_count == 0) return NULL;
-    
-    // 分配数组
-    char** tags = malloc(sizeof(char*) * tag_count);
+
+    const char* p = find_tags_value(value, value_len);
+    const char* end = value + value_len;
+    if (!p) return NULL;
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+    if (p >= end || *p != '[') return NULL;
+
+    char** tags = malloc(sizeof(char*) * TAG_MAX_COUNT);
     if (!tags) return NULL;
-    
-    // 第二遍：复制 tag
-    size_t idx = 0;
-    i = 0;
-    while (i < value_len && idx < tag_count) {
-        unsigned char c = (unsigned char)value[i];
-        if (!is_tag_char(c)) {
-            i++;
+
+    size_t count = 0;
+    p++;
+    while (p < end && count < TAG_MAX_COUNT) {
+        while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',')) p++;
+        if (p >= end || *p == ']') break;
+        if (*p != '"') {
+            // 非字符串元素：跳到下一个分隔符
+            while (p < end && *p != ',' && *p != ']') p++;
             continue;
         }
-        
-        size_t start = i;
-        if (c < 0x80) {
-            while (i < value_len && (isalnum((unsigned char)value[i]) || value[i] == '_')) i++;
-        } else {
-            while (i < value_len) {
-                unsigned char ch = (unsigned char)value[i];
-                if (ch < 0x80) {
-                    if (!isalnum(ch) && ch != '_') break;
-                    i++;
-                } else if (ch >= 0xC0) {
-                    int seq_len = utf8_seq_len(ch);
-                    if (i + seq_len > value_len) break;
-                    i += seq_len;
-                } else {
-                    break;
+        p++;
+        char buf[TAG_MAX_LEN + 1];
+        size_t len = 0;
+        while (p < end && *p != '"') {
+            char c = *p++;
+            if (c == '\\' && p < end) {
+                c = *p++;
+                switch (c) {
+                    case 'n': c = '\n'; break;
+                    case 't': c = '\t'; break;
+                    case 'r': c = '\r'; break;
+                    case 'b': c = '\b'; break;
+                    case 'f': c = '\f'; break;
+                    default: break;  // \" \\ \/ 原样保留
                 }
             }
+            if (len < TAG_MAX_LEN) buf[len++] = c;
         }
-        size_t len = i - start;
-        
-        if (len >= 2) {
-            tags[idx] = malloc(len + 1);
-            if (tags[idx]) {
-                memcpy(tags[idx], value + start, len);
-                tags[idx][len] = '\0';
-                idx++;
-            }
-        }
+        if (p < end && *p == '"') p++;
+        if (len < 2) continue;
+        buf[len] = '\0';
+        char* t = malloc(len + 1);
+        if (!t) continue;
+        memcpy(t, buf, len + 1);
+        tags[count++] = t;
     }
-    
-    *out_count = idx;
+
+    if (count == 0) {
+        free(tags);
+        return NULL;
+    }
+    *out_count = count;
     return tags;
 }
 

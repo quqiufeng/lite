@@ -95,6 +95,7 @@ end
 
 function M:close()
     if self.h then
+        self:maybe_compact()
         cache.sync(self.h)
         cache.close(self.h)
         self.h = nil
@@ -113,12 +114,25 @@ function M:sync()
     return cache.sync(self.h)
 end
 
+-- 更新/淘汰只把旧 entry 标记删除，物理空间不会自动复用；当池占用达到
+-- 存活数据两倍且足够大时，原地重排一次，避免 mem.bin 随长会话单调增长。
+function M:maybe_compact()
+    if not self.h or self.readonly then return nil end
+    local phys = cache.pool_used(self.h) or 0
+    local live = cache.memory_used(self.h) or 0
+    if phys > 16 * 1024 * 1024 and phys > live * 2 then
+        return cache.compact(self.h)
+    end
+    return nil
+end
+
 -- 主循环/agent 定期调用：默认 30 秒落盘一次。
 function M:tick(now_ms)
     if not self.h then return false end
     now_ms = now_ms or (os.time() * 1000)
     if now_ms - (self.last_sync or 0) >= (self.flush_ms or 30000) then
         self:sync()
+        self:maybe_compact()
         return true
     end
     return false
