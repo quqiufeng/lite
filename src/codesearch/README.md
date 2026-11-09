@@ -19,6 +19,114 @@ ctags 切块 ──► 词频 ──► 调用图 ──► 数据流 ──► 
 
 ---
 
+## 0. 快速开始（5 分钟）
+
+### 0.1 它是什么
+
+codesearch 把任意代码仓库变成可查询的索引：
+
+- `build`：切块 → 词频 → 调用图 → 数据流 → KV → 向量/HNSW
+- `search`：自然语言找实现（语义 + 关键词）
+- `symbol`：按符号名精确找定义
+- `context`：看 callers / callees / 调用链 / dataflow
+
+索引默认在 `~/.local/share/lite/codesearch/<project>/`，不碰 lite 的会话记忆。
+
+### 0.2 创建索引
+
+agent 里最简单：
+
+```text
+codesearch action=build path=/path/to/repo
+```
+
+`project` 默认取仓库目录名；要自定义：
+
+```text
+codesearch action=build path=/path/to/repo project=myproj
+```
+
+shell 里（不经过模型）：
+
+```bash
+R=/home/quqiufeng/Desktop/lite
+cd /path/to/repo
+$R/tools/lua.sh -e '
+local H = dofile(os.getenv("LITE_ROOT") .. "/helper/codesearch.lua")
+print(H.run({ action = "build", path = "." }, { cwd = os.getenv("PWD") }))
+'
+```
+
+默认值已经够用：FP16、batch 128、串行索引。常用加速：
+
+```text
+codesearch action=build path=. fork=true
+```
+
+- `fork=true`：多进程切块（fresh 进程更快；已加载 ORT 的会话慎用）
+- `workers=N`：进程数，默认 1；`fork=true` 时默认 CPU 核数
+- `vector=false`：只建索引/调用图/数据流，不做语义
+- 大仓库：`excludes=node_modules,dist,build`；
+  内核类仓库：`excludes=drivers,Documentation skip_kinds=header,file,enumerator,macro`
+- TypeScript/JavaScript：`plugins=/绝对路径/third_party/codesearch/plugins/typescript-indexer/plugin.json`
+
+重复 build 会走增量：源文件没变时跳过模型和 HNSW，通常几秒完成。
+第一次大仓库 build 主要耗在 vectorize + HNSW；之后增量很快。
+
+### 0.3 探索源码（最简流程）
+
+1. **确认索引**
+
+```text
+codesearch action=status project=myproj
+```
+
+2. **架构扫描：自然语言找入口**
+
+```text
+codesearch action=search query="event loop request handling" max_results=5
+codesearch action=search query="configuration parsing" max_results=5
+```
+
+3. **钉住符号：精确查定义**
+
+```text
+codesearch action=symbol query="schedule"
+codesearch action=symbol query="vfs_read"
+```
+
+4. **看关系：callers / callees / 调用链 / dataflow**
+
+```text
+codesearch action=context query="vfs_read" depth=2
+```
+
+5. **读源码 + 验证**
+
+拿到 `file:symbol` 后直接读文件；真正要下结论时，用 build/测试/断点验证。
+`search/context` 都是静态证据，不要直接当运行时真相。
+
+### 0.4 最简单的最佳实践
+
+```text
+status
+  → search（2–5 条自然语言，找子系统入口）
+  → symbol（把关键标识符钉成 file:symbol）
+  → context depth=1..3（看主线 callers/callees）
+  → 读源码 / 跑测试验证
+```
+
+- 先横向（架构入口），再纵向（一条调用链），不要一上来翻目录。
+- `search` 是近似召回，会受同名/分片影响；**精确定位优先 `symbol`/`exact`**。
+- 引用统一写 `file:symbol`，行号只作参考。
+- 大项目先 `status` 确认 chunks/向量/KV 齐全，再开始探索。
+- 同一进程内连续查询很快；每次新起 shell 进程是冷启动（内核索引首次约 4–10s）。
+
+更详细的索引参数、依赖、性能数据和 Linux 内核实录见 §4、§5 和
+`CODE_READING_REPORT.md`。
+
+---
+
 ## 1. 目录与产物
 
 实现全部在 `src/codesearch/`：

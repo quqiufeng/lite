@@ -232,22 +232,16 @@ hook 错误一律 fail-open（记 `_hook_errors`，不炸 agent）。`has_hooks(
 | `fetch` | DeepSeek Fetch：URL→Markdown 正文 | 同上；替代原始 HTTP 抓页面 |
 | `tokens` | 每日 token 账本查询 | 数据源 `/agent/usage`，跨会话同一本账 |
 | `cgrep` | 代码搜索：正则/字面串扫目录，输出 `path:line: text` | 本体是 `helper/cgrep.c`（pthread + POSIX regex）编出的 `.so`，Lua 层只做 JSON→文本；本机没 `rg`/`ugrep`，搜代码就靠它。`ext`/`fixed`/`per_file`/`threads` 可省，输出自身封顶 8000 字 |
-| `codesearch` | 建索引（ctags 切块）→ 调用图/数据流 → KV → 语义向量；查符号/上下文/语义 | 本体 `build/liblite_codesearch.so`（`src/codesearch/`，从 `/opt/my_db` 迁移）。数据在 `$LITE_CS_HOME`（默认 `~/.local/share/lite/codesearch/<project>`）；KV 直接写 lite 自带 kvcache（`src/cache/`，落 `kv/mem.bin`），与 lite 会话记忆同实现、不同目录；`action=build` 一次跑全流程，`workers` 默认 1（`fork=true` 时默认 CPU 核数；库内默认不 fork，`LITE_CS_FORK=1` 或 `fork=true` 才并行），`vector=false` 跳过语义。语义需 `LITE_CS_MODEL_DIR`（默认 `/opt/models`）+ `LITE_ORT_LIB`；ORT 运行期 `dlopen`，不随包 |
+| `codesearch` | 代码库级检索：陌生项目找入口/子系统、跨文件符号与调用关系、数据流、语义找实现 | 需要先建索引；适合 `cgrep` 做不到的跨文件/语义问题。用法、索引、依赖、性能与内核实践见 `src/codesearch/README.md` |
 | `pdftext` | 抽 PDF 文本（`path/first/last/max_chars`） | 纯 Lua FFI 直连 `libpoppler-glib.so.8`，零编译零子进程；本机无 poppler 头文件，cdef 手写（导出符号 `poppler_document_get_page`/`poppler_page_get_text`），释放用 `g_object_unref`（`poppler_page_free`/`poppler_document_free` 已不在 134 里）；缺库报装 `libpoppler-glib8` |
 | `md2png` | Markdown 文件 → HTML → 长图 PNG（`path/out/width/height/scale/gfm`） | 全 FFI 无子进程无 Chrome：`libmd4c.so.0` 解析（**无 md4c.h，cdef 手写**，`abi_version` 必须 = 0、结构体字段顺序不能错否则崩在回调里）→ `build/liblite_html.so` 出图 → `src/html/render.cpp` 的字体。同名 `.html` 一起落盘便于调试；`height` 默认 **0 = 自动测高**（`render.cpp` 先布局取 `doc->height()` 再定高），给正数才是固定视口、超出裁掉 |
 | `trending` | GitHub Trending → Kami 排版 → 长图 PNG（`lang/since/limit/width/height/scale/out`） | `curl` 抓页面（`io.popen`）+ 文件内 `parse()` 的 `gmatch` 逐字段抽（**无 dom 库**，页面结构一变就返回空表）；出图复用 `liblite_html.so`。坑：HTML 必须一次成型（追加 `<style>` 会让内容溢出被裁）；`.page{width:auto}` 铺满、`width` 别低于 780（19px 仓库名会折行）；`os.date` 里 `"%%m"` 是字面量；`height` 默认 0 = 自动测高，加 `limit` 不用手动调高 |
 | `web2png` | URL → 正文 → 资料卡片长图 PNG（`url/out/width/scale/title/max_chars`） | 三段链路：`helper/lib/deepseek.lua` 的 `/v1/tools/fetch` 取干净 Markdown（无 `DEEPSEEK_API_KEY` 则降级 `core.http` 抓 HTML 去标签）→ `helper/lib/md4c.lua` 转 HTML 片段 → `liblite_html.so` 出图（`h=0` 自动测高）。样式全内联，cairo toy font 只认单族名，**禁止写字体栈** |
 
-`codesearch` 提速：`fork=true` + `workers=N`（fresh 进程；或 `LITE_CS_FORK=1`）并行切块；
-FP16 默认开（`LITE_CS_FP16=0` 或 `fp16=false` 关），用 `model_fp16.onnx`（自动沿 `model.onnx` 软链到真实目录找），GPU 约 1.5x；
-`batch`（默认 128，`LITE_CS_BATCH`）控制向量化批大小；`LITE_CS_HNSW_EF`（默认 200，
-降到 100 建图约快一倍、召回略降）。向量化带**增量缓存**：`vectors/*.jina.hash` 记录每条
-name+文本哈希，源文件没变时第二次 `build` 跳过模型加载和 HNSW 重建（55k chunk 从 ~90s 到
-<1s），只对改动 chunk 重新嵌入。换模型/fp16 会因 model tag 不同自动全量重算；中断写临时
-文件，不会破坏旧索引。Linux 内核（7.2.12）实测：排除 `drivers,Documentation` 并
-`skip_kinds=header,file,enumerator,macro` 后 352,294 chunks；index 6s、callgraph 5s、
-vectorize+HNSW 1067s，总约 19min、数据 7.7G。drivers 里的 `asic_reg/*_sh_mask.h`
-会自动生成十几万 macro chunk，别索引；需要宏时单独建索引。
+**什么时候用 codesearch**：陌生代码库要找子系统入口/实现、查某符号的 callers/callees
+与数据流、或按自然语言找相似实现时用它；单文件/精确文本搜索先用 `cgrep`。
+索引创建、参数、加速、依赖、Linux/参考项目实践统一看 `src/codesearch/README.md`
+（§0 快速开始，§4/§5 详细流程）。
 
 `music` 的 `dav://` 语义：`dav://host:port/路径` 列目录**直接流播**（默认整库随机，
 `limit=N` 限首数，`index=N` 选第几首）；**只写 `dav://` 不带路径会 PROPFIND 失败**，
