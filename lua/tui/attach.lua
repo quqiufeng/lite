@@ -53,6 +53,9 @@ function M.run(opts)
     local busy = false
     local running = true
     local diff_view
+    local diff_auto = false
+    local last_tool_diff
+    local auto_diff = os.getenv("LITE_AUTO_DIFF") ~= "0"
     local todo_view
     local help_view
     local approval_view
@@ -72,7 +75,8 @@ function M.run(opts)
         return net.send(fd, s .. "\n")
     end
 
-    local function open_diff(patch)
+    local function open_diff(patch, opts)
+        local auto = type(opts) == "table" and opts.auto == true
         if not patch or patch == "" then
             transcript:add("info", "没有可显示的 diff")
             return
@@ -87,6 +91,7 @@ function M.run(opts)
             height = h,
             mode = w >= 100 and "split" or "unified",
         })
+        diff_auto = auto
     end
 
     local function apply(ev)
@@ -112,6 +117,7 @@ function M.run(opts)
         elseif t == "reasoning" then
             transcript:reasoning_append(ev.text or "")
         elseif t == "delta" then
+            if diff_auto then diff_view, diff_auto = nil, false end
             transcript:end_reasoning()
             transcript:stream_append(ev.text or "")
         elseif t == "assistant" then
@@ -123,10 +129,17 @@ function M.run(opts)
                 transcript:end_stream()
             end
         elseif t == "tool_start" then
+            if diff_auto then diff_view, diff_auto = nil, false end
             current_tool = ev.name
             transcript:tool_start(ev.name, ev.args)
         elseif t == "tool_result" then
             transcript:tool_result(ev.name, ev.result)
+            if type(ev.result) == "string" and ev.result:find("diff --git ", 1, true) then
+                last_tool_diff = ev.result
+                if auto_diff and Diff.tool_patch(ev.name, ev.result) then
+                    open_diff(last_tool_diff, { auto = true })
+                end
+            end
             current_tool = nil
         elseif t == "error" then
             transcript:add("error", tostring(ev.error))
@@ -219,8 +232,14 @@ function M.run(opts)
             return
         end
         if diff_view then
-            if diff_view:handle(ev) == "close" then diff_view = nil end
-            return
+            if diff_auto then
+                -- 自动弹的那张：任意一键收掉，除 esc/q 外继续当正常输入
+                diff_view, diff_auto = nil, false
+                if ev.key == "escape" or ev.key == "q" then return end
+            else
+                if diff_view:handle(ev) == "close" then diff_view = nil end
+                return
+            end
         end
 
         local k = ev.key

@@ -16,15 +16,16 @@ local SessionView = require("tui.session_view")
 local Session = require("core.session")
 local Reload = require("core.reload")
 local CoreText = require("core.text")
+local Reboot = require("core.reboot")
 local http = require("core.http")
 
 local M = {}
 
 local SPINNER = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
 
--- 重启后自动发的第一句。--reboot 的启动钩子会把它塞进输入框并提交，
--- 于是模型带着同一份会话记忆继续干活（新进程只换了代码/插件清单）。
-local REBOOT_TEXT = "重启成功，继续工作。"
+-- 重启后自动发的第一句：`/reboot <提示词>` 给过就用它（跨进程经 core.reboot 落盘），
+-- 没给就回落到 Reboot.DEFAULT_TEXT（"重启成功，继续工作。"）。
+local REBOOT_TEXT = Reboot.DEFAULT_TEXT
 
 local function shq(s)
     return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
@@ -49,6 +50,9 @@ function M.run(ctx, agent, memory, opts)
     local queue = {}
     local last_escape = 0
     local diff_view
+    local diff_auto = false      -- 当前 diff_view 是自动弹的，下一步就收
+    local open_diff              -- 定义在下面，tool_result 钩子要先引用
+    local auto_diff = os.getenv("LITE_AUTO_DIFF") ~= "0"
     local todo_view
     local help_view
     local approval_view
@@ -210,10 +214,13 @@ function M.run(ctx, agent, memory, opts)
             -- 换进程（退出码 75 交给 tools/lite-lua 的监督循环拉起新进程，裸跑时才
             -- 退回 main.lua 里的 execv）。会话/记忆都在盘上，重来不丢历史；换进程
             -- 的意义是重扫插件清单与重载 .so，`native build` 的新工具才上桌。
+            -- `/reboot <提示词>`：那句话重启后自动发出去，优先于默认提示词。
             if busy then
                 transcript:add("info", "无法重启：当前正在执行（先 Esc×2 终止）")
             else
+                local prompt = arg:gsub("^%s+", ""):gsub("%s+$", "")
                 ctx.settings.reboot = true
+                ctx.settings.reboot_prompt = prompt ~= "" and prompt or nil
                 quitting = true
             end
         elseif name == "quit" or name == "exit" or name == "shutdown" then
@@ -225,6 +232,7 @@ function M.run(ctx, agent, memory, opts)
 
     ctx:on("reasoning", function(t) transcript:reasoning_append(t) end)
     ctx:on("delta", function(t)
+        if diff_auto then diff_view, diff_auto = nil, false end
         transcript:end_reasoning()
         transcript:stream_append(t)
     end)
@@ -233,6 +241,7 @@ function M.run(ctx, agent, memory, opts)
         transcript:end_stream()
     end)
     ctx:on("tool_start", function(name, args)
+        if diff_auto then diff_view, diff_auto = nil, false end
         current_tool = name
         transcript:tool_start(name, args)
         if draw then draw() end
@@ -241,6 +250,10 @@ function M.run(ctx, agent, memory, opts)
         transcript:tool_result(name, result)
         if type(result) == "string" and result:find("diff --git ", 1, true) then
             last_tool_diff = result
+            -- 改文件就自动弹两栏，不用手按 g；键一动/模型一开口就收
+            if auto_diff and Diff.tool_patch(name, result) then
+                open_diff({ auto = true })
+            end
         end
         current_tool = nil
         if draw then draw() end
@@ -460,8 +473,10 @@ function M.run(ctx, agent, memory, opts)
         return out
     end
 
-    local function open_diff()
-        local text = load_diff()
+    open_diff = function(opts)
+        local auto = type(opts) == "table" and opts.auto == true
+        -- 自动弹出时直接看这次改动，别被工作区里别的脏文件带跑
+        local text = auto and last_tool_diff or load_diff()
         if not text or text == "" then text = last_tool_diff end
         if not text or text == "" then
             transcript:add("info", "没有可显示的 git diff")
@@ -477,6 +492,7 @@ function M.run(ctx, agent, memory, opts)
             height = h,
             mode = w >= 100 and "split" or "unified",
         })
+        diff_auto = auto
     end
 
     local function complete_path()
@@ -562,8 +578,17 @@ function M.run(ctx, agent, memory, opts)
             return
         end
         if diff_view then
-            if diff_view:handle(ev) == "close" then diff_view = nil end
-            return
+            if diff_auto then
+                -- 自动弹的那张：任意一键收掉；除了 esc/q 都不吞，继续当正常输入
+                diff_view, diff_auto = nil, false
+                if ev.key == "escape" or ev.key == "q" then
+                    if draw then draw() end
+                    return
+                end
+            else
+                if diff_view:handle(ev) == "close" then diff_view = nil end
+                return
+            end
         end
 
         local k = ev.key
@@ -699,8 +724,9 @@ function M.run(ctx, agent, memory, opts)
 
     -- --reboot：上一个进程把自己的重启请求落成这个参数。输入框里塞好句子再提交，
     -- 跟人手打一句「重启成功，继续工作。」完全等价（进历史、进会话记忆）。
+    -- `/reboot <提示词>` 给过就用那句（main.lua 从 core.reboot 取回），否则用默认。
     if opts.reboot then
-        composer:set_text(REBOOT_TEXT)
+        composer:set_text(opts.reboot_text or REBOOT_TEXT)
         submit()
     end
 

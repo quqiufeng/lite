@@ -2025,6 +2025,45 @@ do
     check(ctx.settings.reboot == true, "reboot sets ctx.settings.reboot")
     check(out:find("--reboot", 1, true) ~= nil, "reboot explains the --reboot relaunch")
     check(out:find("重启成功", 1, true) ~= nil, "reboot names the auto-sent prompt")
+    -- 可选 prompt：比默认提示词优先级高，存进 ctx.settings.reboot_prompt
+    check(listed.reboot["function"].parameters.properties.prompt ~= nil,
+        "reboot schema accepts an optional prompt")
+    check(ctx.settings.reboot_prompt == nil, "reboot without prompt leaves reboot_prompt nil")
+    local out2 = t:execute("reboot", { prompt = "  先把 cgrep 装上  " })
+    check(ctx.settings.reboot_prompt == "先把 cgrep 装上", "reboot prompt is trimmed and stored")
+    check(out2:find("先把 cgrep 装上", 1, true) ~= nil, "reboot echoes the custom prompt")
+    t:execute("reboot", { prompt = "   " })
+    check(ctx.settings.reboot_prompt == nil, "blank reboot prompt falls back to the default")
+    os.execute("rm -rf " .. shq(dir))
+end
+
+-- `/reboot <提示词>` 的跨进程通道：子进程改不了父进程环境、argv 会被 ps 看见，
+-- 所以提示词落一个一次性文件（core.reboot），新进程带 --reboot 起来时 take() 取走。
+do
+    local Reboot = require("core.reboot")
+    local dir = os.tmpname()
+    os.remove(dir)
+    os.execute("mkdir -p " .. shq(dir))
+    local real_getenv = os.getenv
+    os.getenv = function(k)
+        if k == "XDG_DATA_HOME" then return dir end
+        return real_getenv(k)
+    end
+    check(Reboot.path() == dir .. "/lite/reboot.prompt",
+        "reboot prompt path follows XDG_DATA_HOME")
+    check(Reboot.take("/w") == nil, "no stored prompt → nil (defaults apply)")
+    Reboot.save("  继续加测试  ", "/w")
+    check(Reboot.take("/other") == nil, "stored prompt is cwd-scoped")
+    Reboot.save("继续加测试", "/w")
+    check(Reboot.take("/w") == "继续加测试", "prompt survives the process boundary")
+    check(Reboot.take("/w") == nil, "stored prompt is one-shot")
+    Reboot.save("   ", "/w")
+    check(Reboot.take("/w") == nil, "blank prompt is not stored")
+    Reboot.save("残留", "/w")
+    Reboot.save(nil, "/w")
+    check(Reboot.take("/w") == nil, "saving nothing clears a stale prompt")
+    check(Reboot.DEFAULT_TEXT == "重启成功，继续工作。", "default reboot text is unchanged")
+    os.getenv = real_getenv
     os.execute("rm -rf " .. shq(dir))
 end
 
@@ -3230,6 +3269,17 @@ do
     local ok2, y2 = coroutine.resume(co, { role = "assistant", content = "done" }, nil)
     check(ok2 and coroutine.status(co) == "dead", "agent async done")
     check(y2 == "done", "agent async answer")
+end
+
+-- tui diff 自动弹窗判定（改文件才弹，bash 里顺带打的 diff 不算）
+do
+    local D = require("tui.diff")
+    local edited = "edited /tmp/a.txt\ndiff --git a/a.txt b/a.txt\n"
+        .. "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-x\n+y"
+    check(D.tool_patch("edit", edited) ~= nil, "auto diff patch for edit")
+    check(D.tool_patch("bash", "diff --git a/x b/x\n") == nil, "no auto diff for bash")
+    check(D.tool_patch("write", "wrote 3 bytes to /tmp/x") == nil, "no auto diff for plain write")
+    check(D.tool_patch("edit", "error: old text not found") == nil, "no auto diff for failed edit")
 end
 
 -- tui diff parse / pair / intraline

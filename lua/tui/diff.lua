@@ -306,4 +306,14 @@ function M.pair(hunk)
     return out
 end
 
+-- 工具结果里带改动就返回整段 patch（自动弹两栏用）。
+-- 只有 edit/write 成功改文件才算；bash 输出里顺带打印的 diff 不算。
+function M.tool_patch(name, result)
+    if name ~= "edit" and name ~= "write" then return nil end
+    if type(result) ~= "string" then return nil end
+    if not result:match("^edited ") and not result:match("^wrote ") then return nil end
+    if not result:find("diff --git ", 1, true) then return nil end
+    return result
+end
+
 return M

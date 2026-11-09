@@ -511,7 +511,16 @@ function M:schemas()
                     .. "\"重启成功，继续工作。\" and you continue with the same history. "
                     .. "Write todo/remember first — anything only in context survives, but "
                     .. "act as if the next turn starts fresh.",
-                parameters = { type = "object", properties = {} },
+                parameters = {
+                    type = "object",
+                    properties = {
+                        prompt = {
+                            type = "string",
+                            description = "Optional first message for the restarted process "
+                                .. "(takes priority over the default \"重启成功，继续工作。\").",
+                        },
+                    },
+                },
             },
         },
         {
@@ -1765,8 +1774,16 @@ function M:execute(name, args)
         elseif name == "reboot" then
             if not self.ctx or not self.ctx.settings then return "error: no ctx" end
             self.ctx.settings.reboot = true
+            -- 可选的「重启后自动发的那句」；空/非字符串 = 用默认提示词。
+            local prompt = ""
+            if type(args.prompt) == "string" then
+                prompt = args.prompt:gsub("^%s+", ""):gsub("%s+$", "")
+            end
+            self.ctx.settings.reboot_prompt = prompt ~= "" and prompt or nil
+            local first = prompt ~= "" and string.format("之后自动发出你给的这句：%q", prompt)
+                or "之后自动发出 \"重启成功，继续工作。\""
             return "reboot requested: lite will restart as a fresh process with --reboot after "
-                .. "this turn and auto-send \"重启成功，继续工作。\". New helper plugins and "
+                .. "this turn and " .. first .. ". New helper plugins and "
                 .. "rebuilt .so files will be in the tool list then."
         elseif name == "shutdown" then
             if not self.ctx or not self.ctx.settings then return "error: no ctx" end

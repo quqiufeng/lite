@@ -27,7 +27,7 @@ AI-native harness：记忆、工具、FFI、X11。
 
 ## 2 代码地图
 
-- `lua/main.lua`：入口；`lua/core/`：agent/tools/memory/prompt/session/compact（含 web）
+- `lua/main.lua`：入口；`lua/core/`：agent/tools/memory/prompt/session/compact（含 web）/reboot
 - `lua/tui/`、`lua/ffi/`、`src/{cache,image,x11}/`、`helper/`、`tools/`
 - `lua/ffi/x11.lua` + `xdo.lua`：**自包含单文件**（只用 LuaJIT `ffi` + 系统 libX11/libxdo，不引用 lite 代码、不注册工具），可整对拷给别的项目；`x11.lua` 靠 `require("ffi.xdo")` 找同伴，换布局要同步改这一行
 - `lua/tui/mouse.lua` + `clipboard.lua`：拖选/剪贴板；选区在 `screen.lua`
@@ -130,8 +130,20 @@ Chrome/WebView/CEF/Electron；不起 `xdotool/wmctrl/import`；不用 `systemd -
 拉起全新进程（裸跑退化成 `execv`）。会话/记忆/todo 都在盘上，**历史不丢**；新进程带
 `--reboot` 起来**自动发「重启成功，继续工作。」**，模型接着上一轮往下干，插件清单与
 `.so` 全部重扫 —— 刚写的 `helper/<x>.lua` 下一轮就带 schema 出现在 API `tools` 里。
+
+**重启可以带话**：`/reboot <提示词>`（或 `reboot` 工具的 `prompt` 参数）给的那句，优先
+于默认的「重启成功，继续工作。」，重启后自动发出去。跨进程靠一次性文件
+`<XDG_DATA_HOME|~/.local/share>/lite/reboot.prompt`（`lua/core/reboot.lua`）：子进程改不了
+父进程环境，argv 会被 `ps` 看见，所以只有文件这条路；写 = `main.lua` 退出 75 之前，
+读 = 新进程带 `--reboot` 起来时 `take()`（读完即删，带 cwd 作用域，陈旧提示词不污染下一次）。
 于是自造工具的完整闭环是：`native build` / `write` → 按名调用验一遍 → `reboot` → 清单可见。
-代价只有一次重读盘 + 重建前缀缓存；连续重启有链上限（`LITE_REBOOT_MAX`，默认 3），
+**前缀缓存不丢**：provider 的 cache 是服务端按 prompt 内容前缀命中的，新进程重建出的
+system prompt 字节相同（时钟/轮次/预算都在本轮尾部的 `runtime_block`）、历史从 JSONL/mem.bin
+原样回放 → 同一串 token，命中率照旧。真代价有三条：多一轮「继续工作」的请求；内存里全文的
+tool 结果在盘上是截断版（`LITE_TOOL_RESULT_CHARS`，默认 8192，`session.lua:store_copy`），
+重启看到的是截断版、且第一个截断点之后的前缀跟重启前不同（那一段才真 miss）；进程内的临时态
+（异步 bash 长跑、连接复用、TUI 回滚）清零，serve/attach 的客户端得重连。本地启动本身
+（插件扫描 + mmap + JSONL 回放）是毫秒级。连续重启有链上限（`LITE_REBOOT_MAX`，默认 3），
 计数只活在 wrapper 进程里、不 export（漏给 bash 工具/测试会让下个 lite 从中间数起）。
 `shutdown` 才是真停（不自动接续）；serve/attach 只认 JSONL 请求、不跑斜杠命令，
 外部客户端要重启就自己 kill 再拉。

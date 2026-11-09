@@ -17,7 +17,8 @@ lite — DeepSeek 终端 coding agent
   lite attach --port 8765      连接服务端并显示 TUI
   lite attach --port 8765 --tmux  在新 tmux 窗口 attach
   lite --tui --snapshot out.txt   输出整屏快照（AI 验收）
-  lite --reboot                重启后自动继续：起来就把「重启成功，继续工作。」发出去
+  lite --reboot                重启后自动继续：起来就把上一轮 /reboot 留下的提示词发出去
+                               （没留就用默认的「重启成功，继续工作。」）
   lite state [--json]          输出会话/记忆/todo 状态
   lite sessions [--json]       列出同 cwd 会话
   lite plugins [--json]        列出 helper/ 插件与加载错误
@@ -537,10 +538,16 @@ elseif cmd == "--tui" or cmd == "--gui" then
         os.exit(0)
     end
 
+    -- 上一轮 `/reboot <提示词>`（或 reboot 工具带 prompt）留下的那句话：新进程带
+    -- --reboot 起来时一次性取走，优先于默认的「重启成功，继续工作。」
+    local reboot_text
+    if flags.reboot then reboot_text = require("core.reboot").take(config.cwd) end
+
     local ok, err = require("tui").run(ctx, agent, memory, {
         multi = multi,
         messages = restored,
         reboot = flags.reboot,
+        reboot_text = reboot_text,
     })
     -- shutdown 工具置的 exit 压过 reboot：说了退出就不再 execv，直接 os.exit(0)。
     local reboot = ctx.settings and ctx.settings.reboot and not ctx.settings.exit
@@ -552,13 +559,17 @@ elseif cmd == "--tui" or cmd == "--gui" then
         os.exit(1)
     end
     -- `/reboot` 或 reboot 工具置的标记：换一个全新进程，新进程带 --reboot 起来后
-    -- 自动重发「重启成功，继续工作。」，所以对话是连着的。
+    -- 自动重发这句话（`/reboot <提示词>` 给的那句，没给就是默认的「重启成功，继续
+    -- 工作。」），所以对话是连着的。
     --
     -- 默认路径是**退出码 75 + 父进程拉起**（tools/lite-lua 监督循环，它导出了
     -- LITE_SUPERVISED=1）：新进程 = 新 Lua 状态，插件清单一类的东西全部重扫，
     -- 而且出错时 tty 一直在 wrapper 手里。只有裸跑（`luajit lua/main.lua`、装了
     -- 二进制但不经 wrapper）才退回原地 execv。
     if reboot then
+        -- 提示词落盘必须在换进程之前：wrapper/execv 都只继承旧环境，argv 又会被
+        -- `ps` 看见，只有文件能把它带到新进程（见 lua/core/reboot.lua）。
+        require("core.reboot").save(ctx.settings.reboot_prompt, config.cwd)
         if os.getenv("LITE_SUPERVISED") == "1" then
             io.stdout:flush()
             io.stderr:flush()

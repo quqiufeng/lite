@@ -20,7 +20,7 @@
 ./tools/release.sh            # 构建 + 打包 + 安装（源码安装把 lua/ 软链过来，改完重启即生效）
 export DEEPSEEK_API_KEY=...   # 或写进 .env / ~/.config/lite/.env
 
-./tools/run.sh --tui                          # TUI：Ctrl+G 看 diff，/session 选会话，/reboot 自动重启
+./tools/run.sh --tui                          # TUI：改文件后自动弹两栏 diff（Ctrl+G 手动看），/session 选会话，/reboot [提示词] 自动重启并从那句接着干
 ./tools/run.sh --tui --thinking --reasoning-effort high
 ./tools/run.sh --once --json "解释这个项目"    # 无 UI 一轮，JSONL 事件
 ./tools/run.sh --recall "关键词"               # 查当前目录的本地记忆
@@ -130,6 +130,7 @@ return {
 | `LITE_COMPACT` | 0 | `1` = 先摘要（有三段式 checkpoint），默认丢弃优先 |
 | `LITE_KEEP_RATIO` | 0.6 | 丢窗口时保留比例（0.3~0.95） |
 | `LITE_BUDGET_HINT` | — | `1` 在尾部块里播报剩余预算（默认关，纯噪声） |
+| `LITE_AUTO_DIFF` | 1 | `edit`/`write` 改完文件自动弹两栏 diff（`0` 只留 Ctrl+G 手动看） |
 | `LITE_MEMORY_MB` | 100 | `mem.bin` 容量 |
 | `LITE_MEMORY_FLUSH` | 30 | 落盘间隔（秒） |
 | `LITE_MEMORY_DIR` | — | 覆盖 `mem.bin` 所在目录 |
