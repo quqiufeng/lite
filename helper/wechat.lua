@@ -8,8 +8,9 @@
 --   button Up/Down）也要清掉。不是 1 就别往下跑，先修桌面再操作。
 --
 -- 流程：activate → 点标题栏拿焦点 → 点搜索框 → 粘贴关键词 → OCR 候选面板
---      → 点候选 → OCR 会话标题验收 → 点输入框 → ctrl+a/BS → 粘贴 → Return
---      → OCR 气泡验收。坐标全部是真实屏幕像素（2560x1440）；
+--      → 回车进会话（第一行即目标时；否则点候选行）→ OCR 会话标题验收
+--      → 点输入框 → ctrl+a/BS → 粘贴 → Return → OCR 气泡验收。
+-- 坐标全部是真实屏幕像素（2560x1440）；
 -- OCR box 已由 _pt() 换算回屏幕坐标，禁止按看图缩放后的像素估点。
 local ffi = require("ffi")
 if not pcall(ffi.cdef, "void usleep(unsigned int);") then end
@@ -227,30 +228,46 @@ local function do_search(name, index)
     end
     if #want == 0 then
         if norm(text) == "" then
-            -- OCR 不可用（无模型/空白截图）：按 index 盲点候选行，不阻塞
-            local c = crop("candidates")           -- {x0,y0,x1,y1}
-            local cx = c[1] + math.floor((c[3] - c[1]) / 2)
-            local cy = c[2] + 40 + (k - 1) * 56
-            return { cx = cx, cy = cy, blind = true }
+            -- OCR 不可用（无模型/空白截图）：不猜候选行坐标（猜错一行就进错会话），
+            -- 直接回车接受搜索框默认项 —— 微信默认项就是第一个真实结果。
+            return { enter = true, blind = true, text = "" }
         end
         error(string.format("搜索 %q 后候选面板没看到该名字（OCR=%q，required: name）",
             name, norm(text):sub(1, 120)))
     end
-    return want[math.min(k, #want)]
+    local hit = want[math.min(k, #want)]
+    -- 「回车 = 进会话」：系统自带条目（文件传输助手、服务号…）和正常联系人，
+    -- 搜索框默认选中项回车就进会话，比拿 OCR 坐标点候选行稳。只有第一行的
+    -- 文本确实就是这个名字时才走回车；否则（目标在第二行及以后）还是点坐标。
+    local top
+    for _, b in ipairs(boxes) do
+        if norm(b.text) ~= "" and (not top or (b.y or 0) < (top.y or 0)) then top = b end
+    end
+    if k == 1 and top and sim(top.text, name) >= D.min_sim then hit.enter = true end
+    return hit
+end
+
+-- 打开 do_search 的候选：能回车就回车（默认项），否则点 OCR 给的坐标。
+-- 返回 "enter" / "click"；标题 OCR 复核不过则抛错（带原参数，可自修）。
+local function open_hit(b, name)
+    local how = b.enter and "enter" or "click"
+    if b.enter then key("Return"); sleep(900)
+    else click(math.floor(b.cx), math.floor(b.cy)); sleep(900) end
+    local last = ""
+    for _ = 1, 8 do
+        local _, text = ocr_area("title", crop("title"))
+        last = text
+        if sim(text, name) >= D.min_sim then return how end
+        sleep(300)
+    end
+    if b.blind or blind(last) then return how end   -- OCR 不可用：盲过，不阻塞
+    error(string.format("%s 打开 %q 后会话标题没变（OCR=%q，required: name；可选 index）",
+        how, name, norm(last):sub(1, 120)))
 end
 
 local function do_open(name, index)
     local b = do_search(name, index)
-    click(math.floor(b.cx), math.floor(b.cy)); sleep(900)
-    local last = ""
-    for i = 1, 8 do
-        local _, text = ocr_area("title", crop("title"))
-        last = text
-        if sim(text, name) >= D.min_sim then return true end
-        sleep(300)
-    end
-    if blind(last) then return true end        -- OCR 不可用：盲过，不阻塞
-    error(string.format("点了候选 %q 但会话标题没变（OCR=%q）", name, norm(last)))
+    return open_hit(b, name)
 end
 
 local function do_send(text, name)
@@ -413,12 +430,16 @@ function M.run(args, env)
     if action == "search" then
         local b = do_search(assert(args.name, "required: name"), args.index)
         leave(bg)
+        if b.enter then
+            return string.format("searched: %s (%s)", args.name,
+                b.blind and "回车进会话，OCR 不可用" or "第一行即目标，回车进会话")
+        end
         return string.format("searched: %s (candidate %q @ %d,%d)",
             args.name, norm(b.text), math.floor(b.cx), math.floor(b.cy))
     elseif action == "open" then
-        do_open(assert(args.name, "required: name"), args.index)
+        local how = do_open(assert(args.name, "required: name"), args.index)
         leave(bg)
-        return "opened: " .. args.name
+        return "opened: " .. args.name .. " (" .. tostring(how) .. ")"
     elseif action == "send" then
         do_send(assert(args.text, "required: text"), args.name)
         leave(bg)
@@ -427,19 +448,14 @@ function M.run(args, env)
         local name = assert(args.name, "required: name")
         local text = assert(args.text, "required: text")
         local b = do_search(name, args.index)
-        local head = string.format("searched: %s (%q @ %d,%d)", name, norm(b.text),
-            math.floor(b.cx), math.floor(b.cy))
-        click(math.floor(b.cx), math.floor(b.cy)); sleep(900)
-        local opened = false
-        for _ = 1, 8 do
-            local _, t = ocr_area("title", crop("title"))
-            if sim(t, name) >= D.min_sim then opened = true break end
-            sleep(300)
-        end
-        if not opened then error("进入会话失败：标题未匹配 " .. name) end
+        local head = string.format("searched: %s (%s)", name,
+            b.enter and "enter" or string.format("%q @ %d,%d", norm(b.text),
+                math.floor(b.cx), math.floor(b.cy)))
+        local how = open_hit(b, name)
         do_send(text, text)
         leave(bg)
-        return head .. "\nopened: " .. name .. "\nsent: " .. text .. " (bubble_seen=true)"
+        return head .. "\nopened: " .. name .. " (" .. tostring(how) .. ")"
+            .. "\nsent: " .. text .. " (bubble_seen=true)"
     end
     error("未知 action: " .. tostring(action) .. "（run|search|open|send|sendfile）")
 end
