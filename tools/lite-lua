@@ -48,16 +48,21 @@ esac
 export LITE_SUPERVISED=1
 LITE_REBOOT_MAX="${LITE_REBOOT_MAX:-3}"
 reboot_args=("$@")
+# 链计数只活在这个 wrapper 进程里，**绝不 export**：export 会漏给 lite 的所有子进程
+# （bash 工具、test.sh、helper 插件），带 `LITE_REBOOT_CHAIN` 起来的下次 lite 就从
+# 中间开始数，链上限提前触发（`reboot chain stops after LITE_REBOOT_MAX restarts`
+# 真这么红过）。计数不需要环境变量跨进程 —— 循环就在同一个 shell 进程里。
+reboot_chain=0
 while :; do
     rc=0
+    unset LITE_REBOOT_CHAIN
     "$LUA" -e "$PRELUDE" ${reboot_args[@]+"${reboot_args[@]}"} || rc=$?
     if [ "$rc" -ne 75 ]; then exit "$rc"; fi
-    chain=$(( ${LITE_REBOOT_CHAIN:-0} + 1 ))
-    if [ "$chain" -gt "$LITE_REBOOT_MAX" ]; then
+    reboot_chain=$(( reboot_chain + 1 ))
+    if [ "$reboot_chain" -gt "$LITE_REBOOT_MAX" ]; then
         echo "lite: reboot chain limit reached ($LITE_REBOOT_MAX)" >&2
         exit 1
     fi
-    export LITE_REBOOT_CHAIN="$chain"
     # 新进程带 --reboot 起来 → 输入框自动填「重启成功，继续工作。」再提交。
     case " ${reboot_args[*]} " in
         *" --reboot "*) ;;

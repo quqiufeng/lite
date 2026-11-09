@@ -125,6 +125,17 @@ Chrome/WebView/CEF/Electron；不起 `xdotool/wmctrl/import`；不用 `systemd -
 反应是「写一个」，不是「等重启」或「做不到」。范例：`rg` 没装 → `helper/cgrep.c`
 （pthread + regex，59 个 lua 文件 1ms）→ `helper/cgrep.lua` 包一层 → 当场调用。
 
+**要清单里看见，就走 `/reboot`** —— 自动重启，自我进化的收尾动作。`reboot` 工具或 TUI
+`/reboot` 只置标记，本轮（含排队消息）收完才动：退出码 75 → `tools/lite-lua` 监督循环
+拉起全新进程（裸跑退化成 `execv`）。会话/记忆/todo 都在盘上，**历史不丢**；新进程带
+`--reboot` 起来**自动发「重启成功，继续工作。」**，模型接着上一轮往下干，插件清单与
+`.so` 全部重扫 —— 刚写的 `helper/<x>.lua` 下一轮就带 schema 出现在 API `tools` 里。
+于是自造工具的完整闭环是：`native build` / `write` → 按名调用验一遍 → `reboot` → 清单可见。
+代价只有一次重读盘 + 重建前缀缓存；连续重启有链上限（`LITE_REBOOT_MAX`，默认 3），
+计数只活在 wrapper 进程里、不 export（漏给 bash 工具/测试会让下个 lite 从中间数起）。
+`shutdown` 才是真停（不自动接续）；serve/attach 只认 JSONL 请求、不跑斜杠命令，
+外部客户端要重启就自己 kill 再拉。
+
 **选路优先级（从省力到费劲，别跳级）**：
 
 1. **系统已有 `.so`** → 直接 `ffi.cdef` + `ffi.load`，**一个 `helper/<x>.lua` 就完事**（零编译、
@@ -165,7 +176,7 @@ wrapper 返回 `{ run=function(args,env) ... end }`；重新 build 生成新 `.s
 | 改已存在插件的 `run` | 立刻，下次调用 |
 | 新建 `helper/x.lua` / `native wrap` | 立刻，**按名调用即可**（模型看不见描述，由 `native` 输出/你点名） |
 | `native build` 出新 `.so` | 立刻，下次调用换新句柄 |
-| 想让新工具**出现在 API 清单** | 新会话（或 system prompt 里点名） |
+| 想让新工具**出现在 API 清单** | `/reboot`（会话接续、历史不丢）或新会话 |
 | 删插件 | 立刻不可调用；清单里残留的 schema 会报 `helper not found` |
 
 所以「不热插拔」只指工具清单，不是能力。要试新代码而不想动进程，走 `lua` 工具（进程外

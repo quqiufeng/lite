@@ -11,7 +11,7 @@
 | 缓存优先 | system prompt 字节稳定；时钟/轮次拼在消息尾部；召回块只在每轮首次请求追加到**最末尾** | 前缀命中 ~97%，计费 miss 少 72% |
 | 有界上下文 | 默认**丢弃优先**：超线从最新往回装，更老整条丢，缺什么 `recall` 召回 | 长会话不用摘要也不炸；`LITE_COMPACT=1` 才回到「先摘要」 |
 | 本地记忆 | 每个目录一份 `mem.bin`（C + mmap 零拷贝），旧轮次不进 prompt | 丢了能查回来，跨会话、跨迭代 |
-| 无框架依赖 | 工具就是 Lua 表；系统 `.so` 直接 FFI；缺能力自己编译 | 加能力不引运行时，也不重启进程 |
+| 无框架依赖 | 工具就是 Lua 表；系统 `.so` 直接 FFI；缺能力自己编译；`/reboot` 自动重启拿新工具 | 加能力不引运行时；重启换新进程但会话/记忆不丢 |
 
 ## 快速开始
 
@@ -20,7 +20,7 @@
 ./tools/release.sh            # 构建 + 打包 + 安装（源码安装把 lua/ 软链过来，改完重启即生效）
 export DEEPSEEK_API_KEY=...   # 或写进 .env / ~/.config/lite/.env
 
-./tools/run.sh --tui                          # 交互 TUI（Ctrl+G 看 git diff，/session 选会话）
+./tools/run.sh --tui                          # TUI：Ctrl+G 看 diff，/session 选会话，/reboot 自动重启
 ./tools/run.sh --tui --thinking --reasoning-effort high
 ./tools/run.sh --once --json "解释这个项目"    # 无 UI 一轮，JSONL 事件
 ./tools/run.sh --recall "关键词"               # 查当前目录的本地记忆
