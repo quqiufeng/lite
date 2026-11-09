@@ -456,7 +456,7 @@ static int is_noise_dir(const char* name) {
     static const char* noise[] = {
         "thirdparty", "3rdparty", "third_party", "third-party",
         "external", "deps", "dependencies", "vendor",
-        "build", "cmake-build", "CMakeFiles", "out", "obj",
+        "build", "cmake-build", "CMakeFiles", "out", "obj", "dist",
         "test", "tests", "testing", "gtest", "googletest",
         "examples", "demo", "demos", "sample", "samples",
         "docs", "doc", "documentation", "website",
@@ -673,14 +673,33 @@ static int path_has_ext(const char* path, const char* ext) {
 // ctags 的 Lua parser 只认 `function` 这个词，字符串里出现也会当定义：
 // `type = "function",`、`tc["function"]`、`~= "function"` 都会产出垃圾 tag
 // （tag 名变成 type / fn / ~）。只保留 pattern 里"带引号之外"的 function。
+// 另外匿名函数（`pcall(function()`）也会产 tag，ctags 拿前面的标识符当名字：
+// `local okf, fn = pcall(function()` → tag 名 `fn`，`then pcall(function()` → `~`。
+// 判据：function 左边（跳过空白）是 `(` 或 `,` 就是传参的匿名函数，名字不可信，跳过。
+// 只看 function 前后是不是引号不够：`"must return { run = function(args) }"` 里
+// function 两侧都是空格/花括号，仍在字符串内。所以逐字符走一遍，跟踪引号状态
+// （含 `\"` 转义），只在字符串外认 function。
 static int lua_tag_is_definition(const char* tagline) {
     char pat[1024];
     if (json_extract_str(tagline, "pattern", pat, sizeof(pat)) <= 0) return 1;
-    for (const char* p = pat; (p = strstr(p, "function")) != NULL; p += 8) {
-        char prev = (p == pat) ? ' ' : p[-1];
-        char next = p[8];
-        if (prev == '"' || prev == '\'' || next == '"' || next == '\'') continue;
-        return 1;
+    char quote = 0;
+    for (size_t i = 0; pat[i]; i++) {
+        char c = pat[i];
+        if (quote) {                                        // 字符串内
+            if (c == '\\' && pat[i + 1]) { i++; continue; }
+            if (c == quote) quote = 0;
+            continue;
+        }
+        if (c == '"' || c == '\'') { quote = c; continue; }
+        if (strncmp(pat + i, "function", 8) != 0) continue;
+        char next = pat[i + 8];
+        if ((next >= 'a' && next <= 'z') || (next >= 'A' && next <= 'Z') ||
+            (next >= '0' && next <= '9') || next == '_') continue;  // functionality 之类
+        const char* b = pat + i;
+        while (b > pat && (b[-1] == ' ' || b[-1] == '\t')) b--;
+        char prev = (b == pat) ? ' ' : b[-1];
+        if (prev == '(' || prev == ',') continue;           // 传参的匿名函数
+        return 1;                                           // 字符串外的真定义
     }
     return 0;
 }
