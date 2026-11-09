@@ -169,6 +169,14 @@ return {
       y0 = 105,
       y1 = 400,
     },
+    contacts = {
+      note = "左侧栏第 2 个图标「通讯录」；搜索前必须先点它，否则搜索框点不进焦点（粘贴落在空处）",
+      static = true,
+      x0 = 26,
+      x1 = 60,
+      y0 = 162,
+      y1 = 196,
+    },
     filecancel = {
       note = "选择框右下「取消」按钮",
       static = true,
@@ -218,7 +226,7 @@ return {
       y1 = 1040,
     },
     search = {
-      note = "左栏顶部搜索框（标题栏下方，需真实点击而非 ctrl+f）",
+      note = "左栏顶部搜索框（标题栏下方，需真实点击而非 ctrl+f；先点 contacts 再点这里）",
       static = true,
       x0 = 90,
       x1 = 486,

@@ -8,7 +8,7 @@ if not pcall(ffi.cdef, "void usleep(unsigned int);") then end
 
 -- 坐标 100% 来自 helper/lib/app_wechat_map.lua（产物，由 helper/lib/apps/wechat.lua 生成）。
 -- 本文件不含任何屏幕坐标：map 缺失或缺 region 时直接报错，不给写死的兜底值。
-local MAP_REQUIRED = { "titlebar", "search", "title", "candidates", "input", "bubble" }
+local MAP_REQUIRED = { "titlebar", "contacts", "search", "title", "candidates", "input", "bubble" }
 
 local function map_candidates()
     local here = (debug.getinfo(1, "S") or {}).source or ""
@@ -198,11 +198,21 @@ end
 local function do_search(name, index)
     ensure()
     click(point("titlebar"))                   -- 关键：ctrl+f 无效，必须先点标题栏
+    -- 关键二：搜索框在「聊天」页拿不到焦点，粘贴会掉到空处（候选面板全空）。
+    -- 先点左侧栏「通讯录」，再点搜索框才生效。
+    click(point("contacts")); sleep(500)
     click(point("search"))
     key("ctrl+a"); key("BackSpace")
-    paste(name); sleep(600)
+    paste(name)
 
-    local boxes, text = ocr_area("candidates", crop("candidates"))
+    -- 下拉候选面板是异步渲染的：固定 sleep 撞运气会 OCR 到空面板 → 走 blind 盲点分支。
+    -- 这里等「面板真的有字」再解析，最多 ~3s；OCR 全程不可用时仍会退回 blind。
+    local boxes, text = {}, ""
+    for _ = 1, 10 do
+        sleep(300)
+        boxes, text = ocr_area("candidates", crop("candidates"))
+        if norm(text) ~= "" then break end
+    end
     local want, k = {}, tonumber(index) or 1
     for _, b in ipairs(boxes) do
         if sim(b.text, name) >= D.min_sim and norm(b.text) ~= "" then want[#want + 1] = b end
