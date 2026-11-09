@@ -13,8 +13,9 @@ libonig.a               # Oniguruma（tokenizers 正则）
 
 ## 需要重新构建时
 
-仓库**不携带** tokenizers-cpp 源码（上游源码 + sentencepiece/msgpack 子模块约 60MB）。
-用脚本按固定 commit 拉取并构建：
+源码已随仓库放在 `third_party/codesearch/tokenizers-cpp/`
+（上游 + sentencepiece/msgpack 子模块，固定 commit 见其 `SOURCE.txt`）。
+重新构建：
 
 ```bash
 ./third_party/codesearch/tools/build-tokenizers.sh
@@ -22,32 +23,27 @@ libonig.a               # Oniguruma（tokenizers 正则）
 
 要求：
 
-- `git`、`cmake >= 3.19`、C++17 编译器
+- `cmake >= 3.19`、C++17 编译器
 - `Rust` / `cargo`（tokenizers 核心）
-- 能访问 `https://github.com/mlc-ai/tokenizers-cpp`
 - 可选 `JOBS=N` 控制并行度
+- `git` 只在用外部源码时才需要
 
 脚本行为：
 
-1. clone 到 `third_party/codesearch/.build/tokenizers-cpp`（已 gitignore）
-2. checkout 固定 commit + 初始化 sentencepiece/msgpack 子模块
-3. `cmake -DCMAKE_BUILD_TYPE=Release` 构建
-4. 把 4 个 `.a` 复制回本目录，头文件复制到
+1. 默认使用仓库内 `third_party/codesearch/tokenizers-cpp/`
+2. 在 `third_party/codesearch/.build/tokenizers-build/` 做 out-of-tree CMake 构建
+3. 把 4 个 `.a` 复制回本目录，头文件复制到
    `third_party/codesearch/include/tokenizers-cpp/`
-5. 写 `SOURCE.txt` 记录上游 commit / 构建时间
+4. 写 `SOURCE.txt` 记录上游 commit / 构建时间
 
-已有源码副本时：
+用外部源码副本（不修改仓库内源码）：
 
 ```bash
 TOKENIZERS_CPP_SRC=/path/to/tokenizers-cpp \
   ./third_party/codesearch/tools/build-tokenizers.sh
 ```
 
-换 commit：
-
-```bash
-TOKENIZERS_CPP_REV=<sha> ./third_party/codesearch/tools/build-tokenizers.sh
-```
+`TOKENIZERS_CPP_REV` 只对“外部源码不存在、脚本临时 clone”的路径生效。
 
 构建完重新编译 lite：
 

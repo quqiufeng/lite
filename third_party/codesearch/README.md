@@ -15,13 +15,14 @@
 | `lib/tokenizers-cpp/libsentencepiece.a` | 同上 | SentencePiece |
 | `lib/tokenizers-cpp/libonig.a` | 同上 | Oniguruma（tokenizers 正则） |
 | `lib/tokenizers-cpp/LICENSE` | tokenizers-cpp | 上游许可证 |
-| `tools/build-tokenizers.sh` | 本仓库脚本 | 按固定 commit 拉源码并重建上述 `.a` |
+| `tokenizers-cpp/` | 上游固定 commit | 完整源码 + sentencepiece/msgpack 子模块（可离线重建） |
+| `tools/build-tokenizers.sh` | 本仓库脚本 | 从仓库内源码重建上述 `.a` |
 | `plugins/typescript-indexer/` | `/opt/my_db/plugins/typescript-indexer/` | tree-sitter TS/JS 切块插件；二进制已预编译，`plugin.json` 用相对 `command` |
 
 这些 `.a` 在链接时被静态并入 `build/liblite_codesearch.so`，所以**运行时不需要**
 `third_party/codesearch/lib/`，也不需要 `/opt/my_db`；保留它们只是为了重新构建。
-普通构建直接用预编译 `.a`，**不需要 tokenizers 源码**；要升级/换架构时运行
-`tools/build-tokenizers.sh`（脚本会临时 clone 上游源码到被 gitignore 的 `.build/`）。
+普通构建直接用预编译 `.a`；要升级/换架构时运行 `tools/build-tokenizers.sh`，
+默认从仓库内 `tokenizers-cpp/` 源码做 out-of-tree 构建（`.build/` 已 gitignore）。
 
 ## 不在这里的依赖
 
@@ -36,8 +37,7 @@
 ## 更新
 
 - tokenizers 静态库：`./third_party/codesearch/tools/build-tokenizers.sh`
-  （可 `TOKENIZERS_CPP_SRC=已 clone 的源码` / `TOKENIZERS_CPP_REV=<sha>`），
-  完成后重新 `./tools/build.sh`。
+  （默认用仓库内源码；也可 `TOKENIZERS_CPP_SRC=外部源码`），完成后重新 `./tools/build.sh`。
 - TypeScript 插件：在 `plugins/typescript-indexer/` 下 `make`（需要
   `/opt/tree-sitter` 与 `/opt/tree-sitter-typescript`），或直接替换
   `bin/typescript-indexer`。

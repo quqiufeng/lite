@@ -1,0 +1,4 @@
+upstream: https://github.com/mlc-ai/tokenizers-cpp
+commit: c586c52f93f7b060753bd2388eb96a105cb7374d
+vendored: 2026-11-09
+note: submodule sources for msgpack and sentencepiece are included in-tree.
