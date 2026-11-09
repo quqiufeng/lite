@@ -72,7 +72,13 @@ if not LIB then
 end
 
 local MODELS = env("LITE_OCR_MODELS")
-if not MODELS then
+if MODELS then
+    -- 环境变量是目录，人写的时候几乎不会带尾斜杠（`/data/models/ocr`），
+    -- 而下面拼的是 MODELS .. "ch_PP-OCRv4_det_infer.onnx" → 会拼成
+    -- `/data/models/ocrch_PP-OCRv4_det_infer.onnx`，于是 ready() 报三个模型
+    -- 全缺、插件里的 OCR 静默返回空（微信搜索退化成 blind 盲点）。统一归一化。
+    MODELS = MODELS:gsub("/+$", "") .. "/"
+else
     MODELS = first_file(under({
         "/models/ocr/ch_PP-OCRv4_det_infer.onnx",
         "/third_party/ocr/models/ocr/ch_PP-OCRv4_det_infer.onnx",
