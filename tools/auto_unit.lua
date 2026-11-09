@@ -2007,6 +2007,50 @@ return {
     os.execute("rm -rf " .. shq(dir))
 end
 
+-- reboot 工具：只置标记，真正的 execv 在 lua/main.lua（进不了单测）；这里管住
+-- 「工具在清单里」「调用后 ctx.settings.reboot 为 true」「返回值讲清后续动作」。
+do
+    local dir = os.tmpname()
+    os.remove(dir)
+    os.execute("mkdir -p " .. shq(dir))
+    local Tools = require("core.tools")
+    local ctx = { settings = {}, session = { id = "t", cwd = dir } }
+    local t = Tools.new({ cwd = dir, ctx = ctx })
+    local listed = {}
+    for _, s in ipairs(t:schemas()) do listed[s["function"].name] = s end
+    check(listed.reboot ~= nil, "reboot tool is listed")
+    check(listed.reboot["function"].parameters.type == "object", "reboot schema is an object")
+    check(ctx.settings.reboot == nil, "no reboot flag before the call")
+    local out = t:execute("reboot", {})
+    check(ctx.settings.reboot == true, "reboot sets ctx.settings.reboot")
+    check(out:find("--reboot", 1, true) ~= nil, "reboot explains the --reboot relaunch")
+    check(out:find("重启成功", 1, true) ~= nil, "reboot names the auto-sent prompt")
+    os.execute("rm -rf " .. shq(dir))
+end
+
+-- shutdown 工具：与 reboot 同形，但只置 exit 标记，main.lua 里 exit 压过 reboot
+-- （不 execv，直接 os.exit(0)）。这里管住清单、标记、返回值语义三件事。
+do
+    local dir = os.tmpname()
+    os.remove(dir)
+    os.execute("mkdir -p " .. shq(dir))
+    local Tools = require("core.tools")
+    local ctx = { settings = {}, session = { id = "t", cwd = dir } }
+    local t = Tools.new({ cwd = dir, ctx = ctx })
+    local listed = {}
+    for _, s in ipairs(t:schemas()) do listed[s["function"].name] = s end
+    check(listed.shutdown ~= nil, "shutdown tool is listed")
+    check(listed.shutdown["function"].parameters.type == "object",
+        "shutdown schema is an object")
+    check(ctx.settings.exit == nil, "no exit flag before the call")
+    local out = t:execute("shutdown", {})
+    check(ctx.settings.exit == true, "shutdown sets ctx.settings.exit")
+    check(ctx.settings.reboot == nil, "shutdown does not set the reboot flag")
+    check(out:find("exit", 1, true) ~= nil, "shutdown says the process exits")
+    check(out:find("no auto-resume", 1, true) ~= nil, "shutdown contrasts with reboot")
+    os.execute("rm -rf " .. shq(dir))
+end
+
 -- plugin report: helper 隐式加载，坏了也要有个地方看
 do
     local dir = os.tmpname()
@@ -2310,6 +2354,31 @@ do
     check(shrun(shq(lroot .. "/tools/lite-lua") .. " -e "
         .. shq('print((os.getenv("LITE_PRELOAD") or "") == "" and "clean" or "dirty")')) == "clean",
         "lite-lua stays clean without plugin flag")
+
+    -- 自重启走「退出码 75 + wrapper 拉起新进程」：lite 自己是前台终端持有者，
+    -- fork 出子进程再自杀会让子进程 read(0) 拿到 EOF，所以换进程这件事必须由
+    -- 一直待在原地的 wrapper 干。这里喂假 lite 验收：75 后带 --reboot 重跑一次，
+    -- 一直 75 则在 LITE_REBOOT_MAX 处刹住（防模型无限自我重启）。
+    local cfile = dir .. "/reboot_once.count"
+    put(dir .. "/reboot_once.lua",
+        'local n = 1\n'
+        .. 'local f = io.open(' .. string.format("%q", cfile) .. ', "r")\n'
+        .. 'if f then n = (tonumber(f:read("*a")) or 0) + 1 f:close() end\n'
+        .. 'f = io.open(' .. string.format("%q", cfile) .. ', "w") f:write(n) f:close()\n'
+        .. 'io.write("run " .. n .. " args: " .. table.concat(arg, " ", 1, #arg) .. "\\n")\n'
+        .. 'if n < 2 then os.exit(75) end\n')
+    check(shrun(shq(lroot .. "/tools/lite-lua") .. " "
+        .. shq(dir .. "/reboot_once.lua") .. " hello")
+        :find("run 2 args: hello --reboot", 1, true) ~= nil,
+        "lite-lua relaunches with --reboot on exit 75")
+    put(dir .. "/reboot_forever.lua", 'io.write("run\\n")\nos.exit(75)\n')
+    local rtxt = shrun("{ " .. shq(lroot .. "/tools/lite-lua") .. " "
+        .. shq(dir .. "/reboot_forever.lua") .. "; echo rc=$?; }")
+    local runs = 0
+    for _ in rtxt:gmatch("run\n") do runs = runs + 1 end
+    check(runs == 4, "reboot chain stops after LITE_REBOOT_MAX restarts")
+    check(rtxt:find("reboot chain limit reached", 1, true) ~= nil
+        and rtxt:find("rc=1", 1, true) ~= nil, "reboot chain limit is reported")
 
     os.execute("rm -rf " .. shq(dir))
 end

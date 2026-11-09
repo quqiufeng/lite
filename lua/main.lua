@@ -17,6 +17,7 @@ lite — DeepSeek 终端 coding agent
   lite attach --port 8765      连接服务端并显示 TUI
   lite attach --port 8765 --tmux  在新 tmux 窗口 attach
   lite --tui --snapshot out.txt   输出整屏快照（AI 验收）
+  lite --reboot                重启后自动继续：起来就把「重启成功，继续工作。」发出去
   lite state [--json]          输出会话/记忆/todo 状态
   lite sessions [--json]       列出同 cwd 会话
   lite plugins [--json]        列出 helper/ 插件与加载错误
@@ -33,6 +34,7 @@ lite — DeepSeek 终端 coding agent
   --sandbox                    bash 使用 bwrap 沙箱（需安装 bubblewrap）
   --approval auto|ask|deny     工具审批策略（默认 auto）
   --no-plugins                 禁用 helper/ 插件与 hook（默认启用）
+  --reboot                     重启后自动继续（见用法里那条）
   --max-turns N                单次任务工具循环上限（默认 256）
   --debug                      开启调试日志（默认 $TMPDIR/lite-debug.jsonl）
   --debug-log PATH             写 JSONL 调试日志（provider/HTTP）
@@ -146,6 +148,9 @@ local function parse_flags(list)
         elseif a == "--reasoning-effort" then
             flags.reasoning_effort = list[i + 1]
             i = i + 2
+        elseif a == "--reboot" then
+            flags.reboot = true
+            i = i + 1
         elseif a == "--no-plugins" then
             flags.no_plugins = true
             i = i + 1
@@ -170,6 +175,60 @@ local function parse_flags(list)
         end
     end
     return flags, pos
+end
+
+-- 自重启的兜底路径：execv 原地换进程（进程还是同一个，只换镜像）。
+-- 正常走的是 main.lua 末尾那条「退出码 75 → tools/lite-lua 监督循环拉起新进程」，
+-- 只有裸跑（`luajit lua/main.lua`、不经 wrapper 的安装部署）才落到这里。终端、
+-- 工作目录、会话 id 全部保留，只有代码/插件清单重新加载（`native build` 出的
+-- 新 .so、新建的 helper/*.lua 都能上桌）。
+--
+-- argv 直接从 `arg` 表还原：`arg[-1]` 是最靠近脚本的那一项，`arg[-2..]` 往前是
+-- 它的选项（外层包装脚本 tools/lite-lua 会塞 `-e <prelude>`），`arg[0]` 是脚本，
+-- `arg[1..]` 是 lite 自己的参数。所以无论从 run.sh / lite-lua / 裸 luajit 启动
+-- 都能原样重启。`LITE_REBOOT_CHAIN` 计数防止模型无限自我重启。
+local REBOOT_MAX = 3
+
+local function exec_self(extra)
+    local ffi = require("ffi")
+    pcall(ffi.cdef, [[
+        int execv(const char *path, char *const argv[]);
+        int setenv(const char *name, const char *value, int overwrite);
+    ]])
+    local path = arg[-1]
+    if not path then return false, "cannot locate interpreter (arg[-1])" end
+    local chain = tonumber(os.getenv("LITE_REBOOT_CHAIN")) or 0
+    if chain >= REBOOT_MAX then
+        return false, string.format("reboot chain limit reached (%d)", REBOOT_MAX)
+    end
+
+    local keep, argv = {}, {}
+    local function push(s)
+        local c = ffi.cast("char *", tostring(s))
+        keep[#keep + 1] = c
+        argv[#argv + 1] = c
+    end
+    -- 解释器调用前缀：arg[-1] 是最靠近脚本的那一项（多 -e 时是最后一个 chunk），
+    -- 往前依次是它的选项、最右端才是解释器本体 —— 倒序抄回去正好是命令行原序。
+    local prefix, i = {}, -1
+    while arg[i] do prefix[#prefix + 1] = arg[i]; i = i - 1 end
+    for j = #prefix, 1, -1 do push(prefix[j]) end
+    push(arg[0] or "lua/main.lua")
+    local seen = false
+    for j = 1, #arg do
+        push(arg[j])
+        if arg[j] == "--reboot" then seen = true end
+    end
+    -- 新进程带 --reboot 起来 → 输入框自动填「重启成功，继续工作。」再提交。
+    if not seen then push("--reboot") end
+
+    local arr = ffi.new("char *[?]", #argv + 1)
+    for j = 1, #argv do arr[j - 1] = argv[j] end
+    ffi.C.setenv("LITE_REBOOT_CHAIN", tostring(chain + 1), 1)
+    io.stdout:flush()
+    io.stderr:flush()
+    ffi.C.execv(prefix[#prefix] or path, arr)
+    return false, "execv failed: " .. tostring(ffi.errno())
 end
 
 if cmd == "--version" then
@@ -481,13 +540,35 @@ elseif cmd == "--tui" or cmd == "--gui" then
     local ok, err = require("tui").run(ctx, agent, memory, {
         multi = multi,
         messages = restored,
+        reboot = flags.reboot,
     })
+    -- shutdown 工具置的 exit 压过 reboot：说了退出就不再 execv，直接 os.exit(0)。
+    local reboot = ctx.settings and ctx.settings.reboot and not ctx.settings.exit
     memory:close()
     http.multi_free(multi)
     if logger then logger:close() end
     if not ok then
         io.stderr:write("lite: " .. tostring(err) .. "\n")
         os.exit(1)
+    end
+    -- `/reboot` 或 reboot 工具置的标记：换一个全新进程，新进程带 --reboot 起来后
+    -- 自动重发「重启成功，继续工作。」，所以对话是连着的。
+    --
+    -- 默认路径是**退出码 75 + 父进程拉起**（tools/lite-lua 监督循环，它导出了
+    -- LITE_SUPERVISED=1）：新进程 = 新 Lua 状态，插件清单一类的东西全部重扫，
+    -- 而且出错时 tty 一直在 wrapper 手里。只有裸跑（`luajit lua/main.lua`、装了
+    -- 二进制但不经 wrapper）才退回原地 execv。
+    if reboot then
+        if os.getenv("LITE_SUPERVISED") == "1" then
+            io.stdout:flush()
+            io.stderr:flush()
+            os.exit(75)
+        end
+        local rok, rerr = exec_self()
+        if not rok then
+            io.stderr:write("lite: reboot failed: " .. tostring(rerr) .. "\n")
+            os.exit(1)
+        end
     end
     os.exit(0)
 elseif cmd == "--once" then

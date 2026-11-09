@@ -36,4 +36,31 @@ case "${1:-}" in
     -v|--version|-h|--help|-b) exec "$LUA" "$@" ;;
 esac
 
-exec "$LUA" -e "$PRELUDE" "$@"
+# 自重启（lite 的 /reboot、reboot 工具）：main.lua 以**退出码 75** 表示「换成
+# 全新进程」，这里当监督者重新拉起自己。选退出码 + 父进程，而不是让 lite 原地
+# execv / 自己 fork 再自杀：
+#   - execv 只换镜像，进程仍是同一个，旧 fds/线程/环境照旧；
+#   - 「lite 自己 fork 新进程然后退出」在终端里**不可行**：lite 是前台作业组
+#     成员，父进程一退 shell 立刻把 tty 收回，fork 出的子进程 read(0) 直接拿到
+#     EOF（tmux 里实测过，不是推测）。留在原地的必须是能一直持有终端的进程，
+#     也就是这个 wrapper。
+# 只认 75，其它退出码原样透传 —— 测试、--once、崩溃路径完全不受影响。
+export LITE_SUPERVISED=1
+LITE_REBOOT_MAX="${LITE_REBOOT_MAX:-3}"
+reboot_args=("$@")
+while :; do
+    rc=0
+    "$LUA" -e "$PRELUDE" ${reboot_args[@]+"${reboot_args[@]}"} || rc=$?
+    if [ "$rc" -ne 75 ]; then exit "$rc"; fi
+    chain=$(( ${LITE_REBOOT_CHAIN:-0} + 1 ))
+    if [ "$chain" -gt "$LITE_REBOOT_MAX" ]; then
+        echo "lite: reboot chain limit reached ($LITE_REBOOT_MAX)" >&2
+        exit 1
+    fi
+    export LITE_REBOOT_CHAIN="$chain"
+    # 新进程带 --reboot 起来 → 输入框自动填「重启成功，继续工作。」再提交。
+    case " ${reboot_args[*]} " in
+        *" --reboot "*) ;;
+        *) reboot_args+=(--reboot) ;;
+    esac
+done

@@ -22,6 +22,10 @@ local M = {}
 
 local SPINNER = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
 
+-- 重启后自动发的第一句。--reboot 的启动钩子会把它塞进输入框并提交，
+-- 于是模型带着同一份会话记忆继续干活（新进程只换了代码/插件清单）。
+local REBOOT_TEXT = "重启成功，继续工作。"
+
 local function shq(s)
     return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
 end
@@ -202,7 +206,17 @@ function M.run(ctx, agent, memory, opts)
                     transcript:add("info", "reload failed: " .. tostring(err))
                 end
             end
-        elseif name == "quit" then
+        elseif name == "reboot" then
+            -- 换进程（退出码 75 交给 tools/lite-lua 的监督循环拉起新进程，裸跑时才
+            -- 退回 main.lua 里的 execv）。会话/记忆都在盘上，重来不丢历史；换进程
+            -- 的意义是重扫插件清单与重载 .so，`native build` 的新工具才上桌。
+            if busy then
+                transcript:add("info", "无法重启：当前正在执行（先 Esc×2 终止）")
+            else
+                ctx.settings.reboot = true
+                quitting = true
+            end
+        elseif name == "quit" or name == "exit" or name == "shutdown" then
             quitting = true
         else
             transcript:add("info", "unknown command /" .. name)
@@ -683,6 +697,13 @@ function M.run(ctx, agent, memory, opts)
         Terminal.write(screen:render())
     end
 
+    -- --reboot：上一个进程把自己的重启请求落成这个参数。输入框里塞好句子再提交，
+    -- 跟人手打一句「重启成功，继续工作。」完全等价（进历史、进会话记忆）。
+    if opts.reboot then
+        composer:set_text(REBOOT_TEXT)
+        submit()
+    end
+
     while not quitting do
         local nw, nh = Terminal.size()
         if nw ~= w or nh ~= h then
@@ -750,6 +771,17 @@ function M.run(ctx, agent, memory, opts)
         end
 
         if memory then memory:tick() end
+
+        -- reboot/shutdown 工具在上一轮置的标记：等这轮（含排队消息）收完尾再动，
+        -- 否则排队里那句会丢。exit 优先——说了退出就不再换进程。
+        if not busy and not quitting and #queue == 0 then
+            if ctx.settings.exit then
+                quitting = true
+            elseif ctx.settings.reboot then
+                quitting = true
+            end
+        end
+
         local now = os.time()
         if now ~= last_stats then
             last_stats = now

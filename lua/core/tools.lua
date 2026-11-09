@@ -20,7 +20,7 @@ local READ_LINE_MAX = 2000
 local BUILTIN_TOOLS = {
     bash = true, web = true, read = true, resize = true, native = true,
     write = true, edit = true, remember = true, recall = true, todo = true,
-    lua = true,
+    lua = true, reboot = true, shutdown = true,
 }
 
 local function shq(s)
@@ -498,6 +498,33 @@ function M:schemas()
                     },
                     required = { "items" },
                 },
+            },
+        },
+        {
+            type = "function",
+            ["function"] = {
+                name = "reboot",
+                description = "Restart lite as a brand-new process (same terminal, same "
+                    .. "session) so tools frozen at startup reload: new helper/*.lua plugins "
+                    .. "and freshly built .so files appear in the tool list. Call it as the "
+                    .. "last action of a turn; the restarted process auto-sends "
+                    .. "\"重启成功，继续工作。\" and you continue with the same history. "
+                    .. "Write todo/remember first — anything only in context survives, but "
+                    .. "act as if the next turn starts fresh.",
+                parameters = { type = "object", properties = {} },
+            },
+        },
+        {
+            type = "function",
+            ["function"] = {
+                name = "shutdown",
+                description = "Exit the lite process for good (no restart, unlike reboot). "
+                    .. "The session, memory and todo stay on disk and `lite` resumes them "
+                    .. "next time; only this process ends. Call it as the last action of a "
+                    .. "turn, after writing anything the task still needs into todo/remember. "
+                    .. "Use it when the work is done or when the user asked to stop — not as "
+                    .. "a way to escape a failing tool.",
+                parameters = { type = "object", properties = {} },
             },
         },
     }
@@ -1735,6 +1762,17 @@ function M:execute(name, args)
         elseif name == "todo" then
             if not self.todos then return "error: todo disabled" end
             return self.todos:set(args.items)
+        elseif name == "reboot" then
+            if not self.ctx or not self.ctx.settings then return "error: no ctx" end
+            self.ctx.settings.reboot = true
+            return "reboot requested: lite will restart as a fresh process with --reboot after "
+                .. "this turn and auto-send \"重启成功，继续工作。\". New helper plugins and "
+                .. "rebuilt .so files will be in the tool list then."
+        elseif name == "shutdown" then
+            if not self.ctx or not self.ctx.settings then return "error: no ctx" end
+            self.ctx.settings.exit = true
+            return "shutdown requested: lite will exit after this turn. Session, memory "
+                .. "and todo stay on disk; no auto-resume (unlike reboot)."
         end
         local helper_out = self:_run_helper_tool(name, args)
         if helper_out ~= nil then return helper_out end
