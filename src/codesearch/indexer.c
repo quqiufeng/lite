@@ -665,6 +665,70 @@ static int find_end_line(const char* filepath, int start_line) {
     return current_line;
 }
 
+static int path_has_ext(const char* path, const char* ext) {
+    size_t lp = strlen(path), le = strlen(ext);
+    return lp > le && strcmp(path + lp - le, ext) == 0;
+}
+
+// ctags 的 Lua parser 只认 `function` 这个词，字符串里出现也会当定义：
+// `type = "function",`、`tc["function"]`、`~= "function"` 都会产出垃圾 tag
+// （tag 名变成 type / fn / ~）。只保留 pattern 里"带引号之外"的 function。
+static int lua_tag_is_definition(const char* tagline) {
+    char pat[1024];
+    if (json_extract_str(tagline, "pattern", pat, sizeof(pat)) <= 0) return 1;
+    for (const char* p = pat; (p = strstr(p, "function")) != NULL; p += 8) {
+        char prev = (p == pat) ? ' ' : p[-1];
+        char next = p[8];
+        if (prev == '"' || prev == '\'' || next == '"' || next == '\'') continue;
+        return 1;
+    }
+    return 0;
+}
+
+// `.lua` 没有花括号：按块关键字算深度（function/if/do/repeat ↔ end/until）。
+// ctags 的 Lua parser 不吐 end 字段，走 find_end_line（只认 `{`）要么退化成
+// 单行空 chunk、要么把下一个函数的 `{ 0 }` 当成函数体，整个 Lua 语料在语义
+// 检索里等于不存在（lite 自己就是 Lua 仓库，所以这条不能省）。
+static int find_end_line_lua(const char* filepath, int start_line) {
+    FILE* fp = fopen(filepath, "r");
+    if (!fp) return 0;
+    int line_no = 0, depth = 0, found = 0, last = 0;
+    char line[4096];
+    while (fgets(line, sizeof(line), fp)) {
+        line_no++;
+        if (line_no < start_line) continue;
+        last = line_no;
+        if (line_no > start_line + 1000) break;
+        for (const char* p = line; *p; ) {
+            if (p[0] == '-' && p[1] == '-') break;                 // 行注释
+            if (*p == '"' || *p == '\'') {                          // 字符串
+                char q = *p++;
+                while (*p && *p != q) { if (*p == '\\' && p[1]) p++; p++; }
+                if (*p) p++;
+                continue;
+            }
+            if (isalpha((unsigned char)*p) || *p == '_') {
+                char w[16];
+                int n = 0;
+                const char* q = p;
+                while ((isalnum((unsigned char)*q) || *q == '_') && n < 15) w[n++] = *q++;
+                w[n] = '\0';
+                p = q;
+                // for/while 的 `do` 就算一个开口，不能把 for/while 也数进去
+                if (!strcmp(w, "function") || !strcmp(w, "if") ||
+                    !strcmp(w, "do") || !strcmp(w, "repeat")) { depth++; found = 1; }
+                else if (!strcmp(w, "end") || !strcmp(w, "until")) { if (depth > 0) depth--; }
+                continue;
+            }
+            p++;
+        }
+        if (found && depth == 0) { fclose(fp); return line_no; }
+        if (!found && line_no > start_line + 5) break;
+    }
+    fclose(fp);
+    return found ? last : 0;
+}
+
 static int extract_content_fp(FILE* fp, int start_line, int end_line, 
                                 char* out, int max_len) {
     if (!fp) return 0;
@@ -973,6 +1037,9 @@ static int worker_process(worker_t* worker, int worker_id) {
 
                     if (!name[0] || !filepath[0] || !line_num) continue;
                     if (kind_is_skipped(kind)) continue;
+                    // ctags 的 Lua parser 会把字符串里的 "function" 当定义：`type = "function",`
+                    // 会产出名为 type/fn/~ 的垃圾 tag（lite 自己就有 199 个）。只认裸 function。
+                    if (path_has_ext(filepath, ".lua") && !lua_tag_is_definition(line)) continue;
 
                     if (filepath[0] == '/') {
                         strncpy(fullpath, filepath, sizeof(fullpath) - 1);
@@ -981,18 +1048,26 @@ static int worker_process(worker_t* worker, int worker_id) {
                         snprintf(fullpath, sizeof(fullpath), "%s/%s", worker->repo_path, filepath);
                     }
                     const char* lang = detect_language(filepath);
+                    int is_lua = path_has_ext(fullpath, ".lua");
 
                     content[0] = '\0';
 
                     if (needs_range(kind)) {
                         if (end_line <= line_num) {
                             if (current_fp) { fclose(current_fp); current_fp = NULL; current_file[0] = '\0'; }
-                            if (file_buffer) { free(file_buffer); file_buffer = NULL; }
-                            if (file_lines) { free(file_lines); file_lines = NULL; }
-                            end_line = find_end_line(fullpath, line_num);
+                            // 不要在这里 free file_buffer/file_lines：它们是本文件的缓存，
+                            // current_file 仍指向同一文件，下一次不会重读 → 指针变空，
+                            // 该文件后续所有 tag 的 content 都会是空的（Lua 无 `end` 字段，
+                            // 每个 tag 都会走到这里，整份文件除第一个函数外全空）。
+                            if (is_lua)
+                                end_line = find_end_line_lua(fullpath, line_num);
+                            else
+                                end_line = find_end_line(fullpath, line_num);
                             if (end_line == 0) end_line = line_num;
                         }
-                        if (end_line > line_num) {
+                        // Lua 单行定义（`function M.x() end` / `M.sync = function() end`）
+                        // end_line == line_num，仍要把这一行当 content，否则检索看不见它。
+                        if (end_line > line_num || (is_lua && end_line == line_num)) {
                             if (strcmp(filepath, current_file) != 0) {
                                 if (current_fp) { fclose(current_fp); current_fp = NULL; }
                                 if (file_buffer) { free(file_buffer); file_buffer = NULL; }
