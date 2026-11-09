@@ -3,8 +3,52 @@ local M = {}
 
 local REPL = "\239\191\189"
 
+-- 合法 UTF-8 校验（与 sanitize 的接受规则逐条一致）。合法时零分配，
+-- 绝大多数请求直接命中这一步，避免逐字符 sub/建表。
+local function utf8_ok(s)
+    local i, n = 1, #s
+    while i <= n do
+        local b = s:byte(i)
+        if b < 0x80 then
+            i = i + 1
+        elseif b >= 0xC2 and b <= 0xDF then
+            local b2 = s:byte(i + 1)
+            if not (b2 and b2 >= 0x80 and b2 <= 0xBF) then return false end
+            i = i + 2
+        elseif b >= 0xE0 and b <= 0xEF then
+            local b2, b3 = s:byte(i + 1), s:byte(i + 2)
+            if not (b2 and b3 and b3 >= 0x80 and b3 <= 0xBF) then return false end
+            if b == 0xE0 then
+                if not (b2 >= 0xA0 and b2 <= 0xBF) then return false end
+            elseif b == 0xED then
+                if not (b2 >= 0x80 and b2 <= 0x9F) then return false end
+            elseif not (b2 >= 0x80 and b2 <= 0xBF) then
+                return false
+            end
+            i = i + 3
+        elseif b >= 0xF0 and b <= 0xF4 then
+            local b2, b3, b4 = s:byte(i + 1), s:byte(i + 2), s:byte(i + 3)
+            if not (b2 and b3 and b4
+                and b3 >= 0x80 and b3 <= 0xBF
+                and b4 >= 0x80 and b4 <= 0xBF) then return false end
+            if b == 0xF0 then
+                if not (b2 >= 0x90 and b2 <= 0xBF) then return false end
+            elseif b == 0xF4 then
+                if not (b2 >= 0x80 and b2 <= 0x8F) then return false end
+            elseif not (b2 >= 0x80 and b2 <= 0xBF) then
+                return false
+            end
+            i = i + 4
+        else
+            return false
+        end
+    end
+    return true
+end
+
 function M.sanitize(s)
     s = tostring(s or "")
+    if utf8_ok(s) then return s, 0 end
     local out, fixed = {}, 0
     local i = 1
     while i <= #s do

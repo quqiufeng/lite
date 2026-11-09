@@ -225,11 +225,15 @@ function M:append(msg)
     self.seq = self.seq + 1
     if self.memory then
         local ttl = self.memory.TTL and self.memory.TTL.long or 0
-        local meta = self.memory:session_meta(self.id)
+        local meta = self._meta
         if not meta then
-            -- 恢复失败时 seq 从 0 起，若不看 meta 就会从 msg/00000001 覆盖写，
-            -- 旧的 1367 条消息被最新几轮顶掉。meta 缺失则补建，存在则对齐 seq。
-            meta = self.memory:ensure_session(self.id)
+            meta = self.memory:session_meta(self.id)
+            if not meta then
+                -- 恢复失败时 seq 从 0 起，若不看 meta 就会从 msg/00000001 覆盖写，
+                -- 旧的 1367 条消息被最新几轮顶掉。meta 缺失则补建，存在则对齐 seq。
+                meta = self.memory:ensure_session(self.id)
+            end
+            self._meta = meta
         end
         local count = tonumber(meta and meta.messages) or 0
         if count > self.seq then self.seq = count + 1 end

@@ -185,12 +185,14 @@ end
 -- 这个兜底不是可选项：状态一丢，baseline 归零，下一次请求就会把整段历史
 -- 重新摘一遍 —— 每次请求多花一次摘要调用，比不压缩贵得多。
 function M:compact_state()
-    local st
-    if self.memory and self.memory.get then
+    -- 进程内状态就是最新值（save_compact_state 同步写这里），先用它，
+    -- 只有新进程/尚无状态时才回落到 KV，避免每个请求都 get+解码一次。
+    local st = self._compact_state
+    if type(st) ~= "table" and self.memory and self.memory.get then
         st = self.memory:get("/agent/session", state_key(self.ctx.session.id))
     end
-    if type(st) ~= "table" then st = self._compact_state end
-    if type(st) ~= "table" or type(st.baseline) ~= "number" then return nil end
+    if type(st) ~= "table" then return nil end
+    if type(st.baseline) ~= "number" then return nil end
     if type(st.digest) ~= "string" or st.digest == "" then return nil end
     if type(st.digest) == "string" and Compact.sanitize_digest then
         st.digest = Compact.sanitize_digest(st.digest)

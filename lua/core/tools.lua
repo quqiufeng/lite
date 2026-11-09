@@ -6,6 +6,29 @@ local Proc = require("core.proc")
 local Text = require("core.text")
 local http = require("core.http")
 
+-- 路径操作用 libc 直达：realpath/test -d 原先每次都 fork 两个 shell，
+-- agent 探索期一次几十次 resolve，代价明显。FFI 不可用时退回 popen。
+local ffi_ok, ffi = pcall(require, "ffi")
+local C = nil
+if ffi_ok then
+    local ok = pcall(ffi.cdef, [[
+        char *realpath(const char *path, char *resolved_path);
+        void free(void *ptr);
+        typedef struct __dirstream DIR;
+        DIR *opendir(const char *name);
+        int closedir(DIR *dirp);
+        struct dirent {
+            unsigned long d_ino;
+            long d_off;
+            unsigned short d_reclen;
+            unsigned char d_type;
+            char d_name[256];
+        };
+        struct dirent *readdir(DIR *dirp);
+    ]])
+    if ok then C = ffi.C end
+end
+
 local M = {}
 M.__index = M
 
@@ -72,12 +95,25 @@ local function file_size(path)
     return size
 end
 
-local function is_dir(path)
+local function is_dir_popen(path)
     local p = io.popen("test -d " .. shq(path) .. " && echo 1 || echo 0")
     if not p then return false end
     local s = p:read("*l")
     p:close()
     return s == "1"
+end
+
+local function is_dir(path)
+    if C then
+        local d = C.opendir(path)
+        if d ~= nil then
+            C.closedir(d)
+            return true
+        end
+        -- EACCES=13：目录存在但不可读，opendir 也会失败，别误判成文件。
+        if ffi.errno() ~= 13 then return false end
+    end
+    return is_dir_popen(path)
 end
 
 local function read_head(path, n)
@@ -200,13 +236,51 @@ local function normalize(path)
     return "/" .. table.concat(parts, "/")
 end
 
-local function realpath(path)
+local function realpath_popen(path)
     local p = io.popen("realpath -m " .. shq(path) .. " 2>/dev/null", "r")
     if not p then return nil end
     local s = p:read("*l")
     p:close()
     if not s or s == "" then return nil end
     return s
+end
+
+local function c_realpath(path)
+    local r = C.realpath(path, nil)
+    if r == nil then return nil end
+    local s = ffi.string(r)
+    C.free(r)
+    return s
+end
+
+-- 等价 `realpath -m`：先试整条路径；不存在就解析最长的已存在祖先，
+-- 再把剩余分量按字面拼回去（write/edit 的目标文件通常还不存在）。
+local function realpath_ffi(path)
+    local ok, r = pcall(c_realpath, path)
+    if ok and r then return r end
+    local tail = {}
+    local p = path
+    while #p > 1 do
+        local dir, base = p:match("^(.*)/([^/]+)$")
+        if not dir or base == "" then break end
+        table.insert(tail, 1, base)
+        p = dir
+        if p == "" then p = "/" end
+        local ok2, rr = pcall(c_realpath, p)
+        if ok2 and rr then
+            if #tail == 0 then return rr end
+            return (rr:gsub("/+$", "")) .. "/" .. table.concat(tail, "/")
+        end
+    end
+    return nil
+end
+
+local function realpath(path)
+    if C and path:sub(1, 1) == "/" then
+        local r = realpath_ffi(path)
+        if r then return r end
+    end
+    return realpath_popen(path)
 end
 
 function M.new(opts)
@@ -597,7 +671,7 @@ function M:bash(command)
     return truncate_mid(out, BASH_MAX_OUT)
 end
 
-local function read_dir(abs, offset, limit)
+local function read_dir_popen(abs, offset, limit)
     local p = io.popen("ls -1ap " .. shq(abs) .. " 2>&1", "r")
     if not p then return "error: cannot list directory: " .. abs end
     local items = {}
@@ -605,6 +679,37 @@ local function read_dir(abs, offset, limit)
         if line ~= "./" and line ~= "../" then items[#items + 1] = line end
     end
     p:close()
+
+    local first = math.max(1, tonumber(offset) or 1)
+    local lim = tonumber(limit) or READ_MAX_LINES
+    local out = {}
+    for i = first, math.min(#items, first + lim - 1) do
+        out[#out + 1] = items[i]
+    end
+    return table.concat(out, "\n") .. string.format("\n(%d entries)", #items)
+end
+
+local function read_dir(abs, offset, limit)
+    local items
+    if C then
+        local d = C.opendir(abs)
+        if d ~= nil then
+            items = {}
+            while true do
+                local ent = C.readdir(d)
+                if ent == nil then break end
+                local name = ffi.string(ent.d_name)
+                if name ~= "." and name ~= ".." then
+                    -- d_type: DT_DIR=4；DT_UNKNOWN=0 时按文件处理（不追 stat，避免额外 syscall）。
+                    if ent.d_type == 4 then name = name .. "/" end
+                    items[#items + 1] = name
+                end
+            end
+            C.closedir(d)
+            table.sort(items)
+        end
+    end
+    if not items then return read_dir_popen(abs, offset, limit) end
 
     local first = math.max(1, tonumber(offset) or 1)
     local lim = tonumber(limit) or READ_MAX_LINES
@@ -1685,13 +1790,19 @@ end
 
 -- 工具失败时把「原发参数」和「schema 必填项」一起回传，模型照着补就行，不用猜。
 function M:tool_spec(name)
-    local ok, list = pcall(function() return self:schemas() end)
-    if not ok or type(list) ~= "table" then return nil end
-    for _, s in ipairs(list) do
-        local fn = s["function"]
-        if fn and fn.name == name then return fn.parameters or {} end
+    local map = self._schema_map
+    if not map then
+        map = {}
+        local ok, list = pcall(function() return self:schemas() end)
+        if ok and type(list) == "table" then
+            for _, s in ipairs(list) do
+                local fn = s["function"]
+                if fn and fn.name then map[fn.name] = fn.parameters or {} end
+            end
+        end
+        self._schema_map = map
     end
-    return nil
+    return map[name]
 end
 
 function M:required_args(name)

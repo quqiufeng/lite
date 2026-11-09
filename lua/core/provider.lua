@@ -47,17 +47,21 @@ end
 -- 喂入任意片段，返回事件列表：{type="content", text=...}
 function M.feed(p, chunk)
     local events = {}
-    p.buf = p.buf .. chunk
+    -- 用绝对游标切行，只在末尾留未完成的一行；避免每行都 sub 一次导致的
+    -- O(lines²) 拷贝（一个 chunk 里塞几十行时非常明显）。
+    local data = p.buf .. chunk
+    local start = 1
 
     while true do
-        local nl = p.buf:find("\n", 1, true)
+        local nl = data:find("\n", start, true)
         if not nl then break end
-        local line = p.buf:sub(1, nl - 1)
-        p.buf = p.buf:sub(nl + 1)
+        local line = data:sub(start, nl - 1)
+        start = nl + 1
         line = line:gsub("\r$", "")
 
         if line == "data: [DONE]" then
             p.done = true
+            start = #data + 1
             break
         end
 
@@ -114,6 +118,7 @@ function M.feed(p, chunk)
             end
         end
     end
+    p.buf = data:sub(start)
     return events
 end
 
@@ -129,15 +134,56 @@ function M.finish(p)
     return msg
 end
 
+-- 合法历史（绝大多数）直接复用原表，不做逐条深拷贝；只有确实发现非法
+-- 字节时才走完整清洗。合法性检查用 Text.sanitize 的零分配快速路径。
 local function clean_messages(messages)
-    local out, fixed = {}, 0
-    for i, m in ipairs(messages or {}) do
+    messages = messages or {}
+    local fixed, any = 0, false
+    for _, m in ipairs(messages) do
+        local content = m.content
+        if type(content) == "string" then
+            local _, f = Text.sanitize(content)
+            if f > 0 then fixed = fixed + f; any = true end
+        elseif type(content) == "table" then
+            for _, part in ipairs(content) do
+                if type(part) == "table" then
+                    if part.type == "text" and type(part.text) == "string" then
+                        local _, f = Text.sanitize(part.text)
+                        if f > 0 then fixed = fixed + f; any = true end
+                    end
+                    if part.type == "image_url" and type(part.image_url) == "table"
+                        and type(part.image_url.url) == "string" then
+                        local s = Text.sanitize(part.image_url.url)
+                        if s ~= part.image_url.url then any = true end
+                    end
+                end
+            end
+        end
+        local tcs = m.tool_calls
+        if type(tcs) == "table" then
+            for _, tc in ipairs(tcs) do
+                local fn = type(tc) == "table" and tc["function"] or nil
+                if type(fn) == "table" then
+                    if type(fn.name) == "string" then
+                        local _, f = Text.sanitize(fn.name)
+                        if f > 0 then fixed = fixed + f; any = true end
+                    end
+                    if type(fn.arguments) == "string" then
+                        local _, f = Text.sanitize(fn.arguments)
+                        if f > 0 then fixed = fixed + f; any = true end
+                    end
+                end
+            end
+        end
+    end
+    if not any then return messages, 0 end
+
+    local out = {}
+    for i, m in ipairs(messages) do
         local c = {}
         for k, v in pairs(m) do c[k] = v end
         if type(c.content) == "string" then
-            local s, f = Text.sanitize(c.content)
-            c.content = s
-            fixed = fixed + f
+            c.content = (Text.sanitize(c.content))
         elseif type(c.content) == "table" then
             local parts = {}
             for k, part in ipairs(c.content) do
@@ -145,14 +191,12 @@ local function clean_messages(messages)
                     local p = {}
                     for kk, vv in pairs(part) do p[kk] = vv end
                     if p.type == "text" and type(p.text) == "string" then
-                        local s, f = Text.sanitize(p.text)
-                        p.text = s
-                        fixed = fixed + f
+                        p.text = (Text.sanitize(p.text))
                     end
                     if p.type == "image_url" and type(p.image_url) == "table" then
                         local u = {}
                         for kk, vv in pairs(p.image_url) do u[kk] = vv end
-                        if type(u.url) == "string" then u.url = Text.sanitize(u.url) end
+                        if type(u.url) == "string" then u.url = (Text.sanitize(u.url)) end
                         p.image_url = u
                     end
                     parts[k] = p
@@ -171,11 +215,9 @@ local function clean_messages(messages)
                 if type(fn) == "table" then
                     local f2 = {}
                     for k, v in pairs(fn) do f2[k] = v end
-                    if type(f2.name) == "string" then
-                        local s, f = Text.sanitize(f2.name); f2.name = s; fixed = fixed + f
-                    end
+                    if type(f2.name) == "string" then f2.name = (Text.sanitize(f2.name)) end
                     if type(f2.arguments) == "string" then
-                        local s, f = Text.sanitize(f2.arguments); f2.arguments = s; fixed = fixed + f
+                        f2.arguments = (Text.sanitize(f2.arguments))
                     end
                     t["function"] = f2
                 end
