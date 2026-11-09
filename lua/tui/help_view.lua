@@ -20,6 +20,8 @@ local ITEMS = {
     { "/new", "start a new session" },
     { "/compact [pct]", "slide window to pct% of budget (history kept)" },
     { "/reload", "reload lua tools/ffi" },
+    { "/reboot", "restart process, then auto-continue" },
+    { "/exit", "quit (same as quit + Enter, Ctrl+D)" },
     { "?", "toggle this help" },
 }
 
