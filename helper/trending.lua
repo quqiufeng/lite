@@ -31,17 +31,38 @@ local M = { schema = {
 } }
 
 local CSS_FALLBACK = [[
-:root{--parchment:#f5f4ed;--hairline:#d8d6ca;--stone:#8a8778;--brand:#1f5f8b;--mono:ui-monospace,SFMono-Regular,Menlo,monospace}
-body{background:var(--parchment);color:#2f2f2a;font-family:"仓耳今楷01","Noto Serif CJK SC",serif}
+/* 令牌对齐 kami.css 模板；--serif/--mono 只写单一族名：
+   cairo toy font API 不认多值列表，写栈会静默落回 Sans（★ 变空心框就是这来的） */
+:root{--parchment:#f5f4ed;--ivory:#faf9f5;--ink:#2b2a26;--muted:#6b665c;
+  --stone:#9a948a;--hairline:#e4dfd3;--tint:#f1efe6;--brand:#1B365D;
+  --serif:"TsangerJinKai02";--mono:"Maple Mono NF CN"}
+body{background:var(--parchment);color:var(--ink);font-family:var(--serif)}
 ]]
 
 -- kami.css 是排版底，缺了就用兜底最小样式（仍能出图，只是不像 Kami）
-local function load_css()
-  for _, p in ipairs({ "/opt/my-agent/operator/report/kami.css" }) do
+local function load_css(env)
+  local dirs = { (env and env.helper_dir) or "helper",
+                 ((env and env.cwd) or ".") .. "/helper" }
+  for _, d in ipairs(dirs) do
+    local p = d .. "/assets/kami.css"
     local f = io.open(p, "r")
     if f then local s = f:read("*a"); f:close(); return s end
   end
   return CSS_FALLBACK
+end
+
+-- 展开 CSS 里的 var(--x)：litehtml 不解析 CSS 变量。取 :root 块里的定义。
+local function expand_vars(css)
+  local defs = {}
+  local root = css:match(":root%s*{([^}]*)}")
+  if root then
+    for k, v in root:gmatch("%-%-([%w%-_]+)%s*:%s*([^;]+);") do
+      defs[k] = v:gsub("^%s+", ""):gsub("%s+$", "")
+    end
+  end
+  return (css:gsub("var%(%s*%-%-([%w%-_]+)%s*%)", function(k)
+    return defs[k] or "inherit"
+  end))
 end
 
 local function esc(s)
@@ -78,7 +99,7 @@ end
 local function build_html(items, css)
   local li = {}
   for _, v in ipairs(items) do
-    li[#li + 1] = ([[<li><div class="row"><span class="repo">%s</span><span class="stat">+%s ★ <span class="dim">%s</span></span></div><div class="desc">%s</div></li>]])
+    li[#li + 1] = ([[<li><div class="row"><span class="repo">%s</span><span class="stat">+%s <span class="star">★</span> <span class="dim">%s</span></span></div><div class="desc">%s</div></li>]])
       :format(esc(v.repo), esc(v.star), esc(v.lang), esc(v.desc))
   end
   return ([[<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
@@ -93,11 +114,11 @@ h1{font-size:41px;margin:5px 0 0}
 hr.hairline{margin:17px 0 20px}
 .lede{font-size:20px;margin:0 0 14px}
 ol.tr{list-style:none;padding-left:0;margin:0;counter-reset:t}
-ol.tr>li{counter-increment:t;position:relative;padding:15px 0 16px 50px;border-bottom:1px solid var(--hairline)}
-ol.tr>li::before{content:counter(t);position:absolute;left:0;top:16px;font-family:var(--mono);font-size:14.5px;color:var(--stone);font-variant-numeric:tabular-nums}
-.row{display:flex;justify-content:space-between;align-items:baseline;gap:40px}
-.repo{flex:1 1 auto;min-width:0;margin-right:24px;font-size:19px;font-weight:500;line-height:1.3}
-.stat{flex:0 0 auto;font-family:var(--mono);font-size:14.5px;color:var(--brand);white-space:nowrap}
+ol.tr li{counter-increment:t;position:relative;padding:15px 0 16px 50px;border-bottom:1px solid var(--hairline)}
+ol.tr li::before{content:counter(t);position:absolute;left:0;top:16px;font-family:var(--mono);font-size:14.5px;color:var(--stone)}
+.row{display:block}
+.repo{margin-right:14px;font-size:19px;font-weight:500;line-height:1.3}
+.stat{font-family:var(--mono);font-size:14.5px;color:var(--brand);white-space:nowrap}
 .dim{color:var(--stone)}
 .desc{font-size:16px;line-height:1.55;margin-top:5px;color:#5a5a52}
 </style></head><body>
@@ -110,6 +131,25 @@ ol.tr>li::before{content:counter(t);position:absolute;left:0;top:16px;font-famil
   <p class="lede">今日 GitHub Trending 前 %d 个项目。</p>
   <ol class="tr">%s</ol>
 </div></body></html>]]):format(css, os.date("%Y-%m-%d · %A"), #items, table.concat(li))
+end
+
+-- 出图后端：只有一个，自带的 liblite_html.so（litehtml + cairo，零子进程、零 Chrome）。
+local function render_png(html, out, width, height, scale, env)
+  local root = (env and env.cwd) or "."
+  local lib
+  for _, p in ipairs({ root .. "/build/liblite_html.so",
+                       ((env and env.helper_dir) or "helper") .. "/../build/liblite_html.so" }) do
+    local f = io.open(p, "rb")
+    if f then f:close(); lib = p; break end
+  end
+  if not lib then error("缺 build/liblite_html.so，先跑 ./tools/build.sh") end
+  local ffi = require("ffi")
+  ffi.cdef[[int lite_html_render(const char*,const char*,int,int,double);
+            const char* lite_html_error(void);]]
+  local L = ffi.load(lib)
+  if L.lite_html_render(html, out, width, height, scale) ~= 0 then
+    error("出图失败: " .. tostring(ffi.string(L.lite_html_error())))
+  end
 end
 
 function M.run(args, env)
@@ -133,19 +173,17 @@ function M.run(args, env)
   if #items == 0 then error("解析到 0 条，GitHub 页面结构可能变了: " .. url) end
   while #items > limit do items[#items] = nil end
 
-  local html = build_html(items, load_css())
+  local html = build_html(items, expand_vars(load_css(env)))
   local html_path = out:gsub("%.png$", ".html")
   local wf = assert(io.open(html_path, "w")); wf:write(html); wf:close()
 
-  local cmd = ("google-chrome --headless --disable-gpu --hide-scrollbars --window-size=%d,%d --force-device-scale-factor=%s --screenshot=%q %q 2>/dev/null")
-    :format(width, height, scale, out, html_path)
-  os.execute(cmd)
+  render_png(html, out, width, height, scale, env)
   local pf = io.open(out, "r")
-  if not pf then error("截图失败（google-chrome 是否安装？）: " .. cmd) end
+  if not pf then error("出图失败: " .. out) end
   local sz = pf:seek("end"); pf:close()
-  if sz < 10000 then error("截图过小（" .. sz .. " bytes），可能被裁切或空白: " .. out) end
+  if sz < 10000 then error("出图过小（" .. sz .. " bytes），可能空白: " .. out) end
 
-  return ("%d 条 · %.1fx%d @%dx\nPNG: %s (%d KB)\nHTML: %s"):format(
+  return ("%d 条 · %.1fx%d @%dx · litehtml\nPNG: %s (%d KB)\nHTML: %s"):format(
     #items, width, height, scale, out, math.floor(sz / 1024), html_path)
 end
 
