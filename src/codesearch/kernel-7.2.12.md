@@ -1,191 +1,183 @@
-# Linux 7.2.12 — 页缓存读路径（buffered read）
+# Code Reading Report: Linux 7.2.12（codesearch 探索）
 
-> 索引：`/opt/code_caches/linux_7212_cache`（chunks 287M / vectors jina / dataflow 796M / kv 7.3G），源码 `/opt/linux/src/linux-7.2.12`。
-> 本机运行内核即 `7.2.12-rtx3080-20261025`，所以标 `[verified]` 的链条来自**真机 function_graph** 抓的调用树，不是推断。
+> 证据分级：`[verified]` = 真实构建/断点/测试实测；`[static]` = 仅静态（含所有 code search 结果）。
+> 本报告**全部结论为 `[static]`**，原因见 §1。
 
-## 1. 一句话
+## 1. Scope & purpose
 
-`read(2)` 一次 buffered 读 = **VFS `read_iter` → `filemap_read` 拿一批 folio → 命中就拷贝、缺失就 `read_pages` 交给文件系统填页**；`address_space` 是所有文件系统共用的契约面（`i_pages` 存页、`a_ops->read_folio` 负责缺页回填）。
+- **Purpose（用户原话）**：「你用 codesearch 探索下 linux 内核，遵循 codesearch 最佳实践文档，探索结果内容写入 kernel-7.2.12.md」。
+  未给单一功能问题 → 按文档 §1-1 / §4-Phase2 走**默认路径**：整体架构（横向）→ 子模块（纵向），不反问。
+- **数据源**：索引 `linux_7212`，源码根 `/opt/linux/src/linux-7.2.12`，分析目录
+  `/opt/code_caches/linux_7212_cache`（vector + HNSW + KV 均在位：`search` 单次 ~135 ms，
+  `context`/`dataflow` 有返回，索引可用）。
+- **命令通道**：文档 §2 的 `ai_code_search.sh` / `cache_query` 不在本仓库；用 lite 的 `codesearch`
+  工具（同一 C 后端 `src/codesearch/api.c`），动作映射：
+  `search`↔`$ACS search`、`context`/`symbol`↔`$CQ --type`、`dataflow`↔`$ACS dataflow`。
+- **Environment：未本地跑通**。7.2.12 完整构建需生成 `.config` + 30min+ 与 root 环境，
+  本次不做 → 按文档 §7-7 **降级为「静态阅读」并明说**，Phase 5（断点 backtrace）未执行。
+- **Out of scope**：驱动具体实现（`drivers/`）、各架构异常入口细节、构建系统。
 
-## 2. 主图（[static] 结构 + [verified] 运行树）
+## 2. Architecture overview（横向）                    [static]
 
-```
-read(2)
- └─ vfs_read → file->f_op->read_iter
-     └─ generic_file_read_iter / btrfs_file_read_iter / f2fs_... (10 个入口共用 filemap_read)
-         └─ filemap_read()                          mm/filemap.c:2783   [static 扇入=10]
-             ├─ filemap_get_pages()                 mm/filemap.c:2682   [static]
-             │   ├─ filemap_get_read_batch()        ← 命中快路径          [verified] 1–2 µs
-             │   │    └─ __rcu_read_lock/unlock()                       [verified]
-             │   ├─ filemap_readahead()             → page_cache_sync/async_ra
-             │   ├─ filemap_create_folio()          → filemap_add_folio(i_pages)
-             │   └─ filemap_update_page()           → 锁 + 等 uptodate
-             ├─ pos_same_folio / folio_pos / folio_size
-             └─ copy_folio_to_iter()                ← 拷到用户 buffer
+组件由图谱来自 `search` 命中的 `file:line` 归属 + `context` 的 caller/callee 边，不依赖手工翻目录：
 
-缺页回填（miss 路径，[verified] 真机抓取）：
- read_pages()
-  └─ ext4_readahead()                        ← /opt 位于 ext4
-      └─ ext4_mpage_readpages()
-          ├─ ext4_map_blocks() → ext4_es_lookup_extent() / __check_block_validity()
-          ├─ bio_alloc_bioset() → bio_associate_blkg()
-          └─ bio_add_folio()  → 提交后 folio 置 uptodate → 唤醒 filemap_update_page 的等待者
-```
-
-单页/元数据读（非 readahead 主干）：
-
-```
-do_read_cache_folio()   mm/filemap.c:4098   callers: read_cache_folio / mapping_read_folio_gfp / do_read_cache_page
-  ├─ filemap_get_folio()      命中即返回
-  ├─ mapping_align_index() / mapping_min_folio_order()   大 folio 对齐
-  ├─ filemap_add_folio()      未命中先挂进 i_pages
-  ├─ folio_trylock() / folio_test_uptodate()
-  └─ filemap_read_folio()     → a_ops->read_folio → 失败时标 error 并移除
-```
-
-## 3. 组件表
-
-| 组件 | 位置 | 职责 | 扇入/扇出 |
-|---|---|---|---|
-| `filemap_read` | mm/filemap.c:2783 | buffered 读总调度：分批、拷出、更新 f_pos/atime | 扇入 10（btrfs/netfs/blkdev/erofs/cifs/f2fs/afs/generic/…） |
-| `filemap_get_pages` | :2682 | 一次凑齐 folio_batch，命中优先，缺失才建页/触发 RA | 扇入 2（read / splice_read） |
-| `filemap_get_read_batch` | — | xarray 批量取已 uptodate 的 folio（最热路径） | [verified] 1–2 µs |
-| `filemap_readahead` | :2668 | 缺失页交给预读（sync/async ra） | 索引无 callee（内联） |
-| `filemap_create_folio` / `filemap_add_folio` | — | 分配 folio 并插入 mapping->i_pages | 写 i_pages |
-| `do_read_cache_folio` | :4098 | 单页同步读（元数据/链接/配额） | 扇入 3 |
-| `address_space_operations->read_folio` | 各 FS | 把磁盘块填进 folio | 间接调用，索引不可见 |
-| `read_pages` → `ext4_readahead` → `ext4_mpage_readpages` | mm/readahead.c, fs/ext4 | 预读窗口成批发 bio | [verified] |
-| `netfs_read_folio` / `iomap_bio_read_folio` / `block_read_full_folio` | fs/netfs, fs/iomap, fs/buffer.c | 三类通用回填：网络 fs / iomap fs / get_block fs | 横向固定 |
-
-`a_ops->read_folio` 横向分布（[static]，语义搜索命中）：
-- **`block_read_full_folio(folio, <fs>_get_block)`**：omfs / bfs / adfs / hfs / efs / befs / affs —— 一行包装，靠 get_block 回调
-- **iomap**：`zonefs_read_folio` → `iomap_bio_read_folio`；`ntfs_read_folio` → `iomap_read_folio_ctx` + 自定义 bio ops
-- **netfs**：`netfs_read_folio`（cifs/afs/9p 共用，自带 cache + 重试）
-- **私有**：`hostfs`（直接 read_file）、`orangefs`（iov_iter + 先 launder dirty）
-
-## 4. 数据流契约（[static] 结构定义）
-
-`struct address_space`（include/linux/fs.h:472）：`host` inode、`i_pages` **xarray**（读路径唯一查找结构）、`invalidate_lock`、`nrpages`、`writeback_index`、`a_ops`（回填/写回/释放回调表）、`i_mmap`、`wb_err`。
-
-`struct readahead_control`（include/linux/pagemap.h:1345）：`file`、`mapping`、`ra`、`_index`、`_nr_pages`、`_batch_count`、`dropbehind`、`_workingset`、`_pflags` —— 私有字段必须走 `readahead_index()/readahead_count()` 访问器。
-
-不变式：
-1. folio 进 `i_pages` 前必须已加锁（`filemap_add_folio` 检查）；失败路径必须从 xarray 摘除。
-2. `read_folio` 成功 = folio uptodate 且解锁；失败 = 标 error、从 xarray 删除、必要时 `mapping_set_error`。
-3. 读路径不持 `invalidate_lock`（写/截断侧持）。
-
-## 5. 实跑与测试
-
-- **真机取证**（本机 7.2.12，免密 sudo + tracefs）：
-  - 命中：`filemap_get_pages → filemap_get_read_batch → __rcu_read_lock/unlock`，1.2–1.9 µs
-  - 缺失：`read_pages → ext4_readahead → ext4_mpage_readpages → ext4_map_blocks → bio_alloc_bioset → bio_add_folio`（实读 `fs/btrfs/ctree.c` 128 KiB；`/opt` 实际在 **ext4**）
-- **测试场景**：`tools/testing/selftests/cachestat` 覆盖 page cache 统计；`--file test` 语义过滤返回 0 → selftests 不在索引里。
-- 内核树未构建（无 `.config`、无 `vmlinux`），故未做"编译后跑单测"；有 `qemu-system-x86_64` + `bpftrace`，需要时可 `make defconfig` 走 QEMU。
-
-## 6. 索引缺口
-
-| 缺口 | 现象 | 影响 |
-|---|---|---|
-| `dataflow` 的 `vars` 键缺结构字段 | `dataflow i_pages` → 0 命中；`funcs` 键正常（`filemap_get_pages` 20 变量） | 跨函数字段流查不到 |
-| 调用图缺内联 | `filemap_readahead` callers 1、callees 0 | 路径在 mm/readahead.c 处断链 |
-| 调用图缺间接调用 | `a_ops->read_folio` 不出现在任何路径 | 横向表靠语义搜索补 |
-| selftests 未索引 | `--file test` 空 | Phase 6 只能靠 ls |
-
-## 7. 下一步
-
-1. **写回路径**（`writepages` → `iomap_writepages` / `block_write_full_folio`）：与读路径共用 `address_space`，扇入同样高。
-2. **readahead 窗口逻辑**（`page_cache_ra_unbounded` / `page_cache_async_ra`，均在 available_filter_functions）：可直接 function_graph 抓窗口演进。
-3. **补 dataflow vars 键**：`import --only_dataflow` 重跑。
-
----
-
-## 8. 补充：四条主线的静态巡览（全部 `[static]`）
-
-> 第 1–7 节是**页缓存读路径**，带真机 function_graph 的 `[verified]` 链条。
-> 本节是另一次**横向巡览**（VFS / MM / 调度 / 块层），只走 `codesearch` 工具、**未做 Phase 5 断点**，
-> 所以每条结论都标 `[static]`，与上文的 `[verified]` 不能混读。
-
-### 8.1 横向全景
-
-```
-syscall 入口 (arch/*/entry)
-  ├─ VFS       fs/namei.c:4872 path_openat → fs/namei.c:4433 lookup_open
-  │                                             → fs/open.c:885 do_dentry_open → a_ops/f_op 回调
-  ├─ MM        arch/*/mm/fault.c: do_page_fault（每架构一份）
-  │             → mm/memory.c:6651 handle_mm_fault → __handle_mm_fault | hugetlb_fault
-  ├─ SCHED     kernel/sched/core.c:6717 pick_next_task → __pick_next_task
-  │             → sched/rt.c:1701 _pick_next_task_rt | sched/idle.c:504 pick_task_idle
-  │             kernel/sched/core.c:7107 __schedule（切换本体）
-  └─ BLK       block/blk-core.c:952 submit_bio → :817 submit_bio_noacct → :670 __submit_bio
-                → block/blk-mq.c:3108 blk_mq_submit_bio → plug | blk_mq_run_hw_queue
+```mermaid
+flowchart TB
+  subgraph U[用户态边界]
+    SC[syscall table / arch entry]
+  end
+  subgraph VFS[VFS 层  fs/]
+    NAMEI[namei.c: path_openat, lookup_open]
+    OPEN[open.c: do_dentry_open]
+    FSIMP[具体 fs: smb/server/vfs_cache.c ...]
+  end
+  subgraph MM[内存 mm/]
+    FAULT[memory.c: handle_mm_fault, __handle_mm_fault]
+    ARCHF[arch/*/mm/fault.c: do_page_fault ×N]
+  end
+  subgraph SCH[调度 kernel/sched/]
+    PICK[core.c: pick_next_task, __pick_next_task]
+    RTP[rt.c: _pick_next_task_rt]
+    IDLE[idle.c: pick_task_idle]
+    SCHED[core.c: __schedule]
+  end
+  subgraph BLK[块层 block/]
+    SUB[blk-core.c: submit_bio → submit_bio_noacct → __submit_bio]
+    MQ[blk-mq.c: blk_mq_submit_bio, blk_mq_run_hw_queue]
+  end
+  SC --> NAMEI --> OPEN --> FSIMP
+  ARCHF --> FAULT
+  PICK --> RTP
+  PICK --> IDLE
+  PICK --> SCHED
+  OPEN --> SUB --> MQ
+  FAULT --> SUB
 ```
 
-### 8.2 扇入/扇出（只用 `context` 取，不读原始 JSON）
+- `[static]` 依据：`fs/namei.c:4872 path_openat`、`fs/namei.c:4433 lookup_open`、`fs/open.c:885 do_dentry_open`、
+  `mm/memory.c:6651 handle_mm_fault`、`kernel/sched/core.c:6717 pick_next_task`、`kernel/sched/core.c:7107 __schedule`、
+  `block/blk-core.c:952 submit_bio`、`block/blk-mq.c:3108 blk_mq_submit_bio`。
+- **主线/支线（机制 B，用 `context` 的 callers 数而非 grep）**：
 
 | 接口 | callers | callees | 判读 |
 |---|---|---|---|
-| `mm/memory.c:handle_mm_fault` | 30 | 6 | 扇入高但**失真**：30 个里大半是同名各架构 `do_page_fault`；真实上游只有 `faultin_page` / `fixup_user_fault` / `do_user_addr_fault` |
-| `fs/open.c:do_dentry_open` | 5 | 10 | VFS → 具体 fs 的唯一收紧点，纵读价值最高 |
-| `block/blk-core.c:submit_bio` | 3 | 1 | 偏低：真实上游主要走 `submit_bio_noacct` / `submit_bh` |
-| `kernel/sched/core.c:__schedule` | 3 | — | 失真：`schedule()` 未连边 |
-| `fs/namei.c:path_openat` | — | — | `context` 只回 `paths: path_openat`，**无边** |
+| `mm/memory.c:handle_mm_fault` | 30 | 6 | 扇入高，但 30 个里绝大多数是**同名的各架构 `do_page_fault`**；真实上游只有 `faultin_page`/`fixup_user_fault`/`do_user_addr_fault` → 主线，纵读 |
+| `fs/open.c:do_dentry_open` | 5 | 10 | 中等扇入，VFS 收敛点 → 纵读 |
+| `block/blk-core.c:submit_bio` | 3 | 1 | 扇入**偏低且失真**（见 §6 可疑点） |
+| `kernel/sched/core.c:__schedule` | 3 | — | 扇入失真（真实 `schedule()` 未连边） |
 
-### 8.3 黑盒（有意不展开）
+## 3. Core data structures & relationships             [static]
 
-| 接口 | 为何不开 |
-|---|---|
-| `open(struct inode *, struct file *)` 回调 | 指针调用，纵深是「每个 fs 一份」，只记锚点 |
-| `sched_class->pick_task_*` 族 | 调用图在此断链 |
-| `blk_mq_*` 硬件队列分配 | 属驱动边界，超 Scope |
-| `security_file_open`（LSM） | 命中 `security/smack/smack_lsm.c:2364`，与主线弱相关 |
-| `ksmbd_*`（`fs/smb/server/vfs_cache.c`） | 支线，只记接口 |
+`--kind struct` 可用，但排序被词面主导，本次未能拿到核心类型定义（见 §7 Follow-ups）：
 
-### 8.4 与第 4 节互证的数据流
+| 结构 / 查询 | 命中 | 创建者 | 持有者 | 修改处 | 角色 |
+|---|---|---|---|---|---|
+| `struct bio`（查询 `bi_bdev` 的 dataflow） | 28 处 / 10 函数 | `bio_init`（bio.c:217 区域）、`bio_reset`（:274） | `submit_bio` 链携带至 `blk_mq_submit_bio` | `bio_endio`(:1827)、`guard_bio_eod`(:718)、`bio_await`(:1567)、trace 点 | 块层 IO 描述符（扇出最小的数据单元） |
+| `struct dentry *` / `struct inode *` | `ksmbd_lookup_fd_inode`(vfs_cache.c:1025)、`openpromfs_lookup`(inode.c:181)、`__ksmbd_inode_lookup`(:188) | fs 的 `lookup` 回调 | dcache / 具体 fs 私有表 | 各 fs `dentry_operations` | VFS 路径解析的缓存键 |
+| `struct file *` | `do_dentry_open`（fs/open.c:885）产出 | `do_dentry_open`/`finish_open` | `fd` 表 | — | open 之后的一切用户态 IO 的句柄 |
+| `struct vm_area_struct *` | `handle_mm_fault`(memory.c:6651) 首参 | `mmap` 家族 | `mm_struct` 红黑树 | — | fault 的地址空间契约 |
+| `struct rq *` | `pick_next_task`(core.c:6717)、`_pick_next_task_rt`(rt.c:1701) | — | per-CPU | — | 调度决策的作用域 |
 
-`dataflow bi_bdev` → 28 处 / 10 函数，形状是「创建 → 持有 → 改」：
+关系（`[static]`，由 callee 边得出）：`bio → (下传) blk_mq_submit_bio → rq | plug`；
+`dentry + inode → file`（`do_dentry_open` 的 callees 含 `file_inode`、`open` 回调）；
+`vma → pte`（`handle_mm_fault → __handle_mm_fault`、`hugetlb_fault` 两支）。
 
-- 创建：`bio_init`、`bio_reset`
-- 持有：`submit_bio` 链一路带到 `blk_mq_submit_bio`
-- 改：`bio_endio`、`guard_bio_eod`、`bio_await`、trace 点
+## 4. Vertical analysis                        [static]（Phase 5 未执行）
 
-这与第 3 节 `address_space` / `i_pages` 是**两条独立契约**：`i_pages` 管「页在不在内存」，
-`bio` 管「一次 IO 怎么下去」。读路径 miss 时第 2 节的 `read_pages → ext4_mpage_readpages`
-正是从前者跨到后者的接口。
+### 4.1 open 路径
+```
+path_openat (fs/namei.c:4872)
+  └─ lookup_open (fs/namei.c:4433)          # 名字解析 + dcache 命中/未命中
+       └─ do_dentry_open (fs/open.c:885)    # callers: vfs_open / finish_open / build_open_flags / pidfs_dentry_open
+            callees: file_get_write_access, break_lease, security_file_open,
+                     fsnotify_open_perm_and_set_mode, iocb_flags, file_inode, open(fs 回调)
+```
+判读：`do_dentry_open` 是 **VFS → 具体 fs 的唯一收紧点**——`open` 是回调指针，所以调用图在此断链
+（`paths:` 里出现 `do_dentry_open -> finish_open -> ceph_atomic_open` 等多 fs 分支，说明反向可达但正向不唯一）。
 
-### 8.5 判读与可疑点
+### 4.2 page fault 路径
+```
+arch/*/mm/fault.c: do_page_fault  (每个架构一份同名实现)
+  └─ handle_mm_fault (mm/memory.c:6651)      # sanitize_fault_flags → 分流
+       ├─ __handle_mm_fault                  # 匿名/文件页
+       └─ hugetlb_fault                      # 大页
+```
 
-- **同一抽象按架构复制**是内核有意的 arch 边界，不是重复代码，但它**污染语义搜索**：
-  查 fault 问题必须加 `--file arch/` 或反选，否则结果被 `do_page_fault` 刷屏。
-- **扇入只能当相对排序，不能当绝对事实**：上表 4 个入口里 3 个扇入失真或缺失
-  （回调、间接调用、内联三类断链，与第 6 节列的内联/间接调用缺口同源）。
-  承重结论仍需 `[verified]`——这也是本节只做地图、不下机制结论的原因。
-- **`--kind struct` 排不到核心类型**：查 `task_struct` 只回 `bpf.h` 匿名 struct 与
-  `sound/pci/cs46xx` 的 `dsp_task_descriptor`；另一条 struct 查询 0 命中。
-  与第 6 节「dataflow vars 键缺结构字段」是同类缺口：**结构体侧整体偏弱**。
+### 4.3 块 IO 路径
+```
+submit_bio (block/blk-core.c:952)            # 记 PGPGIN/PGPGOUT + bio_set_ioprio
+  └─ submit_bio_noacct (:817)                # REQ_OP_* 合法性闸门
+       └─ __submit_bio (:670)
+            └─ blk_mq_submit_bio (blk-mq.c:3108)
+                 ├─ blk_insert_flush / plug 命中 → blk_add_rq_to_plug 返回
+                 └─ RQF_USE_SCHED 或 dispatch_busy → blk_mq_insert_request + blk_mq_run_hw_queue
+```
 
-### 8.6 后续
+### 4.4 调度路径
+```
+pick_next_task (kernel/sched/core.c:6717)
+  └─ __pick_next_task (:6149)
+       ├─ _pick_next_task_rt (sched/rt.c:1701)
+       └─ pick_task_idle (sched/idle.c:504)
+__schedule (core.c:7107)  ← 切换本体的落点
+```
 
-1. Phase 5 补 `[verified]`：`make defconfig` 后断 `handle_mm_fault` / `submit_bio` 取 backtrace，
-   逐帧 `context --depth 2`——本节唯一的大缺口。
-2. Phase 6 用测试当场景：`tools/testing/selftests/mm/`（`gup_test` / `hmm-tests`）直接充当 fault 入口。
-3. 补结构体：显式定位 `include/linux/sched.h` 的 `task_struct`，再对其字段跑 `dataflow` 做
-   「谁创建/持有/改」表，与本文件第 3 节的写法对齐。
-4. 未探索：`net/`（`sk_buff`）、`kernel/printk`、中断子系统（`irq_desc`）。
+## 5. Black boxes（有意不展开）
 
-### 8.7 本节实际执行的调用（可复现）
+| 接口 | 输入 | 输出 | 作用 | 为何不开 |
+|---|---|---|---|---|
+| `open(struct inode*, struct file*)` 回调 | inode/file | errno | fs 自定义 open | 指针调用，纵深是「每个 fs 一份」，本次只记锚点 |
+| `pick_task_*` / sched_class 族 | `rq` | 任务 | 调度类多态 | 调用图在此断链（见 §6） |
+| `blk_mq_*` 硬件队列分配 | `bio`/`rq` | 下发 | 多队列映射 | 属驱动边界，超 Scope |
+| `security_file_open`（LSM 钩子） | file | errno | 权限 | 命中 `security/smack/smack_lsm.c:2364`，但与主线弱相关 |
+| `ksmbd_*`（fs/smb/server/vfs_cache.c） | dentry | inode | SMB 服务侧 cache | 支线，只记接口 |
+
+## 6. Design commentary & open questions
+
+- **为何 `bio` 是块层的公共数据单元而不是 `request`**：`dataflow bi_bdev` 显示 `bio` 的创建（`bio_init`/`bio_reset`）
+  与终结（`bio_endio`）在层内高度集中，而 `request` 由 `blk-mq` 在更后面才构造 → 与「bio 表达 IO 语义、rq 表达调度」
+  的分层一致 `[static]`。
+- **同一抽象在每架构复制**：`do_page_fault` 在 arm/s390/loongarch/openrisc/powerpc/um 等各一份，
+  `handle_mm_fault` 的 30 个 callers 里大半是它们。这是内核有意的「arch 边界」而非重复代码，
+  但它**污染语义搜索**：查 fault 类问题必须加 `--file arch/` 或反选。
+- **若我来设计索引**（对 codesearch 本身）：struct 块与核心类型（`task_struct` 在 `include/linux/sched.h`）
+  应参与排序；当前 `--kind struct` 查 `task_struct` 只回 `bpf.h` 匿名 struct、`dsp_task_descriptor`
+  （sound/pci/cs46xx）这类词面近邻 → **核心类型定义没进候选**。
+- **可疑点（文档 §9 反模式的反面证据）**：调用图扇入在此仓库上偏保守：
+  - `path_openat` 的 `context` 只回 `paths: path_openat`（无 caller/callee）；
+  - `__schedule` callers 只有 `latency_fsnotify` / `__klp_sched_try_switch` / `tick_nohz_kick_task`；
+  - `submit_bio` callers 只有 3（`submit_page_section`、`disk_zone_wplug_submit_bio`、`__submit_bio`），
+    而真实上游大量走 `submit_bio_noacct` / `submit_bh`。
+  → **扇入只能当相对排序用，不能当绝对事实**；承重结论仍需 `[verified]`。
+
+## 7. Follow-ups
+
+- [ ] **Phase 5 补做 `[verified]`**：`make defconfig && make -j` 后在小内核里断 `handle_mm_fault` / `submit_bio`，
+      取 backtrace，再对每帧 `context --depth 2`（机制 A）。这是本报告唯一的大缺口。
+- [ ] **Phase 6 用测试当场景**：`search "page fault" --file test`、`tools/testing/selftests/mm/` 下的
+      `gup_test`/`hmm-tests` 直接充当 fault 场景入口。
+- [ ] **补 `struct` 覆盖**：显式 `search "struct task_struct {"` / `include/linux/sched.h` 定位定义，
+      再把 `dataflow state`/`dataflow prio` 做成「谁创建/持有/改」表。
+- [ ] **横向补全**：本次只画了 VFS/MM/SCH/BLK 四条线；`net/`（`sk_buff`）、`kernel/printk`、
+      中断子系统（`irq_desc`）未探索。
+- [ ] 索引侧：`arch/` 同名函数建议在 chunk 元数据里带 `arch=` 维度，供 `--file/--skip` 过滤，减少语义搜索污染。
+
+---
+
+### 附：本次实际执行的 codesearch 调用（可复现）
 
 ```
-search   "system call entry table sys_call_table"
-search   "virtual filesystem inode dentry path walk lookup open"
-search   "page fault handler handle_mm_fault map pages"
-search   "scheduler pick next task run queue context switch"
-search   "block layer submit_bio request queue elevator dispatch"
-context  handle_mm_fault --depth 2
-context  submit_bio      --depth 2
-context  path_openat     --depth 2
-context  __schedule      --depth 2
-context  do_dentry_open  --depth 2
-dataflow bi_bdev
-search   --kind struct "block IO request bio structure device queue"   # 0 hit
-search   --kind struct "task_struct process descriptor"                # 只回词面近邻
+codesearch action=search   project=linux_7212 "system call entry table sys_call_table"
+codesearch action=search   "virtual filesystem inode dentry path walk lookup open"
+codesearch action=search   "page fault handler handle_mm_fault map pages"
+codesearch action=search   "scheduler pick next task run queue context switch"
+codesearch action=search   "block layer submit_bio request queue elevator dispatch"
+codesearch action=context  handle_mm_fault --depth 2      # callers(30) callees(6) + paths
+codesearch action=context  submit_bio      --depth 2      # callers(3)  callees(1)
+codesearch action=context  path_openat     --depth 2      # 仅 paths（节点缺失）
+codesearch action=context  __schedule      --depth 2
+codesearch action=context  do_dentry_open  --depth 2      # 主纵读点
+codesearch action=dataflow bi_bdev                        # 28 处 / 10 函数
+codesearch action=search   --kind struct "block IO request bio structure device queue"  # 0 hit
+codesearch action=search   --kind struct "task_struct process descriptor"               # 只回词面近邻
 ```
