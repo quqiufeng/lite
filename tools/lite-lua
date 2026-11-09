@@ -48,6 +48,18 @@ esac
 export LITE_SUPERVISED=1
 LITE_REBOOT_MAX="${LITE_REBOOT_MAX:-3}"
 reboot_args=("$@")
+child=0
+# 原始 stdin 存到 fd 3：下面的子进程要以 `&` 起（见循环里的说明）。
+exec 3<&0
+
+# 信号必须转发给子进程：lite 跑在**子**进程里（不能 exec，见下），bash 收到
+# SIGTERM/SIGINT/SIGHUP 默认自己就退，luajit 被 reparent 到桌面 session 继续活着。
+# `serve_smoke.sh` 每次 test.sh 都 kill 这个 wrapper 才收场，于是每跑一次测试就
+# 留下一个还在 listen 的孤儿 `lite serve --port 0`（实测攒到 20 个）。
+forward() { [ "$child" -gt 0 ] && kill -"$1" "$child" 2>/dev/null; return 0; }
+trap 'forward TERM' TERM
+trap 'forward INT' INT
+trap 'forward HUP' HUP
 # 链计数只活在这个 wrapper 进程里，**绝不 export**：export 会漏给 lite 的所有子进程
 # （bash 工具、test.sh、helper 插件），带 `LITE_REBOOT_CHAIN` 起来的下次 lite 就从
 # 中间开始数，链上限提前触发（`reboot chain stops after LITE_REBOOT_MAX restarts`
@@ -56,7 +68,18 @@ reboot_chain=0
 while :; do
     rc=0
     unset LITE_REBOOT_CHAIN
-    "$LUA" -e "$PRELUDE" ${reboot_args[@]+"${reboot_args[@]}"} || rc=$?
+    # 必须以 `&` 起才收得到 trap（前台跑时 bash 要等命令结束才处理信号，
+    # 等于不转发）；但非交互 shell 的后台作业 stdin 会被塞成 /dev/null，
+    # TUI 就读不到终端了 —— 所以提前 dup 一份原始 stdin，后台命令显式接回去。
+    "$LUA" -e "$PRELUDE" ${reboot_args[@]+"${reboot_args[@]}"} <&3 &
+    child=$!
+    wait "$child" || rc=$?
+    # trapped 信号会把 wait 打断成 128+sig，此时子进程可能还在收尾；一直等到它
+    # 真的消失，退出码以最后一次 wait 为准（被信号杀就是 128+sig，原样透传）。
+    while kill -0 "$child" 2>/dev/null; do
+        wait "$child" || rc=$?
+    done
+    child=0
     if [ "$rc" -ne 75 ]; then exit "$rc"; fi
     reboot_chain=$(( reboot_chain + 1 ))
     if [ "$reboot_chain" -gt "$LITE_REBOOT_MAX" ]; then

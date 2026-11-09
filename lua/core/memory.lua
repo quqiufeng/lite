@@ -13,6 +13,11 @@ int flock(int fd, int operation);
 
 local O_CREAT = 0x40
 local O_RDWR = 2
+-- O_CLOEXEC：mem.lock 的 fd 不能被 exec 的子进程继承。否则父进程退出后，
+-- 残留的长命子进程（ffmpeg/vlc/voice loop）仍持有那份 open file description，
+-- flock 一直不放 → 之后每个 lite 启动都抢不到锁、静默降级 readonly，
+-- remember/todo 全废，只能重启才能发现（实测踩过：语音会话的 ffmpeg 录了半小时）。
+local O_CLOEXEC = 0x80000
 local LOCK_EX = 2
 local LOCK_NB = 4
 local LOCK_UN = 8
@@ -55,7 +60,7 @@ function M.new(opts)
     end
     os.execute("mkdir -p '" .. base:gsub("'", "'\\''") .. "'")
 
-    local lock_fd = ffi.C.open(base .. "/mem.lock", bit.bor(O_CREAT, O_RDWR), 420)
+    local lock_fd = ffi.C.open(base .. "/mem.lock", bit.bor(O_CREAT, O_RDWR, O_CLOEXEC), 420)
     if lock_fd < 0 then
         return nil, "cannot open " .. base .. "/mem.lock"
     end
