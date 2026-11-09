@@ -104,7 +104,7 @@ Chrome/WebView/CEF/Electron；不起 `xdotool/wmctrl/import`；不用 `systemd -
 | 步 | 动作 | 怎么落 |
 |---|---|---|
 | 1 判 | 内置工具能覆盖？系统已有 `.so` 能 `ffi.load`？`helper/` 里已经有？（`lite plugins` / `ldconfig -p \| grep`） | 三者都不行才造 |
-| 2 估 | 只跑一次的用 `lua` 内联；会反复用的才落 `helper/` | 代价/收益判定见 `design.md:8.37` |
+| 2 估 | 只跑一次的用 `lua` 内联；会反复用的才落 `helper/` | 代价/收益判定见 `design.md:D6` |
 | 3 写 | C/C++ 导出 `char *lite_helper(const char *input)` + `lite_helper_free`，输入输出 UTF-8/JSON | `native action=build name=x lang=c libs=["pthread"]` |
 | 4 验 | `native action=run` 喂真实输入，**先看返回串**再信它；空结果 / 非法输入 / 超限三种边界都跑 | 报错就改源码重 build |
 | 5 接 | `native action=wrap` 生成 `helper/<name>.lua` + schema，或手写 `{schema=...,run=...}` | 立刻按名可调 |
@@ -152,7 +152,7 @@ Chrome/WebView/CEF/Electron；不起 `xdotool/wmctrl/import`；不用 `systemd -
 插件发现 `<workspace>/helper` → `$LITE_ROOT/helper`；`scope=local|global` 控制写入侧。
 wrapper 返回 `{ run=function(args,env) ... end }`；重新 build 生成新 `.so`，免重启。
 
-**只有清单冻结，派发全是动态的**（`design.md:8.35`）：`helper/*.lua` 里返回
+**只有清单冻结，派发全是动态的**（`design.md:D5`）：`helper/*.lua` 里返回
 `{ schema={...}, run=function(args,env) end }` 即可同时声明工具名和实现
 （`.tool.json` 写法仍可用、优先）。**冻结的只是 API `tools` 字段**：schema 在会话启动
 扫一次并 memo（`_helper_cache`），之后 `schemas()` 用快照 —— 保前缀缓存，新建/删除
@@ -195,10 +195,11 @@ hook 错误一律 fail-open（记 `_hook_errors`，不炸 agent）。`has_hooks(
 | `wechat` | 微信：搜索联系人/群 → 进会话 → 发消息/文件 | libxdo 直驱 + 每步 OCR 验收；坐标是 2560x1440 屏幕像素 |
 | `uimap` | 视觉定位按钮：discover/learn/click/save | 结果落 `helper/lib/app_<class>_map.lua`，每 app 一文件 |
 | `usb` | 本机麦/音箱/摄像头：record/play/photo/video/volume | 设备可用名字子串；缺 arecord/ffmpeg 只对应 action 报错 |
-| `music` | 后台常驻 VLC 放歌：play/pause/next/volume/seek/playlist | 源可为本地路径、关键词（WebDAV 搜）、`dav://host:port/路径`（流播不下载） |
+| `music` | 后台常驻 VLC 放歌：play/pause/next/volume/seek/playlist | 源可为本地路径、关键词（WebDAV 搜）、`dav://host:port/路径`（流播不下载）。控制走 MPRIS（本机无 `playerctl`/`socat`），WebDAV 逻辑在 `helper/lib/webdav.lua` |
 | `search` | DeepSeek Search：关键词→rerank 结果+摘要 | 需要 `DEEPSEEK_API_KEY` |
 | `fetch` | DeepSeek Fetch：URL→Markdown 正文 | 同上；替代原始 HTTP 抓页面 |
 | `tokens` | 每日 token 账本查询 | 数据源 `/agent/usage`，跨会话同一本账 |
+| `cgrep` | 代码搜索：正则/字面串扫目录，输出 `path:line: text` | 本体是 `helper/cgrep.c`（pthread + POSIX regex）编出的 `.so`，Lua 层只做 JSON→文本；本机没 `rg`/`ugrep`，搜代码就靠它。`ext`/`fixed`/`per_file`/`threads` 可省，输出自身封顶 8000 字 |
 | `pdftext` | 抽 PDF 文本（`path/first/last/max_chars`） | 纯 Lua FFI 直连 `libpoppler-glib.so.8`，零编译零子进程；本机无 poppler 头文件，cdef 手写（导出符号 `poppler_document_get_page`/`poppler_page_get_text`），释放用 `g_object_unref`（`poppler_page_free`/`poppler_document_free` 已不在 134 里）；缺库报装 `libpoppler-glib8` |
 | `md2png` | Markdown 文件 → HTML → 长图 PNG（`path/out/width/height/scale/gfm`） | 全 FFI 无子进程无 Chrome：`libmd4c.so.0` 解析（**无 md4c.h，cdef 手写**，`abi_version` 必须 = 0、结构体字段顺序不能错否则崩在回调里）→ `build/liblite_html.so` 出图 → `src/html/render.cpp` 的字体。同名 `.html` 一起落盘便于调试；`height` 是**视口**，内容超出会被裁掉，长文档要同步调大 |
 | `trending` | GitHub Trending → Kami 排版 → 长图 PNG（`lang/since/limit/width/height/scale/out`） | `curl` 抓页面（`io.popen`）+ 文件内 `parse()` 的 `gmatch` 逐字段抽（**无 dom 库**，页面结构一变就返回空表）；出图复用 `liblite_html.so`。坑：HTML 必须一次成型（追加 `<style>` 会让内容溢出被裁）；`.page{width:auto}` 铺满、`width` 别低于 780（19px 仓库名会折行）；`os.date` 里 `"%%m"` 是字面量 |
@@ -206,6 +207,12 @@ hook 错误一律 fail-open（记 `_hook_errors`，不炸 agent）。`has_hooks(
 `music` 的 `dav://` 语义：`dav://host:port/路径` 列目录**直接流播**（默认整库随机，
 `limit=N` 限首数，`index=N` 选第几首）；**只写 `dav://` 不带路径会 PROPFIND 失败**，
 因为 host 拆不出来——要整库就带上 `WEBDAV_MUSIC` 的路径（`~/.env` 里有）。
+
+**`helper/lib/` 是共享模块，不是插件**（扫描只平铺看 `helper/*.lua`，子目录一律跳过）：
+`adb.lua`（传输层）、`music.lua`（VLC/MPRIS 控制）、`usb.lua`（ALSA/V4L2）、`uimap.lua`
+（视觉定位）、`deepseek.lua`（search/fetch 共用的鉴权+重试）、`webdav.lua`（PROPFIND +
+libcurl `CURLOPT_USERPWD`，凭据不进 argv/m3u）、`app_<class>_map.lua`（`uimap learn` 生成的
+坐标表，**勿手改**）。要给插件加共用能力就放这里，别复制两遍。
 
 **调一次插件工具的完整链路**（`lua/core/tools.lua`）：
 

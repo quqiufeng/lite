@@ -562,7 +562,7 @@ end
 -- opts.inject_context：每个用户轮**只在第一次请求**注入召回块，工具循环的后续请求不注入
 -- （模型早已见过，重复注入既打断前缀缓存又白花 token）。
 -- 召回块**追加到最末尾**而不是插在会话中间 —— 原因与实测见下面 "追加到最末尾" 那段注释
--- 以及 design.md §8.31。todo 是工具状态，不自动注入 prompt。
+-- 以及 design.md D1。todo 是工具状态，不自动注入 prompt。
 function M:request_messages(text, stream, opts)
     opts = opts or {}
     local inject = opts.inject_context ~= false
