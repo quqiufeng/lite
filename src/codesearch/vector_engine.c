@@ -20,6 +20,7 @@
 #include <math.h>
 #include <ctype.h>
 #include <time.h>
+#include <limits.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
@@ -839,6 +840,38 @@ struct vector_engine {
 // Public API
 // ============================================================
 
+// 与 batch_embedder 一致：Jina 默认优先 FP16，沿 model.onnx 软链找真实目录。
+static void choose_jina_model(const char* model_home, char* out, size_t outsz) {
+    char base[512];
+    snprintf(base, sizeof(base), "%s/jina-embeddings-v2-base-code", model_home);
+
+    const char* model_file = getenv("LITE_CS_MODEL_FILE");
+    if (model_file && *model_file) {
+        if (model_file[0] == '/') snprintf(out, outsz, "%s", model_file);
+        else snprintf(out, outsz, "%s/%s", base, model_file);
+        return;
+    }
+
+    int fp16 = 1;
+    const char* env = getenv("LITE_CS_FP16");
+    if (env && *env) fp16 = (env[0] != '0');
+    if (fp16) {
+        snprintf(out, outsz, "%s/model_fp16.onnx", base);
+        if (access(out, R_OK) == 0) return;
+        char flat[512], resolved[PATH_MAX];
+        snprintf(flat, sizeof(flat), "%s/model.onnx", base);
+        if (realpath(flat, resolved)) {
+            char* slash = strrchr(resolved, '/');
+            if (slash) {
+                *slash = '\0';
+                snprintf(out, outsz, "%s/model_fp16.onnx", resolved);
+                if (access(out, R_OK) == 0) return;
+            }
+        }
+    }
+    snprintf(out, outsz, "%s/model.onnx", base);
+}
+
 vector_engine_t* vector_engine_open(const char* cache_dir, const char* model) {
     vector_engine_t* engine = calloc(1, sizeof(vector_engine_t));
     if (!engine) {
@@ -867,8 +900,8 @@ vector_engine_t* vector_engine_open(const char* cache_dir, const char* model) {
 
     // Pre-initialize embedder to avoid reload on every search
     if (strcmp(engine->model, "jina") == 0) {
-        snprintf(engine->embedder_model_path, sizeof(engine->embedder_model_path),
-                 "%s/jina-embeddings-v2-base-code/model.onnx", model_home);
+        choose_jina_model(model_home, engine->embedder_model_path,
+                          sizeof(engine->embedder_model_path));
         snprintf(engine->embedder_vocab_path, sizeof(engine->embedder_vocab_path),
                  "%s/jina-embeddings-v2-base-code/vocab.json", model_home);
         engine->embedder = onnx_embedder_init(engine->embedder_model_path, engine->embedder_vocab_path, 512, VE_DIM);
