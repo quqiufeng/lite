@@ -139,7 +139,7 @@ status
 | `callgraph.c` | 调用图 |
 | `dataflow.c` | 变量 / 字段级数据流 |
 | `import.c` | 把 chunks / 符号 / 调用图 / 数据流写入 lite KV |
-| `embedder.c` | ONNX Runtime、tokenizer、CUDA / TensorRT / CPU EP、FP16 输出 |
+| `embedder.c` | ONNX Runtime、tokenizer、CUDA / CPU EP、FP16 输出 |
 | `batch_embedder.c` | 长度分桶批量向量化、增量缓存、HNSW 构建编排 |
 | `vector_engine.c` | 查询侧向量引擎 |
 | `query.c` | 符号 / 上下文 / 语义 / 精确 key 查询 |
@@ -192,11 +192,14 @@ namespace 默认是 `/code/<project>`。
 | C/C++ 工具链 + CMake | 系统 | `.so` 用 C++ 链接（tokenizers 静态库需要） |
 | `jansson` | 系统 `libjansson`，2.14 | JSON 解析；缺失则跳过整个 target |
 | `tokenizers-cpp` 静态库 | `third_party/codesearch/lib/tokenizers-cpp/` | `libtokenizers_c.a`、`libtokenizers_cpp.a`、`libsentencepiece.a`、`libonig.a`，随仓库自带 |
+| `tokenizers-cpp` 源码 | `third_party/codesearch/tokenizers-cpp/` | 固定 commit + sentencepiece/msgpack 子模块；`tools/build-tokenizers.sh` 可离线重建上述 `.a` |
 | TypeScript 插件（可选） | `third_party/codesearch/plugins/typescript-indexer/` | 预编译二进制 + 源码；`plugin.json` 用相对 `command` |
 | ONNX Runtime 头文件 | `third_party/codesearch/include/onnxruntime_c_api.h` | 已 vendor，编译期不依赖 ORT 安装 |
 | tokenizers 头文件 | `third_party/codesearch/include/tokenizers-cpp/tokenizers_c.h` | 已 vendor |
 | `lite_cache` | 仓库内 `include/` + CMake target | KV 写入 / 查询 |
 
+普通构建只用预编译 `.a`，**不需要 tokenizers 源码**；升级/换架构时运行
+`./third_party/codesearch/tools/build-tokenizers.sh`（默认用仓库内源码做 out-of-tree 构建）。
 CMake 默认从 `third_party/codesearch/lib/tokenizers-cpp` 找静态库；找不到会打印
 
 ```
@@ -235,7 +238,6 @@ examples/docs/scripts/tools/utils/benchmark/node_modules/.git/__pycache__` 等�
 | 备选 ONNX Runtime | `/data/venv/onnxruntime-linux-x64-gpu-1.26.0/lib/libonnxruntime.so.1` | 可用；`LITE_ORT_LIB` 指定 |
 | CUDA Runtime / cuBLAS / cuRAND / cuFFT / NVRTC | `/data/cuda/lib64`（CUDA 12.6） | ORT CUDA EP 依赖 |
 | cuDNN 9 | `/data/venv/lib/python3.12/site-packages/nvidia/cudnn/lib` | 启动时由 embedder 预加载 |
-| TensorRT 10.16 | `/opt/TensorRT-10/lib` | **默认关闭**，见 §2.5 |
 | Jina 模型 | `/opt/models/jina-embeddings-v2-base-code/` | 默认 768 维、最大 512 token |
 | MPNet（可选） | `/opt/models/all-mpnet-base-v2/` | 备选 768 维、最大 128 token |
 
@@ -249,9 +251,8 @@ ls /data/venv/lib/python3.12/site-packages/nvidia/cudnn/lib/libcudnn.so.9
 
 embedder 启动时会用 `RTLD_GLOBAL` 预加载：
 
-- `/opt/TensorRT-10/lib`
 - `/data/venv/lib/python3.12/site-packages/nvidia/cudnn/lib`
-- 额外的 `LITE_CS_PRELOAD_DIRS`（冒号分隔）
+- 额外的 `LITE_CS_PRELOAD_DIRS`（冒号分隔，只给高级调试用）
 
 ORT 自己的 provider `.so` 不预加载，交给 ORT 按需加载，避免单独 `dlopen` 时构造顺序崩溃。
 
@@ -262,7 +263,7 @@ export LD_LIBRARY_PATH=/data/cuda/lib64:$LD_LIBRARY_PATH
 export LITE_ORT_LIB=/data/venv/onnxruntime-linux-x64-gpu-1.20.1/lib/libonnxruntime.so.1
 ```
 
-cuDNN 与 TensorRT 库由 embedder 自己预加载，一般不需要再写进 `LD_LIBRARY_PATH`。
+cuDNN 库由 embedder 自己预加载，一般不需要再写进 `LD_LIBRARY_PATH`。
 
 ### 2.4 模型
 
@@ -281,11 +282,12 @@ cuDNN 与 TensorRT 库由 embedder 自己预加载，一般不需要再写进 `L
 
 | 文件 | 大小 | 说明 |
 |---|---|---|
-| `model.onnx` | ~640 MB | FP32，默认 |
-| `model_fp16.onnx` | ~320 MB | FP16；GPU 约快 1.5x，向量与 FP32 cosine ≈ 0.999998 |
+| `model.onnx` | ~640 MB | FP32；FP16 不可用时回退 |
+| `model_fp16.onnx` | ~320 MB | FP16；建索引和查询默认用它，GPU 约快 1.5x，向量与 FP32 cosine ≈ 0.999998 |
 | `model_quantized.onnx` | ~160 MB | INT8；在 CUDA 上大量算子回落 CPU，实测比 FP32 慢几十倍，**不推荐** |
 
-**FP16 默认开启**（`LITE_CS_FP16=0` 或 `fp16=false` 关闭）。代码先找
+**FP16 建索引和查询编码都默认开启**（`LITE_CS_FP16=0` 或 `fp16=false` 关闭；
+`LITE_CS_MODEL_FILE` 可显式指定模型文件）。代码先找
 `<model_dir>/jina-embeddings-v2-base-code/model_fp16.onnx`；若不存在，会沿
 `model.onnx` 的软链 `realpath` 到真实目录，再找同目录的 `model_fp16.onnx`。
 所以本机不用手工建软链；模型缺失时自动回退 `model.onnx`。
@@ -298,25 +300,11 @@ cuDNN 与 TensorRT 库由 embedder 自己预加载，一般不需要再写进 `L
 模型切换（Jina ↔ MPNet、FP32 ↔ FP16）会自动让增量缓存失效：cache tag 由
 模型路径 + 文件大小 + mtime 计算。
 
-### 2.5 TensorRT / flash-attention 说明
+### 2.5 TensorRT / flash-attention
 
-- **TensorRT 默认关闭**：原因是**性能不划算**，不是加载不了。
-- 早期用 ORT 1.20.1 / 1.26.0 配 TensorRT 10.16 会在 `deserializeCudaEngine` 报
-  `Unexpected call to stub deserializeEngine`。根因是预加载 `/opt/TensorRT-10/lib`
-  时把 `libnvinfer_dispatch` / `libnvinfer_lean` 也 `RTLD_GLOBAL` 了，它们的
-  `createInferRuntime_INTERNAL` 抢在 `libnvinfer.so` 前面，ORT 拿到的是
-  dispatch-only runtime。现在 `preload_dir` 跳过这些库和
-  `libnvinfer_builder_resource*`，TRT 10.16 可以正常建/载 engine，
-  **不再要求 TRT 10.4**。
-- 但实测在 Jina + 动态 batch/seq 下，ORT 的 TensorRT EP 反而很慢：
-  920 chunks 约 **46 items/s**；同进程 CUDA + FP16 约 **1600 items/s**。
-  `trtexec` 单独跑 32×512 也要约 60 ms（约 533 chunks/s）。因此仍推荐
-  `fp16=true` 走 CUDA，TRT 保持关闭。
-- 想自己试：`LITE_CS_ENABLE_TRT=1 LITE_CS_TRT_FP16=1`，先删
-  `$HOME/trt_cache` 重建 engine；engine 在**当前 TensorRT 版本**下生成。
-- `/opt/flash-attention` 与 `/data/venv` 里的 PyTorch 扩展是另一条链路；
-  **codesearch 不加载 flash-attention**，ONNX Runtime 也不会用它。
-  它对这里的索引/向量化速度没有影响，不要把它当成本模块的依赖。
+**不使用 TensorRT，也不加载 flash-attention。** GPU 只走 CUDA + FP16；
+不预加载 `/opt/TensorRT-10/lib`，没有 `libnvinfer*` 运行时依赖。
+TensorRT 之前实测在该工作负载下比 CUDA 慢且版本耦合严重，代码路径已移除。
 
 ### 2.6 环境变量速查
 
@@ -334,9 +322,7 @@ cuDNN 与 TensorRT 库由 embedder 自己预加载，一般不需要再写进 `L
 | `LITE_CS_DISABLE_VECTOR` | 关 | helper `build` 时跳过向量化 |
 | `LITE_CS_KV_MAX_GB` | `8` | import 时 KV 逻辑内存上限（大仓库可调） |
 | `LITE_ORT_LIB` | ORT 1.20.1 路径 | 指定 ONNX Runtime `.so.1` |
-| `LITE_CS_ENABLE_TRT` | 关 | `1` = 尝试 TensorRT（能跑，但本工作负载比 CUDA 慢） |
-| `LITE_CS_TRT_FP16` | 非 Jina 为开 | TRT FP16；Jina 显式设 `1` 才开 |
-| `LITE_CS_PRELOAD_DIRS` | 空 | 额外预加载目录，冒号分隔 |
+| `LITE_CS_PRELOAD_DIRS` | 空 | 额外预加载目录，冒号分隔（高级调试） |
 
 ---
 
@@ -398,6 +384,8 @@ print(H.run({ action = "build", path = "." }, { cwd = os.getenv("PWD") }))
 | `workers` | index 进程/分片数；默认 1；`fork=true` 时默认 CPU 核数 |
 | `fork` | 多进程切块；fresh 进程更快（见下方注意） |
 | `excludes` | 追加跳过目录，逗号分隔 |
+| `skip_kinds` | 按 ctags kind 过滤，如 `header,file,enumerator,macro` |
+| `include_dirs` | 把默认 noise 目录重新纳入，如 `tools,utils` |
 | `plugins` | ctags 插件 registry JSON 路径（可选） |
 | `model` | `jina`（默认）或 `mpnet` |
 | `fp16` | 用 `model_fp16.onnx`；默认开，`false` 关闭 |
@@ -785,12 +773,11 @@ print(H.run({
 | `liblite_codesearch.so not found` | tokenizers 静态库或 jansson 缺失；看 `./tools/check_deps.sh`，用 `-DLITE_CS_TOKENIZERS_DIR=` 重配 |
 | `cannot dlopen libonnxruntime.so.1` | 设 `LITE_ORT_LIB` 指向真实 `libonnxruntime.so.1` |
 | `CUDA not available, falling back to CPU` | 检查 `/data/cuda/lib64`、cuDNN 目录、`nvidia-smi`；CPU 会慢几十倍 |
-| `TensorRT session failed, retrying on CUDA` | 当前默认关闭 TRT；若手动开过，删 `$HOME/trt_cache` 重建 engine，或继续用 CUDA + FP16 |
 | `ctags: command not found` | 安装 Universal Ctags；语义/符号仍可用，但无法建索引 |
 | `index not found for this project` | 先 `action=build` |
 | `KV import missing` | 跑 `action=build` 或 `action=import` |
 | 语义搜索很慢 / 占用高 | 用 `fp16=true`；`batch` 降到 64；确认 `Using CUDA GPU acceleration` |
-| 显存不足 | 降低 `batch`（128 → 64/32）；不要开 TRT |
+| 显存不足 | 降低 `batch`（128 → 64/32） |
 | 重复 build 仍然很慢 | 确认没有删 `vectors/*.hash`；确认模型/FP16 没变；大改动会重建 HNSW |
 | 想确认是否走了增量 | 看输出：`Incremental cache: N vectors available`、`reused N`、`Unchanged: ...` |
 | 怀疑向量/索引损坏 | 删 `analysis/vectors/` 重新 `build` |
@@ -800,7 +787,7 @@ print(H.run({
 
 - `Done in ... (reused X, embedded Y)`：向量化结果。
 - `Unchanged: ... skip rewrite and HNSW rebuild`：完全命中增量缓存。
-- `Using CUDA GPU acceleration` / `Using TensorRT ...` / `retrying on CPU`：执行后端。
+- `Using CUDA GPU acceleration` / `retrying on CPU`：执行后端。
 - 所有库内日志走 stderr，stdout 只留 query 的 JSON。
 
 ---
@@ -853,8 +840,8 @@ CS.query({ query = "epoll", repo = "/code/project", type = "search",
 | 索引并行 | 默认多进程 | 库内默认串行，`fork=true` 显式开 |
 | 临时文件 | 固定 `/tmp` 名 | 带父进程 pid，支持多实例 |
 | 向量化 | 全量 | 增量缓存 + 未变化跳过 HNSW |
-| 模型 | FP32 为主 | 支持 FP16，自动找 `model_fp16.onnx` |
-| TensorRT | 视为主要加速 | 默认关闭（版本不兼容），CUDA 为默认 GPU 后端 |
+| 模型 | FP32 为主 | 建索引和查询都默认 FP16，自动找 `model_fp16.onnx` |
+| TensorRT | 视为主要加速 | 不使用；GPU 只走 CUDA + FP16 |
 | KV 实现 | my_db 自己的 cache | **lite 自带 kvcache（`src/cache/`）**，落在 `kv/mem.bin` |
 | 数据目录 | `/memory` / `$LITE_CS_HOME` | `$LITE_CS_HOME/<project>`，KV 在子目录 |
 

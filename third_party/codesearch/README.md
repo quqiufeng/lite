@@ -31,8 +31,9 @@
 - ONNX Runtime：`LITE_ORT_LIB` 指向 `libonnxruntime.so.1`（默认 `/data/venv/.../1.20.1/`）
 - 模型：`LITE_CS_MODEL_DIR`（默认 `/opt/models`，Jina / MPNet）
 - CUDA / cuDNN：`/data/cuda/lib64`、`/data/venv/lib/python3.12/site-packages/nvidia/cudnn/lib`
-- TensorRT：`/opt/TensorRT-10/lib`（默认关闭，版本不兼容）
 - `ctags`：系统 `Universal Ctags`
+
+不使用 TensorRT。
 
 ## 更新
 

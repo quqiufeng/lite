@@ -159,7 +159,8 @@ $ACS cross-search "HTTP request parser state machine"
 
 1. **index + vector 必须配套**：只跑 `index` 没有向量 → `search` 失效。`$ACS vector` 内含 HNSW 自动验收。
 2. **索引任务必须串行**：`code_indexer` worker 临时文件是固定 `/tmp` 名，并行会交叉污染。
-3. **`BATCH_SIZE=16`**（≤ TensorRT profile 上限 32）；编码失败不写零向量、非零退出，`vector` 校验失败即中止。
+3. **向量化 batch 默认 128**；编码失败不写零向量、非零退出，`vector` 校验失败即中止。
+   当前只走 CUDA + FP16，不使用 TensorRT。
 4. **老缓存 root 属主** → embedder/hnsw 静默写失败；先 `chown -R` 再重建；验收 = `.hnsw` 比 `.bin` 新。
 5. **不要指望远程 `git pull`**：远程 `/opt/my_db` 非 git clone；本地改源码→`make`→`scp` 二进制。
 6. **两套查询通道**：`$ACS search` 走向量（需向量文件）；`$CQ --type context/symbol` 走 KV Cache（不需向量）。

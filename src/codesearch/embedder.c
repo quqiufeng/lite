@@ -80,8 +80,8 @@ const char* onnx_embedder_error(void) {
 
 // Initialize ONNX Runtime API
 // Use RTLD_GLOBAL so provider libraries can find symbols in the main library
-// 把目录里所有 lib*.so* 用 RTLD_GLOBAL 拉起来：ORT 的 CUDA/TensorRT EP
-// 依赖 cudnn/nvinfer，而这些库常常只存在于 venv/TensorRT 目录，不在 ld.so 缓存里。
+// 把目录里所有 lib*.so* 用 RTLD_GLOBAL 拉起来：ORT 的 CUDA EP 依赖 cuDNN，
+// 而 cuDNN 常常只存在于 venv 目录，不在 ld.so 缓存里。
 static void preload_dir(const char* dir) {
     if (!dir || !*dir) return;
     DIR* d = opendir(dir);
@@ -90,12 +90,6 @@ static void preload_dir(const char* dir) {
     while ((e = readdir(d)) != NULL) {
         if (strncmp(e->d_name, "lib", 3) != 0) continue;
         if (!strstr(e->d_name, ".so")) continue;
-        // 不要 RTLD_GLOBAL 预加载 TensorRT 的 dispatch/lean/构建资源库：
-        // 它们也导出 createInferRuntime_INTERNAL，会抢在 libnvinfer.so 前面
-        // 造成 ORT TRT EP 拿到 dispatch-only runtime，deserialize 直接是 stub。
-        if (strstr(e->d_name, "libnvinfer_dispatch") ||
-            strstr(e->d_name, "libnvinfer_lean") ||
-            strstr(e->d_name, "libnvinfer_builder_resource")) continue;
         char path[4096];
         snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
         dlopen(path, RTLD_NOW | RTLD_GLOBAL);
@@ -116,7 +110,6 @@ static void preload_default_libs(void) {
     }
     // 只预加载 EP 的**依赖**库；ORT 目录里的 provider .so 不能单独 dlopen，
     // 它们的构造函数依赖 core 已初始化，交给 ORT 自己按需加载。
-    preload_dir("/opt/TensorRT-10/lib");
     preload_dir("/data/venv/lib/python3.12/site-packages/nvidia/cudnn/lib");
 }
 
@@ -694,154 +687,30 @@ onnx_embedder_t* onnx_embedder_init(const char* model_path, const char* vocab_pa
         return NULL;
     }
     
-    // 尝试添加 TensorRT Execution Provider (RTX 4090D - 24GB VRAM)
-    // TensorRT 比 CUDA 更快（通常 2-5x）
-    // 使用 V2 API 以支持动态 batch shape profile（batch embedding 必需）
-    static char trt_cache_path[512];
-    snprintf(trt_cache_path, sizeof(trt_cache_path), "%s/trt_cache", getenv("HOME") ? getenv("HOME") : "/tmp");
-    
-    // TensorRT 默认关闭：本机 ORT 1.20.1 与 TensorRT 10.16 的 engine 反序列化
-    // 不兼容（dispatchStubs 报错），而且单条 query 反序列化比 CUDA 还慢。
-    // 需要时显式 LITE_CS_ENABLE_TRT=1；旧的 ONNX_EMBEDDER_DISABLE_TRT 仍可强制关。
-    const char* enable_trt_env = getenv("LITE_CS_ENABLE_TRT");
-    int disable_trt = !(enable_trt_env && enable_trt_env[0] && enable_trt_env[0] != '0');
-    const char* no_trt_env = getenv("ONNX_EMBEDDER_DISABLE_TRT");
-    if (no_trt_env && no_trt_env[0] && no_trt_env[0] != '0') disable_trt = 1;
+    // 只用 CUDA EP；TensorRT 实测在本工作负载下更慢，且 ORT/TRT 版本耦合严重。
+    // CUDA EP 不可用时 CreateSession 会失败，下面统一回退 CPU。
+    OrtCUDAProviderOptions cuda_options;
+    memset(&cuda_options, 0, sizeof(cuda_options));
+    cuda_options.device_id = 0;
+    cuda_options.arena_extend_strategy = 0;
+    cuda_options.gpu_mem_limit = 16ULL * 1024 * 1024 * 1024;
+    cuda_options.cudnn_conv_algo_search = OrtCudnnConvAlgoSearchHeuristic;
+    cuda_options.do_copy_in_default_stream = 1;
 
-    OrtTensorRTProviderOptionsV2* trt_options_v2 = NULL;
-    int use_tensorrt = 0;
-    const char* trt_fp16_env = getenv("LITE_CS_TRT_FP16");
-    int trt_fp16 = (trt_fp16_env && trt_fp16_env[0] && trt_fp16_env[0] != '0') || !is_jina;
-    
-    // 尝试 V2 API（支持动态 shape profile）
-    if (!disable_trt && g_ort->CreateTensorRTProviderOptions) {
-        status = g_ort->CreateTensorRTProviderOptions(&trt_options_v2);
-        if (status == NULL && trt_options_v2 != NULL) {
-            const char* keys[] = {
-                "device_id",
-                "trt_max_workspace_size",
-                "trt_fp16_enable",
-                "trt_int8_enable",
-                "trt_engine_cache_enable",
-                "trt_engine_cache_path",
-                "trt_dump_subgraphs",
-                "trt_profile_min_shapes",
-                "trt_profile_max_shapes",
-                "trt_profile_opt_shapes"
-            };
-            const char* values[] = {
-                "0",
-                "12884901888",
-                trt_fp16 ? "1" : "0",
-                "0",
-                "1",
-                trt_cache_path,
-                "0",
-                "input_ids:1x64,attention_mask:1x64",
-                "input_ids:32x512,attention_mask:32x512",
-                "input_ids:8x256,attention_mask:8x256"
-            };
-            
-            status = g_ort->UpdateTensorRTProviderOptions(trt_options_v2, keys, values, 10);
-            if (status == NULL) {
-                status = g_ort->SessionOptionsAppendExecutionProvider_TensorRT_V2(session_options, trt_options_v2);
-                if (status == NULL) {
-                    use_tensorrt = 1;
-                } else {
-                    fprintf(stderr, "  [WARN] TensorRT V2 append failed, falling back to legacy API\n");
-                    g_ort->ReleaseStatus(status);
-                }
-            } else {
-                fprintf(stderr, "  [WARN] TensorRT V2 config failed, falling back to legacy API\n");
-                g_ort->ReleaseStatus(status);
-            }
-            g_ort->ReleaseTensorRTProviderOptions(trt_options_v2);
-        } else {
-            if (status) g_ort->ReleaseStatus(status);
-        }
-    }
-    
-    // Fallback: 旧版 API（不支持动态 batch，batch embedding 会失败）
-    if (!use_tensorrt) {
-        OrtTensorRTProviderOptions trt_options;
-        memset(&trt_options, 0, sizeof(trt_options));
-        trt_options.device_id = 0;
-        trt_options.trt_max_partition_iterations = 1000;
-        trt_options.trt_min_subgraph_size = 1;
-        trt_options.trt_max_workspace_size = 12ULL * 1024 * 1024 * 1024;
-        trt_options.trt_fp16_enable = trt_fp16;
-        trt_options.trt_int8_enable = 0;
-        trt_options.trt_engine_cache_enable = 1;
-        trt_options.trt_engine_cache_path = trt_cache_path;
-        trt_options.trt_dump_subgraphs = 0;
-        
-        status = disable_trt
-            ? g_ort->CreateStatus(ORT_FAIL, "TensorRT disabled by ONNX_EMBEDDER_DISABLE_TRT")
-            : g_ort->SessionOptionsAppendExecutionProvider_TensorRT(session_options, &trt_options);
+    status = g_ort->SessionOptionsAppendExecutionProvider_CUDA(session_options, &cuda_options);
     if (status != NULL) {
-        // TensorRT 不可用，回退到 CUDA
+        fprintf(stderr, "  [ERROR] CUDA not available, falling back to CPU. Check LD_LIBRARY_PATH for CUDA/cuDNN libraries.\n");
         g_ort->ReleaseStatus(status);
-        
-        OrtCUDAProviderOptions cuda_options;
-        memset(&cuda_options, 0, sizeof(cuda_options));
-        cuda_options.device_id = 0;
-        cuda_options.arena_extend_strategy = 0;
-        // RTX 4090D: 24GB VRAM, allow up to 16GB for CUDA
-        cuda_options.gpu_mem_limit = 16ULL * 1024 * 1024 * 1024;
-        cuda_options.cudnn_conv_algo_search = OrtCudnnConvAlgoSearchHeuristic;
-        cuda_options.do_copy_in_default_stream = 1;
-        
-        status = g_ort->SessionOptionsAppendExecutionProvider_CUDA(session_options, &cuda_options);
-        if (status != NULL) {
-            fprintf(stderr, "  [ERROR] CUDA not available, falling back to CPU. Check LD_LIBRARY_PATH for CUDA/cuDNN libraries.\n");
-            g_ort->ReleaseStatus(status);
-        } else {
-            fprintf(stderr, "  Using CUDA GPU acceleration\n");
-        }
+        status = NULL;
     } else {
-        if (is_jina) {
-            fprintf(stderr, "  Using TensorRT GPU acceleration (FP32 for Jina)\n");
-        } else {
-            fprintf(stderr, "  Using TensorRT GPU acceleration (FP16)\n");
-        }
+        fprintf(stderr, "  Using CUDA GPU acceleration\n");
     }
-    }  // close if (!use_tensorrt)
     
     status = g_ort->CreateSession(e->env, model_path, session_options, &e->session);
     g_ort->ReleaseSessionOptions(session_options);
     
-    if (status != NULL && use_tensorrt) {
-        // TRT 建/载引擎失败时先退 CUDA，别直接掉到 CPU（CPU 可能慢几十倍）。
-        fprintf(stderr, "  [WARN] TensorRT session failed, retrying on CUDA\n");
-        g_ort->ReleaseStatus(status);
-        status = NULL;
-        OrtSessionOptions* cuda_sess_opts = NULL;
-        OrtStatus* cuda_status = g_ort->CreateSessionOptions(&cuda_sess_opts);
-        if (cuda_status == NULL) {
-            OrtCUDAProviderOptions cuda_prov_opts;
-            memset(&cuda_prov_opts, 0, sizeof(cuda_prov_opts));
-            cuda_prov_opts.device_id = 0;
-            cuda_prov_opts.arena_extend_strategy = 0;
-            cuda_prov_opts.gpu_mem_limit = 16ULL * 1024 * 1024 * 1024;
-            cuda_prov_opts.cudnn_conv_algo_search = OrtCudnnConvAlgoSearchHeuristic;
-            cuda_prov_opts.do_copy_in_default_stream = 1;
-            status = g_ort->SessionOptionsAppendExecutionProvider_CUDA(cuda_sess_opts, &cuda_prov_opts);
-            if (status == NULL) {
-                status = g_ort->CreateSession(e->env, model_path, cuda_sess_opts, &e->session);
-                if (status == NULL) fprintf(stderr, "  Using CUDA GPU acceleration (TensorRT fallback)\n");
-            }
-            g_ort->ReleaseSessionOptions(cuda_sess_opts);
-        } else {
-            g_ort->ReleaseStatus(cuda_status);
-        }
-        if (status != NULL) {
-            g_ort->ReleaseStatus(status);
-            status = NULL;
-        }
-    }
-
     if (status != NULL || e->session == NULL) {
-        // GPU EP 初始化失败（CUDA/cuDNN/TRT 缺失或版本不合）不应让整个功能不可用，
+        // GPU EP 初始化失败（CUDA/cuDNN 缺失或版本不合）不应让整个功能不可用，
         // 退到 CPU 再试一次；语义索引慢一点但可用。
         fprintf(stderr, "  [WARN] GPU session failed, retrying on CPU\n");
         if (status != NULL) g_ort->ReleaseStatus(status);

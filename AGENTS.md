@@ -170,10 +170,10 @@ tool 结果在盘上是截断版（`LITE_TOOL_RESULT_CHARS`，默认 8192，`ses
 - 大库/模型不随包：见 `README.md` 的 `ort_link.sh`、`cuda_provider.sh`、`LITE_DIST_WITH_*`。
 - `lite_codesearch` 的 tokenizers 静态库随仓库自带：
   `third_party/codesearch/lib/tokenizers-cpp/`（`-DLITE_CS_TOKENIZERS_DIR=...` 覆盖）；
+  源码也在 `third_party/codesearch/tokenizers-cpp/`，用 `tools/build-tokenizers.sh` 离线重建 `.a`。
   缺失时 CMake 跳过该 target，索引/查询功能不可用但其余构建正常。
-  ONNX Runtime 运行期 `dlopen`（`LITE_ORT_LIB`），模型用 `LITE_CS_MODEL_DIR`；TensorRT 默认关
-  （`LITE_CS_ENABLE_TRT=1` 才开；TRT 10.16 已可建/载 engine，但本工作负载比 CUDA+FP16 慢，
-  预加载时不能把 `libnvinfer_dispatch/lean` 全局拉起，否则 deserialize 会落到 stub）。
+  ONNX Runtime 运行期 `dlopen`（`LITE_ORT_LIB`），模型用 `LITE_CS_MODEL_DIR`；
+  GPU 只走 CUDA + FP16，不使用 TensorRT，也不预加载 `libnvinfer*`。
 - 热重载：Lua 清 `package.loaded[...]` 后 require；TUI `/reload` 只重载 `core.tools` /
   `core.prompt` / `ffi.*`，**不重扫插件快照**。进程内 `ffi.load` 过的同路径 `.so` 换不掉，
   但 `native build` 每次出新文件名（`<name>-<ts>.so` + `<name>.json` 清单），下一次
