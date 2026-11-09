@@ -1587,18 +1587,21 @@ end
 
 -- OCR (optional system PP-OCRv4)
 do
-    local sample = (arg[0]:match("^(.*)/[^/]+$") or ".") .. "/../testdata/ocr_sample.png"
-    local sf = io.open(sample, "rb")
+    -- 仓库不再带示例图（testdata/ 已删）；要跑这组就自己给一张带字的 PNG：
+    --   LITE_OCR_SAMPLE=/path/ocr.png ./tools/test.sh
+    local sample = os.getenv("LITE_OCR_SAMPLE")
+    local sf = sample and io.open(sample, "rb")
     local OCR = require("ffi.ocr")
     local ready = OCR.ready()
+    local img, dir
     if sf and ready then
         local bytes = sf:read("*a")
         sf:close()
-        local img = os.tmpname() .. ".png"
+        img = os.tmpname() .. ".png"
         local f = assert(io.open(img, "wb"))
         f:write(bytes)
         f:close()
-        local dir = os.tmpname()
+        dir = os.tmpname()
         os.remove(dir)
         os.execute("mkdir -p " .. shq(dir))
         local Tools = require("core.tools")
@@ -1608,6 +1611,13 @@ do
             "tools ocr")
         local with_boxes = t:execute("ocr", { path = img, boxes = true })
         check(with_boxes:find('"x"', 1, true) ~= nil, "tools ocr boxes")
+    else
+        if sf then sf:close() end
+        print("SKIP tools ocr image checks (give LITE_OCR_SAMPLE=/path/shot.png)")
+    end
+
+    -- 下面这些只依赖 onnxruntime + 模型，与样张无关
+    if ready then
         -- 初始化不应把 ONNX Runtime 的 CUDA 缺库报错漏到进程输出里。
         -- 随包只有 CPU 版 onnxruntime，回退是预期行为；那几行红色 ERROR 会
         -- 被误读成「OCR 坏了」。噪声在进程流（libocr 写 stdout，ORT 写 stderr），
@@ -1714,12 +1724,11 @@ io.write(ok and "READY\n" or "NOTREADY\n")
                     "package.sh has escape hatch for bundling OCR models")
             end
         end
-        os.remove(img)
-        os.execute("rm -rf " .. shq(dir))
     else
-        if sf then sf:close() end
-        print("SKIP tools ocr (OCR/onnxruntime/model unavailable)")
+        print("SKIP tools ocr init/packaging checks (onnxruntime or models missing)")
     end
+    if img then os.remove(img) end
+    if dir then os.execute("rm -rf " .. shq(dir)) end
 end
 
 -- OCR 可选性：模型缺失时报错必须可操作，不能是 cdata NULL；
