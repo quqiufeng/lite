@@ -98,8 +98,15 @@ local function grab(url, dir)
   local rc, status, html = http.get(url, { "User-Agent: Mozilla/5.0 (lite web2png)" })
   if rc ~= 0 then error("抓取失败：curl rc=" .. tostring(rc) .. "（" .. tostring(status) .. "）；url=" .. url) end
   if status ~= 200 then error("抓取失败：HTTP " .. tostring(status) .. "；url=" .. url) end
-  local title = (html or ""):match("<title[^>]*>(.-)</title%s*>")
-  return title and plain(title):gsub("%s+", " ") or nil, plain(html or ""), "curl GET"
+  html = html or ""
+  local title = html:match("<title[^>]*>(.-)</title%s*>")
+  title = title and plain(title):gsub("%s+", " ")
+  local ok, hmd = pcall(dofile, dir .. "/lib/htmlmd.lua")
+  if ok and hmd and hmd.to_md then
+    local md = hmd.to_md(html)
+    if md ~= "" then return title, md, "curl GET" end
+  end
+  return title, plain(html), "curl GET"
 end
 
 -- 按段落截断，尽量停在完整句子/段落上
