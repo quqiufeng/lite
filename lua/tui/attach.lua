@@ -157,6 +157,14 @@ function M.run(opts)
             busy = false
         elseif t == "memory" then
             hits = ev.hits or 0
+            -- 服务端只发计数时这里什么也不显示，用户只看到状态栏 hit:N。
+            -- 现在带 keys，transcript 里补一行，和本地 TUI 的表现对齐。
+            if hits > 0 then
+                local keys = ev.keys or {}
+                local body = #keys > 0 and (" · " .. table.concat(keys, ", ")) or ""
+                transcript:add("info", string.format("memory: %d hits%s", hits, body))
+                transcript:reset_scroll()
+            end
         elseif t == "todos" then
             todo_items = ev.items or {}
             if todo_view then todo_view:set_items(todo_items) end

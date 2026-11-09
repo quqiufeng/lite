@@ -3480,6 +3480,27 @@ do
     check(txt:find("queue:3", 1, true) ~= nil, "tui status queue")
 end
 
+-- tui 召回痕迹行（memory 事件在 transcript 里留的一行）
+do
+    local Loop = require("tui.loop")
+    check(Loop.memory_notice({}) == nil, "memory notice empty")
+    local items = {
+        { key = "kernel-7.2.12 报告位置", text = "第一个\n  第二个  第三个" },
+        { key = "mem_write_probe", text = "probe" },
+    }
+    local line = Loop.memory_notice(items, false)
+    check(line == "memory: 2 hits · kernel-7.2.12 报告位置, mem_write_probe", "memory notice keys")
+    check(line:find("第一个", 1, true) == nil, "memory notice hides body by default")
+    local full = Loop.memory_notice(items, true)
+    check(full:find("· [mem_write_probe] probe", 1, true) ~= nil, "memory notice verbose body")
+    check(full:find("第一个 第二个 第三个", 1, true) ~= nil, "memory notice verbose flattens newlines")
+    -- 超过 6 条只列前 6 个 key + 省略计数
+    local many = {}
+    for i = 1, 8 do many[i] = { key = "k" .. i, text = "t" } end
+    local short = Loop.memory_notice(many, false)
+    check(short == "memory: 8 hits · k1, k2, k3, k4, k5, k6, …+2", "memory notice truncates keys")
+end
+
 -- tui status prefix reuse
 do
     local Status = require("tui.status")

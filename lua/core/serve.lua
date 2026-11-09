@@ -203,8 +203,16 @@ function M.run(opts)
     ctx:on("turn_start", function(turn) push({ type = "turn_start", turn = turn }) end)
     ctx:on("turn_end", function(turn) push({ type = "turn_end", turn = turn }) end)
     ctx:on("memory", function(items)
-        last_hits = #(items or {})
-        push({ type = "memory", hits = last_hits })
+        items = items or {}
+        last_hits = #items
+        -- 带 key 出去：客户端（attach）要能把"命中了什么"显示出来，
+        -- 只发计数的话用户只能看到 hit:N，不知道内容。
+        local keys = {}
+        for i, it in ipairs(items) do
+            if i > 6 then break end
+            keys[#keys + 1] = tostring(it.key or "?")
+        end
+        push({ type = "memory", hits = last_hits, keys = keys })
     end)
     ctx:on("todos", function(items)
         push({ type = "todos", items = items or {} })

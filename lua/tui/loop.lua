@@ -31,6 +31,35 @@ local function shq(s)
     return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
 end
 
+-- 召回块（memory 事件）在界面上的一行痕迹。
+-- 背景：召回结果只进 prompt 的 <retrieved_memory> 尾部块，TUI 之前只拿它更新状态栏
+-- 的 hit:N，用户「mem 还在但上下文里看不见」。默认只列 key —— 正文全量塞进滚动区
+-- 会把真正的对话淹掉；LITE_TUI_MEM_VERBOSE=1 展开成 key + 正文摘要（单行、截 200 字）。
+-- 返回 nil 表示没有命中，调用方就不加块。
+function M.memory_notice(items, verbose)
+    items = items or {}
+    local n = #items
+    if n == 0 then return nil end
+    if verbose == nil then verbose = os.getenv("LITE_TUI_MEM_VERBOSE") == "1" end
+    local keys = {}
+    for i, it in ipairs(items) do
+        if i > 6 then
+            keys[#keys + 1] = string.format("…+%d", n - 6)
+            break
+        end
+        keys[#keys + 1] = tostring(it.key or "?")
+    end
+    local lines = { string.format("memory: %d hits · %s", n, table.concat(keys, ", ")) }
+    if verbose then
+        for _, it in ipairs(items) do
+            local text = tostring(it.text or ""):gsub("%s+", " ")
+            if #text > 200 then text = text:sub(1, 200) .. "..." end
+            lines[#lines + 1] = string.format("  · [%s] %s", tostring(it.key or "?"), text)
+        end
+    end
+    return table.concat(lines, "\n")
+end
+
 function M.run(ctx, agent, memory, opts)
     opts = opts or {}
     local multi = opts.multi
@@ -259,8 +288,13 @@ function M.run(ctx, agent, memory, opts)
         if draw then draw() end
     end)
     ctx:on("error", function(err) transcript:add("error", tostring(err)) end)
+    -- 召回块只在第一轮请求注入，界面上却一直看不到内容（只体现在状态栏 hit:N）。
+    -- 这里在 transcript 里留一行痕迹，正文格式见 M.memory_notice。
     ctx:on("memory", function(items)
-        memory_hits = #(items or {})
+        items = items or {}
+        memory_hits = #items
+        local notice = M.memory_notice(items)
+        if notice then transcript:add("info", notice) end
         if draw then draw() end
     end)
     -- 压缩是低频但重要的事件：它一次性改变了 prompt 前缀。
