@@ -24,6 +24,9 @@ std::string g_error;
 
 struct font_entry {
     cairo_scaled_font_t* sf = nullptr;
+    std::string family = "Sans";
+    int slant  = CAIRO_FONT_SLANT_NORMAL;
+    int weight = CAIRO_FONT_WEIGHT_NORMAL;
     double size    = 14;
     double ascent  = 0;
     double descent = 0;
@@ -88,28 +91,45 @@ public:
         fe->size = d.size.value();
         if (fe->size < 1) fe->size = 14;
 
-        const char* family = d.family.empty() ? m_font_name.c_str() : d.family.c_str();
+        // cairo toy font API 只接受单一字体名：CSS 的 "A","B",serif 多值列表会让
+        // cairo_select_font_face 匹配失败并静默落回 Sans。这里取第一个可用的族名。
+        std::string fam = d.family.empty() ? m_font_name : d.family;
+        std::string first;
+        for (size_t i = 0; i < fam.size() && fam[i] != ','; ++i) {
+            char ch = fam[i];
+            if (ch == '"' || ch == '\'' || ch == ' ') { if (ch == ' ' && !first.empty()) {} else continue; }
+            first.push_back(ch);
+        }
+        while (!first.empty() && first.back() == ' ') first.pop_back();
+        if (first.empty()) first = "Sans";
+        const char* family = first.c_str();
         cairo_font_slant_t slant = (d.style == font_style_italic) ? CAIRO_FONT_SLANT_ITALIC : CAIRO_FONT_SLANT_NORMAL;
         cairo_font_weight_t weight = (d.weight >= 600) ? CAIRO_FONT_WEIGHT_BOLD : CAIRO_FONT_WEIGHT_NORMAL;
 
-        cairo_font_face_t* face = cairo_toy_font_face_create(family, slant, weight);
-        cairo_matrix_t font_matrix, ctm;
-        cairo_matrix_init_scale(&font_matrix, fe->size, fe->size);
-        cairo_matrix_init_identity(&ctm);
-        fe->sf = cairo_scaled_font_create(face, &font_matrix, &ctm, nullptr);
-        cairo_font_face_destroy(face);
+        // 本机 cairo_scaled_font_create 返回 CAIRO_STATUS_NULL_POINTER(7)：度量全 0、
+        // show_text 静默不出墨。统一改走 toy font API（select_font_face + set_font_size）。
+        fe->family = family;
+        fe->slant  = (int)slant;
+        fe->weight = (int)weight;
+
+        cairo_surface_t* scratch = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
+        cairo_t* tmp = cairo_create(scratch);
+        cairo_select_font_face(tmp, family, slant, weight);
+        cairo_set_font_size(tmp, fe->size);
 
         cairo_font_extents_t ext;
-        cairo_scaled_font_extents(fe->sf, &ext);
+        cairo_font_extents(tmp, &ext);
         fe->ascent  = ext.ascent;
         fe->descent = ext.descent;
         fe->height  = ext.height;
 
         cairo_text_extents_t te;
-        cairo_scaled_font_text_extents(fe->sf, "x", &te);
+        cairo_text_extents(tmp, "x", &te);
         fe->x_height = te.height;
-        cairo_scaled_font_text_extents(fe->sf, "0", &te);
+        cairo_text_extents(tmp, "0", &te);
         fe->ch_width = te.x_advance;
+        cairo_destroy(tmp);
+        cairo_surface_destroy(scratch);
 
         if (fm) {
             fm->font_size = (float)fe->size;
@@ -135,8 +155,15 @@ public:
     {
         auto* fe = fe_of(hFont);
         if (!fe || !text) return 0;
+        cairo_surface_t* scratch = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
+        cairo_t* tmp = cairo_create(scratch);
+        cairo_select_font_face(tmp, fe->family.c_str(), (cairo_font_slant_t)fe->slant,
+                               (cairo_font_weight_t)fe->weight);
+        cairo_set_font_size(tmp, fe->size);
         cairo_text_extents_t te;
-        cairo_scaled_font_text_extents(fe->sf, text, &te);
+        cairo_text_extents(tmp, text, &te);
+        cairo_destroy(tmp);
+        cairo_surface_destroy(scratch);
         return pixel_t(static_cast<float>(std::ceil(te.x_advance)));
     }
 
@@ -147,7 +174,9 @@ public:
         auto* fe = fe_of(hFont);
         if (!cr || !fe || !text) return;
         cairo_save(cr);
-        cairo_set_scaled_font(cr, fe->sf);
+        cairo_select_font_face(cr, fe->family.c_str(), (cairo_font_slant_t)fe->slant,
+                               (cairo_font_weight_t)fe->weight);
+        cairo_set_font_size(cr, fe->size);
         cairo_set_source_rgba(cr, color.red / 255.0, color.green / 255.0, color.blue / 255.0,
                               color.alpha / 255.0);
         cairo_move_to(cr, pos.x.value(), static_cast<double>(pos.y.value()) + fe->ascent);
@@ -181,7 +210,25 @@ public:
     void draw_radial_gradient(uint_ptr /*hdc*/, const background_layer& /*layer*/, const background_layer::radial_gradient& /*g*/) override {}
     void draw_conic_gradient(uint_ptr /*hdc*/, const background_layer& /*layer*/, const background_layer::conic_gradient& /*g*/) override {}
 
-    void draw_borders(uint_ptr /*hdc*/, const borders& /*b*/, const position& /*pos*/, bool /*root*/) override {}
+    // litehtml 只算布局，边框像素要这里画；空实现会让所有 border 消失。
+    void draw_borders(uint_ptr hdc, const borders& b, const position& pos, bool /*root*/) override
+    {
+        cairo_t* cr = cr_of(hdc);
+        if (!cr) return;
+        const double x = pos.x, y = pos.y, w = pos.width, h = pos.height;
+        auto side = [&](const border& bd, double bx, double by, double bw, double bh) {
+            const double wd = bd.width;
+            if (wd <= 0 || bh <= 0 || bw <= 0) return;
+            if (bd.style == border_style_none || bd.style == border_style_hidden) return;
+            if (bd.color.alpha == 0) return;
+            rect_fill(cr, bd.color, bx, by, bw, bh);
+        };
+        const double tw = b.top.width, bt = b.bottom.width, lw = b.left.width, rw = b.right.width;
+        side(b.top,    x, y, w, tw);
+        side(b.bottom, x, y + h - bt, w, bt);
+        side(b.left,   x, y + tw, lw, h - tw - bt);
+        side(b.right,  x + w - rw, y + tw, rw, h - tw - bt);
+    }
 
     void set_caption(const char* /*c*/) override {}
     void set_base_url(const char* base) override { if (base) m_base_url = base; }
