@@ -31,7 +31,7 @@ AI-native harness：记忆、工具、FFI、X11。
 - `lua/tui/`、`lua/ffi/`、`src/{cache,image,x11,codesearch}/`、`helper/`、`tools/`
 - `src/codesearch/`：从 `/opt/my_db` 全量迁移的代码索引/调用图/数据流/向量检索；
   `api.c` 是 JSON-in/JSON-out 公共入口，其余 `.c` 来自原 CLI（main 改名、日志走 stderr）。
-  `lua/ffi/codesearch.lua` 包 FFI，`helper/lens.lua`（旧名 codesearch，工具名 `lens`）做 action 编排；
+  `lua/ffi/codesearch.lua` 包 FFI，工具入口 `helper/lens.lua` 做 action 编排；
   `locate`（语义/符号查询 + 内联源码窗口，默认起手式）/`peek`（file:line 读窗口）/
   `grep`（作用域 cgrep，>3000 文件的目录直接拒扫）是「搜→读」组合三连，
   写法纪律见 `src/codesearch/code_search_best_practices.md`。`action` 可省：
@@ -285,7 +285,7 @@ hook 错误一律 fail-open（记 `_hook_errors`，不炸 agent）。`has_hooks(
 | `fetch` | DeepSeek Fetch：URL→Markdown 正文 | 同上；替代原始 HTTP 抓页面 |
 | `tokens` | 每日 token 账本查询 | 数据源 `/agent/usage`，跨会话同一本账 |
 | `cgrep` | 代码搜索：正则/字面串扫目录，输出 `path:line: text` | 本体是 `helper/cgrep.c`（pthread + POSIX regex）编出的 `.so`，Lua 层只做 JSON→文本；本机没 `rg`/`ugrep`，搜代码就靠它。`ext`/`fixed`/`per_file`/`threads` 可省，输出自身封顶 8000 字 |
-| `lens` | 代码库级检索：陌生项目找入口/子系统、跨文件符号与调用关系、数据流、语义找实现 | 旧名 `codesearch`。需要先建索引；适合 `cgrep` 做不到的跨文件/语义问题。用法、索引、依赖、性能与内核实践见 `src/codesearch/README.md` |
+| `lens` | 代码库级检索：陌生项目找入口/子系统、跨文件符号与调用关系、数据流、语义找实现 | 需要先建索引；适合 `cgrep` 做不到的跨文件/语义问题。用法、索引、依赖、性能与内核实践见 `src/codesearch/README.md` |
 | `pdftext` | 抽 PDF 文本（`path/first/last/max_chars`） | 纯 Lua FFI 直连 `libpoppler-glib.so.8`，零编译零子进程；本机无 poppler 头文件，cdef 手写（导出符号 `poppler_document_get_page`/`poppler_page_get_text`），释放用 `g_object_unref`（`poppler_page_free`/`poppler_document_free` 已不在 134 里）；缺库报装 `libpoppler-glib8` |
 | `md2png` | Markdown 文件 → HTML → 长图 PNG（`path/out/width/height/scale/gfm`） | 全 FFI 无子进程无 Chrome：`libmd4c.so.0` 解析（**无 md4c.h，cdef 手写**，`abi_version` 必须 = 0、结构体字段顺序不能错否则崩在回调里）→ `build/liblite_html.so` 出图 → `src/html/render.cpp` 的字体。同名 `.html` 一起落盘便于调试；`height` 默认 **0 = 自动测高**（`render.cpp` 先布局取 `doc->height()` 再定高），给正数才是固定视口、超出裁掉 |
 | `trending` | GitHub Trending → Kami 排版 → 长图 PNG（`lang/since/limit/width/height/scale/out`） | `curl` 抓页面（`io.popen`）+ 文件内 `parse()` 的 `gmatch` 逐字段抽（**无 dom 库**，页面结构一变就返回空表）；出图复用 `liblite_html.so`。坑：HTML 必须一次成型（追加 `<style>` 会让内容溢出被裁）；`.page{width:auto}` 铺满、`width` 别低于 780（19px 仓库名会折行）；`os.date` 里 `"%%m"` 是字面量；`height` 默认 0 = 自动测高，加 `limit` 不用手动调高 |
