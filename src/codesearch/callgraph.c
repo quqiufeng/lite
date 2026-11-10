@@ -164,6 +164,11 @@ typedef struct call_edge {
     char file[512];
     int line;
     char args[1024];
+    // 间接/成员调用标注（2026-11-10）：调用点是 `obj->fn()` / `obj.fn()` 时，
+    // 唯一能拿到的线索是接收者表达式（via）；标出来让查询侧能把它和直接调用区分开，
+    // 否则 `i_fop->write_iter()` 与真的 `write_iter()` 调用在图里长得一模一样。
+    char via[MAX_NAME_LEN];
+    int indirect;
     struct call_edge* next;
 } call_edge_t;
 
@@ -307,7 +312,8 @@ static func_node_t* get_func_node(const char* name, int create) {
     return n;
 }
 
-static void add_call_edge(const char* callee, const char* caller, const char* file, int line, const char* args);
+static void add_call_edge(const char* callee, const char* caller, const char* file, int line,
+                          const char* args, const char* via);
 
 static void store_plugin_edge(const char* caller, const char* callee, const char* file, int line) {
     if (g_plugin_edge_count >= g_plugin_edge_capacity) {
@@ -333,7 +339,7 @@ static void apply_plugin_edges() {
     for (int i = 0; i < g_plugin_edge_count; i++) {
         plugin_edge_t* e = &g_plugin_edges[i];
         if (is_func_known(e->callee) && !is_noise_symbol(e->callee) && !is_noise_symbol(e->caller)) {
-            add_call_edge(e->callee, e->caller, e->file, e->line, "");
+            add_call_edge(e->callee, e->caller, e->file, e->line, "", NULL);
             applied++;
         } else {
             skipped++;
@@ -342,7 +348,8 @@ static void apply_plugin_edges() {
     printf("  Applied %d plugin edges, skipped %d external/noise\n", applied, skipped);
 }
 
-static void add_call_edge(const char* callee, const char* caller, const char* file, int line, const char* args) {
+static void add_call_edge(const char* callee, const char* caller, const char* file, int line,
+                          const char* args, const char* via) {
     if (is_noise_symbol(callee) || is_noise_symbol(caller)) return;
     func_node_t* node = get_func_node(callee, 1);
     if (!node) return;
@@ -363,6 +370,14 @@ static void add_call_edge(const char* callee, const char* caller, const char* fi
     e->line = line;
     strncpy(e->args, args ? args : "", sizeof(e->args) - 1);
     e->args[sizeof(e->args) - 1] = '\0';
+    e->via[0] = '\0';
+    if (via && via[0]) {
+        strncpy(e->via, via, MAX_NAME_LEN - 1);
+        e->via[MAX_NAME_LEN - 1] = '\0';
+        e->indirect = 1;
+    } else {
+        e->indirect = 0;
+    }
     e->next = node->calls;
     node->calls = e;
 }
@@ -809,6 +824,42 @@ int lite_cs_callgraph_main(int argc, char** argv) {
                         char tok[MAX_NAME_LEN];
                         memcpy(tok, start, tlen);
                         tok[tlen] = '\0';
+                        // 间接调用识别：token 前面是 `->` 或 `.` 时，调用点形如
+                        // `obj->fn()` / `obj.fn()`，接收者（obj）是唯一可得的线索。
+                        // 拿不到接收者（`arr[i].fn`、`(*o->f).fn`）也标 indirect，
+                        // 只是 via 留空。不改挂边策略（仍按裸名解析），只加标注。
+                        char via[MAX_NAME_LEN];
+                        via[0] = '\0';
+                        {
+                            const char* r = start;
+                            while (r > b->content && isspace((unsigned char)r[-1])) r--;
+                            int back = (int)(r - b->content);
+                            if (back >= 1 && r[-1] == '.') {
+                                const char* end = r - 1;
+                                const char* s = end;
+                                while (s > b->content &&
+                                       (isalnum((unsigned char)s[-1]) || s[-1] == '_')) s--;
+                                if (end > s && (size_t)(end - s) < sizeof(via)) {
+                                    memcpy(via, s, (size_t)(end - s));
+                                    via[end - s] = '\0';
+                                } else {
+                                    via[0] = '#';
+                                    via[1] = '\0';
+                                }
+                            } else if (back >= 2 && r[-1] == '>' && r[-2] == '-') {
+                                const char* end = r - 2;
+                                const char* s = end;
+                                while (s > b->content &&
+                                       (isalnum((unsigned char)s[-1]) || s[-1] == '_')) s--;
+                                if (end > s && (size_t)(end - s) < sizeof(via)) {
+                                    memcpy(via, s, (size_t)(end - s));
+                                    via[end - s] = '\0';
+                                } else {
+                                    via[0] = '#';
+                                    via[1] = '\0';
+                                }
+                            }
+                        }
                         char callee[MAX_NAME_LEN];
                         resolve_callee(b->name, tok, callee, sizeof(callee));
                         if (strcmp(b->name, callee) != 0 && is_func_known(callee)) {
@@ -823,7 +874,7 @@ int lite_cs_callgraph_main(int argc, char** argv) {
                                 seen[sh] = hash_str(callee);
                                 char args[1024];
                                 extract_call_args(q + 1, args, sizeof(args));
-                                add_call_edge(callee, b->name, b->file, b->line_start, args);
+                                add_call_edge(callee, b->name, b->file, b->line_start, args, via);
                             }
                         }
                     }
@@ -872,6 +923,14 @@ int lite_cs_callgraph_main(int argc, char** argv) {
                 char esc_args[4096];
                 json_escape_str(e->args, esc_args, sizeof(esc_args));
                 fprintf(out, ",\"arguments\":[\"%s\"]", esc_args);
+            }
+            if (e->indirect) {
+                fprintf(out, ",\"indirect\":true");
+                if (e->via[0] && e->via[0] != '#') {
+                    char esc_via[MAX_NAME_LEN * 2];
+                    json_escape_str(e->via, esc_via, sizeof(esc_via));
+                    fprintf(out, ",\"via\":\"%s\"", esc_via);
+                }
             }
             fprintf(out, "}");
             e = e->next;

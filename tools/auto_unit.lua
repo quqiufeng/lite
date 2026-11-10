@@ -4292,8 +4292,12 @@ int main(void) {
 }
 ]])
         put(base .. "/repo/sub/b.c", [[
+struct scale_ops { int (*scale)(int); };
 int scale(int v) {
     return v * 10;
+}
+int apply_via_ops(struct scale_ops *o, int v) {
+    return o->scale(v);
 }
 ]])
 
@@ -4328,6 +4332,18 @@ int scale(int v) {
         for _, v in ipairs(callers) do if v.name == "main" then caller_hit = true end end
         for _, v in ipairs(callees) do if v.name == "helper_add" then callee_hit = true end end
         check(caller_hit and callee_hit, "codesearch context callers/callees")
+
+        -- 间接调用标注：o->scale() 只能按裸名挂边，必须标 indirect + via
+        local sctx = CS.query({ query = "scale", repo = ns, type = "context",
+            kv_dir = kv, analysis_dir = dir })
+        local scalls = sctx and sctx.context and sctx.context.callers or {}
+        local indirect_ok = false
+        for _, v in ipairs(scalls) do
+            if v.name == "apply_via_ops" and v.indirect == true and v.via == "o" then
+                indirect_ok = true
+            end
+        end
+        check(indirect_ok, "codesearch indirect call marked (via o)")
 
         local df = CS.dataflow_query("compute_total", kv, ns, 10)
         local dfv = df and df.results and df.results[1] or {}

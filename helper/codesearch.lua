@@ -58,11 +58,25 @@ local function safe_name(s)
     return (s:gsub("[^%w%._%-]", "_"))
 end
 
+local has_index, index_candidates   -- 定义在下方，paths() 里先用
+
 local function paths(args, ctx)
     local repo = abs_path(args.path, ctx and ctx.cwd)
     local project = safe_name(args.project or basename(repo))
-    local analysis = args.analysis_dir or (home() .. "/" .. project)
-    analysis = analysis:gsub("/+$", "")
+    local analysis = args.analysis_dir or os.getenv("LITE_CS_ANALYSIS")
+        or (home() .. "/" .. project)
+    analysis = (analysis:gsub("/+$", ""))
+    -- 默认目录没有索引时，按项目名去已知位置找一份（项目名可能带 _cache 后缀，
+    -- 也可能落在 /opt/code_caches/<project>_cache），找到就直接用，省掉手写长路径。
+    if not args.analysis_dir and has_index and not has_index(analysis) then
+        local hit
+        for _, dir in ipairs(index_candidates and index_candidates() or {}) do
+            local base = dir:match("([^/]+)$") or ""
+            if base == project or base == project .. "_cache"
+                or base:gsub("_cache$", "") == project then hit = dir break end
+        end
+        if hit then analysis = hit end
+    end
     local kv = args.kv_dir or (analysis .. "/kv")
     local ns = args.ns or ("/code/" .. project)
     return repo, project, analysis, kv, ns
@@ -98,6 +112,27 @@ local function fmt_status(d)
     local m = d.models or {}
     out[#out + 1] = string.format("  models              jina=%s ort=%s (%s)",
         tostring(m.jina_onnx), tostring(m.onnxruntime), tostring(m.model_dir))
+    if not (((d.files or {})["chunks_meta.jsonl"] or {}).exists) and index_candidates then
+        local c = index_candidates()
+        if #c > 0 then
+            local want = d.analysis_dir:match("([^/]+)$")
+            local pick
+            for _, dir in ipairs(c) do
+                if want and dir:find(want, 1, true) then pick = dir break end
+            end
+            if pick then
+                out[#out + 1] = "  hint                no index here; pass analysis_dir=" .. pick
+            else
+                -- 没有同名索引：别瞎指一个别的项目，只列出现有的
+                local names = {}
+                for _, dir in ipairs(c) do
+                    names[#names + 1] = (dir:match("([^/]+)$") or dir):gsub("_cache$", "")
+                end
+                out[#out + 1] = "  hint                no index for this project; built: "
+                    .. table.concat(names, ", ")
+            end
+        end
+    end
     return table.concat(out, "\n")
 end
 
@@ -143,7 +178,14 @@ local function fmt_context(d, max_chars)
         local t = {}
         for i, v in ipairs(arr) do
             if i > (cap or 30) then t[#t + 1] = "..."; break end
-            t[#t + 1] = type(v) == "table" and (v.name or "?") or tostring(v)
+            if type(v) == "table" then
+                -- 间接调用：obj->fn()/obj.fn() 只能按裸名挂边，标出来让调用方打折
+                local s = v.name or "?"
+                if v.indirect then s = s .. "[via " .. (v.via or "?") .. "]" end
+                t[#t + 1] = s
+            else
+                t[#t + 1] = tostring(v)
+            end
         end
         out[#out + 1] = string.format("%s(%d): %s", label, #arr, table.concat(t, ", "))
     end
@@ -263,15 +305,68 @@ local function check_stage(name, r)
     return r
 end
 
+has_index = function(dir)
+    local f = io.open(dir .. "/chunks_meta.jsonl", "rb")
+    if f then f:close() return true end
+    return false
+end
+
+-- 索引不在默认路径时报错要可自修（AGENTS.md §5）：把磁盘上真实存在的索引列出来，
+-- 免得调用方看着「run action=build first」去重跑几小时的建索引。
+index_candidates = function()
+    local out, seen = {}, {}
+    local function scan(glob)
+        local p = io.popen("ls -d " .. glob .. " 2>/dev/null")
+        if not p then return end
+        for line in p:lines() do
+            line = line:gsub("/+$", "")
+            if line ~= "" and not seen[line] and has_index(line) then
+                seen[line] = true
+                out[#out + 1] = line
+            end
+        end
+        p:close()
+    end
+    scan("/opt/code_caches/*_cache")
+    scan("/opt/code_caches/*")
+    scan(home() .. "/*")
+    return out
+end
+
 local function need_built(d, what)
     local meta = ((d.files or {})["chunks_meta.jsonl"] or {})
     if not meta.exists then
-        error("codesearch: index not found for this project; run action=build first", 0)
+        local cands = index_candidates()
+        local hint = ""
+        if #cands > 0 then
+            -- 项目名相关的排前面，最多列 8 个，别把 20 多份索引全糊到报错里
+            local want = tostring(d.analysis_dir):match("([^/]+)$") or ""
+            local head, tail = {}, {}
+            for _, dir in ipairs(cands) do
+                if want ~= "" and dir:find(want, 1, true) and #head < 3 then head[#head + 1] = dir
+                else tail[#tail + 1] = dir end
+            end
+            local list = {}
+            for _, dir in ipairs(head) do list[#list + 1] = dir end
+            for _, dir in ipairs(tail) do
+                if #list >= 8 then break end
+                list[#list + 1] = dir
+            end
+            hint = "\navailable indexes: " .. table.concat(list, ", ")
+                .. (#cands > #list and string.format(" (+%d more)", #cands - #list) or "")
+                .. "\n  -> pass analysis_dir=<dir> (add project=<name> when the KV namespace differs)"
+        end
+        error(string.format("codesearch: no index at %s\n"
+            .. "fix: analysis_dir=<dir> overrides it (default ~/.local/share/lite/codesearch/<project>, "
+            .. "LITE_CS_ANALYSIS changes the default), or action=build creates one%s",
+            tostring(d.analysis_dir), hint), 0)
     end
     if what == "kv" then
-        local f = io.open(d.analysis_dir .. "/kv/mem.bin", "rb")
+        local kvf = d.analysis_dir .. "/kv/mem.bin"
+        local f = io.open(kvf, "rb")
         if not f then
-            error("codesearch: KV import missing; run action=build (or action=import)", 0)
+            error(string.format("codesearch: KV import missing at %s\n"
+                .. "fix: action=import (or action=build) with the same analysis_dir/kv_dir", kvf), 0)
         end
         f:close()
     end
@@ -399,7 +494,9 @@ return {
             if not args.query or args.query == "" then
                 error("codesearch: query required for " .. action, 0)
             end
-            if action ~= "exact" then
+            -- symbol/context/file/exact 查的是 KV 里的符号表；语义 search 只要
+            -- vectors/ + chunks_meta（KV 只用来 boost），所以别对 search 强求 kv。
+            if action ~= "exact" and action ~= "search" then
                 local d0 = CS.check(analysis)
                 if not d0 then error("codesearch: cannot read analysis dir " .. analysis, 0) end
                 need_built(d0, "kv")

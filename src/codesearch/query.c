@@ -442,6 +442,69 @@ static json_t* do_context(const char* name, const char* repo, int depth) {
     return result;
 }
 
+// dataflow.json 里混进少量非标识符的"字段名"（分析器把缩进/转义吃进了名字，
+// 内核索引里 24/71450，例如 "ntt"、"75nt"）。展示时直接滤掉，别让它们进结果。
+static int cs_is_ident(const char* s) {
+    if (!s || !*s) return 0;
+    if (!((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') || *s == '_')) return 0;
+    for (const char* p = s + 1; *p; p++) {
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+              (*p >= '0' && *p <= '9') || *p == '_')) return 0;
+    }
+    return 1;
+}
+
+// `dataflow/fields/<field>`：跨结构体聚合的字段访问（import 写）。
+// dataflow.json 里字段访问挂在父结构体下（fields: {name: [occ...]}），字段名
+// 作为变量只有 0 条 occurrence —— 单独一条键才能让 `dataflow i_pages` 有结果。
+static json_t* dataflow_field_entry(const char* repo, const char* field, int max_results) {
+    char key[1024];
+    json_error_t error;
+    snprintf(key, sizeof(key), "%s/dataflow/fields/%s", repo, field);
+    const char* value = cache_get(g_cache, key);
+    if (!value) return NULL;
+    json_t* data = json_loads(value, 0, &error);
+    if (!data) return NULL;
+
+    json_t* entry = json_object();
+    json_object_set_new(entry, "kind", json_string("field"));
+    json_object_set_new(entry, "field", json_string(field));
+    json_t* cnt = json_object_get(data, "count");
+    if (cnt) json_object_set_new(entry, "occurrence_count", json_incref(cnt));
+    json_t* scount = json_object_get(data, "struct_count");
+    if (scount) json_object_set_new(entry, "struct_count", json_incref(scount));
+    json_t* structs = json_object_get(data, "structs");
+    if (structs && json_is_array(structs)) {
+        json_t* clean = json_array();
+        size_t si;
+        json_t* s;
+        json_array_foreach(structs, si, s) {
+            const char* sn = json_string_value(s);
+            if (cs_is_ident(sn)) json_array_append(clean, s);
+        }
+        json_object_set_new(entry, "structs", clean);
+    } else if (structs) {
+        json_object_set_new(entry, "structs", json_incref(structs));
+    }
+
+    json_t* funcs = json_object_get(data, "funcs");
+    json_t* arr = json_array();
+    int total = 0;
+    if (funcs && json_is_array(funcs)) {
+        total = (int)json_array_size(funcs);
+        size_t i;
+        json_t* f;
+        json_array_foreach(funcs, i, f) {
+            if (json_array_size(arr) >= (size_t)max_results) break;
+            json_array_append(arr, f);
+        }
+    }
+    json_object_set_new(entry, "func_count", json_integer(total));
+    json_object_set_new(entry, "funcs", arr);
+    json_decref(data);
+    return entry;
+}
+
 // Dataflow query: 一个函数碰了哪些变量、一个变量流过哪些函数。
 // 走 import 写好的 `dataflow/funcs/<func>`（每函数一条，cache_get O(1)）和
 // `dataflow/vars/<var>`；都 miss 时用前缀搜索给候选函数名，不去读 _func_index
@@ -520,11 +583,62 @@ static json_t* do_dataflow(const char* query, const char* repo, int max_results)
         json_t* data = json_loads(value, 0, &error);
         if (data) {
             json_t* occ = json_object_get(data, "occurrences");
+            size_t occ_n = occ ? json_array_size(occ) : 0;
+            // 字段名作为变量时 occurrences 常常是 0（访问记在父结构体的 fields
+            // 下），这时落到 dataflow/fields/<name> 拿真实访问点。
+            if (occ_n == 0) {
+                json_t* field_hit = dataflow_field_entry(repo, query, max_results);
+                if (field_hit) {
+                    json_array_append_new(results, field_hit);
+                    json_decref(data);
+                    return results;
+                }
+            }
             json_t* entry = json_object();
             json_object_set_new(entry, "kind", json_string("variable"));
             json_object_set_new(entry, "var", json_string(query));
-            json_object_set_new(entry, "occurrence_count",
-                                json_integer(occ ? (json_int_t)json_array_size(occ) : 0));
+            json_object_set_new(entry, "occurrence_count", json_integer((json_int_t)occ_n));
+            json_t* vtype = json_object_get(data, "type");
+            if (vtype) json_object_set_new(entry, "type", json_incref(vtype));
+            json_t* vfields = json_object_get(data, "fields");
+            if (vfields && json_is_object(vfields) && json_object_size(vfields) > 0) {
+                // 字段清单按访问次数降序给前 24 个，方便顺着结构体往下钻
+                size_t fsz = json_object_size(vfields);
+                const char** fnames = malloc(sizeof(char*) * fsz);
+                json_int_t* fcnts = malloc(sizeof(json_int_t) * fsz);
+                size_t fn_n = 0;
+                if (fnames && fcnts) {
+                    const char* fk;
+                    json_t* fv;
+                    json_object_foreach(vfields, fk, fv) {
+                        if (!cs_is_ident(fk)) continue;  // 丢掉缩进吃进名字的脏键
+                        fnames[fn_n] = fk;
+                        fcnts[fn_n] = json_is_integer(fv) ? json_integer_value(fv) : 0;
+                        fn_n++;
+                    }
+                    size_t cap = fn_n < 24 ? fn_n : 24;
+                    for (size_t i = 0; i < cap; i++) {  // 选择前 cap 个，n 很小
+                        size_t best = i;
+                        for (size_t j = i + 1; j < fn_n; j++)
+                            if (fcnts[j] > fcnts[best]) best = j;
+                        if (best != i) {
+                            json_int_t tc = fcnts[i]; fcnts[i] = fcnts[best]; fcnts[best] = tc;
+                            const char* tn = fnames[i]; fnames[i] = fnames[best]; fnames[best] = tn;
+                        }
+                    }
+                    json_t* top = json_array();
+                    for (size_t i = 0; i < cap; i++) {
+                        json_t* item = json_object();
+                        json_object_set_new(item, "field", json_string(fnames[i]));
+                        json_object_set_new(item, "count", json_integer(fcnts[i]));
+                        json_array_append_new(top, item);
+                    }
+                    json_object_set_new(entry, "fields", top);
+                }
+                free(fnames);
+                free(fcnts);
+                json_object_set_new(entry, "field_count", json_integer((json_int_t)fsz));
+            }
             json_t* funcs = json_object();
             json_t* order = json_array();
             if (occ) {
@@ -568,14 +682,24 @@ static json_t* do_dataflow(const char* query, const char* repo, int max_results)
         return results;
     }
 
-    // 3) 都没命中：给候选函数名（前缀搜索，不扫大 JSON）
-    char prefix[1024];
-    snprintf(prefix, sizeof(prefix), "%s/dataflow/funcs/%s", repo, query);
-    cache_search_options_t opts = cache_search_options_default();
-    opts.max_results = max_results;
-    cache_result_t* found = NULL;
-    size_t count = 0;
-    if (cache_search_prefix(g_cache, prefix, &opts, &found, &count) == 0 && found) {
+    // 2b) 结构体字段：`i_pages` 这类字段名不是独立变量，走聚合键
+    json_t* field_hit = dataflow_field_entry(repo, query, max_results);
+    if (field_hit) {
+        json_array_append_new(results, field_hit);
+        return results;
+    }
+
+    // 3) 都没命中：给候选函数名 / 字段名（前缀搜索，不扫大 JSON）
+    const char* prefixes[2] = {"funcs", "fields"};
+    const char* labels[2] = {"functions", "fields"};
+    for (int pi = 0; pi < 2; pi++) {
+        char prefix[1024];
+        snprintf(prefix, sizeof(prefix), "%s/dataflow/%s/%s", repo, prefixes[pi], query);
+        cache_search_options_t opts = cache_search_options_default();
+        opts.max_results = max_results;
+        cache_result_t* found = NULL;
+        size_t count = 0;
+        if (cache_search_prefix(g_cache, prefix, &opts, &found, &count) != 0 || !found) continue;
         json_t* cands = json_array();
         size_t plen = strlen(prefix);
         for (size_t i = 0; i < count && json_array_size(cands) < (size_t)max_results; i++) {
@@ -584,12 +708,15 @@ static json_t* do_dataflow(const char* query, const char* repo, int max_results)
             json_array_append_new(cands, json_string(k + plen));
         }
         if (json_array_size(cands) > 0) {
+            // 只带一部分字段名时提示往哪钻：funcs 的候选就是函数名本身
             json_t* entry = json_object();
             json_object_set_new(entry, "kind", json_string("candidates"));
             json_object_set_new(entry, "query", json_string(query));
-            json_object_set_new(entry, "functions", cands);
+            json_object_set_new(entry, labels[pi], cands);
             json_object_set_new(entry, "hint",
-                json_string("no exact function/variable; these functions share the prefix"));
+                json_string(pi == 0
+                    ? "no exact function/variable/field; these functions share the prefix"
+                    : "no exact field; these struct fields share the prefix"));
             json_array_append_new(results, entry);
         } else {
             json_decref(cands);
@@ -695,8 +822,13 @@ static void print_brief(json_t* response) {
         if (callers && json_array_size(callers)) {
             printf("callers(%zu): ", json_array_size(callers));
             for (size_t i = 0; i < json_array_size(callers); i++) {
-                const char* n = json_string_value(json_object_get(json_array_get(callers, i), "name"));
+                json_t* c = json_array_get(callers, i);
+                const char* n = json_string_value(json_object_get(c, "name"));
+                const char* via = json_string_value(json_object_get(c, "via"));
                 printf("%s%s", i ? ", " : "", n ? n : "?");
+                // 间接调用（obj->fn / obj.fn）标注：边只能按裸名解析，可能混入同名直接调用
+                if (json_is_true(json_object_get(c, "indirect")))
+                    printf("[via %s]", via ? via : "?");
             }
             printf("\n");
         }
@@ -704,8 +836,12 @@ static void print_brief(json_t* response) {
         if (callees && json_array_size(callees)) {
             printf("callees(%zu): ", json_array_size(callees));
             for (size_t i = 0; i < json_array_size(callees) && i < 30; i++) {
-                const char* n = json_string_value(json_object_get(json_array_get(callees, i), "name"));
+                json_t* c = json_array_get(callees, i);
+                const char* n = json_string_value(json_object_get(c, "name"));
+                const char* via = json_string_value(json_object_get(c, "via"));
                 printf("%s%s", i ? ", " : "", n ? n : "?");
+                if (json_is_true(json_object_get(c, "indirect")))
+                    printf("[via %s]", via ? via : "?");
             }
             printf("\n");
         }

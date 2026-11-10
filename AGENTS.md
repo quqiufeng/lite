@@ -35,6 +35,10 @@ AI-native harness：记忆、工具、FFI、X11。
   `action=dataflow`（`lite_cs_dataflow_query`）走 import 写的 `dataflow/funcs/<func>`
   与 `dataflow/vars/<var>` 两条键，`cache_get` 直取，不读几百 MB 的 `dataflow.json`
   / `_func_index`；旧 KV 没这两类键，要重跑一次 `import`。
+  调用边带间接标注：调用点是 `obj->fn()` / `obj.fn()`（Lua 的 `M.fn()` 同理）时
+  `call_graph.json` 里多 `"indirect":true` + `"via":"<接收者>"`，import 透传到
+  `callers/`、`callees/` 的 site，query 显示成 `name[via obj]`。边**仍然**按裸名解析
+  （没有类型信息），标注只表示「这条边可能混了同名直接调用」，旧 KV 无此字段 = 直接调用。
 - `lua/ffi/x11.lua` + `xdo.lua`：**自包含单文件**（只用 LuaJIT `ffi` + 系统 libX11/libxdo，不引用 lite 代码、不注册工具），可整对拷给别的项目；`x11.lua` 靠 `require("ffi.xdo")` 找同伴，换布局要同步改这一行
 - `lua/tui/mouse.lua` + `clipboard.lua`：拖选/剪贴板；选区在 `screen.lua`
 

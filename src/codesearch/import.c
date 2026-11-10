@@ -531,6 +531,11 @@ static void import_callgraph(const char* analysis_dir, const char* namespace) {
             const char* file = json_string_value(json_object_get(call, "file"));
             json_int_t line = json_integer_value(json_object_get(call, "line"));
             const char* args = json_string_value(json_object_get(call, "arguments"));
+            // 间接/成员调用标注（callgraph.c 写、query 侧展示）：obj->fn() 这类边
+            // 只能按裸名解析，可能与同名直接调用混淆，标出来供调用方打折。
+            json_t* indirect_j = json_object_get(call, "indirect");
+            int indirect = (indirect_j && json_is_true(indirect_j)) ? 1 : 0;
+            const char* via = json_string_value(json_object_get(call, "via"));
             
             if (!caller) continue;
             
@@ -539,6 +544,10 @@ static void import_callgraph(const char* analysis_dir, const char* namespace) {
             json_object_set_new(site, "file", json_string(file ? file : ""));
             json_object_set_new(site, "line", json_integer(line));
             json_object_set_new(site, "args", json_string(args ? args : ""));
+            if (indirect) {
+                json_object_set_new(site, "indirect", json_true());
+                if (via) json_object_set_new(site, "via", json_string(via));
+            }
             json_array_append_new(callers, site);
 
             // 正向累加：caller 调用了 callee(=func_name)
@@ -552,6 +561,10 @@ static void import_callgraph(const char* analysis_dir, const char* namespace) {
             json_object_set_new(site2, "file", json_string(file ? file : ""));
             json_object_set_new(site2, "line", json_integer(line));
             json_object_set_new(site2, "args", json_string(args ? args : ""));
+            if (indirect) {
+                json_object_set_new(site2, "indirect", json_true());
+                if (via) json_object_set_new(site2, "via", json_string(via));
+            }
             json_array_append_new(carr, site2);
         }
         
@@ -636,6 +649,25 @@ static void import_dataflow(const char* analysis_dir, const char* namespace) {
         json_t* val = json_object();
         json_object_set_new(val, "count", json_integer(json_array_size(occurrences)));
         json_object_set_new(val, "occurrences", json_incref(occurrences));
+        // type（int/void/struct/...）：查询时才知道这是结构体还是普通变量，
+        // 之前一律丢掉，`dataflow address_space` 只看到一个光秃秃的变量名。
+        json_t* vtype = json_object_get(var_data, "type");
+        if (vtype && json_is_string(vtype))
+            json_object_set_new(val, "type", json_incref(vtype));
+        // 结构体的字段清单（只留名字 + 访问次数，字段的 occurrence 走
+        // dataflow/fields/<field>，不在这里重复存 context 大字符串）。
+        json_t* vfields = json_object_get(var_data, "fields");
+        if (vfields && json_is_object(vfields) && json_object_size(vfields) > 0) {
+            json_t* fs = json_object();
+            const char* fn;
+            json_t* fo;
+            json_object_foreach(vfields, fn, fo) {
+                json_object_set_new(fs, fn, json_integer(
+                    json_is_array(fo) ? (json_int_t)json_array_size(fo) : 0));
+            }
+            json_object_set_new(val, "fields", fs);
+            json_object_set_new(val, "field_count", json_integer(json_object_size(vfields)));
+        }
         
         char* str = json_dumps(val, JSON_COMPACT);
         if (str) {
@@ -718,7 +750,108 @@ static void import_dataflow(const char* analysis_dir, const char* namespace) {
         log_info(msg);
     }
     json_decref(func_index);
-    
+
+    // ---- 结构体字段聚合 dataflow/fields/<field> ------------------------------
+    // dataflow.json 把字段访问挂在父结构体下面（fields: {name: [occ...]}），
+    // 字段名自己作为变量只有 0 条 occurrence —— 所以 `dataflow i_pages`（xarray
+    // 里 22 万次字段访问之一）一直 0 命中。这里按字段名聚合跨结构体的访问：
+    // funcs 计数 + 行号 + 样本文件，**丢掉每条 occurrence 的 context 大字符串**
+    // （内核字段访问总量 22 万条，带 context 会把 KV 撑大一倍）。
+    json_t* field_index = json_object();  // field -> {count, structs, funcs{func:...}}
+    json_object_foreach(root, var_name, var_data) {
+        json_t* vfields = json_object_get(var_data, "fields");
+        if (!vfields || !json_is_object(vfields)) continue;
+        const char* fname;
+        json_t* foccs;
+        json_object_foreach(vfields, fname, foccs) {
+            if (!json_is_array(foccs) || json_array_size(foccs) == 0) continue;
+            json_t* agg = json_object_get(field_index, fname);
+            if (!agg) {
+                agg = json_object();
+                json_object_set_new(agg, "field", json_string(fname));
+                json_object_set_new(agg, "count", json_integer(0));
+                json_object_set_new(agg, "structs", json_array());
+                json_object_set_new(agg, "funcs", json_object());
+                json_object_set_new(field_index, fname, agg);
+            }
+            json_t* structs = json_object_get(agg, "structs");
+            int seen = 0;
+            size_t si;
+            json_t* s;
+            json_array_foreach(structs, si, s) {
+                const char* sn = json_string_value(s);
+                if (sn && strcmp(sn, var_name) == 0) { seen = 1; break; }
+            }
+            if (!seen && json_array_size(structs) < 16)
+                json_array_append_new(structs, json_string(var_name));
+            json_object_set_new(agg, "count", json_integer(
+                json_integer_value(json_object_get(agg, "count")) +
+                (json_int_t)json_array_size(foccs)));
+
+            json_t* funcs = json_object_get(agg, "funcs");
+            size_t oi;
+            json_t* o;
+            json_array_foreach(foccs, oi, o) {
+                const char* fn = json_string_value(json_object_get(o, "func"));
+                if (!fn || !*fn) fn = "unknown";
+                if (strlen(fn) > 200) continue;
+                json_t* fe = json_object_get(funcs, fn);
+                if (!fe) {
+                    if (json_object_size(funcs) >= 256) continue;  // 边界：单个字段最多记 256 个函数
+                    fe = json_object();
+                    json_object_set_new(fe, "func", json_string(fn));
+                    json_object_set_new(fe, "count", json_integer(0));
+                    json_object_set_new(fe, "lines", json_array());
+                    const char* file = json_string_value(json_object_get(o, "file"));
+                    if (file) json_object_set_new(fe, "file", json_string(file));
+                    json_object_set_new(funcs, fn, fe);
+                }
+                json_object_set_new(fe, "count", json_integer(
+                    json_integer_value(json_object_get(fe, "count")) + 1));
+                json_t* lines = json_object_get(fe, "lines");
+                json_t* ln = json_object_get(o, "line");
+                if (lines && json_is_integer(ln) && json_array_size(lines) < 8)
+                    json_array_append(lines, ln);
+            }
+        }
+    }
+
+    const char* field_name;
+    json_t* field_agg;
+    int stored_fields = 0;
+    json_object_foreach(field_index, field_name, field_agg) {
+        if (!field_name || !*field_name || strlen(field_name) > 200) continue;
+        json_t* val = json_object();
+        json_object_set_new(val, "field", json_string(field_name));
+        json_object_set_new(val, "count", json_incref(json_object_get(field_agg, "count")));
+        json_t* structs = json_object_get(field_agg, "structs");
+        json_object_set_new(val, "struct_count", json_integer(json_array_size(structs)));
+        json_object_set_new(val, "structs", json_incref(structs));
+        json_t* funcs = json_object_get(field_agg, "funcs");
+        json_t* farr = json_array();
+        const char* fk;
+        json_t* fv;
+        json_object_foreach(funcs, fk, fv) json_array_append_new(farr, json_incref(fv));
+        json_object_set_new(val, "func_count", json_integer(json_array_size(farr)));
+        json_object_set_new(val, "funcs", farr);
+        char* fstr2 = json_dumps(val, JSON_COMPACT);
+        if (fstr2) {
+            char fkey2[640];
+            snprintf(fkey2, sizeof(fkey2), "%s/dataflow/fields/%s", namespace, field_name);
+            safe_set_json(fkey2, fstr2);
+            free(fstr2);
+            stored_fields++;
+        }
+        json_decref(val);
+    }
+    json_decref(field_index);
+    if (stored_fields > 0) {
+        char fmsg[128];
+        snprintf(fmsg, sizeof(fmsg), "Phase 3: indexed %d struct fields for dataflow",
+                 stored_fields);
+        log_info(fmsg);
+    }
+
     json_decref(root);
     
     char msg[128];
