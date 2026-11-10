@@ -331,7 +331,17 @@ function M.run(ctx, agent, memory, opts)
                 info.stats.region_chars or 0, info.stats.digest_chars or 0,
                 info.baseline or 0, info.stats.kept_user or 0, info.stats.dropped_user or 0))
         else
-            transcript:add("info", "compact skipped: " .. tostring(info.reason or "?"))
+            -- "hard ceiling" 是丢弃优先模式下的**常态**：没做摘要，直接从最新往回装窗口，
+            -- 老消息留在 session/记忆里靠 recall 取回。每轮都提示纯噪声，默认静音；
+            -- 其它 reason（真正的失败）仍然照常提示。要排查窗口行为设
+            -- LITE_TUI_COMPACT_NOTICE=1。
+            local reason = tostring(info.reason or "?")
+            if reason ~= "hard ceiling"
+                or os.getenv("LITE_TUI_COMPACT_NOTICE") == "1" then
+                transcript:add("info", string.format(
+                    "compact skipped: %s (dropped %d older messages, no digest)",
+                    reason, info.dropped or 0))
+            end
         end
         if draw then draw() end
     end)
