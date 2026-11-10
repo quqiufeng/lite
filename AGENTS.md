@@ -43,6 +43,9 @@ AI-native harness：记忆、工具、FFI、X11。
   `call_graph.json` 里多 `"indirect":true` + `"via":"<接收者>"`，import 透传到
   `callers/`、`callees/` 的 site，query 显示成 `name[via obj]`。边**仍然**按裸名解析
   （没有类型信息），标注只表示「这条边可能混了同名直接调用」，旧 KV 无此字段 = 直接调用。
+  **lite 仓库自身不做索引**（`~/.local/share/lite/codesearch/` 下不保留 `lite` 那一份）：
+  自己改自己就 `read`/`cgrep`/`edit`，语义检索丢给 `cgrep` + 代码地图，别为查自己跑
+  `lens build`（几十分钟换不到有用信息，还占几百 M）。`lens` 只服务于**外部**项目。
 - `lua/ffi/x11.lua` + `xdo.lua`：**自包含单文件**（只用 LuaJIT `ffi` + 系统 libX11/libxdo，不引用 lite 代码、不注册工具），可整对拷给别的项目；`x11.lua` 靠 `require("ffi.xdo")` 找同伴，换布局要同步改这一行
 - `lua/tui/mouse.lua` + `clipboard.lua`：拖选/剪贴板；选区在 `screen.lua`
 
@@ -293,6 +296,8 @@ hook 错误一律 fail-open（记 `_hook_errors`，不炸 agent）。`has_hooks(
 
 **什么时候用 lens**：陌生代码库要找子系统入口/实现、查某符号的 callers/callees
 与数据流、或按自然语言找相似实现时用它；单文件/精确文本搜索先用 `cgrep`。
+**只在 cwd 之外的外部项目上建索引**——lite 自己的源码不建（见 §2）。
+
 索引创建、参数、加速、依赖、Linux/参考项目实践统一看 `src/codesearch/README.md`
 （§0 快速开始，§4/§5 详细流程）。
 

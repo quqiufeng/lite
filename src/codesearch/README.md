@@ -44,6 +44,8 @@ agent 里最简单：
 codesearch action=build path=/path/to/repo
 ```
 
+**别给 lite 自己建索引**（见 §1.1）：只索引 cwd 之外的第三方源码。
+
 `project` 默认取仓库目录名；要自定义：
 
 ```text
@@ -187,13 +189,20 @@ namespace 默认是 `/code/<project>`。
 
 ### 1.1 本机已经建好的索引（2026-11-10 快照，已清掉源码丢失的 5 份）
 
-**不要重跑 build**：下面 15 份索引都在 `/opt/code_caches/<project>_cache/`，
+**lite 自身不建索引**：`~/.local/share/lite/codesearch/` 下**不留** `lite` 那一份
+（原 2718 chunks / 196M 已删）。改自己的代码用 `read`/`cgrep`/`edit`，查结构看
+`AGENTS.md` §2 代码地图；`cgrep` 加 `ext=lua,c` 对 600 文件是毫秒级，语义检索在自己
+仓库上没有增量价值（代码是自己刚写的，向量库永远比工作区旧一拍）。**别在 cwd 上跑
+`lens build`**，index/import 几十分钟起步，还占几百 M。`lens` 只用于外部项目。
+
+**不要重跑 build**：下面 14 份索引都在 `/opt/code_caches/<project>_cache/`，
 按 `project=<name>`（不带 `_cache` 后缀）就能直接用——`paths()` 会在默认目录落空时
 去 `/opt/code_caches/` 里按 `<name>_cache` 匹配（`helper/lens.lua:index_candidates`）。
+内核 `linux_7212`（352294 chunks / 7.4G）已于 2026-11-10 按需求整体清掉，需要时用
+`/opt/code_caches/linux_7212_rebuild.lua` 一条命令重跑（约 2.5h，峰值 RSS 6.6G）。
 
 | project | 源码根 | chunks | 体积 | KV | 能查什么 |
 |---|---|---|---|---|---|
-| `linux_7212` | `/opt/linux/src/linux-7.2.12` | 352294 | 13G | 9.3G | search + symbol/context/dataflow |
 | `python`（CPython） | `/opt/cpython` | 89779 | 772M | – | 仅 search |
 | `postgresql` | `/opt/postgresql` | 70787 | 701M | – | 仅 search |
 | `reasonix` | `/opt/reasonix` | 61933 | 704M | 209M | search + symbol/context/dataflow |
@@ -209,16 +218,13 @@ namespace 默认是 `/code/<project>`。
 | `qwenimage-ncnn-vulkan` | `/opt/qwenimage-ncnn-vulkan` | 1145 | 12M | – | 仅 search |
 | `zimage-ncnn-vulkan` | `/opt/zimage-ncnn-vulkan` | 496 | 4.8M | – | 仅 search |
 
-另有一份在默认 home（`~/.local/share/lite/codesearch/lite`）：本仓库，2718 chunks，
-KV + vectors 齐全，可 `symbol/context/dataflow`。
-
 两条硬约束，踩了会浪费时间：
 
-- **只有 KV 的 5 份能 `symbol/context/exact/dataflow`**（`linux_7212`、`reasonix`、
-  `opencode`、`pi-mono`、`redis`，加 home 的 `lite` 共 6 份）：这些 action 查 `kv/mem.bin`
+- **只有带 KV 的 4 份能 `symbol/context/exact/dataflow`**（`reasonix`、`opencode`、
+  `pi-mono`、`redis`）：这些 action 查 `kv/mem.bin`
   里的符号表/数据流键，缺 KV 直接报 `KV import missing`。
 - **语义 `search` 不需要 KV**：它只吃 `vectors/code_local_<name>.jina.*` + `chunks_meta.jsonl`
-  （KV 仅用于 boost）。所以上表 15 份全都能 `search`，别为了搜索去跑几小时的 import。
+  （KV 仅用于 boost）。所以上表 14 份全都能 `search`，别为了搜索去跑几小时的 import。
 
 **源码已删的索引已清掉**（`percona`、`ruby`、`duckdb`、`php`、`perl5` 共约 11G，
 2026-11-10 删除；`/tmp/cs_repo`、`/tmp/idx_lua` 两个测试残留索引一并清掉）。
@@ -233,15 +239,15 @@ codesearch action=status project=postgresql
 
 # 1 横向：自然语言找子系统入口（2–5 条不同问法）
 codesearch action=search project=postgresql query="query planner cost estimation" max_results=5
-codesearch action=search project=linux_7212 query="epoll wait loop" max_results=5
+codesearch action=search project=redis query="event loop multiplexing" max_results=5
 
-# 2 纵向：钉符号 → 看调用链（仅 KV 齐全的项目）
-codesearch action=symbol project=linux_7212 query="vfs_read"
-codesearch action=context project=linux_7212 query="vfs_read" depth=2
+# 2 纵向：钉符号 → 看调用链（仅 KV 齐全的项目：reasonix/opencode/pi-mono/redis）
+codesearch action=symbol project=redis query="aeProcessEvents"
+codesearch action=context project=redis query="aeProcessEvents" depth=2
 codesearch action=context project=reasonix query="..." depth=1
 
 # 3 读源码复核（源码还在的项目）
-read /opt/linux/src/linux-7.2.12/fs/read_write.c
+read /opt/redis/src/ae.c
 
 # 4 看变量/字段流向（仅 KV 齐全）
 codesearch action=dataflow project=redis query="server.client"
@@ -249,14 +255,16 @@ codesearch action=dataflow project=redis query="server.client"
 
 选项目的经验顺序：
 
-1. **要读 C 内核态/超大工程** → `linux_7212`（唯一 KV + 向量都全的大盘，`context` 最快见效）。
+1. **要读 C 内核态/超大工程** → `linux_7212` **已清掉**（见 §1.1），要查就先跑
+   `/opt/code_caches/linux_7212_rebuild.lua` 重建；没重建之前用 `postgresql`/`redis` 顶。
 2. **要看 SQL/存储实现** → `postgresql`（只能 `search`）、`redis`（KV 全，可 `context`）。
 3. **要看 Python 运行时** → `python`（CPython，只能 `search`），拿到 `file:line` 后自己 `read`。
 4. **要看 JS/TS 前端栈** → `opencode`、`pi-mono`、`reasonix`（KV 全、可直接 `context`）。
 5. **要看模型推理/扩散工程** → `llama.cpp`、`comfyui`、`sd`、`qwenimage-ncnn-vulkan`、
    `zimage-ncnn-vulkan`（都是 `search`，后两个是小工程、秒查）。
 6. **要看 nginx/Lua 网关** → `openresty`、`LuaJIT`（`search`）。
-7. **改 lite 自己** → `project=lite`（默认目录，KV + vectors 齐全，可 `symbol/context/dataflow`）。
+7. **改 lite 自己** → **不建索引**，用 `read`/`cgrep`/`edit` + `AGENTS.md` §2 代码地图
+   （理由见 §1.1；`project=lite` 那份已删，别再重建）。
 
 索引新鲜度：重复 `build` 会走增量（`vectors/*.hash` 在就行）。
 **源码不在盘上的项目不要再 build**——`build` 会按源码目录重新切块，源码缺失只会产出空/残缺索引。
@@ -551,6 +559,9 @@ RTX 3080 20GB / 6 核：
 
 ### 4.6 Linux 内核 7.2.12 索引过程记录
 
+> 该索引（`/opt/code_caches/linux_7212_cache`，7.4G）已于 2026-11-10 按要求清掉；
+> 本节保留为**重建方法论**，照它重跑一份即可，数字是当时实测。
+
 #### 目标与环境
 
 - 源码：`/opt/linux/src/linux-7.2.12`（Linux 7.2.12）
@@ -685,7 +696,8 @@ print(H.run({
 ```
 
 之后查询要带 `project=linux_7212` 和 `analysis_dir=/opt/code_caches/linux_7212_cache`；
-也可以把该目录软链到 `~/.local/share/lite/codesearch/linux_7212` 使用默认路径。
+也可以把该目录软链到 `~/.local/share/lite/codesearch/<project>` 使用默认路径
+（**只对 `/opt/code_caches/` 里的项目这么做**，lite 自身不建索引）。
 
 #### 经验
 
