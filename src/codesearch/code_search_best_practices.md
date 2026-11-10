@@ -2,7 +2,7 @@
 
 > 本文不是功能清单，是**用 lens 读懂一个大仓库的纪律**。结论全部来自一次真实作业：
 > 用 lens 通读 Linux 7.2.12（`/opt/linux/src/linux-7.2.12`，36934 个 `.c` + 26899 个 `.h`），
-> 拆成 8 个索引项目，产出源码级架构报告（见 `codesearch/linux_kernel_7.2.12.md`）。
+> 拆成 8 个索引项目，产出源码级架构报告（见 `codesearch/linux-7.2.12-source-report.md`）。
 >
 > 方法论骨架仍来自 codedump《如何阅读源代码》（agent skill `lichuang/how-to-read-code`）；
 > lens 的实现与命令见 `README.md` / `lua/ffi/codesearch.lua`，本文只讲**怎么用才不出错**。
