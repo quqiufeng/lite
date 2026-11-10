@@ -1287,6 +1287,27 @@ do
         check(not bad_text, "recall whitelist: no raw json in item text")
         check(turns <= 2, "recall budget: at most 2 turns")
 
+        -- 显式 recall（transcript=true）必须能翻 assistant/tool 原文：hard_window
+        -- 丢消息时给的提示就是「用 recall 捞」，捞不回来等于一句空话。
+        local tr = mem:recall("needle", 20, { session_id = "s3", transcript = true })
+        local got_a, got_t = false, false
+        for _, it in ipairs(tr) do
+            if it.key:find("/msg/", 1, true) and it.kind == "trunc" then
+                if it.text:find("needle raw assistant", 1, true) then got_a = true end
+                if it.text:find("needle raw tool", 1, true) then got_t = true end
+            end
+        end
+        check(got_a and got_t, "recall transcript: assistant/tool retrievable when asked")
+        -- 截断：落盘的 tool 结果可能 8KB，显式召回只回头部，否则 3 条就顶满窗口。
+        mem:put("/agent/session", "s3/msg/00000009",
+            { role = "tool", content = "needle-longhead " .. string.rep("x", 5000) }, 0)
+        local clipped = false
+        for _, it in ipairs(mem:recall("needle-longhead", 20,
+            { session_id = "s3", transcript = true })) do
+            if it.text:find("needle-longhead", 1, true) and #it.text <= 1300 then clipped = true end
+        end
+        check(clipped, "recall transcript: long tool output clipped")
+
         -- 加权评分：事实(tag 命中高权重)排在轮次之前，轮次不再挤满记忆块。
         mem:remember_fact("needle-fact", "needle canonical fact text", { "needle" })
         mem:remember_turn("s3", 5, "needle", "needle")

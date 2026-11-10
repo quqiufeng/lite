@@ -68,6 +68,9 @@ AI-native harness：记忆、工具、FFI、X11。
 - 白名单 + 权重（`memory.lua:recall`）：只收 `/agent/knowledge/`(1.0)、会话 `working/`
   (0.9)、`msg/` 里的 user 原文(0.8)、`turn/` 摘要(0.6)；`/agent/working` 永不注入。
   `hits>0` 才留，按 IDF + 长度惩罚 + 30 天半衰打分，最多 2 条 turn / 4 条 user。
+  显式 `recall`（`transcript=true`）额外收 `msg/` 里的 assistant/tool 原文（kind `trunc`，
+  权重 0.35，单条截 1200 字、3 条封顶）——`hard_window` 丢掉的 tool 结果因此还能捞回来；
+  自动注入路径不传 `transcript`，每轮 prompt 里仍然只有 user 原话。
 - 主动 `recall`：看到 `hard_window` 的丢弃提示且需要那段；用户提"上次/之前"而窗口里
   没有；动手前核对旧结论。**字面匹配、无向量**，换个说法可能一条不中，且召回失败模型
   自己看不见（`stats()` 不进 prompt）。

@@ -624,6 +624,14 @@ function M:recall(query, limit, opts)
     local KNOW = "/agent/knowledge/"
     local SESS = "/agent/session/"
 
+    -- 显式 recall（opts.transcript=true）才允许翻 assistant/tool 原文：
+    -- 自动注入永远只要 user 原话，中间产物一条都不进每轮 prompt。
+    local allow_transcript = opts.transcript == true
+    -- 单条 transcript 的返回上限。tool 结果落盘时已截到 LITE_TOOL_RESULT_CHARS(8192)，
+    -- 但 8192 字符一条 ×5 就顶满整个窗口；显式 recall 只是「看一眼那段」，
+    -- 头 1200 字足够定位，要看全文再 recall 一次更窄的词或直接重跑命令。
+    local transcript_max = tonumber(opts.transcript_max) or 1200
+
     -- 白名单：只放「长期事实」和「会话内可复用的轮次/工作笔记」进来。
     -- 原始 transcript（/<sid>/msg/<seq>）和 <sid>/meta 一律不注入：msg 是逐条原始
     -- JSON，一条就能吃掉整个字符预算，还会把最近几轮的原文反复塞给模型。
@@ -634,14 +642,16 @@ function M:recall(query, limit, opts)
             local kind = rest:match("^[^/]+/([^/]+)/")
             if kind == "turn" then return "turn" end
             if kind == "working" then return "working" end
-            -- 原始 transcript：只有 user 原文放行（用户自己的话不过期），assistant/tool
-            -- 的原始 JSON 一律不进 prompt —— 下面 add() 里按 data.role 二次过滤。
-            if kind == "msg" then return "user" end
+            -- 原始 transcript：自动注入只放 user 原文（用户自己的话不过期）；
+            -- 显式 recall 时额外放 assistant/tool（kind="trunc"，低权重、有截断），
+            -- 否则 hard_window 丢掉的 tool 结果就是黑洞——文案让模型 recall，
+            -- 却什么也捞不回来。
+            if kind == "msg" then return allow_transcript and "trunc" or "user" end
         end
         return nil
     end
 
-    local WEIGHT = { fact = 1.0, working = 0.9, user = 0.8, turn = 0.6 }
+    local WEIGHT = { fact = 1.0, working = 0.9, user = 0.8, turn = 0.6, trunc = 0.35 }
 
     local function add(r)
         -- 目录级 /agent/working（wake 调度状态、todos 兜底）属于运行态：
@@ -659,14 +669,22 @@ function M:recall(query, limit, opts)
         -- 早先回退成 { c = r.value } 会把这些字节原样拼进 prompt。
         if not ok or type(data) ~= "table" then return end
         if kind == "user" and data.role ~= "user" then return end
+        if kind == "trunc" then
+            -- user 原话一旦被显式召回，按 user 权重算；assistant/tool 才走低权重。
+            if data.role == "user" then
+                kind = "user"
+            elseif data.role ~= "tool" and data.role ~= "assistant" then
+                return
+            end
+        end
         if kind == "user" and cutoff_seq then
             local seq = tonumber(r.key:match("/(%d+)$") or "")
             if seq and seq > cutoff_seq then return end
         end
         local text
-        if kind == "user" then
+        if kind == "user" or kind == "trunc" then
             if type(data.content) ~= "string" then return end
-            text = data.content
+            text = kind == "trunc" and clip_utf8(data.content, transcript_max) or data.content
         elseif data.t == "turn" and data.u then
             text = tostring(data.u) .. " => " .. tostring(data.a or "")
         else
@@ -775,7 +793,7 @@ function M:recall(query, limit, opts)
     -- 最多两条 transcript：轮次权重已经调低，但同分时仍可能挤满整块，
     -- 而重复的旧对话对下一轮几乎没有信息量。事实/工作笔记不受此限。
     local keep = {}
-    local users_kept = 0
+    local users_kept, truncs_kept = 0, 0
     for _, it in ipairs(out) do
         if it.kind == "turn" then
             turns_kept = turns_kept + 1
@@ -783,6 +801,11 @@ function M:recall(query, limit, opts)
         elseif it.kind == "user" then
             users_kept = users_kept + 1
             if users_kept > 4 then goto continue end
+        elseif it.kind == "trunc" then
+            -- 显式 recall 的原文只是「回看一眼」，3 条封顶：再多就把窗口
+            -- 从「模型自己想 recall 的那段」挤回「一堆中间产物」。
+            truncs_kept = truncs_kept + 1
+            if truncs_kept > 3 then goto continue end
         end
         keep[#keep + 1] = it
         ::continue::
