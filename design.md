@@ -142,6 +142,21 @@ KV，重启可恢复，连接时回放历史，SIGINT/SIGTERM 优雅退出。`--
 - `ctx:N%` = 当前 prompt 占触发线的比例，来自真实 `usage` 校准的 chars→tokens
   （`tok_per_char` 用上轮 usage 反推加指数平滑，实测 0.3452 vs 真实 0.3563，误差 2%）。
 
+### D10 远程实例：验证不占本机
+
+改 C/ABI 必须「编译 → 验 → 重启」，这段过程里主工作区会被半成品污染：进程内 `ffi.load` 的
+同路径 `.so` 换不掉（看到旧行为），失败还会写进主会话记忆。所以这条链**不在本机跑**，交给
+另一台机器上的实例（slave）：那边 `git pull` → `./tools/build.sh` → `./tools/test.sh` →
+`run.sh --once` 验行为，过了才 commit，master 再 `git pull` + 重编 + `reboot` 生效。
+
+为什么不做本机 worktree：`build/` 不能跨目录复用（CMakeCache 里是绝对路径），每个 worktree
+都得整片冷编译一次，把「省事」变成「等编译」；而远程实例本来就有自己的 `build/`、自己的
+`mem.bin`/`mem.lock`（`config.cwd` 决定，`memory.lua` 对它 `LOCK_EX`），隔离是天然的，
+主工作区、主记忆、主 `.so` 一个字节都不动。
+
+分工：本机做小改、文档、纯 Lua 与文本级验证；碰 `src/`、C ABI、`lua/ffi/*` 的硬验证推给
+远程实例。提交权留在人手里——slave 通过后就 commit，master 只 pull，不各写一份历史。
+
 ## 3 数字与门槛（默认 `budget` = 64000 字符）
 
 | 项 | 值 | 出处 |

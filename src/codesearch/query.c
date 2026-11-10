@@ -20,6 +20,7 @@
 #include <ctype.h>
 #include <time.h>
 #include <getopt.h>
+#include <sys/stat.h>
 #include <jansson.h>
 #include "cache.h"
 #include "vector_engine.h"
@@ -28,7 +29,21 @@ static cache_t* g_cache = NULL;
 static vector_engine_t* g_ve = NULL;
 // 进程内复用：同一项目连续 query（TUI/agent）不再反复加载 2GB KV 和数 GB HNSW。
 // 反复 create/destroy ORT session 还会偶发段错误；保持 engine 常驻更稳。
+// 但 import 会改写 kv/mem.bin：靠 mem.bin 的 mtime/size 变化判断陈旧，重开一次。
 static char g_cache_dir[512] = {0};
+static long long g_cache_mtime = 0;
+static long long g_cache_size = 0;
+static int g_cache_kv_ok = 0;
+
+static int kv_stamp(const char* dir, long long* mtime, long long* size) {
+    char p[1024];
+    snprintf(p, sizeof(p), "%s/mem.bin", dir);
+    struct stat st;
+    if (stat(p, &st) != 0) return -1;
+    *mtime = (long long)st.st_mtime;
+    *size = (long long)st.st_size;
+    return 0;
+}
 static char g_ve_dir[512] = {0};
 static char g_ve_model[32] = {0};
 
@@ -48,10 +63,59 @@ static const char* detect_query_type(const char* query, const char* repo) {
     return "symbol";
 }
 
-// Exact query
-static json_t* do_exact(const char* query) {
+// 查询串像文件路径（含 '/' 或带扩展名），而不是完整 KV key
+static int looks_like_path(const char* q) {
+    if (!q || !*q) return 0;
+    if (strchr(q, '/')) return 1;
+    const char* dot = strrchr(q, '.');
+    return dot && dot != q && strlen(dot) <= 8;
+}
+
+// 洗成 KV key 里出现的形式：去掉 file://、"./"、首尾斜杠
+static const char* clean_path(const char* path, char* buf, size_t cap) {
+    const char* p = path;
+    if (strncmp(p, "file://", 7) == 0) p += 7;
+    while (p[0] == '.' && p[1] == '/') p += 2;
+    while (*p == '/') p++;
+    size_t n = strlen(p);
+    while (n > 0 && p[n - 1] == '/') n--;
+    if (n >= cap) n = cap - 1;
+    memcpy(buf, p, n);
+    buf[n] = '\0';
+    return buf;
+}
+
+// 按文件列 chunk：key 形如 <repo>/chunks/<绝对路径>/<符号>。
+// 路径段完整匹配（loop.lua 不命中 xloop.lua），绝对/相对路径都能吃。
+static json_t* do_file(const char* path, const char* repo, int max_results);
+
+// Exact query: 完整 key 直取；miss 且像路径时按文件展开成 chunk 列表
+static json_t* do_exact(const char* query, const char* repo) {
     const char* value = cache_get(g_cache, query);
-    if (!value) return json_array();
+    if (!value) {
+        if (repo && *repo) {
+            char clean[1024];
+            const char* ck = strstr(query, "/chunks/");
+            if (ck) {
+                // 完整 key 没命中（多半符号名写错）→ 用其中的文件路径回退
+                char fp[1024];
+                snprintf(fp, sizeof(fp), "%s", ck + 8);
+                char* last = strrchr(fp, '/');
+                if (last) *last = '\0';
+                json_t* chunks = do_file(fp, repo, 50);
+                if (json_array_size(chunks) > 0) return chunks;
+                json_decref(chunks);
+            } else if (looks_like_path(query)) {
+                clean_path(query, clean, sizeof(clean));
+                if (*clean) {
+                    json_t* chunks = do_file(clean, repo, 100);
+                    if (json_array_size(chunks) > 0) return chunks;
+                    json_decref(chunks);
+                }
+            }
+        }
+        return json_array();
+    }
     
     json_error_t error;
     json_t* data = json_loads(value, 0, &error);
@@ -72,20 +136,18 @@ static json_t* do_exact(const char* query) {
     return arr;
 }
 
-// Symbol query
-static json_t* do_symbol(const char* name, const char* repo) {
-    json_t* arr = json_array();
-    
-    char key[512];
+// 展开一个 /symbols/<name> 键：优先取 chunk 全文，缺 chunk 退回符号条目
+static void symbol_entries_into(json_t* arr, const char* repo, const char* name) {
+    char key[1024];
     snprintf(key, sizeof(key), "%s/symbols/%s", repo, name);
     const char* value = cache_get(g_cache, key);
-    if (!value) return arr;
+    if (!value) return;
     
     json_error_t error;
     json_t* symbols = json_loads(value, 0, &error);
     if (!symbols || !json_is_array(symbols)) {
         if (symbols) json_decref(symbols);
-        return arr;
+        return;
     }
     
     size_t idx;
@@ -106,8 +168,10 @@ static json_t* do_symbol(const char* name, const char* repo) {
                 json_object_set_new(chunk, "_source", json_string("symbol"));
                 json_object_set_new(chunk, "_key", json_string(ckey));
                 json_array_append_new(arr, chunk);
+                continue;
             }
-        } else {
+        }
+        {
             json_t* obj = json_object();
             json_object_set(obj, "name", json_object_get(sym, "name"));
             json_object_set(obj, "kind", json_object_get(sym, "kind"));
@@ -120,6 +184,98 @@ static json_t* do_symbol(const char* name, const char* repo) {
     }
     
     json_decref(symbols);
+}
+
+// Symbol query：精确全名优先；miss 时按 ".name" / "::name" 后缀回退。
+// Lua 的 M.foo、C++ 的 Point::norm 在 KV 里都是全名键，直查名字永远 miss。
+static json_t* do_symbol(const char* name, const char* repo, int max_results) {
+    json_t* arr = json_array();
+    if (!g_cache || !repo || !*repo || !name || !*name) return arr;
+    if (max_results <= 0) max_results = 10;
+
+    symbol_entries_into(arr, repo, name);
+    if (json_array_size(arr) > 0) return arr;
+
+    char prefix[1024];
+    snprintf(prefix, sizeof(prefix), "%s/symbols/", repo);
+    size_t plen = strlen(prefix);
+
+    char dot[600], colon[600];
+    snprintf(dot, sizeof(dot), ".%s", name);
+    snprintf(colon, sizeof(colon), "::%s", name);
+    const char* needles[2] = { dot, colon };
+
+    cache_search_options_t opts = cache_search_options_default();
+    for (int n = 0; n < 2 && json_array_size(arr) < (size_t)max_results; n++) {
+        opts.max_results = max_results - (int)json_array_size(arr);
+        cache_result_t* found = NULL;
+        size_t count = 0;
+        if (cache_search_prefix_match(g_cache, prefix, needles[n], CACHE_MATCH_SUFFIX,
+                                      &opts, &found, &count) != 0) {
+            continue;
+        }
+        for (size_t i = 0; i < count; i++) {
+            const char* k = found[i].key;
+            if (!k || strlen(k) <= plen) continue;
+            symbol_entries_into(arr, repo, k + plen);
+        }
+        cache_results_free(found);
+    }
+    return arr;
+}
+
+// 按文件列 chunk：key 形如 <repo>/chunks/<绝对路径>/<符号>。
+// 路径段完整匹配（loop.lua 不命中 xloop.lua），绝对/相对路径都能吃。
+static json_t* do_file(const char* path, const char* repo, int max_results) {
+    json_t* arr = json_array();
+    if (!g_cache || !repo || !*repo || !path || !*path) return arr;
+
+    char clean[1024];
+    clean_path(path, clean, sizeof(clean));
+    if (!*clean) return arr;
+
+    char prefix[1200];
+    snprintf(prefix, sizeof(prefix), "%s/chunks/", repo);
+
+    cache_search_options_t opts = cache_search_options_default();
+    int want = max_results > 0 ? max_results : 10;
+    // 幽灵条目（sorted 索引有、hash 表没有）和重复 key 都会被过滤掉，
+    // 而 max_results 是在 cache 层就截断的，所以这里多要一些再裁剪，
+    // 否则一个文件的历史副本就能把窗口占满、返回 0 条。
+    int want_scan = want * 8 + 64;
+
+    cache_result_t* found = NULL;
+    size_t count = 0;
+    opts.max_results = want_scan;
+    if (cache_search_prefix_match(g_cache, prefix, clean, CACHE_MATCH_PATH,
+                                  &opts, &found, &count) != 0) {
+        return arr;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        if ((int)json_array_size(arr) >= want) break;
+        const char* k = found[i].key;
+        const char* v = found[i].value;
+        if (!k || !v) continue;
+        // KV 里同一个 key 可能有多条历史记录（重复 import），这里按 key 去重，
+        // 否则同一个 .on_stop 会返回 5 遍。
+        int dup = 0;
+        for (size_t j = 0; j < i && !dup; j++) {
+            const char* kj = found[j].key;
+            if (kj && strcmp(kj, k) == 0) dup = 1;
+        }
+        if (dup) continue;
+        // 幽灵条目：sorted 索引里还留着、hash 表里已经没有（历史 import/淘汰留下的
+        // 悬空 offset）。iterator 与前缀搜索都会把它们捞出来，这里按 hash 表校验。
+        if (!cache_exists(g_cache, k)) continue;
+        json_error_t error;
+        json_t* chunk = json_loads(v, 0, &error);
+        if (!chunk) continue;
+        json_object_set_new(chunk, "_source", json_string("file"));
+        json_object_set_new(chunk, "_key", json_string(k));
+        json_array_append_new(arr, chunk);
+    }
+    cache_results_free(found);
     return arr;
 }
 
@@ -190,8 +346,8 @@ static void expand_call_paths(const char* name, const char* repo, int depth,
 static json_t* do_context(const char* name, const char* repo, int depth) {
     json_t* context = json_object();
     
-    // Get symbol
-    json_t* symbol_result = do_symbol(name, repo);
+    // Get symbol（后缀回退也走这里，M.foo 之类能命中）
+    json_t* symbol_result = do_symbol(name, repo, 10);
     json_t* symbol = NULL;
     if (json_array_size(symbol_result) > 0) {
         symbol = json_array_get(symbol_result, 0);
@@ -635,17 +791,25 @@ int lite_cs_query_main(int argc, char** argv) {
         opts.use_caller_boost = 0;
     }
     
-    // Auto-detect type
+    // Auto-detect type（auto 时记住，用于空结果回退语义搜索）
+    int auto_type = 0;
     if (strcmp(type, "auto") == 0) {
         type = detect_query_type(query, repo);
+        auto_type = 1;
     }
     
-    // Open cache (reuse if same project)
-    if (!g_cache || strcmp(g_cache_dir, cache_dir) != 0) {
+    // Open cache (reuse if same project, reopen when import rewrote the KV)
+    long long kv_mtime = 0, kv_size = 0;
+    int kv_stamp_ok = kv_stamp(cache_dir, &kv_mtime, &kv_size);
+    int kv_changed = (!kv_stamp_ok && g_cache_kv_ok) ||
+                     (kv_stamp_ok && g_cache_kv_ok &&
+                      (kv_mtime != g_cache_mtime || kv_size != g_cache_size));
+    if (!g_cache || strcmp(g_cache_dir, cache_dir) != 0 || kv_changed) {
         if (g_cache) {
             cache_close(g_cache);
             g_cache = NULL;
             g_cache_dir[0] = '\0';
+            g_cache_kv_ok = 0;
         }
         // 与 import 使用同一上限；query 若用更小的 max_memory 而 KV 已超过，
         // cache 内部淘汰/索引路径会出问题（内核索引曾因此偶发段错误）。
@@ -663,6 +827,7 @@ int lite_cs_query_main(int argc, char** argv) {
             return 1;
         }
         snprintf(g_cache_dir, sizeof(g_cache_dir), "%s", cache_dir);
+        g_cache_kv_ok = (kv_stamp(cache_dir, &g_cache_mtime, &g_cache_size) == 0);
     }
 
     // Initialize vector engine for semantic search (reuse if same project/model)
@@ -700,12 +865,17 @@ int lite_cs_query_main(int argc, char** argv) {
     json_object_set_new(response, "repo", json_string(repo ? repo : ""));
     
     if (strcmp(type, "exact") == 0) {
-        json_t* results = do_exact(query);
+        json_t* results = do_exact(query, repo);
+        json_object_set_new(response, "results", results);
+        json_object_set_new(response, "context", json_object());
+        json_object_set_new(response, "stats", json_object());
+    } else if (strcmp(type, "file") == 0) {
+        json_t* results = do_file(query, repo, max_results);
         json_object_set_new(response, "results", results);
         json_object_set_new(response, "context", json_object());
         json_object_set_new(response, "stats", json_object());
     } else if (strcmp(type, "symbol") == 0) {
-        json_t* results = do_symbol(query, repo);
+        json_t* results = do_symbol(query, repo, max_results);
         json_object_set_new(response, "results", results);
         json_object_set_new(response, "context", json_object());
         json_object_set_new(response, "stats", json_object());
@@ -714,9 +884,20 @@ int lite_cs_query_main(int argc, char** argv) {
         json_t* results = json_object_get(result, "results");
         json_t* ctx = json_object_get(result, "context");
         json_t* stats = json_object_get(result, "stats");
+        // auto 把单标识符判成 context，但符号不存在时 context 全空；
+        // 有向量引擎就退回语义搜索，别让调用方看到空结果。
         if (results) json_object_set(response, "results", results);
         if (ctx) json_object_set(response, "context", ctx);
         if (stats) json_object_set(response, "stats", stats);
+        if (auto_type && g_ve && (!results || json_array_size(results) == 0)) {
+            json_t* sr = do_search(query, repo, &opts, max_results);
+            if (json_array_size(sr) > 0 && !json_object_get(json_array_get(sr, 0), "_note")) {
+                json_object_set_new(response, "results", sr);
+                json_object_set_new(response, "type", json_string("search"));
+            } else {
+                json_decref(sr);
+            }
+        }
         json_decref(result);
     } else if (strcmp(type, "dataflow") == 0) {
         json_t* results = do_dataflow(query, repo, max_results);

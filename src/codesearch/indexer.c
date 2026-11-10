@@ -575,11 +575,18 @@ static const char* detect_language(const char* filepath) {
     if (strcmp(ext, ".cpp") == 0 || strcmp(ext, ".cc") == 0 || 
         strcmp(ext, ".cxx") == 0 || strcmp(ext, ".hpp") == 0) return "cpp";
     if (strcmp(ext, ".py") == 0) return "python";
-    if (strcmp(ext, ".js") == 0) return "javascript";
-    if (strcmp(ext, ".ts") == 0) return "typescript";
+    if (strcmp(ext, ".lua") == 0) return "lua";
+    if (strcmp(ext, ".js") == 0 || strcmp(ext, ".jsx") == 0) return "javascript";
+    if (strcmp(ext, ".ts") == 0 || strcmp(ext, ".tsx") == 0) return "typescript";
     if (strcmp(ext, ".go") == 0) return "go";
     if (strcmp(ext, ".rs") == 0) return "rust";
     if (strcmp(ext, ".java") == 0) return "java";
+    if (strcmp(ext, ".kt") == 0 || strcmp(ext, ".kts") == 0) return "kotlin";
+    if (strcmp(ext, ".rb") == 0) return "ruby";
+    if (strcmp(ext, ".php") == 0) return "php";
+    if (strcmp(ext, ".m") == 0) return "objc";
+    if (strcmp(ext, ".mm") == 0) return "objcpp";
+    if (strcmp(ext, ".cs") == 0 || strcmp(ext, ".sol") == 0) return "csharp";
     return "unknown";
 }
 

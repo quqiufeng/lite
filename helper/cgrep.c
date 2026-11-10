@@ -1,7 +1,9 @@
 /* cgrep: 代码搜索 helper。输入 flat JSON:
  * {"pattern":"...","path":".","ext":"lua,c,h","ignore_case":true,
  *  "fixed":false,"max_hits":200,"per_file":20,"threads":4}
- * 输出 JSON: {"ok":true,"hits":[{file,line,text}],"files":N,"scanned":N,"ms":N,"truncated":bool}
+ * 输出 JSON: {"ok":true,"hits":[{file,line,text}],"files":N,"scanned":N,"count":N,"ms":N,"truncated":bool}
+ * 注意 count 不能叫 hits：cjson 里同名键取后者，数组会被计数器覆盖成数字
+ * （踩过：helper/cgrep.lua:24 attempt to get length of field 'hits'）。
  */
 #include <stdio.h>
 #include <stdlib.h>

@@ -20,11 +20,14 @@ local function render(res)
     if not d.ok then
         return string.format("cgrep: %s\nrequired: pattern (string)\n", tostring(d.error))
     end
+    -- count 是 C 端计数器（去重前的原始命中数），hits 是数组；老 .so 曾把两者都叫 hits，
+    -- 取到 number 就会在 #d.hits 上炸，这里兜一层。
+    local nhits = d.count or (type(d.hits) == "table" and #d.hits) or 0
     local out = { string.format("%d hit(s) in %d file(s), scanned %d, %d ms%s",
-        d.hits and #d.hits or 0, d.files or 0, d.scanned or 0, d.ms or 0,
+        nhits, d.files or 0, d.scanned or 0, d.ms or 0,
         d.truncated and " (truncated, raise max_hits)" or "") }
     local seen, n, total = {}, 0, 0
-    for _, h in ipairs(d.hits or {}) do
+    for _, h in ipairs(type(d.hits) == "table" and d.hits or {}) do
         local key = h.file .. ":" .. h.line
         if not seen[key] then          -- C 端一行多命中会重复，这里按 file:line 去重
             seen[key] = true

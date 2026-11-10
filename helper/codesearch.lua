@@ -324,16 +324,16 @@ return {
         parameters = {
             type = "object",
             properties = {
-                action = { type = "string", enum = { "build", "index", "import", "search", "symbol", "context", "exact", "dataflow", "status" },
-                           description = "build=全流程；index=只切块；import=analysis 导入 KV；search=语义+关键词；symbol/context/exact=结构化查询；dataflow=函数读写了哪些变量 / 变量流过哪些函数；status=看产物" },
-                query = { type = "string", description = "符号名、标识符、自然语言查询，或 exact 的完整 KV key" },
+                action = { type = "string", enum = { "build", "index", "import", "search", "symbol", "context", "exact", "file", "dataflow", "status" },
+                           description = "build=全流程；index=只切块（不刷新 KV，要 import 才可查）；import=analysis 导入 KV；search=语义+关键词；symbol/context/exact=结构化查询；file=按文件列 chunk；dataflow=函数读写了哪些变量 / 变量流过哪些函数；status=看产物" },
+                query = { type = "string", description = "符号名（可省略表前缀，M.foo 查 foo 也行）、自然语言查询、文件路径，或 exact 的完整 KV key" },
                 path = { type = "string", description = "仓库路径（index/build，默认 cwd）" },
                 project = { type = "string", description = "项目名（默认取仓库目录名），决定 analysis/KV 目录与 namespace" },
                 type = { type = "string", description = "query 类型：auto/exact/symbol/context/search，默认 auto" },
                 max_results = { type = "integer", description = "返回条数，默认 10，上限 100" },
                 depth = { type = "integer", description = "context 调用链向上展开深度，默认 0，上限 5" },
                 kind = { type = "string", description = "按符号 kind 过滤：function/struct/macro/..." },
-                lang = { type = "string", description = "按语言过滤：c/cpp/python/javascript/go/rust" },
+                lang = { type = "string", description = "按语言过滤：c/cpp/python/lua/javascript/typescript/go/rust/java/kotlin/ruby/php/objc/csharp" },
                 file = { type = "string", description = "按文件名子串过滤（语义搜索）" },
                 model = { type = "string", description = "向量模型 jina（默认）或 mpnet" },
                 no_boost = { type = "boolean", description = "关闭 TF-IDF/调用者 boost" },
@@ -372,7 +372,9 @@ return {
                 include_dirs = args.include_dirs,
                 excludes = args.excludes, plugins = args.plugins }))
             if args.json then return cjson.encode(r) end
-            return fmt_status(CS.check(analysis))
+            return "index 只切块，KV 未刷新（symbol/search/exact 查不到新代码）。" ..
+                "要可查再跑 action=import（或 action=build 全流程）。\n" ..
+                fmt_status(CS.check(analysis))
         elseif action == "import" then
             check_stage("import", CS.import(analysis, ns, kv, false))
             return "import ok: " .. ns .. " -> " .. kv
@@ -392,7 +394,8 @@ return {
             if not d then error("codesearch: dataflow query failed: " .. tostring(err), 0) end
             if args.json then return cjson.encode(d) end
             return fmt_dataflow(d)
-        elseif action == "search" or action == "symbol" or action == "context" or action == "exact" then
+        elseif action == "search" or action == "symbol" or action == "context"
+            or action == "exact" or action == "file" then
             if not args.query or args.query == "" then
                 error("codesearch: query required for " .. action, 0)
             end
@@ -402,8 +405,8 @@ return {
                 need_built(d0, "kv")
             end
 
-            local t = action == "search" and "search" or action
-            -- 只有语义搜索才需要 vector engine；symbol/context/exact 传空目录，
+            local t = action
+            -- 只有语义搜索才需要 vector engine；其余传空目录，
             -- 避免每次查询都白加载 ONNX 模型（~1s + 数百 MB）。
             local analysis_arg = (t == "search") and analysis or ""
             local d, err = CS.query({
@@ -416,7 +419,6 @@ return {
             if args.json then return cjson.encode(d) end
             if action == "context" then return fmt_context(d) end
             if action == "symbol" then return fmt_symbols(d) end
-            if action == "exact" then return fmt_results(d) end
             return fmt_results(d)
         end
 

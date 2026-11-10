@@ -157,6 +157,157 @@ static int import_chunk_raw(const char* namespace, const char* line) {
     return safe_set_json(key, line);
 }
 
+// ---- 陈旧 chunk 清理 --------------------------------------------------------
+// import 是纯 upsert：分析目录里已经不存在的文件（例如以前被 index 进来、
+// 后来进了 noise 名单的 dist/ 副本）的 chunk key 会永远留在 KV 里，
+// file/symbol 查询照样返回这些幽灵结果。这里按 chunks_meta.jsonl 的文件集合
+// 反向清理：扫 <ns>/chunks 前缀，file 段不在集合里的 key 全部删掉。
+extern int cache_del(void* cache, const char* key);
+extern void* cache_iter_create(void* cache);
+extern void cache_iter_destroy(void* iter);
+extern int cache_iter_ns_next(void* iter, const char* ns_prefix,
+                              const char** key_out, const char** value_out);
+
+// 路径集合（开放寻址）。只存 chunks_meta 里出现过的文件，内存与文件数成正比
+// 而不是 chunk 数（内核量级 ~90k 文件，几十 MB 以内）。
+typedef struct {
+    char** slot;
+    size_t cap;
+    size_t n;
+} pathset_t;
+
+static uint64_t pathset_hash(const char* s, size_t len) {
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (unsigned char)s[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static int pathset_has(const pathset_t* p, const char* s, size_t len) {
+    if (!p->cap) return 0;
+    size_t mask = p->cap - 1;
+    size_t i = (size_t)pathset_hash(s, len) & mask;
+    while (p->slot[i]) {
+        const char* t = p->slot[i];
+        if (strlen(t) == len && memcmp(t, s, len) == 0) return 1;
+        i = (i + 1) & mask;
+    }
+    return 0;
+}
+
+// 已存在的串直接接管所有权（调用方不再 free）
+static void pathset_insert(pathset_t* p, char* s) {
+    size_t mask = p->cap - 1;
+    size_t i = (size_t)pathset_hash(s, strlen(s)) & mask;
+    while (p->slot[i]) i = (i + 1) & mask;
+    p->slot[i] = s;
+    p->n++;
+}
+
+static int pathset_add(pathset_t* p, const char* s, size_t len) {
+    if (pathset_has(p, s, len)) return 0;
+    if ((p->n + 1) * 10 >= p->cap * 7) {
+        size_t ncap = p->cap ? p->cap * 2 : 1024;
+        char** nslot = calloc(ncap, sizeof(char*));
+        if (!nslot) return -1;
+        char** old = p->slot;
+        size_t ocap = p->cap;
+        p->slot = nslot;
+        p->cap = ncap;
+        p->n = 0;
+        for (size_t i = 0; i < ocap; i++) {
+            if (old[i]) pathset_insert(p, old[i]);
+        }
+        free(old);
+    }
+    char* copy = malloc(len + 1);
+    if (!copy) return -1;
+    memcpy(copy, s, len);
+    copy[len] = '\0';
+    pathset_insert(p, copy);
+    return 1;
+}
+
+static void pathset_free(pathset_t* p) {
+    for (size_t i = 0; i < p->cap; i++) free(p->slot[i]);
+    free(p->slot);
+    p->slot = NULL;
+    p->cap = p->n = 0;
+}
+
+static void purge_stale_chunks(const char* analysis_dir, const char* namespace) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/chunks_meta.jsonl", analysis_dir);
+    FILE* fp = fopen(path, "r");
+    if (!fp) return;
+
+    char* line = malloc(MAX_LINE);
+    if (!line) { fclose(fp); return; }
+
+    pathset_t set = {0};
+    while (fgets(line, MAX_LINE, fp)) {
+        const char* file_p = strstr(line, "\"file\":\"");
+        if (!file_p) continue;
+        file_p += 8;
+        const char* file_end = strchr(file_p, '"');
+        if (!file_end) continue;
+        const char* rel = file_p;
+        while (rel < file_end && *rel == '/') rel++;   // 与 import_chunk_raw 的键格式一致
+        if (pathset_add(&set, rel, (size_t)(file_end - rel)) < 0) break;
+    }
+    free(line);
+    fclose(fp);
+
+    char ns_prefix[512];
+    snprintf(ns_prefix, sizeof(ns_prefix), "%s/chunks", namespace);
+    size_t ns_prefix_len = strlen(ns_prefix);
+
+    char** stale = NULL;
+    size_t nstale = 0, capstale = 0;
+
+    void* it = cache_iter_create(g_cache);
+    if (it) {
+        const char* key = NULL;
+        const char* val = NULL;
+        while (cache_iter_ns_next(it, ns_prefix, &key, &val) == 1 && key) {
+            // key = <ns>/chunks/<rel>/<symbol>；rel 里带 '/'，符号名不带
+            const char* rel = key + ns_prefix_len + 1;
+            const char* last = strrchr(rel, '/');
+            if (!last) continue;                       // 形态不认识就别动
+            size_t rel_len = (size_t)(last - rel);
+            if (pathset_has(&set, rel, rel_len)) continue;
+            if (nstale == capstale) {
+                size_t ncap = capstale ? capstale * 2 : 64;
+                char** grown = realloc(stale, ncap * sizeof(char*));
+                if (!grown) break;
+                stale = grown;
+                capstale = ncap;
+            }
+            char* dup = strdup(key);
+            if (!dup) break;
+            stale[nstale++] = dup;
+        }
+        cache_iter_destroy(it);
+    }
+
+    // 迭代中不能删：迭代器按 sorted 槽位下标走，删 entry 会让槽位移动。
+    size_t deleted = 0;
+    for (size_t i = 0; i < nstale; i++) {
+        if (cache_del(g_cache, stale[i]) == 0) deleted++;
+        free(stale[i]);
+    }
+    free(stale);
+    pathset_free(&set);
+
+    if (nstale) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "Purged %zu/%zu stale chunk key(s)", deleted, nstale);
+        log_info(msg);
+    }
+}
+
 // Import chunks_meta.jsonl
 static void import_chunks(const char* analysis_dir, const char* namespace) {
     char path[512];
@@ -199,6 +350,8 @@ static void import_chunks(const char* analysis_dir, const char* namespace) {
     char msg[256];
     snprintf(msg, sizeof(msg), "Stored %d chunks out of %d", stored, valid);
     log_info(msg);
+
+    purge_stale_chunks(analysis_dir, namespace);
 }
 
 // 从原始 JSON 行提取字符串字段（简单 strstr，字段顺序保证顶层字段先出现）
@@ -241,25 +394,35 @@ static void import_symbols(const char* analysis_dir, const char* namespace) {
     log_info("Phase 1b: Building symbol index...");
 
     json_t* map = json_object();   // name -> array of {name,kind,file,line}
-    char* line = malloc(MAX_LINE);
+    char* line = NULL;
+    size_t line_cap = 0;
     int added = 0;
 
-    while (fgets(line, MAX_LINE, fp)) {
+    // 用 jansson 解析整行：raw_field 靠 strchr('"') 找结尾，遇转义引号即截断
+    // （signature 里带引号/中文正是高危样本）。getline 顺手解决超长行。
+    while (getline(&line, &line_cap, fp) != -1) {
         char name[512], kind[64], file[1024];
-        if (!raw_field(line, "name", name, sizeof(name))) continue;
-        if (!raw_field(line, "file", file, sizeof(file))) continue;
-        raw_field(line, "kind", kind, sizeof(kind));
+        json_error_t jerr;
+        json_t* rec = json_loads(line, 0, &jerr);
+        if (!rec) continue;
+        const char* nv = json_string_value(json_object_get(rec, "name"));
+        const char* fv = json_string_value(json_object_get(rec, "file"));
+        const char* kv = json_string_value(json_object_get(rec, "kind"));
+        name[0] = kind[0] = file[0] = '\0';
+        if (nv) snprintf(name, sizeof(name), "%s", nv);
+        if (fv) snprintf(file, sizeof(file), "%s", fv);
+        if (kv) snprintf(kind, sizeof(kind), "%s", kv);
+        if (!name[0] || !file[0]) { json_decref(rec); continue; }
 
         // 过滤低价值 kind（变量/成员/局部等不建符号索引）
         if (strcmp(kind, "variable") == 0 || strcmp(kind, "member") == 0 ||
             strcmp(kind, "field") == 0 || strcmp(kind, "local") == 0 ||
             strcmp(kind, "parameter") == 0) {
+            json_decref(rec);
             continue;
         }
 
-        long ln = 0;
-        const char* lp = strstr(line, "\"line_start\":");
-        if (lp) ln = strtol(lp + 13, NULL, 10);
+        long ln = (long)json_integer_value(json_object_get(rec, "line_start"));
 
         json_t* arr = json_object_get(map, name);
         if (!arr) {
@@ -279,7 +442,7 @@ static void import_symbols(const char* analysis_dir, const char* namespace) {
                 break;
             }
         }
-        if (duplicate) continue;
+        if (duplicate) { json_decref(rec); continue; }
 
         json_t* obj = json_object();
         json_object_set_new(obj, "name", json_string(name));
@@ -298,6 +461,7 @@ static void import_symbols(const char* analysis_dir, const char* namespace) {
         }
         json_array_insert_new(arr, pos, obj);
         added++;
+        json_decref(rec);
     }
 
     free(line);

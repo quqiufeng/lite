@@ -91,6 +91,20 @@ int cache_search_prefix(cache_t* cache, const char* prefix,
                         const cache_search_options_t* options,
                         cache_result_t** out_results, size_t* out_count);
 
+// 前缀 + 过滤扫描：先在 prefix 范围内扫 key，再按 needle 过滤。
+// 用途：symbol 后缀回退（needle=".name"）、按文件路径找 chunk（needle="lua/tui/loop.lua"）。
+// 注意：这是前缀范围内线性扫描，签名/路径不在 key 段首时只能靠它；命中 max_results 即停。
+typedef enum {
+    CACHE_MATCH_NONE = 0,   // 不过滤（等价 cache_search_prefix）
+    CACHE_MATCH_SUFFIX = 1, // key 以 needle 结尾
+    CACHE_MATCH_PATH = 2    // key 中出现 "/<needle>/"（needle 两端不带斜杠）
+} cache_match_mode_t;
+
+int cache_search_prefix_match(cache_t* cache, const char* prefix,
+                              const char* needle, cache_match_mode_t mode,
+                              const cache_search_options_t* options,
+                              cache_result_t** out_results, size_t* out_count);
+
 // 范围搜索：[start_key, end_key)
 int cache_search_range(cache_t* cache, const char* start_key, const char* end_key,
                        const cache_search_options_t* options,

@@ -114,9 +114,34 @@ Chrome/WebView/CEF/Electron；不起 `xdotool/wmctrl/import`；不用 `systemd -
 判据：这东西「下个会话/下个用户也该有」→ 升级进 `tools/` 并补测试与文档；只有当前任务
 有价值 → 留在 `helper/` 用完即弃。
 
+**`tools/` 同样能进化**，不是人写死的封地：会话里发现某个已存在的 `tools/` 脚本/插件不够用，
+就改它、重编、测过、写进文档——只是纪律更严（`tools/test.sh` 必须过、接口要稳、要更新
+`AGENTS.md` 对应表格）。差别只在**代价与责任**，不在能不能改。
+
 注意发现机制：插件只扫 `<cwd>/helper` → `$LITE_ROOT/helper`（`lua/core/tools.lua:_helper_roots`），
 **`tools/` 里的 `.lua` 不会被当插件加载**（那是 build/test/run/release 这类仓库脚本）。
 现有 adb/wechat/music/search/fetch/tokens/uimap/usb 八个住 `helper/`，因为发现只认那里。
+
+**改过 C/C++ 就必须重编，然后 `/reboot` 才算测得上**（硬规矩，适用于 `tools/` 与 `helper/`
+两条通道）。`reboot` 只重启进程、**不编译**；Lua 侧 `ffi.load` 的 `build/liblite_*.so` 是进程内
+一次性句柄，同路径换不掉，中间态永远是旧代码。所以顺序是：
+
+| 步 | 动作 |
+|---|---|
+| 1 | 仓库 C/C++（`src/**`、`include/**`）→ `./tools/build.sh`（或 `cmake --build build --target <t> -j`） |
+| 1b | **跑的是安装版就走 `./tools/release.sh`**（= build + package + install）。`lua/` 是软链回仓库、改了立刻生效，`build/liblite_*.so` 却是 `install` 时的实体拷贝：只 `build.sh` 的话仓库 `.so` 变新、`/usr/local/share/lite/build` 还是旧的，reboot 起来仍是旧 C 代码。对不上就 `ls -l build/liblite_*.so /usr/local/share/lite/build/` 比大小/mtime |
+| 2 | `helper/<x>.c` → `native build name=x`（每次出新 `<name>-<ts>.so` + 清单，免重启即生效） |
+| 3 | 先用**进程外** `./tools/lite-lua -e ...` / `native action=run` 验行为，别在主进程里猜 |
+| 4 | `/reboot` —— 让新 `.so` 与插件 schema 进清单，主进程换成新代码 |
+| 5 | 重启后跑真实用例 + `./tools/test.sh`；ABI 变了没改 `lua/ffi/*.lua` 的 cdef 会在这里炸 |
+
+**别跳步**：只改 C 不重编就 reboot（看到的是旧行为）、用 `native build` 冒充 `./tools/build.sh`
+（产物不同，`build/liblite_*.so` 还是旧的）、或者改完 C 直接 `shutdown` 收工（下个会话才踩）。
+
+**C/ABI 的硬验证放远程实例**（见 `design.md:D10`）：本机进程内 `ffi.load` 过的同路径 `.so`
+换不掉，验失败还会污染主工作区与主会话记忆。所以「编译 → 验 → 重启」这套搬到另一台机器上的
+实例里做：slave 上 `./tools/build.sh && ./tools/test.sh` 过了才 commit，master `git pull` 后
+重编、`reboot` 生效。本机只做小改与文本级验证，不为了试错在主工作区反复编译半成品。
 
 **缺能力先造，别降级**（自我进化流程）。碰到「这个命令没装 / 这个库没有 / 内置工具缺这个
 动作」时，不许手工硬凑、更不许直接回「做不到」——按下表走一遍。整条链**会话内**可用，
@@ -158,6 +183,7 @@ Chrome/WebView/CEF/Electron；不起 `xdotool/wmctrl/import`；不用 `systemd -
 父进程环境，argv 会被 `ps` 看见，所以只有文件这条路；写 = `main.lua` 退出 75 之前，
 读 = 新进程带 `--reboot` 起来时 `take()`（读完即删，带 cwd 作用域，陈旧提示词不污染下一次）。
 于是自造工具的完整闭环是：`native build` / `write` → 按名调用验一遍 → `reboot` → 清单可见。
+**改的是仓库 C/C++ 就先 `./tools/build.sh` 再 reboot**（reboot 不编译，见本节开头那张表）。
 **前缀缓存不丢**：provider 的 cache 是服务端按 prompt 内容前缀命中的，新进程重建出的
 system prompt 字节相同（时钟/轮次/预算都在本轮尾部的 `runtime_block`）、历史从 JSONL/mem.bin
 原样回放 → 同一串 token，命中率照旧。真代价有三条：多一轮「继续工作」的请求；内存里全文的

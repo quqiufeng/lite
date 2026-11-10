@@ -17,6 +17,21 @@ typedef struct word_freq {
 
 static word_freq_t* hash_table[HASH_SIZE] = {0};
 static int total_docs = 0;
+static int unique_words = 0;
+
+static void word_freq_reset(void) {
+    for (int i = 0; i < HASH_SIZE; i++) {
+        word_freq_t* e = hash_table[i];
+        while (e) {
+            word_freq_t* next = e->next;
+            free(e);
+            e = next;
+        }
+        hash_table[i] = NULL;
+    }
+    total_docs = 0;
+    unique_words = 0;
+}
 
 static unsigned int hash_word(const char* word) {
     unsigned int h = 5381;
@@ -40,6 +55,8 @@ static void add_word_doc(const char* word) {
         entry = entry->next;
     }
     
+    if (unique_words >= MAX_WORDS) return;
+
     entry = calloc(1, sizeof(word_freq_t));
     if (entry) {
         strncpy(entry->word, word, MAX_WORD_LEN - 1);
@@ -47,6 +64,7 @@ static void add_word_doc(const char* word) {
         entry->doc_count = 1;
         entry->next = hash_table[h];
         hash_table[h] = entry;
+        unique_words++;
     }
 }
 
@@ -86,6 +104,9 @@ int lite_cs_word_freq_main(int argc, char** argv) {
     snprintf(out_file, sizeof(out_file), "%s/word_freq.json", cache_dir);
     
     printf("Analyzing %s...\n", text_file);
+
+    // 文件级全局表：同进程二次调用必须清零，否则 doc_count 累加、IDF 漂移。
+    word_freq_reset();
     
     FILE* fp = fopen(text_file, "r");
     if (!fp) {
@@ -104,16 +125,9 @@ int lite_cs_word_freq_main(int argc, char** argv) {
     
     printf("Total chunks: %d\n", total_docs);
     
-    // Count unique words
-    int unique_words = 0;
-    for (int i = 0; i < HASH_SIZE; i++) {
-        word_freq_t* entry = hash_table[i];
-        while (entry) {
-            unique_words++;
-            entry = entry->next;
-        }
-    }
-    printf("Unique words: %d\n", unique_words);
+    // 唯一词计数（唯一词在 add_word_doc 里累计，超过 MAX_WORDS 后不再新增）
+    printf("Unique words: %d%s\n", unique_words,
+           unique_words >= MAX_WORDS ? " (capped at MAX_WORDS)" : "");
     
     // Save to JSON
     FILE* out = fopen(out_file, "w");

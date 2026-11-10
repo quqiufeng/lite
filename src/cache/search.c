@@ -159,6 +159,104 @@ int cache_search_prefix(cache_t* cache, const char* prefix,
     return CACHE_OK;
 }
 
+// ====== 前缀 + needle 过滤 ======
+
+static int needle_match(const char* key, size_t key_len,
+                        const char* needle, cache_match_mode_t mode) {
+    if (mode == CACHE_MATCH_NONE) return 1;
+    if (!needle || !*needle) return 0;
+    size_t nlen = strlen(needle);
+    if (key_len < nlen) return 0;
+
+    if (mode == CACHE_MATCH_SUFFIX) {
+        return memcmp(key + key_len - nlen, needle, nlen) == 0;
+    }
+
+    // CACHE_MATCH_PATH: 要求 "/<needle>/" 完整路径段，避免 loop.lua 命中 xloop.lua
+    for (size_t i = 0; i + nlen + 2 <= key_len; i++) {
+        if (key[i] != '/') continue;
+        if (memcmp(key + i + 1, needle, nlen) != 0) continue;
+        if (key[i + 1 + nlen] == '/') return 1;
+    }
+    return 0;
+}
+
+int cache_search_prefix_match(cache_t* cache, const char* prefix,
+                              const char* needle, cache_match_mode_t mode,
+                              const cache_search_options_t* options,
+                              cache_result_t** out_results, size_t* out_count) {
+    if (!cache || !prefix || !*prefix || !out_results || !out_count) return CACHE_ERR_INVAL;
+
+    *out_results = NULL;
+    *out_count = 0;
+
+    size_t prefix_len = strlen(prefix);
+    uint64_t now = cache_now_ms();
+    int max_results = options ? options->max_results : 100;
+    const char* ns_filter = options ? options->ns_filter : NULL;
+
+    cache_result_t* results = NULL;
+    size_t result_count = 0;
+    size_t result_cap = 0;
+
+    // 跳表与排序数组两条路径保持一致：扫完整个 prefix 段，命中 max_results 提前停。
+    if (cache->sorted.skiplist && cache->sorted.count >= CACHE_SKIPLIST_THRESHOLD) {
+        cache_skiplist_node_t* current = cache->sorted.skiplist->head;
+        for (int i = cache->sorted.skiplist->max_level - 1; i >= 0; i--) {
+            while (current->forward[i] &&
+                   strncmp(current->forward[i]->key, prefix, prefix_len) < 0) {
+                current = current->forward[i];
+            }
+        }
+        current = current->forward[0];
+
+        while (current) {
+            if (!str_starts_with(current->key, current->key_len, prefix, prefix_len)) break;
+            if (entry_is_valid(cache, current->offset, now) &&
+                ns_filter_match(cache, current->offset, ns_filter) &&
+                needle_match(current->key, current->key_len, needle, mode)) {
+                if (append_result(&results, &result_count, &result_cap,
+                                  cache, current->offset, 1.0) < 0) {
+                    free(results);
+                    return CACHE_ERR_NOMEM;
+                }
+                if (max_results > 0 && result_count >= (size_t)max_results) break;
+            }
+            current = current->forward[0];
+        }
+
+        *out_results = results;
+        *out_count = result_count;
+        return CACHE_OK;
+    }
+
+    size_t start = cache_sorted_find_lower_bound(cache, prefix, prefix_len);
+    size_t count = cache->sorted.count;
+
+    for (size_t i = start; i < count; i++) {
+        size_t offset = cache_sorted_get(cache, i);
+        if (!offset) break;
+
+        size_t key_len;
+        const char* key = entry_key(cache, offset, &key_len);
+        if (!str_starts_with(key, key_len, prefix, prefix_len)) break;
+
+        if (!entry_is_valid(cache, offset, now)) continue;
+        if (!ns_filter_match(cache, offset, ns_filter)) continue;
+        if (!needle_match(key, key_len, needle, mode)) continue;
+
+        if (append_result(&results, &result_count, &result_cap, cache, offset, 1.0) < 0) {
+            free(results);
+            return CACHE_ERR_NOMEM;
+        }
+        if (max_results > 0 && result_count >= (size_t)max_results) break;
+    }
+
+    *out_results = results;
+    *out_count = result_count;
+    return CACHE_OK;
+}
+
 // ====== 范围搜索 [start_key, end_key) ======
 
 int cache_search_range(cache_t* cache, const char* start_key, const char* end_key,

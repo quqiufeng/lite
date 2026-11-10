@@ -7,6 +7,7 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <dirent.h>
@@ -67,7 +68,10 @@ static int mkdir_p(const char* path) {
 }
 
 // 捕获子步骤写到 stdout 的内容（目前只有 query 走 JSON stdout）。
-static char* run_capture(int (*fn)(int, char**), int argc, char** argv, int* out_rc) {
+// dup2 换的是进程全局 stdout，多线程/并发调用会串输出 → 串行化。
+static pthread_mutex_t g_capture_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static char* run_capture_locked(int (*fn)(int, char**), int argc, char** argv, int* out_rc) {
     fflush(stdout);
     FILE* tmp = tmpfile();
     if (!tmp) {
@@ -111,6 +115,13 @@ static char* run_capture(int (*fn)(int, char**), int argc, char** argv, int* out
     buf[n] = '\0';
     while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = '\0';
     return buf;
+}
+
+static char* run_capture(int (*fn)(int, char**), int argc, char** argv, int* out_rc) {
+    pthread_mutex_lock(&g_capture_lock);
+    char* out = run_capture_locked(fn, argc, argv, out_rc);
+    pthread_mutex_unlock(&g_capture_lock);
+    return out;
 }
 
 // ---------------- index / analysis pipeline ----------------

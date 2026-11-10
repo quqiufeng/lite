@@ -49,15 +49,30 @@ local function self_root()
 end
 
 local ROOTS = {}
-for _, r in ipairs({ env("LITE_ROOT"), self_root(), "." }) do
+for _, r in ipairs({ self_root(), ".", env("LITE_ROOT") }) do
     r = (r or ""):gsub("/+$", "")
     if r ~= "" and r ~= "/" then ROOTS[#ROOTS + 1] = r end
 end
 
+local function exists(p)
+    local f = io.open(p, "rb")
+    if f then f:close(); return true end
+    return false
+end
+
+-- 有源码的 root（含 src/codesearch/）优先：那里的 build/*.so 一定是刚编出来的新库。
+-- 安装目录（$LITE_ROOT）只有 build/ 没有源码，排后面兜底。不这么分会被软链坑到：
+-- lua/ 软链到源码时模块路径是 /usr/local/share/lite/lua/...，self_root() 解析出的是
+-- 安装目录，于是老库永远先命中（踩过：symbol 查询返回空，实际跑的是几天前的旧 .so）。
+local SOURCE_TREES, OTHER_TREES = {}, {}
+for _, base in ipairs(ROOTS) do
+    local t = exists(base .. "/src/codesearch/api.c") and SOURCE_TREES or OTHER_TREES
+    t[#t + 1] = base
+end
+
 local function first_file(paths)
     for _, p in ipairs(paths) do
-        local f = io.open(p, "rb")
-        if f then f:close(); return p end
+        if exists(p) then return p end
     end
 end
 
@@ -66,9 +81,11 @@ local load_err
 local explicit = env("LITE_CS_LIB")
 local candidates = {}
 if explicit then candidates[#candidates + 1] = explicit end
-for _, base in ipairs(ROOTS) do
-    candidates[#candidates + 1] = base .. "/build/liblite_codesearch.so"
-    candidates[#candidates + 1] = base .. "/lib/liblite_codesearch.so"
+for _, t in ipairs({ SOURCE_TREES, OTHER_TREES }) do
+    for _, base in ipairs(t) do
+        candidates[#candidates + 1] = base .. "/build/liblite_codesearch.so"
+        candidates[#candidates + 1] = base .. "/lib/liblite_codesearch.so"
+    end
 end
 candidates[#candidates + 1] = "liblite_codesearch.so"
 
