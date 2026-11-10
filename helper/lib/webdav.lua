@@ -30,6 +30,9 @@ local CACHE = os.getenv("LITE_MUSIC_CACHE") or "/tmp/lite-music-cache"
 local LIST_TTL = 600 -- 列目录缓存秒数
 M.cache_dir = CACHE
 
+-- 曲库子路径一律走 WEBDAV_MUSIC（~/.env → ~/.config/lite/.env 回退，见 env()）。
+-- 仓库里不写死任何主机/账号/盘符：那些是机器私有信息，只活在 dotenv 里。
+
 local CURLOPT_URL = 10002
 local CURLOPT_WRITEDATA = 10001
 local CURLOPT_HTTPHEADER = 10023
@@ -119,6 +122,7 @@ function M.cfg()
         base = hb
         if not root or root == "" then root = hp end
     end
+    -- WEBDAV_MUSIC 缺就报错，不内置兜底路径（机器私有信息只活在 dotenv 里）
     local rb, rp = split_dav(root)
     if rb then
         base = rb
