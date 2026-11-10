@@ -29,12 +29,24 @@
 
 ### 1.1 用什么读的
 
+主力是 `lens`（本仓库的代码索引：ctags + 调用图 + 数据流 + 向量），**先按符号/语义找，再读内联源码窗口**；`bash` 只用于 lens 不覆盖的目录级统计。
+
 | 手段 | 目的 |
 |---|---|
-| `find` + `wc -l`（排除 `vendor`/`node_modules`/`testdata`） | 包级/目录级规模，全部 `[verified]` |
-| `grep -n '^func \|^type '` | 骨架提取：只看类型与函数签名，不逐行读实现 |
-| `sed -n 'N,Mp'` | 关键段原文（`Run`、`runToolLoop`、`executeOne`、`compact`） |
+| `lens action=status`（`/opt/code_caches/reasonix_cache`） | 索引规模：58,770 chunk / 226,406 条调用边 / 48,361 条 dataflow 记录 |
+| `lens action=symbol` / `locate` | 按符号或自然语言定位，`locate` 直接给命中行 ±N 行源码，省掉 `grep`+`sed` 两跳 |
+| `lens action=context depth=2` | **调用图**：谁调它、它调谁，间接调用带 `[via recv]` 标注（接口分发看得见） |
+| `lens action=peek` | `file:line` 精确读窗口（`Run`、`runToolLoop`、`executeOne`、`Provider`/`Tool` 契约） |
+| `lens action=grep`（作用域限制） | 在单目录内做正则扫，避免整仓扫描 |
+| `find` + `wc -l`（排除 `vendor`/`node_modules`/`testdata`） | 包级/目录级规模，全部 `[verified]`（lens 不给行数聚合） |
 | `docs/*.md`（104 篇） | 作者自述的契约（EXTENSIONS/ACP/CLI/SPEC），与代码对照 |
+
+**索引视角补上的事实**（纯 grep 扫不出来的，`[static]`）：
+
+- `agent.Agent::runToolLoop` 在图上入度 **1**（`Agent.Run`）、出度 **30** —— 主循环是**单点枢纽**，所有分支（采样、压缩、工具轮、final）都挂在它下面，没有第二个入口。
+- `agent.Agent::executeOne` 入度 **133**（其中大量是测试直接打它）：执行单点是**契约边界**，测试拿它当公开面来验策略，不经过 HTTP/serve。
+- `Provider` 只有 `Name()` + `Stream()` 两个方法（`internal/contract/provider/provider.go:536`）—— 用 `peek` 验证过，不是摘要猜测。
+- 索引里 `testdata`/测试用例占比极高：`executeOne` 的 133 个调用者里绝大多数是 `TestXxx`，印证了 §2.1 的 53.7% 测试密度。
 
 ### 1.2 明确**没**做
 
@@ -46,16 +58,26 @@
 
 ### 1.3 复现
 
+用 `lens`（索引已建在 `/opt/code_caches/reasonix_cache`，无需重建）：
+
+```
+lens action=status project=reasonix                    # 58,770 chunk / 226,406 调用边 / 48,361 dataflow
+lens action=locate query=runToolLoop                   # 命中行 + 源码窗口
+lens action=context query=agent.Agent::runToolLoop depth=2   # 入度 1 / 出度 30
+lens action=context query=agent.Agent::executeOne depth=2    # 入度 133
+lens action=peek path=/opt/reasonix/internal/contract/provider/provider.go line=536 lines=10
+lens action=peek path=/opt/reasonix/internal/ext/extension/intercept.go line=13 lines=18   # 17 个拦截点
+lens action=peek path=/opt/reasonix/internal/runtime/agent/compact.go line=24 lines=16     # 预算常量
+lens action=import project=reasonix only_dataflow=true       # dataflow.json 已存在但 KV 缺 funcs/vars 键时补一次
+```
+
+目录级规模（lens 不做行数聚合，用 `bash`，全 `[verified]`）：
+
 ```bash
 cd /opt/reasonix
 find . -name '*.go' -not -path './vendor/*' -not -path '*/node_modules/*' | wc -l   # 6657
 find . -name '*_test.go' | wc -l                                                    # 3582
-sed -n '832,900p' internal/runtime/agent/agent.go                                    # Agent.Run
-sed -n '195,320p' internal/runtime/agent/run_loop.go                                 # 主循环
-sed -n '22,50p'  internal/contract/tool/tool.go                                      # Tool 契约
-sed -n '536,545p' internal/contract/provider/provider.go                             # Provider 契约
-sed -n '14,32p'  internal/ext/extension/intercept.go                                 # 17 个拦截点
-sed -n '25,44p'  internal/runtime/agent/compact.go                                   # 压缩预算表
+find . -name '*.go' -not -path './vendor/*' -not -path '*/node_modules/*' -exec cat {} + | wc -l   # 1,010,634
 ```
 
 ---
