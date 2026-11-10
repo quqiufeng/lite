@@ -514,6 +514,10 @@ local function do_locate(args, ctx, analysis, kv, ns)
     if t == "auto" then t = nil end
     t = t or "search"
 
+    -- 索引/KV 不存在时先给可自修的报错，别让 C 层的 "query failed" 冒到调用方面前
+    local pre = CS.check(analysis)
+    if pre then need_built(pre, "kv") end
+
     local notes = {}
     local d, err = cs_query(args, kv, ns, analysis, t, maxr)
     if (not d or #((d or {}).results or {}) == 0) and not args.type then
