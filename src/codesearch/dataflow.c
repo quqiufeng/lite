@@ -180,6 +180,19 @@ static var_record_t* find_or_create_var(const char* name) {
     return var;
 }
 
+// 只查不建：赋值/使用不该凭空造变量（`a->field = 1` 会把 field 变成"变量"），
+// 变量表只由声明行建立。
+static var_record_t* find_var(const char* name) {
+    if (!g_var_hash || !is_identifier(name)) return NULL;
+    unsigned int h = var_hash(name) & (unsigned int)(g_var_hash_size - 1);
+    while (g_var_hash[h]) {
+        int idx = g_var_hash[h] - 1;
+        if (strcmp(g_vars[idx].name, name) == 0) return &g_vars[idx];
+        h = (h + 1) & (unsigned int)(g_var_hash_size - 1);
+    }
+    return NULL;
+}
+
 static field_record_t* find_or_create_field(var_record_t* var, const char* field_name) {
     for (int i = 0; i < var->field_count; i++) {
         if (strcmp(var->fields[i].field_name, field_name) == 0) 
@@ -301,6 +314,35 @@ static int is_c_type(const char* word) {
     return 0;
 }
 
+// 声明行的判定用的修饰词：它们是类型的一部分，不是变量名。
+static int is_type_qualifier(const char* w) {
+    static const char* q[] = {
+        "const", "static", "inline", "volatile", "register", "extern",
+        "struct", "union", "enum", "signed", "unsigned", NULL
+    };
+    for (int i = 0; q[i]; i++) if (strcmp(w, q[i]) == 0) return 1;
+    return 0;
+}
+
+// "size_t"/"s64"/"ngx_str_t" 这类：既有白名单，也认 _t 后缀与 s/u + 位宽写法。
+static int is_type_word(const char* w) {
+    if (is_c_type(w) || is_type_qualifier(w)) return 1;
+    size_t n = strlen(w);
+    if (n > 2 && strcmp(w + n - 2, "_t") == 0) return 1;
+    if (n >= 2 && n <= 3 && (w[0] == 's' || w[0] == 'u')) {
+        int digits = 1;
+        for (size_t i = 1; i < n; i++) if (!isdigit((unsigned char)w[i])) digits = 0;
+        if (digits) return 1;   // s8 u8 s16 u32 s64 ...
+    }
+    return 0;
+}
+
+// 变量名后面必须紧跟这些 token 才算"声明"：`struct sds {` 里的 sds 因此不会被当变量。
+static int is_decl_terminator(const char* t) {
+    return strcmp(t, "=") == 0 || strcmp(t, ";") == 0 || strcmp(t, ",") == 0 ||
+           strcmp(t, "[") == 0 || strcmp(t, ")") == 0 || strcmp(t, ":") == 0;
+}
+
 static void tokenize_line(const char* line, char tokens[][128], int* token_count, int max_tokens) {
     *token_count = 0;
     const char* p = line;
@@ -364,37 +406,56 @@ static void analyze_line_impl(const char* line, ctx_info_t* ctx) {
     tokenize_line(line, tokens, &token_count, 64);
     
     for (int i = 0; i < token_count; i++) {
-        // 1. 变量定义
-        if (is_c_type(tokens[i]) && i + 1 < token_count) {
-            char* next = tokens[i + 1];
-            if (strcmp(next, "*") == 0 && i + 2 < token_count) {
-                next = tokens[i + 2];
+        // 1. 变量定义：类型词（含 struct/union 标签、xxx_t、s64 之类）→ 跳过修饰词与
+        //    指针星号 → 变量名。变量名后必须紧跟 = ; , [ ) : 之一，否则不是声明
+        //    （`struct sds {` 的 sds、`if (x == y)` 的 x 都不会被误收）。
+        if (is_type_word(tokens[i])) {
+            int j = i;
+            while (j < token_count) {
+                const char* t = tokens[j];
+                if (strcmp(t, "struct") == 0 || strcmp(t, "union") == 0 ||
+                    strcmp(t, "enum") == 0) {
+                    j += 2;                       // 跳过标签名
+                    continue;
+                }
+                if (is_type_word(t) || strcmp(t, "*") == 0) { j++; continue; }
+                break;
             }
-            if (isalpha((unsigned char)next[0]) || next[0] == '_') {
-                var_record_t* var = find_or_create_var(next);
+            if (j < token_count && (isalpha((unsigned char)tokens[j][0]) || tokens[j][0] == '_')) {
+                int k = j + 1;
+                while (k < token_count && strcmp(tokens[k], "*") == 0) k++;
+                if (k < token_count && !is_decl_terminator(tokens[k])) continue;
+                var_record_t* var = find_or_create_var(tokens[j]);
                 if (var && var->occur_count == 0) {
-                    strncpy(var->type, tokens[i], sizeof(var->type) - 1);
+                    // 类型取"变量名前面最后一个非 * token"：`const char *src` 记 char
+                    // 而不是 const（旧版一律取第一个词）。
+                    int ti = j - 1;
+                    while (ti > i && strcmp(tokens[ti], "*") == 0) ti--;
+                    if (ti < i) ti = i;
+                    strncpy(var->type, tokens[ti], sizeof(var->type) - 1);
+                    var->type[sizeof(var->type) - 1] = '\0';
                     add_occurrence(var, ctx->file, ctx->func, ctx->abs_line, 0, line, 1, NULL);
                 }
             }
+            continue;
         }
-        
-        // 2. 赋值
+
+        // 2. 赋值：只更新已声明的变量（`ctx->field = 1` 里的 field 不是变量）
         if (strcmp(tokens[i], "=") == 0 && i > 0) {
             char* prev = tokens[i - 1];
             if (strcmp(prev, "+") != 0 && strcmp(prev, "-") != 0 &&
                 strcmp(prev, "*") != 0 && strcmp(prev, "&") != 0) {
-                var_record_t* var = find_or_create_var(prev);
+                var_record_t* var = find_var(prev);
                 if (var) {
                     const char* field = extract_field_access(line, prev);
                     add_occurrence(var, ctx->file, ctx->func, ctx->abs_line, 0, line, 2, field);
                 }
             }
         }
-        
+
         // 3. 使用（含字段访问）
         if ((isalpha((unsigned char)tokens[i][0]) || tokens[i][0] == '_') &&
-            !is_c_type(tokens[i])) {
+            !is_type_word(tokens[i])) {
             int is_lvalue = 0;
             if (i + 1 < token_count && strcmp(tokens[i + 1], "=") == 0) {
                 is_lvalue = 1;
@@ -404,7 +465,7 @@ static void analyze_line_impl(const char* line, ctx_info_t* ctx) {
                 is_lvalue = 1;
             }
             if (!is_lvalue) {
-                var_record_t* var = find_or_create_var(tokens[i]);
+                var_record_t* var = find_var(tokens[i]);
                 if (var && var->occur_count > 0) {
                     int dup = 0;
                     for (int j = 0; j < var->occur_count; j++) {
@@ -420,11 +481,42 @@ static void analyze_line_impl(const char* line, ctx_info_t* ctx) {
     }
 }
 
+// 去注释：//、/* */（跨行靠 in_block 传递），字符串字面量原样保留（tokenizer 会跳过，
+// 但 "http://x" 不能被当成行注释开头）。
+static void strip_comments_line(char* line, int* in_block) {
+    char* out = line;
+    const char* p = line;
+    while (*p) {
+        if (*in_block) {
+            const char* e = strstr(p, "*/");
+            if (!e) { *out = '\0'; return; }
+            p = e + 2;
+            *in_block = 0;
+            continue;
+        }
+        if (p[0] == '/' && p[1] == '*') { *in_block = 1; p += 2; continue; }
+        if (p[0] == '/' && p[1] == '/') break;
+        if (*p == '"' || *p == '\'') {
+            char q = *p;
+            *out++ = *p++;
+            while (*p && *p != q) {
+                if (*p == '\\' && p[1]) *out++ = *p++;
+                *out++ = *p++;
+            }
+            if (*p) *out++ = *p++;
+            continue;
+        }
+        *out++ = *p++;
+    }
+    *out = '\0';
+}
+
 static void process_function_content(const char* content, ctx_info_t* ctx_base) {
     char line[1024];
     const char* p = content;
     int rel_line = 0;
-    
+    int in_block_comment = 0;
+
     while (*p) {
         int i = 0;
         while (*p && *p != '\n' && i < (int)(sizeof(line) - 1)) {
@@ -433,11 +525,52 @@ static void process_function_content(const char* content, ctx_info_t* ctx_base) 
         line[i] = '\0';
         if (*p == '\n') p++;
         rel_line++;
-        
+
+        strip_comments_line(line, &in_block_comment);
+
         ctx_info_t ctx = *ctx_base;
         ctx.abs_line = ctx_base->abs_line + rel_line - 1;
         analyze_line_impl(line, &ctx);
     }
+}
+
+// JSON 字符串反转义（content 里 \n \t \" \\ \/ \uXXXX）。\u 只保留 ASCII，
+// 其余置 '?' —— dataflow 只做 C 词法，非 ASCII 字符不会成为变量名。
+static int decode_json_string(const char* src, size_t raw_len, char* out, int cap) {
+    int i = 0;
+    size_t j = 0;
+    while (j < raw_len && i < cap - 1) {
+        if (src[j] != '\\') { out[i++] = src[j++]; continue; }
+        j++;
+        if (j >= raw_len) break;
+        switch (src[j]) {
+            case 'n': out[i++] = '\n'; j++; break;
+            case 't': out[i++] = '\t'; j++; break;
+            case 'r': out[i++] = '\r'; j++; break;
+            case 'b': out[i++] = '\b'; j++; break;
+            case 'f': out[i++] = '\f'; j++; break;
+            case '/': out[i++] = '/'; j++; break;
+            case '\\': out[i++] = '\\'; j++; break;
+            case '"': out[i++] = '"'; j++; break;
+            case 'u': {
+                unsigned v = 0;
+                size_t k = 1;
+                for (; k <= 4 && j + k < raw_len; k++) {
+                    char c = src[j + k];
+                    v <<= 4;
+                    if (c >= '0' && c <= '9') v |= (unsigned)(c - '0');
+                    else if (c >= 'a' && c <= 'f') v |= (unsigned)(c - 'a' + 10);
+                    else if (c >= 'A' && c <= 'F') v |= (unsigned)(c - 'A' + 10);
+                }
+                j += k;
+                if (v > 0 && v < 128) out[i++] = (char)v;
+                break;
+            }
+            default: out[i++] = src[j++]; break;
+        }
+    }
+    out[i] = '\0';
+    return i;
 }
 
 static int analyze_meta(const char* meta_file) {
@@ -483,19 +616,20 @@ static int analyze_meta(const char* meta_file) {
         if (strcmp(kind, "function") != 0 && strcmp(kind, "method") != 0 &&
             strcmp(kind, "ts_function") != 0 && strcmp(kind, "ts_method") != 0) continue;
         
-        i = 0;
+        // content 是 JSON 字符串：必须先反转义再分析。旧版把 "\\n" 拷成字面 'n'，
+        // 整个函数被压成一行 → 所有变量行号都落在签名行（B3 的主因）。
         const char* cp = content_p;
-        while (*cp && i < (int)(sizeof(content) - 1)) {
-            if (*cp == '\\' && *(cp+1)) {
-                content[i++] = *(++cp);
-                cp++;
-            } else if (*cp == '"') {
-                break;
-            } else {
-                content[i++] = *cp++;
-            }
+        size_t raw_len = 0;
+        int escaped = 0;
+        while (cp[raw_len]) {
+            char ch = cp[raw_len];
+            if (escaped) { escaped = 0; raw_len++; continue; }
+            if (ch == '\\') { escaped = 1; raw_len++; continue; }
+            if (ch == '"') break;
+            raw_len++;
         }
-        content[i] = '\0';
+        decode_json_string(cp, raw_len, content, (int)sizeof(content));
+        if (!content[0]) continue;
         
         ctx_info_t ctx;
         strncpy(ctx.file, file, sizeof(ctx.file) - 1);

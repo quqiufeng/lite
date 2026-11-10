@@ -713,12 +713,23 @@ static void import_dataflow(const char* analysis_dir, const char* namespace) {
         }
     }
     
-    // Store function index as single bulk entry
+    // 全量函数索引：内核量级会超过 1MB 单值上限（旧版在这里打一条
+    // "Value too large, skipping"，谁也不知道到底丢了什么）。查询侧已经改成
+    // cache_get `dataflow/funcs/<func>`，这份大块索引只剩调试价值，所以
+    // 超限就明确说一句跳过，不再假装失败。
     char fkey[512];
     snprintf(fkey, sizeof(fkey), "%s/dataflow/_func_index", namespace);
     char* fstr = json_dumps(func_index, JSON_COMPACT);
     if (fstr) {
-        safe_set_json(fkey, fstr);
+        if (strlen(fstr) < MAX_VALUE_LEN) {
+            safe_set_json(fkey, fstr);
+        } else {
+            char msg[128];
+            snprintf(msg, sizeof(msg),
+                     "Phase 3: _func_index %.1f MB > limit, skipped (use dataflow/funcs/<func>)",
+                     (double)strlen(fstr) / (1024.0 * 1024.0));
+            log_info(msg);
+        }
         free(fstr);
     }
 
