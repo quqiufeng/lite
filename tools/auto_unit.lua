@@ -4317,6 +4317,13 @@ int apply_via_ops(struct scale_ops *o, int v) {
     return o->scale(v);
 }
 ]])
+        -- 同目录里再放一个「文件名是 b.c 后缀」的兄弟文件：exact 按 chunk key 过滤时
+        -- 必须按 '/' 分段对齐，否则查 sub/b.c 会把 sub/ab.c 的 chunk 一起端上来。
+        put(base .. "/repo/sub/ab.c", [[
+int only_ab(int v) {
+    return v - 7;
+}
+]])
 
         local dir = base .. "/analysis"
         local kv = base .. "/kv"
@@ -4340,6 +4347,32 @@ int apply_via_ops(struct scale_ops *o, int v) {
         check(sym and sym.results[1].content and
             sym.results[1].content:find("helper_add", 1, true) ~= nil,
             "codesearch symbol returns chunk content")
+
+        -- exact 落文件：<ns>/chunks/sub/b.c 与「文件 + 写错符号」两种写法都必须只命中
+        -- sub/b.c 自己的 chunk（不能因整段子串匹配把同目录 sub/ab.c 也带出来）。
+        local function exact_names(q)
+            local r = CS.query({ query = q, repo = ns, type = "exact",
+                kv_dir = kv, analysis_dir = dir, max_results = 20 })
+            local names, files = {}, {}
+            for _, item in ipairs(r and r.results or {}) do
+                names[#names + 1] = tostring(item.name)
+                files[#files + 1] = tostring(item.file)
+            end
+            return names, files, #(r and r.results or {})
+        end
+        local en, ef, ec = exact_names(ns .. "/chunks/sub/b.c")
+        local clean_file, has_ab = ec > 0, false
+        for i = 1, ec do
+            if en[i] == "only_ab" then has_ab = true end
+            if not ef[i]:find("sub/b.c", 1, true) then clean_file = false end
+        end
+        check(clean_file and not has_ab, "codesearch exact chunks path keeps one file")
+        local tn, tf, tc = exact_names(ns .. "/chunks/sub/b.c/oops_typo")
+        local typo_ok = tc > 0
+        for i = 1, tc do
+            if tn[i] == "only_ab" or not tf[i]:find("sub/b.c", 1, true) then typo_ok = false end
+        end
+        check(typo_ok, "codesearch exact symbol typo falls back to same file")
 
         local ctx = CS.query({ query = "compute_total", repo = ns, type = "context",
             kv_dir = kv, analysis_dir = dir, depth = 2 })

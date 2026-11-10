@@ -4,6 +4,78 @@
 -- 每个项目一个 analysis 目录，KV 落在其 kv/ 子目录，避免和 lite 自己的
 -- mem.bin 写实例抢锁。实现是 liblite_codesearch.so（从 /opt/my_db 全量迁移），
 -- 语义向量需要 /opt/models 下的 Jina 模型与 ONNX Runtime。
+--
+-- ════════ 实战手册：Linux 内核（v7.2.12，36934 个 .c）上摸出来的用法纪律 ════════
+-- 下面每条都是「工具的真实行为边界」，不是理想设计；括号里是当初踩出来的证据，
+-- 别当成可以随手改掉的注释。改行为前先重跑一次证据里的命令。
+--
+-- [1] 起手式固定 locate → peek → grep。
+--     locate（query=符号名）一次往返就给出 签名 + callers/callees + 内联源码窗口，
+--     等价于原来 grep + read 两次；peek 补读别的窗口；grep 只用来兜底复核。
+--
+-- [2] 语义检索只吃英文标识符/短语。中文 query 基本 0 命中（无向量、纯词面）。
+--     实测：「NAPI 轮询收包」→ 0 命中；换 "napi poll receive packets" → napi_poll 0.921。
+--     内核里 ship 的名字本来就是英文，query 直接用符号名或英文短语，别翻译。
+--
+-- [3] path_prefix 是唯一有效的降噪手段。给了 path_prefix=net/core 就只翻该子树的
+--     75 个文件、21ms 出结果；不给就是全仓噪声。查符号优先 symbol + path_prefix。
+--
+-- [4] 【最重要】call_graph 的边是「函数体文本扫到的标识符」，注释也算，不是语法解析。
+--     所以任何 caller 结论都要 grep 兜底复核。
+--     证据 A：enqueue_task_fair 报 callers=remove_entity_load_avg / clear_delayed /
+--       tg_unthrottle_up —— 这三个函数体里只是在注释中提到了「enqueue_task_fair()」
+--       （fair.c:5917 / 6439 / 6986）；反过来在 enqueue_task_fair 体内 grep 这三个
+--       名字是 0 命中，真 caller 只有 fair.c:7004 和表项赋值 fair.c:15671。
+--     证据 B：tcp_v4_rcv 报 callers=rds_cong_queue_updates / inet_child_forget，
+--       分别只来自 net/rds/cong.c:235 与 net/ipv4/inet_connection_sock.c:1384 的注释
+--       「held by tcp_v4_rcv()」；整个 net/ 里 tcp_v4_rcv() 带括号只出现在注释中。
+--     复核手法：被报成 caller 却看不出调用关系时，去对方函数体里 grep 这个名字，
+--     命中落在 /* */ 或 // 行内 → 伪边，直接丢弃。
+--
+-- [5] call_graph.json 顶层 key 是裸函数名（无文件前缀），同名函数直接串边。
+--     内核里 init / read / xmit 之类满地重名，这类边一律不可信。
+--     物证：arguments 字段里的 `ntttt` 是 ctags 输出 \n\t 的转义残留 ——
+--     这就是「按行抓文本」而非解析 AST 的铁证。
+--
+-- [6] 函数指针注册出来的入口，调用图完全看不见，必须手工 grep 赋值点：
+--       .handler      = tcp_v4_rcv        → net/ipv4/af_inet.c:1937（inet_protos[]）
+--       .enqueue_task = enqueue_task_fair → kernel/sched/fair.c:15671（sched_class ops）
+--     同类断点：f_op->read_iter、ndo_start_xmit、irq handler 表、notifier/rcu 回调链、
+--     SYSCALL_DEFINE3(read,...)（生成 sys_read，但索引里搜不到 sys_read 的定义）。
+--     ⇒「这个函数谁调我」的两个真源只有：grep 调用点 + grep 表项赋值。
+--
+-- [7] 间接边带 [via xxx] 标注（obj->fn() / obj.fn() / M.fn()），语义是
+--     「这条边可能混了同名直接调用」，不是精确虚调用解析；边仍按裸名解析（无类型信息）。
+--     看到 [via] 当「可能」，不要当「就是」。
+--
+-- [8] context 的 depth 上限 5，但内核规模两层就够看清形状；再深一路穿到
+--     printk / kmalloc 这类公共出口，全是噪声。
+--
+-- [9] dataflow 走 KV 键 funcs/<函数> 与 vars/<变量> 直取，不要去解析 dataflow.json。
+--     注意旧 KV 可能根本没有这两类键（实测 /opt/code_caches/linux_7212_cache 下
+--     连 dataflow/ 目录都没有，只有 58M 的 call_graph.json），要 only_dataflow=true
+--     重跑一次 import 才查得到。
+--
+-- [10] 内核建索引的参数（一次成功，别重来）：excludes 掉
+--      Documentation,tools,samples,scripts（除非专门要查），
+--      skip_kinds=header,file,enumerator,macro（头文件声明和宏会淹没符号表），
+--      先 index 看切块量再 import。产物按 G 算（该 cache 8.0G），磁盘先腾。
+--
+-- [11] 复用已有索引靠 analysis_dir / kv_dir / project 三个覆盖参数，别在
+--      /opt/linux 下重跑 build（几十分钟换不到新信息）。status 先看产物；
+--      报「找不到索引」时会列出磁盘上真实存在的那几个，按它给路径重试。
+--      lite 仓库自身不建索引（改自己用 read/cgrep/edit）。
+--
+-- [12] 读代码前先确认版本：cat Makefile | head -6 拿 VERSION/PATCHLEVEL/SUBLEVEL，
+--      不要用记忆里的版本套结论。7.2.12 上已变、与 6.x 记忆冲突的例子：
+--        __schedule(int sched_mode)，preempt = sched_mode > SM_NONE
+--          （SM_NONE 定义在 core.c:6732；PREEMPT_RT 合并后把抢占来源压成一个参数）
+--        proxy execution 已进树（core.c:6917 find_proxy_task）
+--        sched_ext 已是目录 kernel/sched/ext/{ext,arena,cid,idle}.c
+--        pick_next_task 换成 pick_task(rq, rf)（sched.h:2637），pick_task_fair 对外导出
+--        netif_receive_skb_core 是导出的非双下划线包装（dev.c:6289）
+--      结论标 [verified]（读到了具体源码行）/ [static]（仅从索引推断）。
+-- ═══════════════════════════════════════════════════════════════════════════════
 
 local CS = require("ffi.codesearch")
 local cjson = require("cjson")
@@ -59,6 +131,28 @@ local function safe_name(s)
     return (s:gsub("[^%w%._%-]", "_"))
 end
 
+-- namespace 只由索引目录决定，不能拿 repo 目录名推：/opt/code_caches/linux_7212_cache
+-- 这种命名的项目，用 repo 名会拼出 /code/linux_7212_cache，跟 import 写的 /code/linux_7212
+-- 对不上 → 所有查询稳定返回 0 条且不报错（看起来像「没索引」）。优先读 build 时写的
+-- <analysis>/namespace.txt，没有就按目录名去掉 _cache 后缀推。
+local function marker_ns(dir)
+    if not dir or dir == "" then return nil end
+    local f = io.open(dir .. "/namespace.txt", "r")
+    if not f then return nil end
+    local s = f:read("*l")
+    f:close()
+    s = s and s:gsub("%s+$", "")
+    if s and s:match("^/[%w%._%-/]+$") then return s end
+    return nil
+end
+
+local function ns_from_dir(dir)
+    if not dir or dir == "" then return nil end
+    local base = dir:gsub("/+$", ""):match("([^/]+)$")
+    if not base then return nil end
+    return "/code/" .. safe_name((base:gsub("_cache$", "")))
+end
+
 local has_index, index_candidates   -- 定义在下方，paths() 里先用
 
 local function paths(args, ctx)
@@ -79,7 +173,9 @@ local function paths(args, ctx)
         if hit then analysis = hit end
     end
     local kv = args.kv_dir or (analysis .. "/kv")
-    local ns = args.ns or ("/code/" .. project)
+    -- ns 跟着「实际用的索引目录」走，否则 fallback/analysis_dir 换目录时 ns 还留在 repo 名上，
+    -- 查询会一条不中却报 count=0（错误不可自修）。build 侧同样走 paths()，两边一致。
+    local ns = args.ns or marker_ns(analysis) or ns_from_dir(analysis) or ("/code/" .. project)
     return repo, project, analysis, kv, ns
 end
 
@@ -411,6 +507,12 @@ local function do_build(args, repo, project, analysis, kv, ns)
     stage("callgraph", function() return CS.callgraph(analysis) end)
     stage("dataflow", function() return CS.dataflow(analysis) end)
     stage("import", function() return CS.import(analysis, ns, kv, args.only_dataflow) end)
+    -- 落一份 namespace 标记：查询侧 paths() 优先读它。索引目录名和 repo 名不一致时
+    -- （/opt/code_caches/linux_7212_cache），靠目录名反推会得到错的 ns → 稳定 0 命中。
+    do
+        local f = io.open(analysis .. "/namespace.txt", "w")
+        if f then f:write(ns, "\n"); f:close() end
+    end
 
     local caps = CS.check(analysis) or {}
     local models = caps.models or {}
@@ -477,23 +579,19 @@ local function read_window(path, first, last)
     return table.concat(out, "\n") .. (cut and "\n      (long lines cut at 200 chars)" or "")
 end
 
-local function is_dir(p)
-    local f = io.popen("test -d " .. shell_quote(p) .. " && echo 1 || echo 0")
-    if not f then return false end
-    local r = f:read("*l")
-    f:close()
-    return r == "1"
-end
-
--- 护栏用：目录下最多数到 cap+1 个文件就停（find | head 靠 SIGPIPE 提前退出）。
-local function scan_file_count(dir, cap)
-    local cmd = string.format("find %s -maxdepth 8 -type f 2>/dev/null | head -n %d | wc -l",
-        shell_quote(dir), cap + 1)
+-- 护栏用：一次问完「是不是目录 + 里面有多少文件」。
+-- 原来 is_dir 和 scan_file_count 各起一个 sh（各带一个 find），热路径上多花一次
+-- fork/exec + 一次 find 遍历；合成一条 shell：非目录就回 -1，是目录最多数到 cap+1
+-- 个文件就停（find | head 靠 SIGPIPE 提前退出）。
+local function probe_dir(dir, cap)
+    local cmd = string.format(
+        "test -d %s || { echo -1; exit 0; }; find %s -maxdepth 8 -type f 2>/dev/null | head -n %d | wc -l",
+        shell_quote(dir), shell_quote(dir), cap + 1)
     local f = io.popen(cmd)
-    if not f then return 0 end
-    local s = f:read("*l") or "0"
+    if not f then return -1 end
+    local s = f:read("*l") or "-1"
     f:close()
-    return tonumber(s) or 0
+    return tonumber(s:match("^%s*(%-?%d+)")) or -1
 end
 
 -- 单次查询：type 决定走向量（search）还是 KV（symbol/context/exact）。
@@ -600,14 +698,12 @@ local function do_grep(args, ctx)
     -- 注意：上面的 env() 未命中时返回「零个值」，直接 tonumber(env(...)) 会变成零参数
     -- 调用而炸 "value expected"，所以先 or "" 兜一个实参。
     local cap = tonumber(env("LITE_CS_GREP_MAX_FILES") or "") or GREP_MAX_FILES_DEFAULT
-    if is_dir(path) then
-        local n = scan_file_count(path, cap)
-        if n > cap then
-            error(string.format("codesearch: refusing whole-tree grep under %s (>%d files, "
-                .. "noise + slow).\nfix: narrow first — action=locate query=\"...\" then "
-                .. "grep path=<file> or path=<subdir>; LITE_CS_GREP_MAX_FILES raises the cap",
-                path, cap), 0)
-        end
+    local nfiles = probe_dir(path, cap)          -- -1 = 单文件，不做规模护栏
+    if nfiles > cap then
+        error(string.format("codesearch: refusing whole-tree grep under %s (>%d files, "
+            .. "noise + slow).\nfix: narrow first — action=locate query=\"...\" then "
+            .. "grep path=<file> or path=<subdir>; LITE_CS_GREP_MAX_FILES raises the cap",
+            path, cap), 0)
     end
     if not ctx or not ctx.call then
         error("codesearch: grep needs the cgrep native helper (env.call); "
@@ -634,7 +730,9 @@ local function do_grep(args, ctx)
             seen[key] = true
             local line = string.format("%s:%d: %s", h.file, h.line, (h.text or ""):gsub("^%s+", ""))
             used = used + #line + 1
-            if used > 8000 then out[#out + 1] = "... (output capped, raise per_file/max_hits)"; break end
+            if used > (tonumber(args.max_chars) or 8000) then
+                out[#out + 1] = "... (output capped, raise max_chars or lower per_file/max_hits)"; break
+            end
             out[#out + 1] = line
             shown = shown + 1
             if #files < 3 and not files[h.file] then files[#files + 1] = h.file; files[h.file] = true end
@@ -707,6 +805,7 @@ local schema = {
                 project = { type = "string", description = "项目名（默认取仓库目录名），决定 analysis/KV 目录与 namespace" },
                 type = { type = "string", description = "query 类型：auto/exact/symbol/context/search，默认 auto" },
                 max_results = { type = "integer", description = "返回条数，默认 10，上限 100" },
+                max_chars = { type = "integer", description = "输出字符预算，默认 8000（locate/grep/symbol/exact 都认；调大才看得全）" },
                 depth = { type = "integer", description = "context 调用链向上展开深度，默认 0，上限 5" },
                 kind = { type = "string", description = "按符号 kind 过滤：function/struct/macro/..." },
                 lang = { type = "string", description = "按语言过滤：c/cpp/python/lua/javascript/typescript/go/rust/java/kotlin/ruby/php/objc/csharp" },
@@ -819,9 +918,9 @@ local function run_inner(args, ctx)
             -- C 侧对 context 查不到符号时会带 error（不再吐空壳），这里直接抛给调用方
             if d.error then error("lens: " .. tostring(d.error), 0) end
             if args.json then return cjson.encode(d) end
-            if action == "context" then return fmt_context(d) end
+            if action == "context" then return fmt_context(d, tonumber(args.max_chars)) end
             if action == "symbol" then return fmt_symbols(d) end
-            return fmt_results(d)
+            return fmt_results(d, tonumber(args.max_chars))
         end
 
         error("codesearch: unknown action " .. tostring(action), 0)

@@ -93,6 +93,32 @@ static json_t* do_symbol(const char* name, const char* repo, int max_results);
 static json_t* do_prefix_dump(const char* prefix, const char* needle,
                               cache_match_mode_t mode, int want, const char* source);
 
+// key 形如 <ns>/chunks/<绝对文件路径>/<符号>；只保留文件段与 relpath 段对齐相等的条目。
+// do_file 走 CACHE_MATCH_PATH，只保证 needle 是一串完整段（`net/ipv4` 也算命中），
+// exact 的路径回退必须收窄到「同一个文件」，否则查一个文件会返回同目录别人的函数。
+static json_t* chunks_under_file(json_t* chunks, const char* relpath, int want) {
+    json_t* out = json_array();
+    if (!chunks || !json_is_array(chunks) || !relpath || !*relpath) return out;
+    size_t m = strlen(relpath);
+    size_t idx;
+    json_t* e;
+    json_array_foreach(chunks, idx, e) {
+        if ((int)json_array_size(out) >= (want > 0 ? want : 10)) break;
+        const char* key = json_string_value(json_object_get(e, "_key"));
+        if (!key) continue;
+        const char* f = strstr(key, "/chunks/");
+        if (!f) continue;
+        f += 8;
+        const char* last = strrchr(f, '/');        // 最后一段是符号名，丢掉
+        if (!last) continue;
+        size_t n = (size_t)(last - f);
+        if (n < m || memcmp(f + (n - m), relpath, m) != 0) continue;
+        if (n > m && f[n - m - 1] != '/') continue;   // 段对齐：loop.c 不命中 xloop.c
+        json_array_append(out, e);
+    }
+    return out;
+}
+
 // Exact query: 完整 key 直取；miss 时按「容器键 → 文件 → 符号名」回退。
 // max_results 必须生效（旧的写死 50/100 让 --max-results 形同虚设）。
 static json_t* do_exact(const char* query, const char* repo, int max_results) {
@@ -157,16 +183,27 @@ static json_t* do_exact(const char* query, const char* repo, int max_results) {
         }
     }
 
-    // 2) <repo>/chunks/<file>/<symbol> 里符号名写错 → 用文件路径展开
+    // 2) <repo>/chunks/<file>[/<symbol>]：`.../chunks/net/ipv4/tcp_input.c` 与
+    //    `.../chunks/<file>/<符号写错>` 两种写法都要落到**同一个文件**上。
+    //    旧实现无条件砍掉最后一段（把文件名当目录），再把 `net/ipv4` 交给 do_file ——
+    //    而 CACHE_MATCH_PATH 允许整段子树命中，于是查 tcp_input.c 返回 ah4.c 的函数。
     const char* ck = strstr(query, "/chunks/");
     if (ck) {
         char fp[1024];
         snprintf(fp, sizeof(fp), "%s", ck + 8);
-        char* last = strrchr(fp, '/');
-        if (last) *last = '\0';
-        json_t* chunks = do_file(fp, repo, max_results);
-        if (json_array_size(chunks) > 0) return chunks;
-        json_decref(chunks);
+        size_t fl = strlen(fp);
+        while (fl > 0 && fp[fl - 1] == '/') fp[--fl] = '\0';
+        for (int pass = 0; pass < 2 && *fp; pass++) {
+            json_t* chunks = do_file(fp, repo, max_results);
+            json_t* hit = chunks_under_file(chunks, fp, max_results);
+            json_decref(chunks);
+            if (json_array_size(hit) > 0) return hit;
+            json_decref(hit);
+            // 第一遍整段当文件路径；没命中再退一段，覆盖「符号名写错」那种 key
+            char* slash = strrchr(fp, '/');
+            if (!slash) break;
+            *slash = '\0';
+        }
     }
 
     // 3) 裸标识符（或 /symbols/<name>）：退回符号表，别返回 0 条
