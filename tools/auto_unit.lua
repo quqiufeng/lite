@@ -4296,18 +4296,22 @@ do
 static int helper_add(int a, int b) {
     return a + b;
 }
+int shared_util(int v) {
+    return v + 1;
+}
 int compute_total(int x) {
     int y = helper_add(x, 3);
     return y * 2;
 }
 int main(void) {
-    return compute_total(4);
+    return compute_total(4) + shared_util(1);
 }
 ]])
         put(base .. "/repo/sub/b.c", [[
+int shared_util(int v);
 struct scale_ops { int (*scale)(int); };
 int scale(int v) {
-    return v * 10;
+    return v * 10 + shared_util(v);
 }
 int apply_via_ops(struct scale_ops *o, int v) {
     return o->scale(v);
@@ -4358,6 +4362,25 @@ int apply_via_ops(struct scale_ops *o, int v) {
         end
         check(indirect_ok, "codesearch indirect call marked (via o)")
 
+        -- context 也吃 path_prefix：shared_util 的 caller 横跨根目录(main)与 sub/(scale)
+        local function ctx_callers(prefix)
+            local r = CS.query({ query = "shared_util", repo = ns, type = "context",
+                kv_dir = kv, analysis_dir = dir, path_prefix = prefix })
+            local names = {}
+            local calls = r and r.context and r.context.callers or {}
+            for _, v in ipairs(calls) do names[#names + 1] = tostring(v.name) end
+            table.sort(names)
+            return names, #calls, r
+        end
+        local all_n = ctx_callers(nil)
+        check(#all_n >= 2, "codesearch context callers span dirs")
+        local sub_n, sub_cnt, sub_r = ctx_callers("sub/")
+        check(sub_cnt == 1 and sub_n[1] == "scale", "codesearch context path_prefix keeps sub/")
+        local fo = sub_r and sub_r.stats and sub_r.stats.filtered_out
+        check(fo ~= nil and tonumber(fo.callers) >= 1, "codesearch context path_prefix reports dropped")
+        local root_n, root_cnt = ctx_callers("arch/absent")
+        check(root_cnt == 0 and #root_n == 0, "codesearch context path_prefix can empty out")
+
         local df = CS.dataflow_query("compute_total", kv, ns, 10)
         local dfv = df and df.results and df.results[1] or {}
         check(dfv.kind == "function" and (dfv.var_count or 0) > 0,
@@ -4383,6 +4406,17 @@ int apply_via_ops(struct scale_ops *o, int v) {
                 if item.name == "helper_add" then hit = true end
             end
             check(hit, "codesearch semantic search")
+
+            -- path_prefix：sub/ 下只有 scale/apply_via_ops；带前缀后结果必须全落在 sub/
+            local sp = CS.query({ query = "scale multiply value", repo = ns,
+                type = "search", kv_dir = kv, analysis_dir = dir, max_results = 5,
+                path_prefix = "sub/" })
+            local all_sub, any_hit = true, false
+            for _, item in ipairs(sp and sp.results or {}) do
+                any_hit = true
+                if not (item.file and item.file:find("sub/", 1, true)) then all_sub = false end
+            end
+            check(any_hit and all_sub, "codesearch path_prefix filters subtree")
         else
             check(true, "codesearch semantic search skipped (model missing)")
         end

@@ -924,7 +924,8 @@ char* lite_cs_vectorize_ex(const char* analysis_dir, const char* model,
 char* lite_cs_query(const char* query, const char* repo, const char* type,
                     const char* kv_dir, const char* analysis_dir, const char* model,
                     int max_results, int depth, int no_boost,
-                    const char* kind, const char* lang, const char* file);
+                    const char* kind, const char* lang, const char* file,
+                    const char* path_prefix);
 char* lite_cs_check(const char* analysis_dir);
 char* lite_cs_capabilities(void);
 const char* lite_cs_error(void);

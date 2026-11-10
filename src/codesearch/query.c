@@ -88,52 +88,111 @@ static const char* clean_path(const char* path, char* buf, size_t cap) {
 // 按文件列 chunk：key 形如 <repo>/chunks/<绝对路径>/<符号>。
 // 路径段完整匹配（loop.lua 不命中 xloop.lua），绝对/相对路径都能吃。
 static json_t* do_file(const char* path, const char* repo, int max_results);
+static json_t* do_symbol(const char* name, const char* repo, int max_results);
+// 前缀扫描 + 装载值；needle 为 NULL（CACHE_MATCH_NONE）时列 <prefix> 下的全部子键
+static json_t* do_prefix_dump(const char* prefix, const char* needle,
+                              cache_match_mode_t mode, int want, const char* source);
 
-// Exact query: 完整 key 直取；miss 且像路径时按文件展开成 chunk 列表
-static json_t* do_exact(const char* query, const char* repo) {
+// Exact query: 完整 key 直取；miss 时按「容器键 → 文件 → 符号名」回退。
+// max_results 必须生效（旧的写死 50/100 让 --max-results 形同虚设）。
+static json_t* do_exact(const char* query, const char* repo, int max_results) {
+    if (max_results <= 0) max_results = 10;
+    if (max_results > 100) max_results = 100;
+
+    // KV 里的 key 带 namespace 原样前缀（ns=/code/x → 键就是 "/code/x/..."）。
+    // 调用方写 `code/x/_meta` 跟 `/code/x/_meta` 都该命中，所以两种形态都试。
+    char alt[1024];
+    if (query[0] == '/') {
+        snprintf(alt, sizeof(alt), "%s", query + 1);
+    } else {
+        snprintf(alt, sizeof(alt), "/%s", query);
+    }
+    const char* hit_key = query;
     const char* value = cache_get(g_cache, query);
     if (!value) {
-        if (repo && *repo) {
-            char clean[1024];
-            const char* ck = strstr(query, "/chunks/");
-            if (ck) {
-                // 完整 key 没命中（多半符号名写错）→ 用其中的文件路径回退
-                char fp[1024];
-                snprintf(fp, sizeof(fp), "%s", ck + 8);
-                char* last = strrchr(fp, '/');
-                if (last) *last = '\0';
-                json_t* chunks = do_file(fp, repo, 50);
-                if (json_array_size(chunks) > 0) return chunks;
-                json_decref(chunks);
-            } else if (looks_like_path(query)) {
-                clean_path(query, clean, sizeof(clean));
-                if (*clean) {
-                    json_t* chunks = do_file(clean, repo, 100);
-                    if (json_array_size(chunks) > 0) return chunks;
-                    json_decref(chunks);
-                }
-            }
+        value = cache_get(g_cache, alt);
+        if (value) hit_key = alt;
+    }
+    if (value) {
+        json_error_t error;
+        json_t* data = json_loads(value, 0, &error);
+        if (!data) return json_array();
+
+        json_t* arr = json_array();
+        if (json_is_array(data)) {
+            json_t* obj = json_object();
+            json_object_set_new(obj, "_key", json_string(hit_key));
+            json_object_set_new(obj, "_source", json_string("exact"));
+            json_object_set_new(obj, "entries", data);
+            json_array_append_new(arr, obj);
+        } else {
+            json_object_set_new(data, "_key", json_string(hit_key));
+            json_object_set_new(data, "_source", json_string("exact"));
+            json_array_append_new(arr, data);
         }
-        return json_array();
+        return arr;
     }
-    
-    json_error_t error;
-    json_t* data = json_loads(value, 0, &error);
-    if (!data) return json_array();
-    
-    json_t* arr = json_array();
-    if (json_is_array(data)) {
-        json_t* obj = json_object();
-        json_object_set_new(obj, "_key", json_string(query));
-        json_object_set_new(obj, "_source", json_string("exact"));
-        json_object_set_new(obj, "entries", data);
-        json_array_append_new(arr, obj);
+
+    if (!repo || !*repo) return json_array();
+
+    char clean[1024];
+    // 1) 容器键：<query>/... 的直接子键。`code/<proj>/_meta` 这种父键本身不存
+    //    值（真正写的是 .../_meta/info），`.../chunks/<file>` 也只是前缀 ——
+    //    按子键列出来才是调用方要的语义。同样两种斜杠形态都试。
+    size_t qlen = strlen(query);
+    while (qlen > 0 && query[qlen - 1] == '/') qlen--;
+    if (qlen > 0) {
+        const char* bases[2] = { query, (query[0] == '/') ? query + 1 : alt };
+        for (int b = 0; b < 2; b++) {
+            char pref[1024];
+            size_t bl = strlen(bases[b]);
+            while (bl > 0 && bases[b][bl - 1] == '/') bl--;
+            if (bl == 0 || bl + 2 >= sizeof(pref)) continue;
+            memcpy(pref, bases[b], bl);
+            pref[bl] = '/';
+            pref[bl + 1] = '\0';
+            json_t* kids = do_prefix_dump(pref, NULL, CACHE_MATCH_NONE, max_results, "exact");
+            if (json_array_size(kids) > 0) return kids;
+            json_decref(kids);
+        }
+    }
+
+    // 2) <repo>/chunks/<file>/<symbol> 里符号名写错 → 用文件路径展开
+    const char* ck = strstr(query, "/chunks/");
+    if (ck) {
+        char fp[1024];
+        snprintf(fp, sizeof(fp), "%s", ck + 8);
+        char* last = strrchr(fp, '/');
+        if (last) *last = '\0';
+        json_t* chunks = do_file(fp, repo, max_results);
+        if (json_array_size(chunks) > 0) return chunks;
+        json_decref(chunks);
+    }
+
+    // 3) 裸标识符（或 /symbols/<name>）：退回符号表，别返回 0 条
+    if (is_identifier(query)) {
+        json_t* syms = do_symbol(query, repo, max_results);
+        if (json_array_size(syms) > 0) return syms;
+        json_decref(syms);
     } else {
-        json_object_set_new(data, "_key", json_string(query));
-        json_object_set_new(data, "_source", json_string("exact"));
-        json_array_append_new(arr, data);
+        const char* sp = strstr(query, "/symbols/");
+        if (sp && is_identifier(sp + 9)) {
+            json_t* syms = do_symbol(sp + 9, repo, max_results);
+            if (json_array_size(syms) > 0) return syms;
+            json_decref(syms);
+        }
     }
-    return arr;
+
+    // 4) 路径：按文件列 chunk
+    if (looks_like_path(query)) {
+        clean_path(query, clean, sizeof(clean));
+        if (*clean) {
+            json_t* chunks = do_file(clean, repo, max_results);
+            if (json_array_size(chunks) > 0) return chunks;
+            json_decref(chunks);
+        }
+    }
+    return json_array();
 }
 
 // 展开一个 /symbols/<name> 键：优先取 chunk 全文，缺 chunk 退回符号条目
@@ -224,36 +283,54 @@ static json_t* do_symbol(const char* name, const char* repo, int max_results) {
     return arr;
 }
 
+// ctags 给匿名 struct/union/enum 生成的名字（__anon1a2b3c4d）。它们既不能按名字
+// 查到、也不会出现在源码里，列文件时纯属噪声。
+static int is_anon_name(const char* name) {
+    return name && strncmp(name, "__anon", 6) == 0;
+}
+
+static int cmp_line(const void* a, const void* b) {
+    json_t* x = *(json_t* const*)a;
+    json_t* y = *(json_t* const*)b;
+    long lx = (long)json_integer_value(json_object_get(x, "line_start"));
+    long ly = (long)json_integer_value(json_object_get(y, "line_start"));
+    if (lx != ly) return lx < ly ? -1 : 1;
+    const char* nx = json_string_value(json_object_get(x, "name"));
+    const char* ny = json_string_value(json_object_get(y, "name"));
+    return strcmp(nx ? nx : "", ny ? ny : "");
+}
+
 // 按文件列 chunk：key 形如 <repo>/chunks/<绝对路径>/<符号>。
 // 路径段完整匹配（loop.lua 不命中 xloop.lua），绝对/相对路径都能吃。
-static json_t* do_file(const char* path, const char* repo, int max_results) {
+// 输出按 line_start 升序（原来是 KV 前缀序 = 字母序，读文件时对不上）。
+static json_t* do_prefix_dump(const char* prefix, const char* needle,
+                              cache_match_mode_t mode, int want, const char* source) {
     json_t* arr = json_array();
-    if (!g_cache || !repo || !*repo || !path || !*path) return arr;
-
-    char clean[1024];
-    clean_path(path, clean, sizeof(clean));
-    if (!*clean) return arr;
-
-    char prefix[1200];
-    snprintf(prefix, sizeof(prefix), "%s/chunks/", repo);
+    if (!g_cache || !prefix || !*prefix) return arr;
+    if (want <= 0) want = 10;
 
     cache_search_options_t opts = cache_search_options_default();
-    int want = max_results > 0 ? max_results : 10;
     // 幽灵条目（sorted 索引有、hash 表没有）和重复 key 都会被过滤掉，
     // 而 max_results 是在 cache 层就截断的，所以这里多要一些再裁剪，
     // 否则一个文件的历史副本就能把窗口占满、返回 0 条。
-    int want_scan = want * 8 + 64;
+    opts.max_results = want * 8 + 64;
 
     cache_result_t* found = NULL;
     size_t count = 0;
-    opts.max_results = want_scan;
-    if (cache_search_prefix_match(g_cache, prefix, clean, CACHE_MATCH_PATH,
-                                  &opts, &found, &count) != 0) {
+    if (cache_search_prefix_match(g_cache, prefix, needle, mode, &opts, &found, &count) != 0) {
         return arr;
     }
 
+    // 先收集进临时指针数组 → 按行号排序 → 再截 want 条入 json：
+    // 边收边截会把「字母序前 want 个符号」截下来，排序也就没有意义了。
+    size_t cap = count ? count : 1;
+    json_t** bag = malloc(cap * sizeof(json_t*));
+    size_t nbag = 0;
+    if (!bag) {
+        cache_results_free(found);
+        return arr;
+    }
     for (size_t i = 0; i < count; i++) {
-        if ((int)json_array_size(arr) >= want) break;
         const char* k = found[i].key;
         const char* v = found[i].value;
         if (!k || !v) continue;
@@ -271,12 +348,42 @@ static json_t* do_file(const char* path, const char* repo, int max_results) {
         json_error_t error;
         json_t* chunk = json_loads(v, 0, &error);
         if (!chunk) continue;
-        json_object_set_new(chunk, "_source", json_string("file"));
+        if (is_anon_name(json_string_value(json_object_get(chunk, "name")))) {
+            json_decref(chunk);
+            continue;
+        }
+        json_object_set_new(chunk, "_source",
+                            json_string(source ? source : "file"));
         json_object_set_new(chunk, "_key", json_string(k));
-        json_array_append_new(arr, chunk);
+        bag[nbag++] = chunk;
     }
     cache_results_free(found);
+
+    if (nbag > 1) qsort(bag, nbag, sizeof(json_t*), cmp_line);
+    for (size_t i = 0; i < nbag; i++) {
+        if ((int)i >= want) {
+            json_decref(bag[i]);
+            continue;
+        }
+        json_array_append_new(arr, bag[i]);
+    }
+    free(bag);
     return arr;
+}
+
+// 按文件列 chunk：key 形如 <repo>/chunks/<绝对路径>/<符号>。
+static json_t* do_file(const char* path, const char* repo, int max_results) {
+    if (!repo || !*repo || !path || !*path) return json_array();
+
+    char clean[1024];
+    clean_path(path, clean, sizeof(clean));
+    if (!*clean) return json_array();
+
+    char prefix[1200];
+    snprintf(prefix, sizeof(prefix), "%s/chunks/", repo);
+    int want = max_results > 0 ? max_results : 10;
+
+    return do_prefix_dump(prefix, clean, CACHE_MATCH_PATH, want, "file");
 }
 
 // Helper: expand call paths upward (who calls X)
@@ -342,8 +449,34 @@ static void expand_call_paths(const char* name, const char* repo, int depth,
     json_array_remove(current_path, json_array_size(current_path) - 1);
 }
 
+// 调用边按目录子树收窄：内核里 handle_mm_fault 的 32 个 callers 会跨 arch 糊在
+// 一起（B6），站点本身带 file 字段，所以 context 也吃 `--path-prefix`。
+// 匹配规则与语义搜索一致：容忍前缀无开头 '/'（arch/x86 也能命中 /opt/linux/arch/x86/...）。
+// 没有 file 信息的站点（旧 KV 里的裸字符串、跨文件引用）保留而不是丢掉。
+static int site_matches_prefix(json_t* site, const char* needle) {
+    if (!json_is_object(site)) return 1;
+    const char* file = json_string_value(json_object_get(site, "file"));
+    if (!file || !*file) return 1;
+    return strstr(file, needle) != NULL;
+}
+
+static json_t* filter_sites_by_prefix(json_t* sites, const char* prefix, int* dropped) {
+    if (!prefix || !*prefix) return json_incref(sites);
+    const char* needle = prefix;
+    if (*needle == '/') needle++;
+    json_t* out = json_array();
+    size_t idx;
+    json_t* site;
+    json_array_foreach(sites, idx, site) {
+        if (site_matches_prefix(site, needle)) json_array_append(out, site);
+        else if (dropped) (*dropped)++;
+    }
+    return out;
+}
+
 // Context query: symbol + callers + callees + call_sites + dataflow + call_paths
-static json_t* do_context(const char* name, const char* repo, int depth) {
+static json_t* do_context(const char* name, const char* repo, int depth,
+                          const char* path_prefix) {
     json_t* context = json_object();
     
     // Get symbol（后缀回退也走这里，M.foo 之类能命中）
@@ -390,6 +523,17 @@ static json_t* do_context(const char* name, const char* repo, int depth) {
         }
     }
     
+    // path_prefix：调用边按目录子树收窄（跨 arch 的同名边是内核索引的主要噪声）
+    int callers_dropped = 0, callees_dropped = 0;
+    {
+        json_t* fc = filter_sites_by_prefix(callers, path_prefix, &callers_dropped);
+        json_decref(callers);
+        callers = fc;
+        json_t* fe = filter_sites_by_prefix(callees, path_prefix, &callees_dropped);
+        json_decref(callees);
+        callees = fe;
+    }
+
     // Get dataflow
     snprintf(key, sizeof(key), "%s/dataflow/vars/%s", repo, name);
     cvalue = cache_get(g_cache, key);
@@ -421,6 +565,16 @@ static json_t* do_context(const char* name, const char* repo, int depth) {
     json_object_set_new(context, "callees", callees);
     json_object_set_new(context, "call_paths", call_paths);
     json_object_set_new(context, "dataflow", dataflow);
+
+    // 符号表、调用边、dataflow 三者全空 = 这个符号根本不存在（或未建索引）。
+    // 旧行为是照样吐一个 "?  ?:?  kind=" 的空壳，调用方没法区分「不存在」和
+    // 「存在但没有调用边」—— 这里显式标出来。
+    int found = (symbol != NULL)
+        || json_array_size(callers) > 0
+        || json_array_size(callees) > 0
+        || json_array_size(dataflow) > 0;
+    json_object_set_new(context, "found", found ? json_true() : json_false());
+    json_object_set_new(context, "symbol_name", json_string(name ? name : ""));
     
     // Build stats
     json_t* stats = json_object();
@@ -428,6 +582,15 @@ static json_t* do_context(const char* name, const char* repo, int depth) {
     json_object_set_new(stats, "callee_count", json_integer(json_array_size(callees)));
     json_object_set_new(stats, "call_path_count", json_integer(json_array_size(call_paths)));
     json_object_set_new(stats, "dataflow_entries", json_integer(json_array_size(dataflow)));
+    if (path_prefix && *path_prefix) {
+        // 过滤过就把丢了多少条明写出来：调用方才知道"少"是因为过滤还是因为本来就没有。
+        json_t* filtered = json_object();
+        json_object_set_new(filtered, "path_prefix", json_string(path_prefix));
+        json_object_set_new(filtered, "callers", json_integer(callers_dropped));
+        json_object_set_new(filtered, "callees", json_integer(callees_dropped));
+        json_object_set_new(stats, "filtered_out", filtered);
+        json_object_set_new(context, "path_prefix", json_string(path_prefix));
+    }
     
     // Build result
     json_t* result = json_object();
@@ -774,6 +937,7 @@ static void print_usage(const char* prog) {
     printf("  --kind <kind>            Filter by symbol kind: function, struct, macro, typedef\n");
     printf("  --lang <lang>            Filter by language: c, cpp, python, javascript, go, rust\n");
     printf("  --file <pattern>        Filter by filename pattern (substring match)\n");
+    printf("  --path-prefix <prefix>   Filter by directory subtree, e.g. arch/x86, net/, drivers/gpu/\n");
     printf("  --no-boost              Disable TF-IDF keyword boost and caller count boost\n");
     printf("  --max-results <n>       Maximum number of results (default: 10)\n");
     printf("  --model <model>         Model type: jina (default) or mpnet\n");
@@ -897,6 +1061,8 @@ int lite_cs_query_main(int argc, char** argv) {
             opts.lang_filter = argv[++i];
         } else if (strcmp(argv[i], "--file") == 0 && i + 1 < argc) {
             opts.file_filter = argv[++i];
+        } else if (strcmp(argv[i], "--path-prefix") == 0 && i + 1 < argc) {
+            opts.path_prefix = argv[++i];
         } else if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
             model_type = argv[++i];
         } else if (strcmp(argv[i], "--max-results") == 0 && i + 1 < argc) {
@@ -1001,7 +1167,7 @@ int lite_cs_query_main(int argc, char** argv) {
     json_object_set_new(response, "repo", json_string(repo ? repo : ""));
     
     if (strcmp(type, "exact") == 0) {
-        json_t* results = do_exact(query, repo);
+        json_t* results = do_exact(query, repo, max_results);
         json_object_set_new(response, "results", results);
         json_object_set_new(response, "context", json_object());
         json_object_set_new(response, "stats", json_object());
@@ -1016,7 +1182,7 @@ int lite_cs_query_main(int argc, char** argv) {
         json_object_set_new(response, "context", json_object());
         json_object_set_new(response, "stats", json_object());
     } else if (strcmp(type, "context") == 0) {
-        json_t* result = do_context(query, repo, call_depth);
+        json_t* result = do_context(query, repo, call_depth, opts.path_prefix);
         json_t* results = json_object_get(result, "results");
         json_t* ctx = json_object_get(result, "context");
         json_t* stats = json_object_get(result, "stats");
@@ -1032,6 +1198,19 @@ int lite_cs_query_main(int argc, char** argv) {
                 json_object_set_new(response, "type", json_string("search"));
             } else {
                 json_decref(sr);
+            }
+        }
+        // 还是空 → 符号确实不存在，明确报出来（别让调用方拿到 "?  ?:?  kind=" 空壳）
+        {
+            json_t* rs = json_object_get(response, "results");
+            if (!rs || json_array_size(rs) == 0) {
+                char msg[1200];
+                snprintf(msg, sizeof(msg),
+                         "symbol not found: %s (no symbol entry, caller/callee edge, "
+                         "or dataflow record under %s; try --type search/locate, "
+                         "or check that the index was imported)",
+                         query, (repo && *repo) ? repo : "<no repo>");
+                json_object_set_new(response, "error", json_string(msg));
             }
         }
         json_decref(result);

@@ -50,7 +50,7 @@ lite 只有**一个入口**：`lens` 工具（旧名 `codesearch`；实现 `help
 `tests/validate_tools.sh`，看到旧文档里的这些名字一律按本节映射，不要去调。
 
 ```text
-lens action=... query=... path=... project=... [max_results] [depth] [kind] [lang] [file] [json]
+lens action=... query=... path=... project=... [max_results] [depth] [kind] [lang] [file] [path_prefix] [json]
 ```
 
 | 字段 | 含义 |
@@ -61,6 +61,7 @@ lens action=... query=... path=... project=... [max_results] [depth] [kind] [lan
 | `query` | 符号名 / 自然语言 / `exact` 的完整 KV key |
 | `depth` | `context` 向上展开调用链深度（0–5） |
 | `kind`/`lang`/`file` | 过滤（`function/struct/...`、`c/cpp/python/...`、文件名子串） |
+| `path_prefix` | 按目录子树过滤（`search`/`context`/`symbol`），如 `arch/x86`、`net/`、`drivers/gpu/`——内核多架构仓库用它把别的 arch 结果压掉；`context` 只过滤 callers/callees，被滤掉的条数记在 `stats.filtered_out` |
 | `json` | 返回原始 JSON（`locate`/`peek`/`grep` 只出文本，源码窗口不适合塞 JSON） |
 
 shell 侧等价写法（一行封装，复制即用；`tools/lua.sh` 是仓库里真实存在的 LuaJIT 入口。
@@ -83,7 +84,7 @@ cs '{"action":"search","query":"event loop epoll","project":"nginx","max_results
 | 单函数完整角色（caller/callee/调用链/dataflow） | `action=context query=<fn> depth=N` |
 | 批量符号关系 | 循环调用，或用一个 `lua` 片段在单进程里跑多个 `context` |
 | 精确符号 | `action=symbol query=<fn>` |
-| 完整 KV key 直查 | `action=exact query=<key>` |
+| 完整 KV key / 容器键 | `action=exact query=<key>`：先直取，miss 时依次退 `<key>/...` 子键（`_meta` → `_meta/info`、`chunks/<file>` → 该文件全部 chunk）→ `/symbols/<name>` → 文件路径；`max_results` 生效，带不带前导 `/` 都认 |
 | 片段相似实现 | `action=search query="<这看起来像什么>"`，命中后 `read` 该文件（**没有 `snippet` 子命令**） |
 | 变量/字段级数据流 | `action=dataflow query=<fn 或 var>` |
 | 调用图 / 扇入排序 | `action=context` 看 callers/callees；全局图读 `<analysis>/call_graph.json`（见下） |

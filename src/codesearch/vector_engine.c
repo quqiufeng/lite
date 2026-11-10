@@ -772,11 +772,19 @@ static int search_hnsw(ve_source_t* source, const float* query_vec, int top_k,
         }
         
         // Apply filters using metadata
-        if (opts && (opts->kind_filter || opts->lang_filter || opts->file_filter)) {
+        if (opts && (opts->kind_filter || opts->lang_filter || opts->file_filter ||
+                     opts->path_prefix)) {
             if (!meta) continue;
             if (opts->kind_filter && strcasecmp(meta->kind, opts->kind_filter) != 0) continue;
             if (opts->lang_filter && strcasecmp(meta->language, opts->lang_filter) != 0) continue;
             if (opts->file_filter && !strstr(meta->file, opts->file_filter)) continue;
+            // path_prefix：按目录子树过滤，容忍前缀无开头的 '/'（arch/x86 也能匹配
+            // /opt/linux/arch/x86/...）。内核仓库实测全靠这个把 arch/arm 结果压掉。
+            if (opts->path_prefix) {
+                const char* needle = opts->path_prefix;
+                if (*needle == '/') needle++;
+                if (!strstr(meta->file, needle)) continue;
+            }
         }
         
         strncpy(temp[temp_count].name, name, VE_MAX_NAME_LEN - 1);

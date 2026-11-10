@@ -141,6 +141,10 @@ local function fmt_results(d, max_chars)
     local rs = d.results or {}
     local out = { string.format('%s "%s" -> %d result(s), %d ms',
         d.type or "?", d.query or "", #rs, d.timing_ms or 0) }
+    if #rs == 0 and (d.type or "") == "exact" then
+        out[#out + 1] = "hint: exact 试过 <key> 直取 → <key>/... 子键 → /symbols/<name> → 文件路径，" ..
+            "都没有；用 symbol/locate/grep 再收窄"
+    end
     local total = 0
     for i, r in ipairs(rs) do
         local line
@@ -232,6 +236,12 @@ local function fmt_context(d, max_chars)
     end
     if #vars > 0 then
         out[#out + 1] = "dataflow: " .. table.concat(vars, "\n          ")
+    end
+    -- path_prefix 过滤过就报一声：否则「callers 变少」看起来像索引没建全
+    local fo = (d.stats or {}).filtered_out
+    if fo then
+        out[#out + 1] = string.format("filtered by path_prefix=%s: -%d callers, -%d callees",
+            fo.path_prefix or "?", tonumber(fo.callers) or 0, tonumber(fo.callees) or 0)
     end
     local s = table.concat(out, "\n")
     if #s > (max_chars or 8000) then s = s:sub(1, max_chars or 8000) .. "\n... (capped)" end
@@ -496,6 +506,7 @@ local function cs_query(args, kv, ns, analysis, t, maxr)
         model = args.model or "jina",
         max_results = maxr or args.max_results or 10, depth = args.depth or 0,
         no_boost = args.no_boost, kind = args.kind, lang = args.lang, file = args.file,
+        path_prefix = args.path_prefix,
     })
 end
 
@@ -503,7 +514,7 @@ local function do_locate(args, ctx, analysis, kv, ns)
     if not args.query or args.query == "" then
         error("codesearch: query required for locate (symbol name or natural language)\n"
             .. "required: query (string); optional: max_results (default 3), lines (default 40), "
-            .. "before (default 2), kind/lang/file, type", 0)
+            .. "before (default 2), kind/lang/file/path_prefix, type", 0)
     end
     local maxr = math.min(tonumber(args.max_results) or 3, 10)
     local budget = tonumber(args.max_chars) or 8000
@@ -700,6 +711,7 @@ local schema = {
                 kind = { type = "string", description = "按符号 kind 过滤：function/struct/macro/..." },
                 lang = { type = "string", description = "按语言过滤：c/cpp/python/lua/javascript/typescript/go/rust/java/kotlin/ruby/php/objc/csharp" },
                 file = { type = "string", description = "按文件名子串过滤（语义搜索）" },
+                path_prefix = { type = "string", description = "按目录子树过滤（search/context/symbol），如 arch/x86、net/、drivers/gpu/" },
                 model = { type = "string", description = "向量模型 jina（默认）或 mpnet" },
                 no_boost = { type = "boolean", description = "关闭 TF-IDF/调用者 boost" },
                 vector = { type = "boolean", description = "build 时是否做语义向量化（默认 true，缺模型自动跳过）" },
@@ -801,8 +813,11 @@ local function run_inner(args, ctx)
                 kv_dir = kv, analysis_dir = analysis_arg, model = args.model or "jina",
                 max_results = args.max_results or 10, depth = args.depth or 0,
                 no_boost = args.no_boost, kind = args.kind, lang = args.lang, file = args.file,
+                path_prefix = args.path_prefix,
             })
             if not d then error("codesearch: query failed: " .. tostring(err), 0) end
+            -- C 侧对 context 查不到符号时会带 error（不再吐空壳），这里直接抛给调用方
+            if d.error then error("lens: " .. tostring(d.error), 0) end
             if args.json then return cjson.encode(d) end
             if action == "context" then return fmt_context(d) end
             if action == "symbol" then return fmt_symbols(d) end

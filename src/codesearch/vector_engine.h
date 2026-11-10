@@ -51,6 +51,7 @@ typedef struct {
     const char* kind_filter;    // e.g., "function", "struct", "macro"
     const char* lang_filter;    // e.g., "c", "cpp"
     const char* file_filter;    // substring match on filename
+    const char* path_prefix;    // 路径前缀（内核按 arch/ 过滤：arch/x86、net/、drivers/gpu/）
     int use_keyword_boost;      // TF-IDF keyword boost from word_freq.json
     int use_caller_boost;       // PageRank-like boost from call_graph.json
 } vector_search_opts_t;
