@@ -62,7 +62,7 @@ function M.new(opts)
 
     local lock_fd = ffi.C.open(base .. "/mem.lock", bit.bor(O_CREAT, O_RDWR, O_CLOEXEC), 420)
     if lock_fd < 0 then
-        return nil, "cannot open " .. base .. "/mem.lock"
+        return nil, string.format("cannot open %s/mem.lock (errno %d)", base, ffi.errno())
     end
     -- 写进程持独占锁；只读诊断命令不加锁，允许在 TUI/serve 运行时读取。
     local readonly = opts.readonly and true or false

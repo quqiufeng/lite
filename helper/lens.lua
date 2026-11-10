@@ -297,11 +297,17 @@ local function fmt_symbols(d)
     return table.concat(out, "\n")
 end
 
-local function check_stage(name, r)
-    if not r then error("codesearch: " .. name .. " failed: " .. tostring(CS.lib and "no result" or "library missing"), 0) end
+-- 失败必须能定位：报错带上日志路径，进度/真实 stderr 都在那里面。
+local function check_stage(name, r, logpath)
+    if not r then
+        error("codesearch: " .. name .. " failed: " ..
+              tostring(CS.lib and "no result" or "library missing") ..
+              (logpath and ("\n日志: " .. logpath) or ""), 0)
+    end
     if r.ok == false or (r.exit and r.exit ~= 0) then
-        error(string.format("codesearch: %s failed (exit %s): %s", name,
-            tostring(r.exit), tostring(r.error or "")), 0)
+        error(string.format("codesearch: %s failed (exit %s): %s%s", name,
+            tostring(r.exit), tostring(r.error or ""),
+            logpath and ("\n日志: " .. logpath) or ""), 0)
     end
     return r
 end
@@ -375,9 +381,11 @@ end
 
 local function do_build(args, repo, project, analysis, kv, ns)
     local stages = {}
+    local logpath = (args.log and args.log ~= "") and args.log or CS.log_path(analysis)
+    -- 每个阶段都在 <analysis>/build.log 上留起止+退出码，失败原因不再只活在 stdout
     local function stage(name, fn)
-        local r = fn()
-        check_stage(name, r)
+        local r, e = CS.logged(name, logpath, fn)
+        check_stage(name, r or nil, logpath)
         stages[#stages + 1] = name .. " ok"
         return r
     end
@@ -410,7 +418,7 @@ local function do_build(args, repo, project, analysis, kv, ns)
 
     local st = CS.check(analysis)
     return "build: " .. project .. "\n  " .. table.concat(stages, "\n  ") ..
-        "\n" .. fmt_status(st)
+        "\n" .. fmt_status(st) .. "\n日志: " .. logpath
 end
 
 -- ── 组合动作：locate（搜+读）/ grep（作用域搜）/ peek（定点读）──────────────
@@ -700,6 +708,7 @@ local schema = {
                 include_dirs = { type = "string", description = "把默认 noise 目录重新纳入，如 tools,utils" },
                 plugins = { type = "string", description = "index 插件 registry JSON 路径" },
                 only_dataflow = { type = "boolean", description = "import 只导入 dataflow（增量更新时用）" },
+                log = { type = "string", description = "构建日志路径，默认 <analysis_dir>/build.log（每阶段起止/退出码/progress/stderr 都写这里）" },
                 analysis_dir = { type = "string", description = "覆盖 analysis 目录（高级）" },
                 kv_dir = { type = "string", description = "覆盖 KV 目录（高级）" },
                 json = { type = "boolean", description = "返回原始 JSON 而不是摘要文本" },
@@ -725,19 +734,25 @@ local function run_inner(args, ctx)
         if action == "build" then
             return do_build(args, repo, project, analysis, kv, ns)
         elseif action == "index" then
-            local r = check_stage("index", CS.index({
-                repo = repo, analysis_dir = analysis,
-                workers = worker_count(args),
-                fork = args.fork, skip_kinds = args.skip_kinds,
-                include_dirs = args.include_dirs,
-                excludes = args.excludes, plugins = args.plugins }))
+            local logpath = (args.log and args.log ~= "") and args.log or CS.log_path(analysis)
+            local r = CS.logged("index", logpath, function()
+                return CS.index({ repo = repo, analysis_dir = analysis,
+                    workers = worker_count(args),
+                    fork = args.fork, skip_kinds = args.skip_kinds,
+                    include_dirs = args.include_dirs,
+                    excludes = args.excludes, plugins = args.plugins })
+            end)
+            check_stage("index", r, logpath)
             if args.json then return cjson.encode(r) end
             return "index 只切块，KV 未刷新（symbol/search/exact 查不到新代码）。" ..
                 "要可查再跑 action=import（或 action=build 全流程）。\n" ..
                 fmt_status(CS.check(analysis))
         elseif action == "import" then
-            check_stage("import", CS.import(analysis, ns, kv, false))
-            return "import ok: " .. ns .. " -> " .. kv
+            local logpath = (args.log and args.log ~= "") and args.log or CS.log_path(analysis)
+            check_stage("import", CS.logged("import", logpath, function()
+                return CS.import(analysis, ns, kv, false)
+            end), logpath)
+            return "import ok: " .. ns .. " -> " .. kv .. "\n日志: " .. logpath
         elseif action == "status" then
             local d = CS.check(analysis)
             if not d then error("codesearch: status failed", 0) end

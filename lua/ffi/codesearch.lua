@@ -115,6 +115,73 @@ local function call(name, ...)
     return v
 end
 
+-- 日志：C 侧只把进度/错误 printf 到 stdout/stderr，返回 JSON 只有 ok+exit，
+-- 失败时原因全丢（TUI 里连 stdout 都看不见）。所以每次阶段调用把 fd 1/2 临时指到
+-- <analysis>/build.log（append），跑完 fflush 再还原 —— 事后可在盘上翻完整上下文。
+-- 注意：open 必须写成固定三参（与 core/memory.lua、ffi/ocr.lua 一致）。写成变参
+-- `...` 的话，别处那份 pcall(ffi.cdef) 的固定版静默失败、调用落到变参版，mode 被当
+-- vararg 传成垃圾 → 建出 0000 权限的文件（实测：mem.lock 第二次打开 errno 13）。
+ffi.cdef[[
+int fflush(void* stream);
+int open(const char *pathname, int flags, unsigned int mode);
+int dup(int fd);
+int dup2(int oldfd, int newfd);
+int close(int fd);
+]]
+local O_WRONLY, O_CREAT, O_APPEND = 1, 0x40, 0x400
+
+function M.log_path(dir) return (dir or ".") .. "/build.log" end
+
+local function log_line(path, fmt, ...)
+    local f = io.open(path, "a")
+    if not f then return end
+    f:write(string.format("[%s] " .. fmt .. "\n", os.date("%Y-%m-%d %H:%M:%S"), ...))
+    f:close()
+end
+
+-- 在 fd 1/2 指向 path 的情况下跑 fn(...)，把起止/退出码/异常记进日志。
+function M.logged(name, path, fn, ...)
+    path = path or "codesearch.log"
+    -- 先让 Lua 按 umask 建好文件（固定三参 open 建出来的权限才是对的），再拿 fd 追加
+    do
+        local f = io.open(path, "a")
+        if not f then                       -- 目录还没被 C 建出来时先补一次
+            local d = path:match("^(.*)/[^/]+$")
+            if d and d ~= "" then
+                os.execute("mkdir -p '" .. d:gsub("'", "'\\''") .. "'")
+            end
+            f = io.open(path, "a")
+        end
+        if f then f:close() end
+    end
+    local fd = ffi.C.open(path, O_WRONLY + O_APPEND, 420)
+    if fd < 0 then return fn(...) end          -- 打不开日志也不能拖垮构建
+    log_line(path, ">> %s start", name)
+    io.stdout:flush(); io.stderr:flush()
+    local s1, s2 = ffi.C.dup(1), ffi.C.dup(2)
+    local t0 = os.time()
+    ffi.C.dup2(fd, 1); ffi.C.dup2(fd, 2)
+    local res = { pcall(fn, ...) }
+    ffi.C.fflush(nil)                          -- 关键：C 的缓冲还属于日志 fd，先刷出去
+    ffi.C.dup2(s1, 1); ffi.C.dup2(s2, 2)
+    ffi.C.close(s1); ffi.C.close(s2); ffi.C.close(fd)
+    local el = os.time() - t0
+    if not res[1] then
+        log_line(path, "!! %s raised after %ds: %s", name, el, tostring(res[2]))
+        error(res[2], 0)
+    end
+    local r, e = res[2], res[3]
+    if type(r) == "table" then
+        log_line(path, "<< %s %s in %ds (exit=%s)", name,
+                 (r.ok == false and "FAILED" or "ok"), el, tostring(r.exit))
+    else
+        log_line(path, "<< %s %s in %ds %s", name, r and "ok" or "FAILED", el,
+                 tostring(e or r))
+    end
+    if not r then return nil, e end
+    return r, e
+end
+
 function M.index(opts)
     opts = opts or {}
     local fork = -1
