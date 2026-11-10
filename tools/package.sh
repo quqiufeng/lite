@@ -10,7 +10,12 @@ mkdir -p "$DIST/lua" "$DIST/tools" "$DIST/third_party" "$DIST/build" "$DIST/lib"
 
 cp -r "$ROOT/lua/." "$DIST/lua/"
 if [ -d "$ROOT/helper" ]; then
-    find "$ROOT/helper" -maxdepth 1 -type f ! -name '.gitkeep' -exec cp {} "$DIST/helper/" \;
+    # 必须递归：helper/lib/*.lua 是插件共用的库（webdav/music/uimap/usb/adb/md4c…），
+    # helper/assets/ 是字体与 CSS（md2png/trending 出图用）。早期这里只拷
+    # `-maxdepth 1 -type f`，安装版于是缺整个 lib/ 与 assets/，插件在目标机上
+    # 一 require 就炸（music 报 "cannot load webdav lib …"）。整目录 `cp -r` 一次到位。
+    find "$ROOT/helper" -mindepth 1 -maxdepth 1 ! -name '.gitkeep' \
+        -exec cp -r {} "$DIST/helper/" \;
 fi
 cp "$ROOT/AGENTS.md" "$ROOT/design.md" "$DIST/"
 if [ -f "$ROOT/build/liblite_cache.so" ]; then
