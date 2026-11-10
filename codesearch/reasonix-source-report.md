@@ -14,7 +14,7 @@
 | 2 | 分层是硬约束：`internal/base` → `internal/contract`（纯契约） → `internal/{model,tools,safety,state}` → `internal/runtime` → `internal/frontend`；`contract` 只依赖 `base`，不许反向 | §2.3 `[static]` |
 | 3 | 骨架只有两件东西：**一个 1,888 行的 `Agent` 结构体**（`agent.go`）+ **一个 `runToolLoop` 主循环**（`run_loop.go:195`）；其余 300 个包全是给这两件供货的 | `agent.go:270,832`、`run_loop.go:195` `[static]` |
 | 4 | 模型侧的扩展面窄到只有 **2 个方法**：`Name()` + `Stream(ctx, Request) (<-chan Chunk, error)`；DeepSeek/OpenAI/Anthropic/Gemini 四种协议各一个包实现它 | `contract/provider/provider.go:536` `[static]` |
-| 5 | 工具侧是 **5 个必需方法 + 6 个可选能力接口**（`Previewer`/`WritePathResolver`/`ReadPathResolver`/`ContextualTool`/`ContextualReasoner`/`FilePresenter`）；内置 **38** 个工具全部 `init()` 自注册 | `contract/tool/tool.go:22,40,48,74,83` `[static]` |
+| 5 | 工具侧是 **5 个必需方法 + 21 个可选能力接口**（`Previewer`/`WritePathResolver`/`ReadPathResolver`/`ContextualTool`/`DecisionBarrier`/`Paged`/`SnipHinter`…）；内置 **38** 个工具全部 `init()` 自注册，注册表是**七个 map** 的 `Registry` | `contract/tool/tool.go:22-340`（22 个 interface）、`:375` `Registry`、`:489` `Add` `[static]` |
 | 6 | 一次工具调用穿过 **9 道闸**：解析 → 策略 → 上下文可用性 → 变更依赖栅栏 → planmode/代理 → 交付策略 → 恢复+权限 → 准备 → 执行 → 收尾 | `execute_one.go:107,175,233,263,292,331,438,463,567,646` `[static]` |
 | 7 | 并发只放行 `ReadOnly()==true` 的批次：`partitionToolCalls` 按只读性切段，写工具一律串行、且失败会升级成 **barrier** 拦住后续批 | `execute_batch.go:489,507,27,397` `[static]` |
 | 8 | 上下文压缩是**预算常量表**而不是启发式：窗口用到 90% 触发，摘要输出上限 16K（重试 32K），近尾 verbatim 保留 clamp(窗口×10%, 32K, 96K)，摘要接受上限 50% | `agent/compact.go:25-44` `[static]` |
@@ -79,6 +79,13 @@ cd /opt/reasonix
 find . -name '*.go' -not -path './vendor/*' -not -path '*/node_modules/*' | wc -l   # 6657
 find . -name '*_test.go' | wc -l                                                    # 3582
 find . -name '*.go' -not -path './vendor/*' -not -path '*/node_modules/*' -exec cat {} + | wc -l   # 1,010,634
+
+# §2.4 包级源码地图（注意 LANG=C：中文 locale 下 wc 会多一行「总计」）
+cd /opt/reasonix && for d in $(find internal sdk -name '*.go' -not -path '*/testdata/*' -printf '%h\n' | sort -u); do
+  nn=$(find $d -maxdepth 1 -name '*.go' -not -name '*_test.go' -exec cat {} + 2>/dev/null | wc -l)
+  [ "$nn" -ge 1500 ] && echo "$nn $d $(LANG=C find $d -maxdepth 1 -name '*.go' -not -name '*_test.go' \
+    -exec wc -l {} + | grep -v total | sort -rn | head -1)"
+done | sort -rn
 ```
 
 ---
@@ -130,6 +137,58 @@ base  ←  contract  ←  {model, tools, safety, state, ext, platform}  ←  run
 - `assembly/boot` 是全仓唯一「知道所有人」的包（`build.go` 730 + `runtime.go` 628 + 100+ 个 `composition_*.go`），也是唯一允许 import 一切的地方。
 
 **一句话**：`contract` 挡在中间，`boot` 收口在顶上，中间 300 个包互不越层。
+
+### 2.4 包级源码地图（`[verified]`，非测试行数 ≥ 1500 的 39 个包，占全部非测试代码的 **67.8%**）
+
+读一个 303 包的仓库，先要有一张「哪 39 个包占了三分之二代码」的表，否则 `locate` 出来的位置没有坐标系。
+下表按**非测试行数**排序，最大单文件用 `LANG=C wc -l` 取（中文 locale 下 `grep -v total` 会漏掉「总计」行，这是本次踩到的坑）。
+
+| 包 | 非测试行 | 最大单文件 | 是什么 |
+|---|---|---|---|
+| `internal/session/control` | 35,435 | `controller.go` 1218 | **前端唯一入口**：turn 提交、编排、steer、审批桥 |
+| `internal/frontend/serve` | 31,254 | `serve.go` 967 | WebSocket/HTTP 前端 + 远程会话 |
+| `internal/contract/config` | 29,456 | `edit.go` 2007 | 配置契约 + 编辑器（294 个文件里最大的一块「接口」） |
+| `internal/runtime/agent` | 23,143 | `agent.go` 1888 | **骨架本体**：Agent + runToolLoop + 九道闸 + 压缩 |
+| `internal/frontend/cli` | 19,343 | `cli.go` 1770 | 28 个子命令、`RunWithBuildInfo` |
+| `internal/state/sessionstore` | 14,710 | `save.go` 2000 | 会话快照/事件/分支/迁移 |
+| `internal/tools/builtin` | 13,410 | `encoding_helpers.go` 633 | 86 个非测试文件的内置工具实现 |
+| `internal/ext/plugin` | 12,252 | `plugin.go` 1658 | 插件宿主（Manifest v2、生命周期） |
+| `internal/frontend/tui` | 11,069 | `screen.go` 692 | 自绘 TUI |
+| `internal/assembly/boot` | 9,820 | `build.go` 730 | **唯一装配点**，100+ `composition_*.go` |
+| `internal/frontend/acp` | 8,296 | `service.go` 1556 | ACP（NDJSON JSON-RPC）前端 |
+| `internal/platform/repair` | 7,726 | `update.go` 3290 | 自愈/修复引擎（单文件极大） |
+| `internal/safety/evidence` | 6,815 | `evidence.go` 683 | 证据账本：什么算「已交付」 |
+| `internal/state/memory` | 5,744 | `store.go` 779 | 长期记忆 |
+| `internal/ext/installsource` | 5,417 | `plugin_package.go` 792 | 扩展安装源解析 |
+| `internal/state/checkpoint` | 5,013 | `transaction.go` 1448 | 事务式 checkpoint |
+| `internal/safety/sandbox` | 4,932 | `shell.go` 762 | bwrap/Seatbelt/Windows 三套沙箱抽象 |
+| `internal/ext/extension` | 4,778 | `builder.go` 451 | 扩展贡献者模型 + 17 个拦截点 |
+| `internal/platform/browser` | 4,308 | `act.go` 651 | 浏览器自动化 |
+| `internal/ext/hook` | 4,278 | `hook.go` 1574 | 宿主钩子（spawn 子进程） |
+| `internal/base/i18n` | 4,272 | `messages_zh_tw.go` 799 | 文案表（zh-CN/zh-TW/en） |
+| `internal/platform/update` | 4,205 | `apply_darwin.go` 723 | 自更新（分平台） |
+| `internal/ext/skill` | 4,195 | `skill.go` 1250 | Skill 加载与作用域 |
+| `internal/ext/pluginpkg` | 4,122 | `pluginpkg.go` 1141 | 插件打包格式 |
+| `internal/contract/provider` | 3,385 | `provider.go` 660 | Provider 契约 + 归一化/重试/schema |
+| `internal/frontend/termrender` | 3,612 | `md.go` 553 | Markdown→终端渲染 |
+| `internal/runtime/recovery` | 3,346 | `gate.go` 1191 | 恢复闸（Auto Guard 的载体） |
+| `internal/contract/tool` | 3,289 | `tool.go` 794 | Tool 契约 + 22 个接口 + Registry |
+| `internal/tools/jobs` | 3,182 | `jobs.go` 1796 | 后台任务 |
+| `sdk/go` | 3,014 | `sdk.go` 928 | 对外 Go SDK |
+| `internal/runtime/usecap` | 3,001 | `usecapability.go` 1457 | 能力探测/使用记录 |
+| `internal/ext/extension/sidecar` | 2,898 | `client.go` 797 | 扩展 sidecar 进程客户端 |
+| `internal/platform/remote` | 2,786 | `client.go` 592 | 远程执行 |
+| `internal/state/sessioninbox` | 2,755 | `store.go` 542 | steer/inbox 队列 |
+| `internal/runtime/taskmonitor` | 2,678 | `jsonstore.go` 783 | 任务监控 + tmux 会话 |
+| `internal/model/openai` | 2,541 | `openai.go` 1225 | OpenAI 兼容协议（DeepSeek 也走这条） |
+| `internal/contract/event` | 2,534 | `event.go` 719 | 20+ 事件 Kind，只追加 |
+| `internal/ext/extension/protocol` | 2,253 | `validate.go` 419 | Extension Protocol 校验 |
+| `internal/safety/permission` | 2,185 | `permission.go` 790 | 权限策略与审批 |
+
+> 剩下 260 多个包单个 100–1500 行，按目录自然聚合（`[verified]`：`platform/` 41 包、`base/` 31 包、
+> `ext/` 30 包、`state/` 28 包、`runtime/` 23 包、`contract/` 21 包、`model/` 12 包、`frontend/` 11 包、
+> `safety/` 8 包、`tools/` 9 包，`session/`、`assembly/` 各 1 包）。**读的顺序就是这张表的顺序**：
+> `runtime/agent` → `session/control` → `contract/{tool,provider,event}` → `state/sessionstore` → `ext/extension`，其余按需。
 
 ---
 
@@ -231,8 +290,13 @@ type Tool interface {
     Execute(ctx, args json.RawMessage) (string, error)
     ReadOnly() bool          // 批次能否并行的唯一判据
 }
-// 可选：FilePresenter / ContextualTool(ProviderVisible) / ContextualReasoner(Unavailable)
-//      / Previewer(Preview→diff.Change) / WritePathResolver / ReadPathResolver
+// 可选能力共 21 个（tool.go:22-340 一共 22 个 interface，去掉 Tool 本身）：
+//   常用 6 个 —— FilePresenter / ContextualTool(ProviderVisible) / ContextualReasoner(Unavailable)
+//               / Previewer(Preview→diff.Change) / WritePathResolver / ReadPathResolver
+//   其余 15 个 —— ReadRefusalFormatter / SequentialTool / PathWriter / ImageTool / PlanModeClassifier
+//               / DecisionBarrier / ReadOnlyExecutionHostMutation / ReadOnlyExecutionBlockReason
+//               / CapabilityAliased / MCPMetadata / MCPVisibleMetadata / MCPPackageMetadata
+//               / SnipHinter / Paged / ReadTargeter
 ```
 
 `ReadOnly()` 的注释直接把策略写在接口上：*"A batch parallelises only when every call in it is ReadOnly... bash and plugin tools return false, their effects being unknowable from args alone."* —— **不可知就当写**，这是整个并发模型的默认值。
@@ -281,6 +345,26 @@ protocolReserveTokens      = 256          // provider 框架字段预留
 文件头注释把这个机制定性成**低频率的缓存重置点**：*"the prompt grows append-only until a maintenance boundary is crossed, then one content-driven summary checkpoint is installed (stable prefix + one structured digest + recent tail)."* —— 压缩不是随时发生，而是攒到边界一次性重构；这样中间的每一轮请求前缀都字节稳定。
 
 `capacityCompactTrigger()`（`compact.go:96`）还有一条反向逻辑：ablation 关掉压缩时 ratio 从 0.90 降到 0.50 —— **关掉功能反而更早报警**，避免静默溢出。
+
+### 4.4 扩展点与注册表总表（`[static]`）
+
+Go 没有 ops 表，但间接调用的坑一样存在：`Provider`/`Tool` 都是接口，`call_graph.json` 只能看到
+`Stream` 的边，看不见「谁实现了它」。所以下面这张表必须**反查实现者**，不能只看调用图。
+
+| 表 / 注册表 | 定义 `file:symbol` | 槽位 | 实例数 | 谁注册 | 断链后果 |
+|---|---|---|---|---|---|
+| 工具注册表 | `contract/tool/tool.go:375` `Registry`（`tools`/`order`/`canon`/`suspended`/`disabledTools`/`disabledMCP`/`heldMCP` 七个 map） | `Add` @ `:489` | `builtin/` 86 个非测试文件、28 个含 `init()`；内置 **38** 个工具 | `init()` 自注册 + MCP `BindMCPRuntime` | 工具不进 schema，模型**完全看不见**该能力（无报错） |
+| 能力接口（可选） | `contract/tool/tool.go:22-340` | **22 个 interface** = `Tool` + **21** 个可选（`Previewer`/`WritePathResolver`/`ContextualTool`/`DecisionBarrier`/`Paged`/`SnipHinter`…） | 按工具各自断言 | 工具作者 | 断言失败 → 该路径静默退化为普通执行（如无预览、无路径解析） |
+| 拦截点 | `ext/extension/intercept.go:14-31` `InterceptorPoint` | **17 个**（session.{start,end,load,save,rotate} / input.receive / agent.before_start / system_prompt.build / context.prepare / provider.{request,response} / tool.{before,after} / permission.decision / compaction.{prepare,complete} / frontend.event） | 每个扩展任意条 | 扩展 `KindInterceptor` 贡献 | `knownInterceptorPoint` 校验期就拒掉拼错点名的拦截器（`:34-46`） |
+| 拦截器优先级 | 同上 | `MinInterceptorPriority=-1000` / `Max=+1000` | — | 扩展 | 越界被 `ValidatePriority` 拒；防止某个扩展永远抢在所有内建闸之前 |
+| Provider | `contract/provider/provider.go:536` | **2 个方法**（`Name`/`Stream`）+ 可选策略接口（`RequiresToolCallReasoning` 等 `RequiresXxx` 自由函数） | **4** 个协议实现：openai / anthropic / gemini / responses | `cmd/reasonix/main.go:15-18` blank import | 未注册 → `boot` 的 provider catalog 解析失败，启动即报错（**不静默**） |
+| 事件 Kind | `contract/event/event.go` | **20+** 个（TurnStarted/Reasoning/Text/Message/ToolDispatch/ToolResult/Usage/Notice/Phase/ApprovalRequest/AskRequest/TurnDone/Compaction*/ToolProgress/MCPSurfaceReady/Retrying…） | 每个前端一个 `Sink` | `runtime/agent` 发，`frontend/{tui,serve,acp}` 收 | 新 Kind 只能**追加在末尾**，否则 serve/acp 的 wire 序号错位 |
+| 扩展贡献 | `ext/extension/builder.go` | `Kind` 分类（skill/agent/command/prompt/hook/theme/interceptor/MCP） | `ext/` 下 24 个包各管一类 | Manifest v1 声明式；v2 `runtime` 走 sidecar | 声明式跑在宿主权限内；sidecar 是**完全信任**的外部进程 |
+| MCP | `ext/{mcpregistry,mcplaunch,mcpsetup,mcpdiag}` + `contract/tool/{disabled_mcp,held_mcp}.go` | 每 server 一组绑定 | 运行时发现 | `mcpsetup` 握手 | 工具定义变了 → 进 `heldMCP` 等重新批准，别名不覆盖用户禁用策略 |
+| Skill / Rules / Hooks | `ext/{skill,rules,hook}` | skill 注入 prompt，rules 注入约束，hook spawn 子进程 | — | 用户目录 + 扩展 | hook 失败只影响该次动作；skill 未加载则 prompt 里少一段（无报错） |
+| 配置契约 | `contract/config/`（**29,456 行 / 294 文件**，`edit.go` 2007） | 100+ 个 `composition_*.go` 按配置分支 | — | 用户 `config.toml` | `boot.Build` 是唯一装配点；配置项与装配分支一一对应，新增字段必须两边同时改 |
+
+**一句话**：这张表就是「300 个包怎么长在一起」的接线图——**工具/Provider/扩展三条注册链，四条内建闸（权限/沙箱/恢复/证据）夹在中间**，其余全是适配。
 
 ---
 
