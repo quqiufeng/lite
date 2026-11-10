@@ -714,9 +714,12 @@ print(H.run({
 
 | 项目 | 源码 | 索引目录 | chunks | 大小 |
 |---|---|---|---|---|
-| Pi | `/opt/pi-mono` | `/opt/code_caches/pi-mono_cache` | 16,977 | 245MB |
-| Reasonix | `/opt/reasonix` | `/opt/code_caches/reasonix_cache` | 58,356 | 580MB |
-| opencode | `/opt/opencode` | `/opt/code_caches/opencode_cache` | 27,111 | 361MB |
+| Pi | `/opt/pi-mono` | `/opt/code_caches/pi-mono_cache` | 17,022 | 276MB |
+| Reasonix | `/opt/reasonix` | `/opt/code_caches/reasonix_cache` | 58,770 | 759MB |
+| opencode | `/opt/opencode` | `/opt/code_caches/opencode_cache` | 27,181 | 397MB |
+
+（2026-11-10 全量重建后的实测值；此前一轮 Pi 16,977 / 245MB、Reasonix 58,356 / 580MB、
+opencode 27,111 / 361MB。）
 
 统一参数：
 
