@@ -232,6 +232,18 @@ static json_t* do_exact(const char* query, const char* repo, int max_results) {
     return json_array();
 }
 
+// chunk 里只有 line_start，符号条目里只有 line。调用方（尤其模型）不该猜字段名是哪一套，
+// 所以出结果时把两个键补齐：缺 line 用 line_start 填，缺 line_start 用 line 填。
+static void add_line_alias(json_t* obj) {
+    if (!json_is_object(obj)) return;
+    json_t* ls = json_object_get(obj, "line_start");
+    json_t* ln = json_object_get(obj, "line");
+    if (!json_is_integer(ln) && json_is_integer(ls))
+        json_object_set_new(obj, "line", json_integer(json_integer_value(ls)));
+    else if (!json_is_integer(ls) && json_is_integer(ln))
+        json_object_set_new(obj, "line_start", json_integer(json_integer_value(ln)));
+}
+
 // 展开一个 /symbols/<name> 键：优先取 chunk 全文，缺 chunk 退回符号条目
 static void symbol_entries_into(json_t* arr, const char* repo, const char* name) {
     char key[1024];
@@ -261,6 +273,7 @@ static void symbol_entries_into(json_t* arr, const char* repo, const char* name)
         if (cvalue) {
             json_t* chunk = json_loads(cvalue, 0, &error);
             if (chunk) {
+                add_line_alias(chunk);
                 json_object_set_new(chunk, "_source", json_string("symbol"));
                 json_object_set_new(chunk, "_key", json_string(ckey));
                 json_array_append_new(arr, chunk);
@@ -392,6 +405,7 @@ static json_t* do_prefix_dump(const char* prefix, const char* needle,
         json_object_set_new(chunk, "_source",
                             json_string(source ? source : "file"));
         json_object_set_new(chunk, "_key", json_string(k));
+        add_line_alias(chunk);
         bag[nbag++] = chunk;
     }
     cache_results_free(found);
@@ -714,6 +728,20 @@ static json_t* do_dataflow(const char* query, const char* repo, int max_results)
     if (!query || !*query || !repo || !*repo) return results;
     if (max_results <= 0) max_results = 10;
 
+    // `func:` / `var:` / `field:` 只是调用方标注「我要查哪一类」，KV 键里没有这层前缀。
+    // 不剥掉的话 func:__schedule 会稳定 0 条（键是 <ns>/dataflow/funcs/__schedule），
+    // 调用方却看不出是前缀害的。剥掉再按原流程走（funcs 精确 → vars → 回退）。
+    {
+        const char* p = NULL;
+        if (strncmp(query, "func:", 5) == 0) p = query + 5;
+        else if (strncmp(query, "var:", 4) == 0) p = query + 4;
+        else if (strncmp(query, "field:", 6) == 0) p = query + 6;
+        if (p) {
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p) return do_dataflow(p, repo, max_results);
+        }
+    }
+
     char key[1024];
     json_error_t error;
 
@@ -949,6 +977,7 @@ static json_t* do_search(const char* query, const char* repo,
         json_object_set_new(obj, "name", json_string(results[i].name));
         json_object_set_new(obj, "file", json_string(results[i].file));
         json_object_set_new(obj, "line_start", json_integer(results[i].line_start));
+        json_object_set_new(obj, "line", json_integer(results[i].line_start));
         json_object_set_new(obj, "line_end", json_integer(results[i].line_end));
         json_object_set_new(obj, "kind", json_string(results[i].kind));
         json_object_set_new(obj, "language", json_string(results[i].language));
