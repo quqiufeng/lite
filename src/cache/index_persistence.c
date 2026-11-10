@@ -13,6 +13,10 @@
 #define CACHE_PTR(cache, offset) ((void*)((char*)(cache)->pool.base + (offset)))
 #define INDEX_FILE_NAME "mem.idx"
 
+// 定义在文件后半（加载侧校验/自愈），保存侧也要用
+static int cache_hash_readable(cache_t* cache);
+static int rebuild_hash_index_inplace(cache_t* cache);
+
 // ====== Namespace Tree Persistence ======
 
 static size_t ns_node_size(cache_ns_node_t* node) {
@@ -233,6 +237,17 @@ int cache_index_save(cache_t* cache) {
     char tmp_path[520];
     snprintf(path, sizeof(path), "%s/%s", cache->db_dir, INDEX_FILE_NAME);
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+
+    // 写盘前自检 hash 索引：内存里的桶数组若已被踩坏（桶头越界/不在 pool 内），
+    // 原样落盘就是把损坏固化成下一次启动的 SIGSEGV。这里扫描 pool 就地重建，
+    // 保证写出去的索引自洽。
+    if (!cache_hash_readable(cache)) {
+        CACHE_LOG("[CACHE] hash index corrupt before save, rebuilding from pool\n");
+        if (rebuild_hash_index_inplace(cache) < 0) {
+            CACHE_LOG("[CACHE] hash rebuild failed, skip saving index\n");
+            return -1;
+        }
+    }
     
     size_t hash_size, sorted_size, vector_size, hnsw_size, ns_size;
     size_t total_size = calculate_index_size(cache, &hash_size, &sorted_size, &vector_size, &hnsw_size, &ns_size);
@@ -441,7 +456,6 @@ static int loaded_hash_valid(cache_t* cache, const cache_hash_bucket_t* buckets,
         size_t off = buckets[i].entry_offset;
         size_t guard = 0;
         while (off) {
-            if ((off % MYDB_ALIGN) != 0) return 0;
             if (off < CACHE_HEADER_SIZE || off + sizeof(cache_hash_bucket_t) > used) return 0;
             if (++guard > saved_size + 1) return 0;  // 环或异常长链
 
@@ -463,6 +477,67 @@ static int loaded_hash_valid(cache_t* cache, const cache_hash_bucket_t* buckets,
         }
     }
     return nodes == saved_size;
+}
+
+// fast_read 路径的廉价校验：只看桶头偏移是否落在 pool 内。
+//
+// 全量 loaded_hash_valid 要沿冲突链随机解引用所有节点 + 重算 key 的 hash，
+// 对 2.6GB pool 的内存缓存等于把「跳过扫描」的收益全吃掉，所以快路径只做
+// O(bucket_count) 的顺序扫描（64MB 的 .idx 桶区，毫秒级）。曾见桶头写成
+// 13027149816（>4GB pool）→ 解引用直接 SIGSEGV，这一步就能拦住。
+// 链内更深处的坏偏移由 cache_hash_lookup 的逐跳边界检查兜底。
+static int loaded_hash_heads_ok(cache_t* cache, const cache_hash_bucket_t* buckets,
+                                size_t bucket_count, size_t saved_size) {
+    size_t used = cache->pool.used;
+    if (bucket_count == 0) return saved_size == 0;
+    if (used < CACHE_HEADER_SIZE) return saved_size == 0;
+    size_t heads = 0;
+    for (size_t i = 0; i < bucket_count; i++) {
+        size_t off = buckets[i].entry_offset;
+        if (!off) continue;
+        if (off < CACHE_HEADER_SIZE || off + sizeof(cache_hash_bucket_t) > used) return 0;
+        heads++;
+    }
+    return heads <= saved_size;
+}
+
+// 内存里（非落盘）的 hash 索引是否仍然可用：写盘前自检用
+static int cache_hash_readable(cache_t* cache) {
+    if (cache->hash.bucket_count == 0) return 1;
+    size_t used = cache->pool.used;
+    size_t need = cache->hash.bucket_count * sizeof(cache_hash_bucket_t);
+    if (cache->hash.buckets_offset < CACHE_HEADER_SIZE ||
+        cache->hash.buckets_offset > used || need > used - cache->hash.buckets_offset) {
+        return 0;
+    }
+    return loaded_hash_heads_ok(cache,
+        (const cache_hash_bucket_t*)CACHE_PTR(cache, cache->hash.buckets_offset),
+        cache->hash.bucket_count, cache->hash.size);
+}
+
+// 扫描 pool 就地重建 hash 索引（保存前发现索引已损坏时自愈）。
+// 旧 bucket 数组留在 pool 里不回收（与 hash_resize 一致）。
+static int rebuild_hash_index_inplace(cache_t* cache) {
+    size_t min_buckets = cache->entry_count > 0 ? cache->entry_count * 4 / 3 + 1 : 64;
+    if (cache_hash_init_capacity(cache, min_buckets) < 0) return -1;
+
+    size_t offset = CACHE_HEADER_SIZE;
+    while (offset + sizeof(cache_entry_header_t) <= cache->pool.used) {
+        cache_entry_header_t* h = (cache_entry_header_t*)CACHE_PTR(cache, offset);
+        if (h->key_len == 0 || h->key_len > CACHE_MAX_KEY_LEN ||
+            h->value_len > CACHE_MAX_VALUE_LEN) {
+            offset += MYDB_ALIGN;
+            continue;
+        }
+        size_t total = cache_entry_total_size(h);
+        if (offset + total > cache->pool.used) break;
+        if (!(h->flags & CACHE_ENTRY_DELETED)) {
+            const char* key = (const char*)CACHE_PTR(cache, offset + sizeof(cache_entry_header_t));
+            if (cache_hash_insert(cache, offset, key, h->key_len) < 0) return -1;
+        }
+        offset += total;
+    }
+    return 0;
 }
 
 // 加载路径从不重算 cache->memory_used（只有扫描重建会累加），导致带索引启动后
@@ -583,9 +658,13 @@ int cache_index_load(cache_t* cache) {
                     size_t hash_size = *(size_t*)((char*)data + 8);
                     size_t buckets_data_size = bucket_count * sizeof(cache_hash_bucket_t);
 
-                    // 落盘内容必须先自洽：容量合法、字节数不超过本条索引的数据区
+                    // 落盘内容必须先自洽：容量合法、字节数不超过本条索引的数据区，
+                    // 桶头偏移都落在 pool 内。快路径只验桶头（O(bucket_count) 顺序扫描），
+                    // 慢路径再全量验链（loaded_hash_valid）。
                     if (bucket_count == 0 || buckets_data_size / sizeof(cache_hash_bucket_t) != bucket_count ||
                         buckets_data_size > entry->data_size - 16 ||
+                        !loaded_hash_heads_ok(cache, (const cache_hash_bucket_t*)((char*)data + 16),
+                                             bucket_count, hash_size) ||
                         (!fast_read &&
                          !loaded_hash_valid(cache, (const cache_hash_bucket_t*)((char*)data + 16),
                                             bucket_count, hash_size))) {

@@ -161,23 +161,58 @@ int cache_hash_insert(cache_t* cache, size_t entry_offset, const char* key, size
     return 0;
 }
 
+// 偏移是否落在 pool 的已用区内（且够放下 n 字节）
+static int offset_readable(const cache_t* cache, size_t off, size_t n) {
+    // 注意：不能要求 8 字节对齐。cache 写 entry 时 key/value 长度不定，
+    // pool->used 只按实际字节推进，节点偏移可能只是 4 字节对齐。
+    size_t used = cache->pool.used;
+    if (off < CACHE_HEADER_SIZE) return 0;
+    if (off > used || n > used - off) return 0;
+    return 1;
+}
+
 // 查找 key → entry_offset
+//
+// 每次解引用前都校验偏移：落盘的索引可能是旧的/被踩坏的（曾见 bucket 节点
+// entry_offset 远大于 pool 大小 → 直接解引用 SIGSEGV）。宁可返回 0（未命中，
+// 加载时的校验随后会丢弃整份索引走扫描重建），也不能炸进程。
 size_t cache_hash_lookup(cache_t* cache, const char* key, size_t key_len) {
-    if (!cache || !key || key_len == 0 || !cache->hash.buckets_offset) return 0;
-    
+    if (!cache || !key || key_len == 0 || !cache->hash.buckets_offset ||
+        cache->hash.bucket_count == 0) return 0;
+    if (!offset_readable(cache, cache->hash.buckets_offset,
+                         cache->hash.bucket_count * sizeof(cache_hash_bucket_t))) {
+        return 0;
+    }
+
     uint64_t h = hash_fnv1a(key, key_len);
     size_t idx = h % cache->hash.bucket_count;
     
     cache_hash_bucket_t* buckets = (cache_hash_bucket_t*)CACHE_PTR(cache, cache->hash.buckets_offset);
     size_t current = buckets[idx].entry_offset;
+    size_t guard = 0;
     
     while (current) {
+        if (!offset_readable(cache, current, sizeof(cache_hash_bucket_t))) return 0;
+        if (++guard > cache->hash.size + 1) return 0;  // 环/异常长链
         cache_hash_bucket_t* b = (cache_hash_bucket_t*)CACHE_PTR(cache, current);
-        cache_entry_header_t* header = (cache_entry_header_t*)CACHE_PTR(cache, b->entry_offset);
-        char* entry_key = (char*)CACHE_PTR(cache, b->entry_offset + sizeof(cache_entry_header_t));
-        
-        if (header->key_len == key_len && memcmp(entry_key, key, key_len) == 0) {
-            return b->entry_offset;
+        size_t eoff = b->entry_offset;
+        if (!offset_readable(cache, eoff, CACHE_ENTRY_HEADER_ALIGNED)) return 0;
+        cache_entry_header_t* header = (cache_entry_header_t*)CACHE_PTR(cache, eoff);
+        if (header->key_len != key_len ||
+            !offset_readable(cache, eoff + sizeof(cache_entry_header_t), key_len)) {
+            current = b->next_offset;
+            continue;
+        }
+        // 墓碑（更新时旧 entry 被标删、节点仍留在链上）跳过继续往下找：
+        // 同一 key 的活副本可能在链尾。fast_read 加载不沿用全量校验，
+        // 链上带墓碑是常态，不能让第一个墓碑吃掉查询。
+        if (header->flags & CACHE_ENTRY_DELETED) {
+            current = b->next_offset;
+            continue;
+        }
+        char* entry_key = (char*)CACHE_PTR(cache, eoff + sizeof(cache_entry_header_t));
+        if (memcmp(entry_key, key, key_len) == 0) {
+            return eoff;
         }
         current = b->next_offset;
     }
@@ -195,11 +230,23 @@ int cache_hash_remove(cache_t* cache, const char* key, size_t key_len) {
     cache_hash_bucket_t* buckets = (cache_hash_bucket_t*)CACHE_PTR(cache, cache->hash.buckets_offset);
     size_t* pp = &buckets[idx].entry_offset;
     size_t current = buckets[idx].entry_offset;
-    
+    size_t guard = 0;
+
     while (current) {
+        // 与 lookup 同一条纪律：陈旧索引里的偏移可能越界，逐跳验边界再解引用
+        if (!offset_readable(cache, current, sizeof(cache_hash_bucket_t))) return -1;
+        if (++guard > cache->hash.size + 1) return -1;
         cache_hash_bucket_t* b = (cache_hash_bucket_t*)CACHE_PTR(cache, current);
-        cache_entry_header_t* header = (cache_entry_header_t*)CACHE_PTR(cache, b->entry_offset);
-        char* entry_key = (char*)CACHE_PTR(cache, b->entry_offset + sizeof(cache_entry_header_t));
+        size_t eoff = b->entry_offset;
+        if (!offset_readable(cache, eoff, CACHE_ENTRY_HEADER_ALIGNED)) return -1;
+        cache_entry_header_t* header = (cache_entry_header_t*)CACHE_PTR(cache, eoff);
+        if (header->key_len != key_len ||
+            !offset_readable(cache, eoff + sizeof(cache_entry_header_t), key_len)) {
+            pp = &b->next_offset;
+            current = b->next_offset;
+            continue;
+        }
+        char* entry_key = (char*)CACHE_PTR(cache, eoff + sizeof(cache_entry_header_t));
         
         if (header->key_len == key_len && memcmp(entry_key, key, key_len) == 0) {
             *pp = b->next_offset;
