@@ -47,6 +47,7 @@
 - `agent.Agent::executeOne` 入度 **133**（其中大量是测试直接打它）：执行单点是**契约边界**，测试拿它当公开面来验策略，不经过 HTTP/serve。
 - `Provider` 只有 `Name()` + `Stream()` 两个方法（`internal/contract/provider/provider.go:536`）—— 用 `peek` 验证过，不是摘要猜测。
 - 索引里 `testdata`/测试用例占比极高：`executeOne` 的 133 个调用者里绝大多数是 `TestXxx`，印证了 §2.1 的 53.7% 测试密度。
+- **dataflow 只作旁证，不作骨架依据**：`dataflow/funcs/<name>` 的键是**裸函数名**（无包限定），会跨语言撞名（查 `capToolOutput` 返回的是 `desktop/frontend-next/.../outputcap.ts`），且覆盖不全（`executeOne`/`handleToolRound` 都查不到）。所以本报告的主循环/短路逻辑全部以 `peek` 的源码原文为准，dataflow 只用来快速点名某个函数读了哪些变量。
 
 ### 1.2 明确**没**做
 
