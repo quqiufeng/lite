@@ -1,224 +1,220 @@
-# 代码搜索最佳实践：用 how-to-read-code 方法论探索开源项目
+# 代码搜索最佳实践（内核实战版）
 
-> 本文是 **code search 系统的使用最佳实践**。
-> 把 codedump《如何阅读源代码》方法论（agent skill: [lichuang/how-to-read-code](https://github.com/lichuang/how-to-read-code)）
-> 作为工作流骨架，把 lite 的 lens（旧名 codesearch，`helper/lens.lua` + 项目 `kv/`）作为检索底座，
-> 目标：**有纪律、有真相、有横向参照地**探索一个陌生开源项目。
+> 本文不是功能清单，是**用 lens 读懂一个大仓库的纪律**。结论全部来自一次真实作业：
+> 用 lens 通读 Linux 7.2.12（`/opt/linux/src/linux-7.2.12`，36934 个 `.c` + 26899 个 `.h`），
+> 拆成 8 个索引项目，产出源码级架构报告（见 `codesearch/linux_kernel_7.2.12.md`）。
 >
-> lite 的实现、命令和依赖见 `README.md`；本文只讲「怎么用才高效、才不出错」。
+> 方法论骨架仍来自 codedump《如何阅读源代码》（agent skill `lichuang/how-to-read-code`）；
+> lens 的实现与命令见 `README.md` / `lua/ffi/codesearch.lua`，本文只讲**怎么用才不出错**。
 
 ---
 
 ## 0. 一句话原则
 
-**用方法论定方向，用搜索做证据；搜索是静态证据（`[static]`），运行/断点才是真相（`[verified]`）。**
+**搜索给的是「结构坐标」（`[static]`），运行/测试给的是「真相」（`[verified]`）；
+lens 的本事是把坐标压缩到三跳以内，而不是替代运行时。**
 
-> **默认规则**：用户没有给出明确问题/指令时，**不要反问**，直接按「**整体架构（横向）→ 子模块下钻（纵向）**」推进。
-> 只有用户给出了具体问题时，才聚焦该问题读取。
+内核这一次的实测收益排序：
 
-- 代码搜索 = 快、全、可对比的**静态结构与关系**检索。
-- how-to-read-code = **目的界定** + **运行时验证**。
-- 两者互补：搜索治「列文件猜架构」，方法论治「有片段无理解」。
-
----
-
-## 1. 最佳实践速查（先看这个）
-
-| # | 实践 | 说明 |
+| 动作 | 收益 | 典型耗时 |
 |---|---|---|
-| 1 | **先定目的再搜；无明确指令则默认「整体架构→子模块」** | 有明确问题就聚焦它（问一句即可）；**用户未给明确目的时不要反问**，默认先从整体架构（横向）起手，再逐个下钻子模块（纵向） |
-| 2 | **搜索结果是 `[static]`，不是真相** | `action=search`/`context`/`dataflow` 本质静态分析；承重结论必须能跑出来才算 `[verified]` |
-| 3 | **运行时栈反查，别沿路径读文件** | 断点 `bt` 拿到真路径后，对每帧 `action=context query=<frame> depth=2` 秒懂角色（最大提效点） |
-| 4 | **用扇入扇出客观分主线/支线** | `action=context` 的 callers/callees + `call_graph.json` 扇入统计：高扇入=公共接口（主线，纵读）；低扇入=支线（黑盒，只记接口） |
-| 5 | **数据类型先于代码** | `action=search kind=struct` 拿类型 + `action=dataflow query=<field>` 得「谁创建/持有/改」——数据结构定义架构 |
-| 6 | **测试即现成场景** | `action=search file=test` / `query="<test 名>"`：跑一个测试胜过读十个文件 |
-| 7 | **跨项目提问几乎免费** | 对每个已索引项目各跑一次 `action=search`，对比 nginx/redis/sqlite/linux/postgres 的同类实现 |
-| 8 | **引用用 `file:symbol`，行号仅参考** | 版本免疫 |
-| 9 | **无产出不算读过** | 每阶段留下图/笔记/repro；最终交付结构化读码报告 |
-| 10 | **索引纪律是前提** | `action=build` 一条龙（index→import→vectorize 配套）、索引任务串行、`batch=128`、老 analysis 目录先 chown，否则搜索结果不可信 |
-
-> **起手式（默认动作）**：`lens action=locate query="<模块/概念>"` —— 命中 + 内联源码窗口
-> 一次拿到，不用再为「读一眼」单独发 `read`。要收窄就 `action=peek path=<file> line=N`；
-> 只有需要**字面/正则**匹配时才 `action=grep pattern=<re> path=<file|dir>`（整仓 grep 会被护栏拒掉）。
+| `locate`（搜 + 内联源码） | 最高，替代 80% 的 `read` 往返 | 秒级 |
+| 指针表反查（ops 实例 grep） | 高，找回间接调用断链 | 秒级 |
+| `context` 看扇入扇出 | 高，客观分主线/支线 | 秒级 |
+| `dataflow` 看字段生命周期 | 中，专治「谁改了这个值」 | 秒级 |
+| `search` 自然语言 | 中，用来找**入口**而不是找答案 | 秒级 |
+| 全树重索引 | 低（见 §2），几乎不划算 | 小时级 |
 
 ---
 
-## 2. 命令约定
-
-lite 只有**一个入口**：`lens` 工具（旧名 `codesearch`；实现 `helper/lens.lua`，底座 `liblite_codesearch.so`）。
-仓库里**没有** `ai_code_search.sh` / `tools/cache_query` / `tools/vector_search` / `tools/ctx.py` /
-`tests/validate_tools.sh`，看到旧文档里的这些名字一律按本节映射，不要去调。
+## 1. 起手式（三条命令覆盖 90% 的阅读）
 
 ```text
-lens action=... query=... path=... project=... [max_results] [depth] [kind] [lang] [file] [path_prefix] [json]
+lens action=locate query="<概念或符号>" [project=<p>] [max_results=3] [lines=40]
+lens action=peek   path=<file> line=N [lines=40] [before=5]
+lens action=grep   pattern=<re> path=<file|dir> [fixed=true]
 ```
 
-| 字段 | 含义 |
-|---|---|
-| `action` | `locate` `peek` `grep` `build` `index` `import` `search` `symbol` `context` `exact` `dataflow` `status` |
-| `path` | 仓库路径（`index`/`build` 用，默认 cwd） |
-| `project` | 项目名（默认仓库目录名）；决定 analysis 目录 `~/.local/share/lite/codesearch/<project>` 与 KV 命名空间 `/code/<project>` |
-| `query` | 符号名 / 自然语言 / `exact` 的完整 KV key |
-| `depth` | `context` 向上展开调用链深度（0–5） |
-| `kind`/`lang`/`file` | 过滤（`function/struct/...`、`c/cpp/python/...`、文件名子串） |
-| `path_prefix` | 按目录子树过滤（`search`/`context`/`symbol`），如 `arch/x86`、`net/`、`drivers/gpu/`——内核多架构仓库用它把别的 arch 结果压掉；`context` 只过滤 callers/callees，被滤掉的条数记在 `stats.filtered_out` |
-| `json` | 返回原始 JSON（`locate`/`peek`/`grep` 只出文本，源码窗口不适合塞 JSON） |
+- **`locate` 是默认动作**：一次往返拿到命中 + 带行号源码窗口，不用再发 `read`。
+  语义没命中或该索引没向量时会自动退回 `symbol`；top1 `score < 0.35` 会打弱匹配警告——
+  **警告就是提醒你别当真**。内核实测：`locate query="read_folio address_space_operations"`
+  的 top3 分别是 `fs/ext4/verity.c`(0.948)、`fs/netfs/buffered_read.c`(0.891)、
+  `fs/ntfs3/inode.c`(0.861)——**都是具体文件系统，没有一个是 VFS 门面**。
+  想要门面（`read_mapping_folio`/`filemap_read`）就把 query 写具体，或直接 `symbol`。
+- **`peek` 用于二次落地**：`locate` 给的窗口不够，就按 `file:line` 精确开窗，别整文件读。
+- **`grep` 只用于字面/正则**（`\.read\s*=\s*`、`EXPORT_SYMBOL\(`）；整仓 grep 会被护栏拒掉
+  （>3000 文件的目录直接拒扫），这是**特性不是限制**：它逼你先收窄。
 
-shell 侧等价写法（一行封装，复制即用；`tools/lua.sh` 是仓库里真实存在的 LuaJIT 入口。
-**在 lite 仓库根下执行**——`loadfile("helper/lens.lua")` 是相对路径；换目录用
-`LITE_CWD=<lite 仓库根> cs ...`）：
+探索任何项目**第一步**永远是对齐索引状态：
 
-```bash
-cs() { LITE_LUA_ARGS="$1" ./tools/lua.sh -e 'local j=require("cjson"); local t=assert(loadfile("helper/lens.lua"))(); print(t.run(j.decode(os.getenv("LITE_LUA_ARGS")), {cwd=os.getenv("PWD")}))'; }
-cs '{"action":"status","project":"lite"}'
-cs '{"action":"search","query":"event loop epoll","project":"nginx","max_results":10}'
+```text
+lens action=status project=<p>     # chunks / vectors / .hnsw / kv 是否齐、覆盖哪些目录
 ```
 
-| 需求 | 调用 |
-|---|---|
-| **一步「搜 + 读」（**首选起手式**，省掉一次 `read` 往返）** | `action=locate query="..." [max_results=3] [lines=40] [before=2] [kind=] [lang=] [file=]` → 命中 + 内联带行号源码窗口 + `-- next --`（context/grep 建议）；语义没命中或没向量时自动退回 `symbol`，top1 `score<0.35` 会显式警告 |
-| **file:line 定点读** | `action=peek path=<file> line=N [lines=40] [before=5]`，或 `query=<fn>` 让工具自己定位定义处 |
-| **作用域 grep（配 cgrep 原生）** | `action=grep pattern=<re> [path=<file|dir>] [fixed=] [ext=] [max_hits=] [per_file=]`；**>3000 文件的目录直接拒扫**（提示先 `locate` 收窄，`LITE_CS_GREP_MAX_FILES` 可放宽） |
-| **探索前置检查**（chunks/向量/HNSW/KV 是否齐） | `action=status project=<p>` |
-| 语义搜索（自然语言→file:line，默认 brief） | `action=search query="..." max_results=N [kind=] [lang=] [file=]` |
-| 单函数完整角色（caller/callee/调用链/dataflow） | `action=context query=<fn> depth=N` |
-| 批量符号关系 | 循环调用，或用一个 `lua` 片段在单进程里跑多个 `context` |
-| 精确符号 | `action=symbol query=<fn>` |
-| 完整 KV key / 容器键 | `action=exact query=<key>`：先直取，miss 时依次退 `<key>/...` 子键（`_meta` → `_meta/info`、`chunks/<file>` → 该文件全部 chunk）→ `/symbols/<name>` → 文件路径；`max_results` 生效，带不带前导 `/` 都认 |
-| 片段相似实现 | `action=search query="<这看起来像什么>"`，命中后 `read` 该文件（**没有 `snippet` 子命令**） |
-| 变量/字段级数据流 | `action=dataflow query=<fn 或 var>` |
-| 调用图 / 扇入排序 | `action=context` 看 callers/callees；全局图读 `<analysis>/call_graph.json`（见下） |
-| 跨项目对比 | 对每个已索引项目各跑一次 `action=search project=<p>`（**没有 `cross-search` 子命令**） |
-| 全量重建 | `action=build`（index→word_freq→callgraph→dataflow→import→vectorize） |
-
-扇入排序（`call_graph.json` 是 `{caller: {calls: [{function,file,line}]}}`）：
-
-```bash
-jq -r '[ .[] | .calls[] | .function ] | group_by(.) | map({f:.[0], n:length})
-       | sort_by(-.n) | .[0:10][] | "\(.n)\t\(.f)"' \
-   ~/.local/share/lite/codesearch/<project>/call_graph.json
-```
-
-> **约定**：`search` 输出是 brief（`[n] name file:line kind score` + 截断签名），适合架构扫描；
-> 需要完整定义就 `read` 命中文件或加 `json=true` 取原文。**探索前先跑 `action=status`**，
-> 确认 chunks/向量/HNSW 齐全且 KV 已导入（`kv/mem.bin` 缺失则 `context/symbol/exact` 不可用，
-> 报错会直接让你跑 `action=build`）。
+`action` 也可以全省：给了 `pattern`→`grep`、`query`→`locate`、只给 `path`→`peek`、都没有→`status`。
 
 ---
 
-## 3. 证据分级（最容易被违反的纪律）
+## 2. 索引纪律：按子系统切项目，不要索引整棵树
 
-- **`[static]`**：一切来自 `action=search` / `context` / `dataflow` / `symbol` / `call_graph.json` 的结果。
-  即使用了 Jina 向量，也是静态分析，**不能标 `[verified]`**。
-- **`[verified]`**：真实 build + 断点 backtrace / 测试实跑观测到的路径与变量值。
-- **规则**：报告每条承重结论二选一标注；若是 `[static]`，附「如何验证」的步骤。
-  若大部分结论都会是 `[static]`，要么去 Phase 1 把环境跑起来，要么在报告里明说。
+内核这一次的硬教训，**先读这段再动手**：
+
+1. **整棵树不要一个 project**。35 万个 chunk 的单一索引，查询会跨架构、跨子系统污染结果，
+   且每次改一点都要重跑几十分钟。正确做法是**按阅读目的切**：
+   `linux-fs`(55661 chunk) / `linux-net`(47663) / `linux-kernel`(23952) / `linux-mm`(8975) /
+   `linux-security`(4706) / `linux-block`(3107) / `linux-io_uring`(1256) / `linux-ipc`(400)。
+   项目名决定 analysis 目录 `~/.local/share/lite/codesearch/<project>` 与 KV 命名空间
+   `/code/<project>`，彼此隔离、可并行阅读、可单独重建。
+2. **`action=build` 一条龙**（index→word_freq→callgraph→dataflow→import→vectorize），
+   别手工分步：只 `index` 不 `vectorize` → 语义搜索失效；只 `import` 不 `index` → KV 是旧的。
+3. **索引任务串行**。`code_indexer` 的临时文件是固定 `/tmp` 名，两个 build 并行会交叉污染。
+   `fork=true`/`workers=N` 只用在**单次** index 内部。
+4. **验收看 `.hnsw` 是否新于 `.jina.bin`**，且 `search` top1 `score > 0.3`；
+   零向量/坏索引的表现是「结果全是无关文件」，不报错。
+5. **老 analysis 目录 root 属主** → embedder/hnsw 静默写失败，`chown -R` 后重建。
+6. **索引是快照，不是源码**。`drivers/` 这次就没进索引（22247 个 `.c`）。
+   任何「项目里没有 X」的结论，必须先用 `ls`/`grep` 在**源码树**上复核（§3.1）。
 
 ---
 
-## 4. Phase → 命令映射（工作流骨架）
+## 3. 四条「检索结果 ≠ 事实」的铁律
 
-| Phase | 用 code search 怎么做 | 证据 |
+这四条全部是内核实战中真实踩出来的，违反任何一条，报告就会写出看似有理实则错误的架构结论。
+
+### 3.1 快照偏差：没索引 ≠ 不存在
+
+判定某机制是否存在前，先确认**该目录在索引覆盖范围内**：
+
+```bash
+wc -l ~/.local/share/lite/codesearch/<p>/chunks_meta.jsonl
+grep -o '"/opt/linux/src/linux-7.2.12/[a-z_0-9-]*' ~/.local/share/lite/codesearch/<p>/chunks_meta.jsonl \
+  | sed 's#.*/##' | sort | uniq -c   # 每个索引只覆盖一个顶层目录
+```
+
+内核这次 `drivers/` 为 0 →「内核没有驱动框架」这种结论会把整个报告带偏。
+写法纪律：**「在本次索引快照内未命中」**，而不是「不存在」。
+
+### 3.2 指针表断链：ops 结构体让 call_graph 静默缺边
+
+内核（以及任何 C 面向对象代码）的调用大量走函数指针：
+
+| 表 | 槽数 | 定义 | 树内规模 |
+|---|---|---|---|
+| `struct file_operations` | 34 | `include/linux/fs.h` | 2001 个实例（`grep -rn "struct file_operations [a-z_0-9]* *=" --include=*.c`） |
+| `struct proto_ops` | 28 | `include/linux/net.h` | 每个协议族一份 |
+| `struct super_operations` | 27 | `include/linux/fs/super_types.h` | 116 个 `file_system_type` 挂靠 |
+| `struct address_space_operations` | 19 | `include/linux/fs.h` | 每个 inode 后端一份 |
+| `struct vm_operations_struct` | 17 | `include/linux/mm.h` | 每个 mmap 提供者一份 |
+| `struct sched_class` | 30 | `kernel/sched/sched.h` | 6 个 `DEFINE_SCHED_CLASS` |
+
+`call_graph.json` **没有类型信息**：`file->f_op->read(...)` 在图上完全消失，
+`vfs_read` 的 callee 只有 `new_sync_read` / `rw_verify_area`（实测），
+看不到任何一个具体文件系统。所以：
+
+```text
+# 错：只 context query=vfs_read → 「vfs_read 不调用任何文件系统」
+# 对：反查实例，再用 grep 数实现者
+lens action=grep pattern="\.read\s*=\s*" path=fs/
+lens action=grep pattern="DEFINE_SCHED_CLASS\(" path=kernel/sched
+```
+
+工具已在能推断的地方补标注：调用点是 `obj->fn()` / `obj.fn()` 时，边带
+`"indirect":true` + `"via":"<接收者>"`，`context` 显示成 `name[via obj]`。
+**看到 `[via ...]` 就是提醒你这条边可能混了同名直接调用**，不算精确边。
+
+### 3.3 多架构污染：一定要 `path_prefix`
+
+`arch/` 下有几十份同名函数。整树索引时代实测：`do_page_fault` 扇入 142 条，分布在
+arm64(22)/nios2(17)/openrisc(17)/arm(11)/alpha(10)…——**这不是「被 142 处调用」，
+是把几十个架构的独立实现混在一起**。
+
+这也是 §2 主张**按目录切项目**的第二个理由：本次 8 个索引各自只覆盖一个顶层目录
+（`linux-kernel`→`kernel/`、`linux-fs`→`fs/`、`linux-mm`→`mm/`、`linux-net`→`net/`…），
+`arch/` 根本不在索引里，污染从源头消失。所以查 `do_page_fault` 这类架构相关符号时，
+**先 `ls` 源码树确认它在不在本次快照内**，别指望 `linux-mm` 能回答 x86 缺页细节。
+需要混读时（`fs/` + `block/`）用 `path_prefix` 显式收窄：
+
+```text
+lens action=context query=<fn> path_prefix=fs/    # 只过滤 callers/callees，被滤条数见 stats.filtered_out
+```
+
+### 3.4 伪符号：扇入榜首常常是垃圾
+
+未净化的 `call_graph.json` 扇入第一可能是 `ntt` 这类不存在的符号（ctags 对宏/汇编/生成代码
+误切）。**任何「扇入 top10」先人工扫一遍名字**，`ntt`/`container...`/`void`/`return`/`__fentry__`
+一律剔除后再排序。同理 `dataflow`：变量键里出现 `void`/`return`/`__key` 说明该函数切得不干净，
+只能当噪声，别据此下「谁改了这个字段」的结论。
+
+---
+
+## 4. 主线/支线：用扇入客观排序，用方向校核
+
+`call_graph.json` 的方向是 **callee → callers**
+（实测 `{"efivar_entry_set_get_size": {"calls":[{"function":"efivarfs_file_write"}]}}`
+= 前者被后者调用）。方向搞反会把「底层原语」当成「顶层门面」。
+
+```bash
+jq -r 'to_entries | map({f:.key, n:(.value.calls|length)}) | sort_by(-.n) | .[0:15][]
+       | "\(.n)\t\(.f)"' ~/.local/share/lite/codesearch/<p>/call_graph.json
+```
+
+判据：
+
+- **高扇入 + 稳定签名** → 公共接口 → 主线，必须纵读；
+- **低扇入 + 单一调用者 + 内部工具** → 支线 → 只记接口，写进报告「黑盒」节；
+- 扇入高但**只被同文件调用** → 局部辅助，不是主线。
+
+内核骨架就是靠这条判出来的：`vfs_*` 系列（高扇入、不依赖 f_op）是**稳定门面**，
+具体文件系统是**可插拔实现**——这个结论先于任何一次单文件阅读。
+
+---
+
+## 5. 数据结构先于代码：内核的经验
+
+读内核如果按「文件」读，永远读不完；按**数据结构 + 生命周期**读，一天能画出骨架。
+
+| 问题 | 命令 |
+|---|---|
+| 这个类型长什么样、几个槽 | `locate query="struct address_space"` 或 `search kind=struct` |
+| 谁创建 / 持有 / 修改某字段 | `dataflow query=<field 或 fn>` |
+| 这个结构是谁的成员 | `grep pattern="struct address_space\s+\w+;"` |
+
+内核那 6 张 ops 表就是**架构本身**：`file_operations`（VFS↔FS）、`address_space_operations`
+（page cache↔FS）、`super_operations`（挂载↔FS）、`vm_operations_struct`（mm↔VM 提供者）、
+`proto_ops`（socket↔协议族）、`sched_class`（调度器↔策略）。**认全这 6 张表，
+内核 60% 的「架构」就解释完了**——它们同时是扩展点、也是 `call_graph` 的断点。
+
+纪律：报告里给每个核心结构一行 `file:line` + 创建者 + 持有者 + 改写点，
+凑不齐这一行说明还没读懂，不要往下写结论。
+
+---
+
+## 6. Phase → 命令映射（精简）
+
+| Phase | 动作 | 证据 |
 |---|---|---|
-| **1 跑起来** | `action=search query="main entry point"`、`query="build configuration cmake makefile"`、`file=Makefile` 定位入口与构建点 | static |
-| **2 明确目的** | **有明确指令**：写进 Scope，用它决定 `kind`/`lang`/`file` 过滤。**无明确指令（默认）**：不反问，直接进入「整体架构 → 子模块」探索路径 | — |
-| **3 主线/支线** | `call_graph.json` 扇入判主线；`action=context query=<fn>` 看单函数角色；支线只记接口（黑盒） | static |
-| **4 纵横** | 横：跨项目 `action=search` + `kind=struct` 拼组件图，`call_graph.json` 看模块依赖；纵：`action=context depth=3` 展开一条链 | static |
-| **5 情景分析** | 断点 backtrace 得真相 `[verified]` → 对每帧 `action=context query=<frame> depth=2` / `json=true` 秒懂角色 | verified |
-| **6 测试用例** | `action=search query="<module>" file=test`，把测试当场景入口（命中后 `read`） | static |
-| **7 数据结构** | `action=search query="<概念>" kind=struct` 拿类型；`action=dataflow query=<field>` 直接产出「谁创建/持有/改」表 | static |
-| **8 主动提问** | 对已索引项目逐个 `action=search project=<p>`，对比其他项目做法；回答「别人怎么做 / 我会不会这么设计」 | static |
-| **9 写报告** | 引用 `file:symbol`，逐条标 `[verified]/[static]` | — |
+| 1 跑起来 | `action=status`；`search query="main entry point"`、`file=Makefile`、`file=test` | static |
+| 2 定目的 | 有明确问题就聚焦；**没有就默认「横向架构→纵向一条路径」，不要反问** | — |
+| 3 分主线 | §4 扇入排序（先剔伪符号）+ `context depth=2` | static |
+| 4 纵横 | 横：`kind=struct` + ops 表；纵：`context depth=3` 展开一条链 | static |
+| 5 拿真相 | 真跑 / gdb `bt`，对每帧 `context query=<frame> depth=2` 秒懂角色 | verified |
+| 6 用测试 | `search file=test` / `query="<test 名>"`，跑一个测试胜过读十个文件 | static |
+| 7 数据流 | `dataflow query=<field>`（注意 §3.4 噪声） | static |
+| 8 横向参照 | 对每个已索引项目各跑一次 `search project=<p>`（没有 cross-search 子命令） | static |
+| 9 写报告 | `file:symbol` 引用 + `[static]`/`[verified]` 逐条标注 | — |
 
 ---
 
-## 5. 三个提效机制
+## 7. 证据分级与引用
 
-### 机制 A：verified 闭环（最大增量）
-运行时栈是唯一真相，但单帧看不懂。拿到栈后**立即反查每帧**：
+- **`[static]`**：`search` / `locate` / `context` / `dataflow` / `symbol` / `call_graph.json`
+  的一切结果——**即使用了向量，也只是静态分析**。
+- **`[verified]`**：真实构建 + 断点 backtrace / 测试实跑观测到的路径与变量值。
+- 承重结论必须二选一标注；标 `[static]` 的必须附「怎么验证」的步骤。
+- 引用写 `file:symbol`（如 `fs/read_write.c:vfs_read`），**行号只作参考**，版本无关。
 
-```
-断点 → bt 得真实调用栈                         # [verified]
-   ↓ 对每一帧
-lens action=context query=<frame> project=<p> depth=2
-   → 符号 + callers + callees + call_sites + dataflow
-   ↓
-「真路径 + 每步角色」→ 报告第 4 节 sequence diagram
-```
-
-比读完路径上所有文件快一个数量级，且结论有运行时背书。
-
-### 机制 B：调用图客观分主线/支线
-- **高扇入** = 被到处调用 → 公共接口 → 主线，必须纵读；
-- **低扇入 + 内部工具** = 支线 → 只记接口，列进报告「黑盒」节。
-
-### 机制 C：跨项目提问
-Phase 8 问「同类问题别人怎么解」。lite 没有单独的 `cross-search` 子命令：对每个已索引项目
-各跑一次 `action=search project=<p>`（`ls ~/.local/share/lite/codesearch/` 看现成项目），
-再横向比对结果——这是单机 grep / IDE 做不到的独有能力。
-
----
-
-## 6. 标准工作流（示例：nginx HTTP 请求读路径）
-
-> 示例假设 nginx 已索引为 `project=nginx`（`action=status project=nginx` 能看到
-> `chunks_meta.jsonl` + `.jina.bin/.hnsw` + `kv/mem.bin`）。`cs` 见 §2。
-
-```bash
-# ── 前置：确保已索引（串行）见 §7 ────────────────────────
-cs '{"action":"build","path":"/opt/nginx","project":"nginx","workers":4}'
-cs '{"action":"status","project":"nginx"}'
-
-# ── Phase 2 目的：只关心『从 accept 到 reply 的读路径』────
-# 写进 Scope；后续聚焦函数，不展开配置解析等支线
-
-# ── Phase 3/4 横向：组件图 + 入口 ────────────────────────
-cs '{"action":"search","query":"HTTP request phase handler pipeline","project":"nginx","max_results":10}'
-cs '{"action":"search","query":"event loop epoll","project":"nginx","max_results":10}'
-cs '{"action":"context","query":"ngx_http_process_request","project":"nginx","depth":3}'
-jq -r '[ .[] | .calls[] | .function ] | group_by(.) | map({f:.[0],n:length})
-       | sort_by(-.n) | .[0:10][] | "\(.n)\t\(.f)"' \
-   ~/.local/share/lite/codesearch/nginx/call_graph.json    # 扇入排序
-
-# ── Phase 5/6 纵向：以真实请求/测试为场景 ────────────────
-# 在 ngx_http_process_request 下断点，发一个请求，bt 抓栈 [verified]
-# 对栈中每帧：
-cs '{"action":"context","query":"ngx_http_process_request_line","project":"nginx","depth":2}'
-cs '{"action":"search","query":"ngx_http_process_request","project":"nginx","file":"test"}'
-
-# ── Phase 7 数据结构 ─────────────────────────────────────
-cs '{"action":"search","query":"ngx_http_request_t","project":"nginx","kind":"struct"}'
-cs '{"action":"dataflow","query":"ngx_http_request_t","project":"nginx"}'
-
-# ── Phase 8 提问：其他服务器怎么做 ───────────────────────
-for p in nginx redis sqlite; do
-  cs "{\"action\":\"search\",\"query\":\"HTTP request parser state machine\",\"project\":\"$p\",\"max_results\":5}"
-done
-
-# ── Phase 9 写报告：file:symbol + [verified]/[static] ────
-```
-
----
-
-## 7. 前置条件与索引纪律（血泪教训）
-
-1. **index + vector 必须配套**：只跑 `action=index` 没有向量 → 语义 `action=search` 退化/失效。
-   `action=build` 一条龙跑 index→word_freq→callgraph→dataflow→import→vectorize，并内含 HNSW 验收。
-2. **索引任务必须串行**：`code_indexer` worker 临时文件是固定 `/tmp` 名，并行会交叉污染。
-   `action=index fork=true` 只是单次 index 内部的并行，别同时跑两个项目的 index/build。
-3. **向量化 `batch` 默认 128**；编码失败不写零向量、非零退出，vectorize 失败即中止 build。
-   当前只走 CUDA + FP16，不使用 TensorRT。
-4. **老 analysis 目录 root 属主** → embedder/hnsw 静默写失败；先 `chown -R` 再重建；
-   验收 = `action=status` 里 `.hnsw` 比 `.bin` 新。
-5. **源码在仓库内**（`src/codesearch/`，`lua/ffi/codesearch.lua` 封装），不再依赖远程 `/opt/my_db`；
-   `./tools/build.sh` 构建 `build/liblite_codesearch.so`。缺 tokenizers 静态库 / ONNX Runtime / Jina 模型时
-   该 target 跳过：索引/查询不可用，但其余构建正常。
-6. **两套查询通道**：`action=search` 走向量（需 `.jina.bin/.hnsw`）；`action=symbol|context|exact` 走 KV Cache
-   （需 `kv/mem.bin`，不需要向量）。
-7. **`dataflow`/`context` 用裸函数名**：`cache_set`、`M.run` 能命中，`M:drop_first` 这种
-   带 `:` 的方法名查不到（ctags 里记的是定义处的名字）——查不到先用 `action=symbol` 或
-   `action=search` 确认真名。
-8. **无法本地运行的项目**：在报告里明说，Phase 5 降级为「测试 + 静态阅读」，**不要隐藏限制**。
+内核那次报告能立住，全靠 6 张 ops 表的槽数 / 实例数、`do_page_fault` 的 arch 分布这类
+**可复跑的命令输出**，而不是「我觉得它大概是这样」。
 
 ---
 
@@ -229,86 +225,72 @@ done
 
 > [verified] = 运行/断点/测试实测；[static] = 仅静态（含所有 code search 结果）。
 
-## 1. Scope & purpose
-- Purpose（用户原话）：...
-- Environment：是否本地跑通？构建命令？未跑通原因与降级方案？
-- Out of scope：...
+## 1. Scope & method
+- 用户原话目的：...
+- 索引快照：project 名 / chunk 数 / 覆盖目录 / **明确未覆盖的目录**
+- 能否本地构建运行？不能则说明降级方案
 
-## 2. Architecture overview（横向）                    [static]
-{mermaid flowchart}；组件与职责
+## 2. Architecture overview（横向）                              [static]
+{mermaid}；分层与边界；稳定门面 vs 可插拔实现
 
-## 3. Core data structures & relationships             [static]
-| 结构 | 定义 file:line | 创建者 | 持有者 | 修改处 | 角色 |
-来源：`action=search kind=struct` + `action=dataflow`
+## 3. Core data structures                                        [static]
+| 结构 | 定义 file:line | 槽数/字段 | 创建者 | 持有者 | 改写点 | 角色 |
 
-## 4. Vertical analysis: {flow}                        [verified]
-{sequence diagram，标注 file:symbol}
-Observed path（Phase 5 backtrace 摘录，短）：
-```
-...
-```
+## 4. Extension points（ops 表 / 注册表）                          [static]
+| 表 | 定义 | 槽数 | 实例数 | 谁注册 | 断链影响 |
 
-## 5. Black boxes（有意不展开）
-| 接口 | 输入 | 输出 | 作用 | 为何不开（支线理由） |
+## 5. Vertical analysis: {一条路径}                               [verified]
+{sequence}，每步 file:symbol；Observed path（backtrace 摘录，短）
 
-## 6. Design commentary & open questions（Phase 8）
-- 为何选这个数据结构/算法；跨项目 `action=search` 显示同类项目怎么做
-- 若我来设计会怎么改（至少 1 条）
-- 可疑点：死代码/重复/缺错误处理
+## 6. Black boxes（有意不展开）
+| 接口 | 输入 | 输出 | 为何不开 |
 
-## 7. Follow-ups
-- [ ] 未开黑盒、未覆盖场景、待验证的 [static] 结论
+## 7. Design commentary
+- 为何这样设计；其他已索引项目怎么解同一个问题（§6 Phase 8）
+- 若我重来会改什么（至少 1 条）
+- 可疑点：死代码 / 重复实现 / 缺错误处理
+
+## 8. Follow-ups
+- [ ] 未开黑盒、未验证的 static 结论、待补索引的目录
 ```
 
 ---
 
-## 9. 反模式与边界
+## 9. 反模式
 
-**应拒绝**：
-- 无明确目的、无秩序的乱搜乱读 → 用默认路径「整体架构 → 子模块」有序推进，而非无目标翻文件。
-- 只凭 `action=search` 命中就下架构结论且不跑/不测 → 必须标 `[static]` 并给出验证路径。
-- 把搜索/数据流结果标成 `[verified]` → 严重违规。
-
-**边界**：
-- code search **不提供运行能力**；Phase 1/5 仍需真实构建 + gdb/lldb。
-- 搜索质量受索引质量影响：chunk 缺失 / 向量与 chunks 不同批 → 结果不可信，先修索引（见 §7）。
+- **索引整棵树再问问题** → 慢，且结果互相污染（§2）。
+- **只看 `search` 命中就下结构结论** → 必须有 `locate`/`peek` 的源码窗口或 grep 计数兜底。
+- **把 `[static]` 写成 `[verified]`** → 最严重的一类错误。
+- **顺着路径逐个 `read` 文件** → 用 `context` 反查每帧角色，快一个数量级。
+- **拿扇入榜首当核心** → 先剔伪符号（§3.4）。
+- **把 ops 间接调用当不存在** → §3.2，报告里会漏掉整个实现层。
+- **用 `cross-search` / `snippet` / `tools/cache_query` 这类旧名字** → 不存在，
+  等价动作见 §1/§6（对每个项目各跑一次 `search`）。
 
 ---
 
-## 10. 真实项目验证（必须）
+## 10. 验收：改完 lens 必须用真实项目跑
 
-工具是否"好用"**只能靠真实项目检验**——绝大多数缺陷只在真数据下触发。建议每次改动后跑：
+单元测试抓不到内核级缺陷，全部靠真数据暴露（UTF-8 abort、cache_import O(n²)、
+namespace 去重爆炸、callees 全自指、日志污染 stdout——都是真实项目炸出来的）。
 
 ```bash
-./tools/test.sh                    # 单元 + 插件清单 + codesearch 索引/查询块（缺 lib 时整块跳过）
+./tools/test.sh                                   # 单元 + 插件清单 + codesearch 块
 
-# 真实项目验收：换成已索引的 project（ls ~/.local/share/lite/codesearch/）
-P=lite
-cs "{\"action\":\"status\",\"project\":\"$P\"}"
-cs "{\"action\":\"search\",\"query\":\"event loop poll\",\"project\":\"$P\",\"max_results\":5}"
-cs "{\"action\":\"context\",\"query\":\"cache_set\",\"project\":\"$P\",\"depth\":2}"
-cs "{\"action\":\"dataflow\",\"query\":\"cache_set\",\"project\":\"$P\"}"
+P=linux-fs
+lens action=status project=$P
+lens action=locate query="writeback dirty inode" project=$P max_results=3
+lens action=context query=vfs_read project=$P depth=2 path_prefix=fs/
+lens action=dataflow query=vfs_read project=$P
 ```
 
-不变量（`action=status` / 查询输出里直接核对；目前没有 `validate_tools.sh` 这种自动断言脚本）：
-- **向量**：`.jina.bin` 存在、`.hnsw` 新于 `.bin`、`search` top1 `score > 0.3`（防零向量/坏索引）
-- **KV**：`kv/mem.bin` 存在（否则 `context/symbol/exact` 报 "KV import missing"）
-- **context**：`symbol` 命中、`callees` 非空且**不全自指**（防 call_graph 反向图 bug）
-- **dataflow**：`action=dataflow` 输出不是 "not found"，变量列表里无 `void`/`return` 噪声键
+不变量：
 
-> 经验：本项目的关键缺陷（UTF-8 abort、cache_import O(n²)、namespace 去重爆炸、
-> dataflow 内存/上限、symbol 未导入、`[CACHE]`/embedder 日志污染 stdout、callees 全自指）
-> **全部由真实项目暴露**，而非单元测试。
+- **向量**：`.jina.bin` 存在、`.hnsw` 新于 `.bin`、`search` top1 `score > 0.3`；
+- **KV**：`kv/mem.bin` 存在（否则 `context/symbol/exact` 直接报 "KV import missing"）；
+- **context**：callees 非空且**不全自指**（防 call_graph 反向图 bug）；
+- **dataflow**：不是 "not found"，且变量键里没有 `void`/`return` 噪声；
+- **grep**：`path=fs/` 能扫、`path=.` 在 >3000 文件目录被拒（护栏生效）。
 
----
-
-## 11. 后续落地建议（可选）
-
-固化为 opencode skill：
-- 路径：`.opencode/skill/how-to-read-code-with-search/SKILL.md`
-- 内容：§4 的 Phase 映射 + §3 证据分级 + §8 报告模板，附 `templates/report-template.md`
-- frontmatter `description` 命中「读一下这个项目 / 分析这个模块 / how does X work internally」
-- 前置探测：`lens action=status project=<p>`，无 `chunks_meta.jsonl` / `.hnsw` / `kv/mem.bin` 则提示先 `action=build`
-
-**一句话**：原 skill 教 agent「怎么读」，本系统给 agent「读得快、看得全、能对比」的检索底座；
-合起来 = **有纪律、有真相、有横向参照的代码探索**。
+**一句话**：lens 给的是「读得快、看得全、能横向对比」的坐标系统，
+真相永远在运行里；把两者混为一谈，报告就是自欺。
