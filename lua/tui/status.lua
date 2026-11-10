@@ -63,7 +63,12 @@ function M.render(screen, y, w, ctx, info)
         end
     end
     local queued = (info.queue or 0) > 0 and string.format(" queue:%d", info.queue) or ""
-    local right = mem .. cache .. ctxpct .. todo .. queued .. " · " .. status .. " "
+    -- 监工倒计时：看一眼就知道下一次「继续」还有多久，不用记时刻。
+    local watch = ""
+    if type(info.watchdog) == "number" then
+        watch = string.format(" watch:%ds", info.watchdog)
+    end
+    local right = mem .. cache .. ctxpct .. todo .. queued .. watch .. " · " .. status .. " "
     local lw, rw = utf8.width_str(left), utf8.width_str(right)
     if lw + rw + 1 > w then
         local keep = math.max(1, w - rw - 2)

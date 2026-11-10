@@ -13,6 +13,7 @@ local HelpView = require("tui.help_view")
 local ApprovalView = require("tui.approval_view")
 local Complete = require("tui.complete")
 local SessionView = require("tui.session_view")
+local Watchdog = require("tui.watchdog")
 local Session = require("core.session")
 local Reload = require("core.reload")
 local CoreText = require("core.text")
@@ -117,6 +118,27 @@ function M.run(ctx, agent, memory, opts)
     local spinner_i = 0
     local mem_count = 0
     local last_stats = -1
+    -- 监工模式：定时替你发「继续」（见 lua/tui/watchdog.lua）。
+    local watchdog = Watchdog.new()
+
+    -- 开关状态落 mem，`reboot` / 换回该会话时自动接上（能力靠重启更新，状态不该被重启抹掉）。
+    -- 键走 /agent/session/<sid>/watchdog —— **不是** working/：working/ 在召回白名单里
+    -- （权重 0.9），把「监工开着」注入 prompt 纯噪声；todos 走的也是这条旁路键。
+    local function watchdog_save(now)
+        local id = ctx.session and ctx.session.id
+        if not (memory and id) then return end
+        local ttl = (memory.TTL and memory.TTL.long) or 0
+        memory:put("/agent/session", id .. "/watchdog", watchdog:state(now), ttl)
+    end
+
+    local function watchdog_load(id)
+        id = id or (ctx.session and ctx.session.id)
+        local st = (memory and id) and memory:get("/agent/session", id .. "/watchdog") or nil
+        watchdog:restore(st)
+        return watchdog.on
+    end
+
+    watchdog_load()
 
     local HINT = "lite TUI · Enter 发送 · Ctrl+J 换行 · Tab 补全 · 左键拖选=复制 · /session 会话 · Esc×2 终止 · Ctrl+G diff · Ctrl+T todo · ? help · Ctrl+D 退出"
 
@@ -180,6 +202,7 @@ function M.run(ctx, agent, memory, opts)
         end
         -- 换会话必须重接 usage，否则状态栏会带着上一个会话的账继续累加。
         agent:restore_usage()
+        watchdog_load(id)   -- 每个会话各带一份监工开关，切回来接着催
         if agent.tools and agent.tools.todos then
             agent.tools.todos:load()
             ctx:emit("todos", ctx.session.todos)
@@ -201,6 +224,7 @@ function M.run(ctx, agent, memory, opts)
             memory:ensure_session(id, ctx.session.cwd, ctx.session.model)
         end
         agent:restore_usage()
+        watchdog_load(id)   -- 新会话没有落盘状态 → 落到关闭态，不会把上个会话的催命带过来
         if agent.tools and agent.tools.todos then
             agent.tools.todos:load()
             ctx:emit("todos", ctx.session.todos)
@@ -484,6 +508,24 @@ function M.run(ctx, agent, memory, opts)
             if draw then draw() end
             return
         end
+        -- 监工模式开关：#监工模式 / #终止监工
+        local wcmd = Watchdog.command(text)
+        if wcmd then
+            composer:clear()
+            if wcmd == "on" then
+                watchdog:start()
+                transcript:add("system", string.format(
+                    "监工模式已开启：每 %d 秒自动替你发一句「%s」（仅在空闲且输入框为空时发）。输入 #终止监工 关闭",
+                    watchdog.sec, Watchdog.TEXT))
+            else
+                watchdog:stop()
+                transcript:add("system", "监工模式已关闭")
+            end
+            watchdog_save()      -- 开着/关掉都要落盘，否则重启后又回到默认关闭
+            if draw then draw() end
+            return
+        end
+
         local word = text:lower()
         if word == "quit" or word == "exit" or word == ":q" then
             composer:clear()
@@ -789,6 +831,7 @@ function M.run(ctx, agent, memory, opts)
                 ctxeng = agent and agent._compact_probe or nil,
                 todos = todo_items,
                 queue = #queue,
+                watchdog = watchdog.on and watchdog:left() or nil,
                 spinner = busy and SPINNER[spinner_i + 1] or nil,
                 status = current_tool and ("tool:" .. current_tool) or nil,
             })
@@ -875,6 +918,18 @@ function M.run(ctx, agent, memory, opts)
         end
 
         if memory then memory:tick() end
+
+        -- 监工心跳：只在「空闲 + 队列空 + 输入框空」时发，任何一项不满足就滑窗后推，
+        -- 所以它既不会打断在跑的工具，也不会抢你正在打的半句话。
+        if watchdog.on then
+            local idle = (not busy) and (not quitting) and #queue == 0 and composer:is_empty()
+            if watchdog:tick(os.time(), idle) then
+                transcript:add("system", string.format("监工模式 %d: 自动发送「%s」",
+                    watchdog.fired, Watchdog.TEXT))
+                start_prompt(Watchdog.TEXT)
+                draw()
+            end
+        end
 
         -- reboot/shutdown 工具在上一轮置的标记：等这轮（含排队消息）收完尾再动，
         -- 否则排队里那句会丢。exit 优先——说了退出就不再换进程。

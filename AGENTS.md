@@ -109,6 +109,17 @@ Chrome/WebView/CEF/Electron；不起 `xdotool/wmctrl/import`；不用 `systemd -
 ./tools/release.sh             # build + package + install；源码安装软链 lua/
 ```
 
+**TUI 斜杠外的两个 `#` 开关**（`submit()` 里先拦，不进模型）：
+
+- `#语音模式` / `#退出`：语音转文字，见 `core/voice.lua:command`；
+- `#监工模式` / `#终止监工`：每 `LITE_WATCHDOG_SEC`（默认 180s）自动发一句
+  `LITE_WATCHDOG_TEXT`（默认「继续」），状态栏显 `watch:Ns`。只在**空闲 + 队列空 +
+  输入框空**时发，忙时 deadline 滑窗后推（收工后再等满一个周期），不抢用户的半句话。
+  开关状态落 mem：`/agent/session/<sid>/watchdog`（`TTL.long`，与 todos 同一条旁路键，
+  **不放 `working/`**那里在召回白名单里）→ `reboot` / 切回该会话时自动接上，恢复后重起
+  一个完整周期；新会话无快照即关闭态。逻辑与单测见 `lua/tui/watchdog.lua`
+  （`state`/`restore`）、`lua/tui/loop.lua:watchdog_save`、`tools/auto_unit.lua:tui watchdog`。
+
 工具输出 ≤ 32KB；`read` 文本/目录限 workspace，图片可读 `$TMPDIR:/tmp:/var/tmp`；
 `bash` 可异步长跑，TUI 里 `Ctrl+C` 取消。回归测试先在修复前 commit 确认 FAIL。
 

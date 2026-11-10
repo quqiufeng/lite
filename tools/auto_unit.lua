@@ -4466,6 +4466,46 @@ int only_ab(int v) {
     end
 end
 
+-- tui watchdog（监工模式：命令解析 + 只在空闲发「继续」）
+do
+    local W = require("tui.watchdog")
+    check(W.command("#监工模式") == "on", "watchdog command on")
+    check(W.command("  #监工模式  ") == "on", "watchdog command on trimmed")
+    check(W.command("#终止监工") == "off", "watchdog command off")
+    check(W.command("#监工") == nil, "watchdog command partial ignored")
+    check(W.command("帮我看看 #监工模式 怎么写的") == nil, "watchdog command mid-text ignored")
+    check(W.command(nil) == nil and W.command(123) == nil, "watchdog command non-string")
+
+    local wd = W.new(60)
+    check(not wd.on and wd:tick(0, true) == false, "watchdog idle before start")
+    wd:start(0)
+    check(wd.on and wd:left(0) == 60, "watchdog start arms deadline")
+    check(wd:tick(59, true) == false, "watchdog no fire before deadline")
+    check(wd:tick(60, true) == true, "watchdog fires when idle at deadline")
+    check(wd.fired == 1 and wd:left(60) == 60, "watchdog rearms after fire")
+    -- 忙：不催，且 deadline 后推，收工后要再等满一个周期
+    check(wd:tick(200, false) == false, "watchdog inactive while busy")
+    check(wd:tick(230, true) == false, "watchdog waits full period after busy")
+    check(wd:tick(260, true) == true, "watchdog fires after post-busy period")
+    wd:stop()
+    check(not wd.on and wd:left(0) == nil and wd:tick(99999, true) == false, "watchdog stop")
+    check(W.new(1).sec == 5, "watchdog minimum period clamps")
+
+    -- 落盘快照往返：开着 → 存 → 新实例恢复后仍开着且重新起完整周期；
+    -- 关掉/坏数据 → 恢复成关闭态（脏状态不许自己把「继续」发起来）。
+    wd:start(100)
+    local snap = wd:state(100)
+    check(snap.on == true and snap.sec == 60 and snap.ts == 100, "watchdog state snapshot")
+    local wd2 = W.new(180)
+    wd2:restore(snap, 100)
+    check(wd2.on and wd2.sec == 60 and wd2:left(100) == 60, "watchdog restore re-arms full period")
+    check(wd2:tick(159, true) == false and wd2:tick(160, true) == true, "watchdog restored fires on schedule")
+    wd:stop()
+    check(W.new(60):restore(wd:state(0), 0).on == false, "watchdog restore off snapshot stays off")
+    check(W.new(60):restore(nil, 0).on == false, "watchdog restore nil stays off")
+    check(W.new(60):restore({ on = "yes" }, 0).on == false, "watchdog restore junk stays off")
+end
+
 -- entry
 check(loadfile(root .. "/lua/main.lua") ~= nil, "load lua/main.lua")
 
