@@ -68,6 +68,12 @@ function M.run(ctx, agent, memory, opts)
     local multi = opts.multi
     local provider = agent.provider
 
+    -- 逐键/逐事件 trace：排查「Esc 没生效、输入框像死的」时手动打开，
+    -- 平时注释掉（每次按键都 fflush 一次，白耗 IO）。
+    -- 启用 = 注释掉下面这行空桩、放开整块实现，再 `LITE_TUI_TRACE=1 lite`；
+    -- 日志落在 /tmp/lite-tui-trace.log。调用点保持原样，开关只在这一处。
+    local function trace() end
+    --[[
     local TRACE = os.getenv("LITE_TUI_TRACE")
     local trace_f
     local function trace(...)
@@ -79,6 +85,7 @@ function M.run(ctx, agent, memory, opts)
         trace_f:write(string.format("%d %s\n", os.time(), table.concat(p, " ")))
         trace_f:flush()
     end
+    --]]
 
     local input = Input.new()
     local composer = Composer.new()
