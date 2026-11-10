@@ -576,6 +576,11 @@ function M:request_messages(text, stream, opts)
             limit = 8,
             max_chars = 2400,
             session_id = self.ctx.session.id,
+            -- 自命中闸门：query 就是最新这句用户原文，所以刚落盘的自己 100% 命中；
+            -- 最近两条 msg（本轮这句 + 上一条）原文都在窗口里，召回等于把 prompt
+            -- 再抄一遍。实测每轮稳定白占 2~3 个名额（上限 8）。
+            skip_text = text,
+            skip_recent = 2,
         })
         self.ctx:emit("memory", items or {})
     end
@@ -677,6 +682,44 @@ local STOP_NOTE = table.concat({
     "3) 仅当确实需要时再给下一步。",
     "</session_context>",
 }, "\n")
+
+-- 用户中断（Esc×2）后收尾：把悬空的 tool_calls 补成"已取消"结果。
+--
+-- 不补的话那条 assistant 会被 view_messages 整块丢掉，模型下一轮只看到
+-- 「请用 bash 跑 sleep 45」这条 user 指令、看不到自己已经回过，于是把刚被
+-- 中断的工具原样再发一遍 —— 用户的感觉就是「Esc 没生效 / 输入没反应」。
+function M:abort(reason)
+    local ctx = self.ctx
+    local msgs = ctx.session.messages
+    local note = "[cancelled by user]" .. (reason and (" " .. tostring(reason)) or "")
+    for i = #msgs, 1, -1 do
+        local m = msgs[i]
+        if m.role == "user" then
+            return 0 -- 最近一条 user 之后没有悬空工具块
+        elseif m.role == "assistant" and type(m.tool_calls) == "table"
+            and #m.tool_calls > 0 then
+            local got = {}
+            local j = i + 1
+            while j <= #msgs and msgs[j].role == "tool" do
+                got[msgs[j].tool_call_id] = true
+                j = j + 1
+            end
+            local filled, at = 0, j
+            for _, tc in ipairs(m.tool_calls) do
+                local id = tc.id or tc["tool_call_id"]
+                if id and not got[id] then
+                    local msg = { role = "tool", tool_call_id = id, content = note }
+                    table.insert(msgs, at, msg)
+                    self.session:append(msg)
+                    at = at + 1
+                    filled = filled + 1
+                end
+            end
+            return filled
+        end
+    end
+    return 0
+end
 
 -- 循环被迫结束时，再要一次"不带工具"的收尾。
 --

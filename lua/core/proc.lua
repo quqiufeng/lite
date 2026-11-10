@@ -17,7 +17,10 @@ function M.new(command, opts)
 
     local script = "{\n" .. command .. "\n} > " .. shq(out)
         .. " 2>&1\necho $? > " .. shq(status_file)
-    local launcher = "bash -c " .. shq(script) .. " & echo $!"
+    -- setsid：让这条命令自成一个进程组，cancel 时 killpg 才能连它的孙子
+    -- （`sleep 40` 这类）一起收掉；stdin 接 /dev/null，否则常驻的后台命令
+    -- 会和 TUI 抢同一份 stdin，按键被它吃掉，输入框看起来就是死的。
+    local launcher = "setsid bash -c " .. shq(script) .. " </dev/null & echo $!"
 
     local p = io.popen(launcher, "r")
     if not p then
@@ -45,6 +48,13 @@ function M.new(command, opts)
         done = false,
         exit_code = nil,
     }, M)
+end
+
+-- 命令本身是 setsid 起来的进程组长，负 pid 才能连孙子进程一起收掉。
+local function kill_tree(pid, sig)
+    if not pid then return end
+    ffi.C.kill(-pid, sig)
+    ffi.C.kill(pid, sig)
 end
 
 function M:output()
@@ -87,7 +97,7 @@ function M:poll()
     end
 
     if os.time() - self.start > self.timeout then
-        ffi.C.kill(self.pid, 9)
+        kill_tree(self.pid, 9)
         self:_read_new()
         self.done = true
         self.exit_code = 124
@@ -114,7 +124,7 @@ end
 
 function M:cancel()
     if self.done then return self:output() end
-    ffi.C.kill(self.pid, 9)
+    kill_tree(self.pid, 9)
     self:_read_new()
     self.done = true
     self.exit_code = 130

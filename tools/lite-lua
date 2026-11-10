@@ -46,7 +46,6 @@ esac
 #     也就是这个 wrapper。
 # 只认 75，其它退出码原样透传 —— 测试、--once、崩溃路径完全不受影响。
 export LITE_SUPERVISED=1
-LITE_REBOOT_MAX="${LITE_REBOOT_MAX:-3}"
 reboot_args=("$@")
 child=0
 # 原始 stdin 存到 fd 3：下面的子进程要以 `&` 起（见循环里的说明）。
@@ -60,11 +59,11 @@ forward() { [ "$child" -gt 0 ] && kill -"$1" "$child" 2>/dev/null; return 0; }
 trap 'forward TERM' TERM
 trap 'forward INT' INT
 trap 'forward HUP' HUP
-# 链计数只活在这个 wrapper 进程里，**绝不 export**：export 会漏给 lite 的所有子进程
-# （bash 工具、test.sh、helper 插件），带 `LITE_REBOOT_CHAIN` 起来的下次 lite 就从
-# 中间开始数，链上限提前触发（`reboot chain stops after LITE_REBOOT_MAX restarts`
-# 真这么红过）。计数不需要环境变量跨进程 —— 循环就在同一个 shell 进程里。
-reboot_chain=0
+# 重启链**不设上限**：自我进化就是把「写插件 → reboot 让它进清单」当正常收尾动作，
+# 一刀切的上限会让长任务在第 4 次自我演进时被打断，代价比「模型无限自我重启」这个
+# 理论风险大得多。`reboot` 工具本身由模型决定调用时机、每次还带着真实工作，成环靠
+# `shutdown` 或用户中断收场。
+# `LITE_REBOOT_CHAIN` 仍然不 export（漏给 bash 工具/测试会让下个 lite 从中间计数）。
 while :; do
     rc=0
     unset LITE_REBOOT_CHAIN
@@ -81,11 +80,6 @@ while :; do
     done
     child=0
     if [ "$rc" -ne 75 ]; then exit "$rc"; fi
-    reboot_chain=$(( reboot_chain + 1 ))
-    if [ "$reboot_chain" -gt "$LITE_REBOOT_MAX" ]; then
-        echo "lite: reboot chain limit reached ($LITE_REBOOT_MAX)" >&2
-        exit 1
-    fi
     # 新进程带 --reboot 起来 → 输入框自动填「重启成功，继续工作。」再提交。
     case " ${reboot_args[*]} " in
         *" --reboot "*) ;;

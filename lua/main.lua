@@ -187,21 +187,14 @@ end
 -- argv 直接从 `arg` 表还原：`arg[-1]` 是最靠近脚本的那一项，`arg[-2..]` 往前是
 -- 它的选项（外层包装脚本 tools/lite-lua 会塞 `-e <prelude>`），`arg[0]` 是脚本，
 -- `arg[1..]` 是 lite 自己的参数。所以无论从 run.sh / lite-lua / 裸 luajit 启动
--- 都能原样重启。`LITE_REBOOT_CHAIN` 计数防止模型无限自我重启。
-local REBOOT_MAX = 3
-
+-- 都能原样重启。重启链不设上限（见 tools/lite-lua 里的说明）。
 local function exec_self(extra)
     local ffi = require("ffi")
     pcall(ffi.cdef, [[
         int execv(const char *path, char *const argv[]);
-        int setenv(const char *name, const char *value, int overwrite);
     ]])
     local path = arg[-1]
     if not path then return false, "cannot locate interpreter (arg[-1])" end
-    local chain = tonumber(os.getenv("LITE_REBOOT_CHAIN")) or 0
-    if chain >= REBOOT_MAX then
-        return false, string.format("reboot chain limit reached (%d)", REBOOT_MAX)
-    end
 
     local keep, argv = {}, {}
     local function push(s)
@@ -225,7 +218,6 @@ local function exec_self(extra)
 
     local arr = ffi.new("char *[?]", #argv + 1)
     for j = 1, #argv do arr[j - 1] = argv[j] end
-    ffi.C.setenv("LITE_REBOOT_CHAIN", tostring(chain + 1), 1)
     io.stdout:flush()
     io.stderr:flush()
     ffi.C.execv(prefix[#prefix] or path, arr)

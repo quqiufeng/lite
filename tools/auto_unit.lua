@@ -2396,8 +2396,8 @@ do
 
     -- 自重启走「退出码 75 + wrapper 拉起新进程」：lite 自己是前台终端持有者，
     -- fork 出子进程再自杀会让子进程 read(0) 拿到 EOF，所以换进程这件事必须由
-    -- 一直待在原地的 wrapper 干。这里喂假 lite 验收：75 后带 --reboot 重跑一次，
-    -- 一直 75 则在 LITE_REBOOT_MAX 处刹住（防模型无限自我重启）。
+    -- 一直待在原地的 wrapper 干。这里喂假 lite 验收：75 后带 --reboot 重跑一次；
+    -- 链**不设上限**（曾有过 LITE_REBOOT_MAX=3，会打断长任务里的连续自我演进）。
     local cfile = dir .. "/reboot_once.count"
     put(dir .. "/reboot_once.lua",
         'local n = 1\n'
@@ -2410,14 +2410,23 @@ do
         .. shq(dir .. "/reboot_once.lua") .. " hello")
         :find("run 2 args: hello --reboot", 1, true) ~= nil,
         "lite-lua relaunches with --reboot on exit 75")
-    put(dir .. "/reboot_forever.lua", 'io.write("run\\n")\nos.exit(75)\n')
+    -- 连着重启 5 次仍然会拉起第 6 次（旧代码在 3 次就 exit 1 了）。假 lite 自己
+    -- 数到 6 就退出 0，否则这条测试自己会变成无限循环。
+    local mfile = dir .. "/reboot_many.count"
+    put(dir .. "/reboot_many.lua",
+        'local n = 1\n'
+        .. 'local f = io.open(' .. string.format("%q", mfile) .. ', "r")\n'
+        .. 'if f then n = (tonumber(f:read("*a")) or 0) + 1 f:close() end\n'
+        .. 'f = io.open(' .. string.format("%q", mfile) .. ', "w") f:write(n) f:close()\n'
+        .. 'io.write("run " .. n .. "\\n")\n'
+        .. 'if n < 6 then os.exit(75) end\n')
     local rtxt = shrun("{ " .. shq(lroot .. "/tools/lite-lua") .. " "
-        .. shq(dir .. "/reboot_forever.lua") .. "; echo rc=$?; }")
+        .. shq(dir .. "/reboot_many.lua") .. "; echo rc=$?; }")
     local runs = 0
-    for _ in rtxt:gmatch("run\n") do runs = runs + 1 end
-    check(runs == 4, "reboot chain stops after LITE_REBOOT_MAX restarts")
-    check(rtxt:find("reboot chain limit reached", 1, true) ~= nil
-        and rtxt:find("rc=1", 1, true) ~= nil, "reboot chain limit is reported")
+    for _ in rtxt:gmatch("run %d+\n") do runs = runs + 1 end
+    check(runs == 6, "reboot chain is unlimited (kept relaunching past 3)")
+    check(rtxt:find("reboot chain limit", 1, true) == nil
+        and rtxt:find("rc=0", 1, true) ~= nil, "no chain-limit bail out")
 
     os.execute("rm -rf " .. shq(dir))
 end
@@ -3455,7 +3464,9 @@ do
     check(txt:find("world", 1, true) ~= nil, "tui screen assistant")
     check(txt:find("● bash", 1, true) ~= nil, "tui screen tool")
     check(txt:find("next question", 1, true) ~= nil, "tui screen composer")
-    check(txt:find("mem:6 hit:2", 1, true) ~= nil, "tui screen status")
+    check(txt:find("mem:6", 1, true) ~= nil, "tui screen status")
+    -- 召回明细/计数不再上进界面（用户要求静音），状态栏只留记忆总数
+    check(txt:find("hit:", 1, true) == nil, "tui screen status no hits")
 end
 
 -- tui status memory hits
@@ -3475,7 +3486,9 @@ do
         queue = 3,
     })
     local txt = s:snapshot_text()
-    check(txt:find("hit:2", 1, true) ~= nil, "tui status memory hits")
+    -- hits 传进来也不再渲染：召回计数是噪声，用户不要看
+    check(txt:find("hit:2", 1, true) == nil, "tui status no memory hits")
+    check(txt:find("mem:5", 1, true) ~= nil, "tui status mem count")
     check(txt:find("todo:1/2", 1, true) ~= nil, "tui status todos")
     check(txt:find("queue:3", 1, true) ~= nil, "tui status queue")
 end

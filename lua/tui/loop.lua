@@ -31,10 +31,13 @@ local function shq(s)
     return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
 end
 
--- 召回块（memory 事件）在界面上的一行痕迹。
--- 背景：召回结果只进 prompt 的 <retrieved_memory> 尾部块，TUI 之前只拿它更新状态栏
--- 的 hit:N，用户「mem 还在但上下文里看不见」。默认只列 key —— 正文全量塞进滚动区
--- 会把真正的对话淹掉；LITE_TUI_MEM_VERBOSE=1 展开成 key + 正文摘要（单行、截 200 字）。
+-- 召回块（memory 事件）在界面上的一行痕迹 —— **默认不显示**。
+-- 召回每轮都发生，普通人只关心对话本身，刷一行 key 列表纯噪声（用户明确说不要）。
+-- 但召回质量由模型自己看不见（stats() 不进 prompt），排查「怎么又召回些无关的」时
+-- 需要它，所以留一个开关：
+--   LITE_TUI_MEM_NOTICE=1    滚一行 `memory: N hits · key, key`
+--   LITE_TUI_MEM_VERBOSE=1   再展开每条的正文摘要（单行、截 200 字）
+-- 本函数只管格式化（纯函数，测试直接调）；要不要显示由调用点按开关决定。
 -- 返回 nil 表示没有命中，调用方就不加块。
 function M.memory_notice(items, verbose)
     items = items or {}
@@ -65,6 +68,18 @@ function M.run(ctx, agent, memory, opts)
     local multi = opts.multi
     local provider = agent.provider
 
+    local TRACE = os.getenv("LITE_TUI_TRACE")
+    local trace_f
+    local function trace(...)
+        if not TRACE then return end
+        if not trace_f then trace_f = io.open("/tmp/lite-tui-trace.log", "a") end
+        if not trace_f then return end
+        local p = {}
+        for i = 1, select("#", ...) do p[#p + 1] = tostring((select(i, ...))) end
+        trace_f:write(string.format("%d %s\n", os.time(), table.concat(p, " ")))
+        trace_f:flush()
+    end
+
     local input = Input.new()
     local composer = Composer.new()
     local transcript = Transcript.new()
@@ -91,7 +106,6 @@ function M.run(ctx, agent, memory, opts)
     local todo_items = ctx.session.todos or {}
     local last_tool_diff
     local current_tool
-    local memory_hits = 0
     local draw
     local spinner_i = 0
     local mem_count = 0
@@ -288,13 +302,14 @@ function M.run(ctx, agent, memory, opts)
         if draw then draw() end
     end)
     ctx:on("error", function(err) transcript:add("error", tostring(err)) end)
-    -- 召回块只在第一轮请求注入，界面上却一直看不到内容（只体现在状态栏 hit:N）。
-    -- 这里在 transcript 里留一行痕迹，正文格式见 M.memory_notice。
+    -- 召回块只在第一轮请求注入，界面上不需要留痕（用户明确要求静音）。
+    -- 排查召回质量时开 LITE_TUI_MEM_NOTICE=1，正文格式见 M.memory_notice。
     ctx:on("memory", function(items)
         items = items or {}
-        memory_hits = #items
-        local notice = M.memory_notice(items)
-        if notice then transcript:add("info", notice) end
+        if os.getenv("LITE_TUI_MEM_NOTICE") == "1" then
+            local notice = M.memory_notice(items)
+            if notice then transcript:add("info", notice) end
+        end
         if draw then draw() end
     end)
     -- 压缩是低频但重要的事件：它一次性改变了 prompt 前缀。
@@ -348,6 +363,7 @@ function M.run(ctx, agent, memory, opts)
     local start_next
 
     local function finish_agent()
+        trace("finish_agent")
         busy = false
         co = nil
         active_req = nil
@@ -393,6 +409,7 @@ function M.run(ctx, agent, memory, opts)
     end
 
     local function start_prompt(text, block)
+        trace("start_prompt ", tostring(text):sub(1, 20))
         if block then
             block.kind = "user"
             transcript._cache = nil
@@ -400,7 +417,6 @@ function M.run(ctx, agent, memory, opts)
             transcript:add("user", text)
         end
         transcript:reset_scroll()
-        memory_hits = 0
         last_escape = 0
         busy = true
         co = agent:run_async(text)
@@ -477,6 +493,7 @@ function M.run(ctx, agent, memory, opts)
     end
 
     local function cancel()
+        trace("cancel busy=", busy, "req=", tostring(active_req ~= nil), "proc=", tostring(active_proc ~= nil))
         if not busy then return end
         -- 双 Esc 的语义是终止本轮。不要依赖 coroutine 再走一次错误收尾：
         -- HTTP/工具阶段不同，resume 失败时 busy 会残留，输入框就像死了一样。
@@ -488,6 +505,15 @@ function M.run(ctx, agent, memory, opts)
         if active_proc then
             active_proc:cancel()
             active_proc = nil
+        end
+        -- 悬空的 tool_calls 补成"已取消"，否则下一轮模型看不见自己回过，
+        -- 会把刚被中断的工具原样再发一遍。
+        local filled = agent.abort and agent:abort("user pressed esc") or 0
+        -- 底栏状态（status）只有 end_turn 会收回 idle；不调它就一直挂着
+        -- tool，看着像还在跑。
+        ctx:end_turn()
+        if filled and filled > 0 then
+            transcript:add("info", "已中断：本轮工具调用标记为 cancelled")
         end
         finish_agent()
         if start_next then start_next() end
@@ -626,6 +652,7 @@ function M.run(ctx, agent, memory, opts)
         end
 
         local k = ev.key
+        trace("key=", tostring(k), "busy=", busy, "le=", last_escape)
         if k ~= "escape" then last_escape = 0 end
 
         if k == "escape" then
@@ -740,7 +767,6 @@ function M.run(ctx, agent, memory, opts)
             Status.render(screen, h, w, ctx, {
                 busy = busy,
                 mem = mem_count,
-                hits = memory_hits,
                 cache = ctx.cache_ratio and ctx:cache_ratio() or nil,
                 reuse = ctx.prefix_ratio and ctx:prefix_ratio() or nil,
                 ctxeng = agent and agent._compact_probe or nil,
@@ -799,6 +825,7 @@ function M.run(ctx, agent, memory, opts)
         if active_proc then
             local done, out = active_proc:poll()
             if done then
+                trace("proc done code=", tostring(active_proc.exit_code))
                 local code = active_proc.exit_code
                 active_proc = nil
                 if code and code ~= 0 then

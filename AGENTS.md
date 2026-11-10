@@ -31,7 +31,11 @@ AI-native harness：记忆、工具、FFI、X11。
 - `lua/tui/`、`lua/ffi/`、`src/{cache,image,x11,codesearch}/`、`helper/`、`tools/`
 - `src/codesearch/`：从 `/opt/my_db` 全量迁移的代码索引/调用图/数据流/向量检索；
   `api.c` 是 JSON-in/JSON-out 公共入口，其余 `.c` 来自原 CLI（main 改名、日志走 stderr）。
-  `lua/ffi/codesearch.lua` 包 FFI，`helper/codesearch.lua` 做 action 编排。
+  `lua/ffi/codesearch.lua` 包 FFI，`helper/lens.lua`（旧名 codesearch，工具名 `lens`）做 action 编排；
+  `locate`（语义/符号查询 + 内联源码窗口，默认起手式）/`peek`（file:line 读窗口）/
+  `grep`（作用域 cgrep，>3000 文件的目录直接拒扫）是「搜→读」组合三连，
+  写法纪律见 `src/codesearch/code_search_best_practices.md`。`action` 可省：
+  给了 `pattern`→`grep`、`query`→`locate`、只给 `path`→`peek`、都没有→`status`。
   `action=dataflow`（`lite_cs_dataflow_query`）走 import 写的 `dataflow/funcs/<func>`
   与 `dataflow/vars/<var>` 两条键，`cache_get` 直取，不读几百 MB 的 `dataflow.json`
   / `_func_index`；旧 KV 没这两类键，要重跑一次 `import`。
@@ -194,8 +198,9 @@ system prompt 字节相同（时钟/轮次/预算都在本轮尾部的 `runtime_
 tool 结果在盘上是截断版（`LITE_TOOL_RESULT_CHARS`，默认 8192，`session.lua:store_copy`），
 重启看到的是截断版、且第一个截断点之后的前缀跟重启前不同（那一段才真 miss）；进程内的临时态
 （异步 bash 长跑、连接复用、TUI 回滚）清零，serve/attach 的客户端得重连。本地启动本身
-（插件扫描 + mmap + JSONL 回放）是毫秒级。连续重启有链上限（`LITE_REBOOT_MAX`，默认 3），
-计数只活在 wrapper 进程里、不 export（漏给 bash 工具/测试会让下个 lite 从中间数起）。
+（插件扫描 + mmap + JSONL 回放）是毫秒级。连续重启**不设次数上限**（旧的
+`LITE_REBOOT_MAX` 已去掉：自我演进常常连着重启几次，一刀切会打断长任务），
+`LITE_REBOOT_CHAIN` 也不再注入子进程环境。
 `shutdown` 才是真停（不自动接续）；serve/attach 只认 JSONL 请求、不跑斜杠命令，
 外部客户端要重启就自己 kill 再拉。
 
@@ -280,13 +285,13 @@ hook 错误一律 fail-open（记 `_hook_errors`，不炸 agent）。`has_hooks(
 | `fetch` | DeepSeek Fetch：URL→Markdown 正文 | 同上；替代原始 HTTP 抓页面 |
 | `tokens` | 每日 token 账本查询 | 数据源 `/agent/usage`，跨会话同一本账 |
 | `cgrep` | 代码搜索：正则/字面串扫目录，输出 `path:line: text` | 本体是 `helper/cgrep.c`（pthread + POSIX regex）编出的 `.so`，Lua 层只做 JSON→文本；本机没 `rg`/`ugrep`，搜代码就靠它。`ext`/`fixed`/`per_file`/`threads` 可省，输出自身封顶 8000 字 |
-| `codesearch` | 代码库级检索：陌生项目找入口/子系统、跨文件符号与调用关系、数据流、语义找实现 | 需要先建索引；适合 `cgrep` 做不到的跨文件/语义问题。用法、索引、依赖、性能与内核实践见 `src/codesearch/README.md` |
+| `lens` | 代码库级检索：陌生项目找入口/子系统、跨文件符号与调用关系、数据流、语义找实现 | 旧名 `codesearch`。需要先建索引；适合 `cgrep` 做不到的跨文件/语义问题。用法、索引、依赖、性能与内核实践见 `src/codesearch/README.md` |
 | `pdftext` | 抽 PDF 文本（`path/first/last/max_chars`） | 纯 Lua FFI 直连 `libpoppler-glib.so.8`，零编译零子进程；本机无 poppler 头文件，cdef 手写（导出符号 `poppler_document_get_page`/`poppler_page_get_text`），释放用 `g_object_unref`（`poppler_page_free`/`poppler_document_free` 已不在 134 里）；缺库报装 `libpoppler-glib8` |
 | `md2png` | Markdown 文件 → HTML → 长图 PNG（`path/out/width/height/scale/gfm`） | 全 FFI 无子进程无 Chrome：`libmd4c.so.0` 解析（**无 md4c.h，cdef 手写**，`abi_version` 必须 = 0、结构体字段顺序不能错否则崩在回调里）→ `build/liblite_html.so` 出图 → `src/html/render.cpp` 的字体。同名 `.html` 一起落盘便于调试；`height` 默认 **0 = 自动测高**（`render.cpp` 先布局取 `doc->height()` 再定高），给正数才是固定视口、超出裁掉 |
 | `trending` | GitHub Trending → Kami 排版 → 长图 PNG（`lang/since/limit/width/height/scale/out`） | `curl` 抓页面（`io.popen`）+ 文件内 `parse()` 的 `gmatch` 逐字段抽（**无 dom 库**，页面结构一变就返回空表）；出图复用 `liblite_html.so`。坑：HTML 必须一次成型（追加 `<style>` 会让内容溢出被裁）；`.page{width:auto}` 铺满、`width` 别低于 780（19px 仓库名会折行）；`os.date` 里 `"%%m"` 是字面量；`height` 默认 0 = 自动测高，加 `limit` 不用手动调高 |
 | `web2png` | URL → 正文 → 资料卡片长图 PNG（`url/out/width/scale/title/max_chars`） | 三段链路：`helper/lib/deepseek.lua` 的 `/v1/tools/fetch` 取干净 Markdown（无 `DEEPSEEK_API_KEY` 则降级 `core.http` 抓 HTML 去标签）→ `helper/lib/md4c.lua` 转 HTML 片段 → `liblite_html.so` 出图（`h=0` 自动测高）。样式全内联，cairo toy font 只认单族名，**禁止写字体栈** |
 
-**什么时候用 codesearch**：陌生代码库要找子系统入口/实现、查某符号的 callers/callees
+**什么时候用 lens**：陌生代码库要找子系统入口/实现、查某符号的 callers/callees
 与数据流、或按自然语言找相似实现时用它；单文件/精确文本搜索先用 `cgrep`。
 索引创建、参数、加速、依赖、Linux/参考项目实践统一看 `src/codesearch/README.md`
 （§0 快速开始，§4/§5 详细流程）。
@@ -386,7 +391,7 @@ libcurl `CURLOPT_USERPWD`，凭据不进 argv/m3u）、`app_<class>_map.lua`（`
 
 - **单写者**：slave 验过才 commit，master 只 `git pull` + 重编 + `reboot`，不各写一份历史
   （`design.md:D10`）；两边各自 commit 再合 = 第三份谁都没验过的代码。
-- **长任务开远程实例（分身）**：`LITE_REBOOT_MAX`（默认 3）链上限、进程内临时态（异步
+- **长任务开远程实例（分身）**：进程内临时态（异步
   bash、连接复用）清零、同目录 `mem.lock` 单写实例这些麻烦自然消失，主工作区与主记忆
   一个字节不动。`serve` 走 `net.listen(host, port)`（`lua/core/serve.lua:138`）是 TCP
   而非 unix socket，所以主实例能连上去看 slave 在干什么。

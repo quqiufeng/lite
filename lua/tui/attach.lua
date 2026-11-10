@@ -157,9 +157,9 @@ function M.run(opts)
             busy = false
         elseif t == "memory" then
             hits = ev.hits or 0
-            -- 服务端只发计数时这里什么也不显示，用户只看到状态栏 hit:N。
-            -- 现在带 keys，transcript 里补一行，和本地 TUI 的表现对齐。
-            if hits > 0 then
+            -- 默认静音，和本地 TUI 对齐（lua/tui/loop.lua:memory_notice）：
+            -- 每轮都刷一行召回 key 纯噪声，排查时开 LITE_TUI_MEM_NOTICE=1。
+            if hits > 0 and os.getenv("LITE_TUI_MEM_NOTICE") == "1" then
                 local keys = ev.keys or {}
                 local body = #keys > 0 and (" · " .. table.concat(keys, ", ")) or ""
                 transcript:add("info", string.format("memory: %d hits%s", hits, body))
@@ -376,7 +376,6 @@ function M.run(opts)
                 Status.render(screen, h, w, ctx, {
                     busy = busy,
                     mem = mem,
-                    hits = hits,
                     todos = todo_items,
                     spinner = busy and SPINNER[spinner_i + 1] or nil,
                     status = current_tool and ("tool:" .. current_tool) or nil,

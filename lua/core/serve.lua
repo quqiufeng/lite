@@ -205,8 +205,8 @@ function M.run(opts)
     ctx:on("memory", function(items)
         items = items or {}
         last_hits = #items
-        -- 带 key 出去：客户端（attach）要能把"命中了什么"显示出来，
-        -- 只发计数的话用户只能看到 hit:N，不知道内容。
+        -- 带 key 出去：客户端（attach）默认静音，开 LITE_TUI_MEM_NOTICE=1 才显示
+        -- 命中了什么；只发计数的话客户端连开关都撑不起来。
         local keys = {}
         for i, it in ipairs(items) do
             if i > 6 then break end

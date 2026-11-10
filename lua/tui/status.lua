@@ -23,7 +23,7 @@ function M.render(screen, y, w, ctx, info)
 
     local left = string.format(" lite · %s · turn %d · %s ", model, turn, cwd)
     local mem = string.format(" mem:%d", info.mem or 0)
-    if (info.hits or 0) > 0 then mem = mem .. string.format(" hit:%d", info.hits) end
+    -- 不再显示 hit:N：每轮召回都刷数字，只增噪声（要看召回明细开 LITE_TUI_MEM_NOTICE=1）。
     -- 缓存命中率：唯一能说明"前缀是否稳定"的指标。低于 50% 说明每轮 prompt
     -- 都在整体位移，等于按 miss 价重付整段历史。
     local cache = ""

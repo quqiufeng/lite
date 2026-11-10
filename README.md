@@ -131,7 +131,8 @@ return {
 | `LITE_KEEP_RATIO` | 0.6 | 丢窗口时保留比例（0.3~0.95） |
 | `LITE_BUDGET_HINT` | — | `1` 在尾部块里播报剩余预算（默认关，纯噪声） |
 | `LITE_AUTO_DIFF` | 1 | `edit`/`write` 改完文件自动弹两栏 diff（`0` 只留 Ctrl+G 手动看） |
-| `LITE_TUI_MEM_VERBOSE` | — | `1` = 召回命中在 transcript 里展开成 key + 正文摘要（默认只列 key） |
+| `LITE_TUI_MEM_NOTICE` | — | `1` = 召回命中在 transcript 里留一行 `memory: N hits · key, ...`（默认静音，状态栏也不再显示 `hit:N`） |
+| `LITE_TUI_MEM_VERBOSE` | — | `1` = 上面那行再展开成 key + 正文摘要（要配合 `LITE_TUI_MEM_NOTICE`） |
 | `LITE_MEMORY_MB` | 100 | `mem.bin` 容量 |
 | `LITE_MEMORY_FLUSH` | 30 | 落盘间隔（秒） |
 | `LITE_MEMORY_DIR` | — | 覆盖 `mem.bin` 所在目录 |

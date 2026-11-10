@@ -438,6 +438,33 @@ local function add_term(terms, seen, term)
     end
 end
 
+-- 虚字表：CJK bigram 里两个音节都只是语气/代词/结构助词时，这条 term 不携带任何
+-- 语义信息，却几乎每句中文都命中（「为什么」→ 为什/什么 曾把「为什么停下」召回到
+-- 跟当前话题毫无关系的旧消息）。判据是「两个字都在表里」，只要有一个实词就放行，
+-- 所以「为什么每个指令」里的 每个/个指/指令 不受影响。
+local STOP_CHARS = {}
+do
+    local s = "的了吗呢吧啊呀嘛哦是我不你他她它们这那哪有和就都也还再又很太更最"
+        .. "为什怎何如么样个些一上下中要会能可对把被给让从向于在以与及而但却只"
+        .. "话说用做去来到过起出得地道着之其此该每"
+    local i = 1
+    while i <= #s do
+        local b = s:byte(i)
+        local n = (b < 0x80) and 1 or (b < 0xE0 and 2 or (b < 0xF0 and 3 or 4))
+        STOP_CHARS[s:sub(i, i + n - 1)] = true
+        i = i + n
+    end
+end
+
+local function all_stop(term)
+    local chars = utf8_chars(term)
+    if #chars == 0 then return false end
+    for _, ch in ipairs(chars) do
+        if not STOP_CHARS[ch] then return false end
+    end
+    return true
+end
+
 -- ASCII 词 + CJK bigram，避免中文 query 退化成“随机命中”。
 local function build_terms(query)
     local terms, seen = {}, {}
@@ -448,10 +475,14 @@ local function build_terms(query)
     for _, ch in ipairs(chars) do
         if #ch > 1 then cjk[#cjk + 1] = ch end
     end
-    if #cjk == 1 then add_term(terms, seen, cjk[1]) end
+    if #cjk == 1 and not STOP_CHARS[cjk[1]] then add_term(terms, seen, cjk[1]) end
     for i = 1, #chars - 1 do
         local a, b = chars[i], chars[i + 1]
-        if #a > 1 and #b > 1 then add_term(terms, seen, a .. b) end
+        if #a > 1 and #b > 1 then
+            local term = a .. b
+            -- 全虚字的 bigram 不参与打分：它在几乎每句中文里都命中，IDF 也压不住。
+            if not all_stop(term) then add_term(terms, seen, term) end
+        end
     end
 
     if #terms > 32 then
@@ -569,6 +600,19 @@ function M:recall(query, limit, opts)
     local session_prefix = "/agent/session/"
     local want_session = opts.session_id and (session_prefix .. tostring(opts.session_id) .. "/") or nil
 
+    -- 自命中闸门：本轮刚落盘的用户原文（以及最近 skip_recent 条 msg）不参与召回。
+    -- 它们本来就在窗口里，query 又正是这句话本身（prompt.recall_query 把最新 user 文本
+    -- 直接当查询串），所以 100% 命中，白占名额把长期事实挤掉。
+    local skip_text = opts.skip_text and tostring(opts.skip_text) or nil
+    local cutoff_seq
+    do
+        local n = tonumber(opts.skip_recent) or 0
+        if want_session and n > 0 then
+            local ok_c, cnt = pcall(self.session_message_count, self, opts.session_id)
+            if ok_c and tonumber(cnt) then cutoff_seq = tonumber(cnt) - n end
+        end
+    end
+
     -- 打分候选池：先收集原文（hay），扫完再统一按 IDF + 长度 + 年龄打分。
     -- 旧版 hits/#terms 让 200 字笔记和 2 万字整段对话同分，同分又按 a.key<b.key
     -- 排序（字典序里 msg<turn<working，越旧越靠前），所以召回质量一直不稳。
@@ -615,6 +659,10 @@ function M:recall(query, limit, opts)
         -- 早先回退成 { c = r.value } 会把这些字节原样拼进 prompt。
         if not ok or type(data) ~= "table" then return end
         if kind == "user" and data.role ~= "user" then return end
+        if kind == "user" and cutoff_seq then
+            local seq = tonumber(r.key:match("/(%d+)$") or "")
+            if seq and seq > cutoff_seq then return end
+        end
         local text
         if kind == "user" then
             if type(data.content) ~= "string" then return end
@@ -625,6 +673,7 @@ function M:recall(query, limit, opts)
             text = tostring(data.c or data.a or "")
         end
         if text == "" then return end
+        if skip_text and skip_text ~= "" and text == skip_text then return end
         local tl = {}
         for _, t in ipairs(data.tags or {}) do tl[#tl + 1] = tostring(t):lower() end
         out[#out + 1] = {
