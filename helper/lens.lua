@@ -75,6 +75,32 @@
 --        pick_next_task 换成 pick_task(rq, rf)（sched.h:2637），pick_task_fair 对外导出
 --        netif_receive_skb_core 是导出的非双下划线包装（dev.c:6289）
 --      结论标 [verified]（读到了具体源码行）/ [static]（仅从索引推断）。
+--
+-- [13] 【静默坑】ns（KV 键前缀）错一个斜杠 = 读到旧数据却报 count=0。
+--     键就是 `<ns>/...` 原文，`code/x` 与 `/code/x` 是两套互不可见的前缀：import 用
+--     ns="code/linux" 写进 code/linux/*，查询默认拼 /code/linux/* → 一条不中，
+--     而 read 侧还可能命中上一次构建残留的旧 key（不报错，只给你旧答案）。
+--     三道防线（改行为时别拆）：
+--       a. norm_ns() 统一补前导 '/'（两种写法都落 /code/x），非法字符直接报错带协议；
+--       b. import 成功就把 ns 钉进 `<analysis>/namespace.txt`，paths() 优先读它
+--          → import / query 不可能各写一套前缀；索引目录名与 repo 名不一致时
+--          （/opt/code_caches/linux_7212_cache）靠目录名反推本来就会推错；
+--       c. 已有 namespace.txt 且与本次 ns 不同 → 只 WARN 不覆盖（可能是有意的另一套）。
+--     自查：build 输出里的 ns 与 `cat <analysis>/namespace.txt` 不一致 = 踩了这条。
+--
+-- [14] 没有向量时 search 不会退化，它直接「没用」：do_search 在 g_ve 为空时只返回
+--     一条 {"_note":"Vector engine not initialized..."} 的假结果（query.c:934 的
+--     !g_ve 分支）；关键词 boost 只是在向量命中上重排，不是关键词兜底。所以：
+--       · build 阶段缺模型/ORT 会跳过 vectorize（输出 "vectorize skipped
+--         (model/onnxruntime missing)"），status 的 vectors 字段随之变成 none；
+--       · 缺向量时查符号要走 symbol/exact/context，别用 search，也别信它的空结果。
+--
+-- [15] analysis_dir 与 kv_dir 是两样东西，别混：analysis 放 chunks/call_graph/
+--     dataflow.json 与向量，kv 才是查询真正读的键值库（默认 <analysis>/kv）。
+--     只拿到旧 cache 的 analysis 却没重跑 import → status 看得见几十 M 的
+--     call_graph.json，查询却全空（旧 KV 里连 /code 前缀的键都没有）；
+--     只拷 kv 没有 analysis → 符号/调用边能查，但 status 全是 missing、没有向量
+--     （search 只有 _note）、locate 的窗口还得靠 repo 文件本身在。两者要同源同版本。
 -- ═══════════════════════════════════════════════════════════════════════════════
 
 local CS = require("ffi.codesearch")
@@ -153,6 +179,24 @@ local function ns_from_dir(dir)
     return "/code/" .. safe_name((base:gsub("_cache$", "")))
 end
 
+-- 手工传 ns 时统一补前导 '/'。KV 键前缀就是 ns 原文，`code/x` 与 `/code/x` 是两套
+-- 互不可见的键空间：import 写错一个斜杠，查询侧仍是 /code/x → 读到的是上一次构建留下的
+-- 旧 key，表现为「重建了但 dataflow 还是垃圾」，且不报错。归一化让两种写法都落到 /code/x；
+-- 非法字符则直接报错（带原参数 + 期望格式），别让它静默写进一套查不到的前缀。
+local function norm_ns(ns)
+    if not ns or ns == "" then return nil end
+    local raw = tostring(ns)
+    ns = (raw:gsub("%s+", "")):gsub("^/+", "")
+    if not ns:match("^[%w%._%-/]+$") then
+        -- 报错回报**原始入参**，别报归一化后的串：否则 `code/x y!` 被剥成 `code/xy!`，
+        -- 用户对着报错找不回自己写的那个值（这里要的是可自修，不是整洁）。
+        error(string.format(
+            "codesearch: bad ns %q (required: ns like \"/code/<repo>\" / [A-Za-z0-9._-/:])",
+            raw), 0)
+    end
+    return "/" .. ns
+end
+
 local has_index, index_candidates   -- 定义在下方，paths() 里先用
 
 local function paths(args, ctx)
@@ -175,7 +219,8 @@ local function paths(args, ctx)
     local kv = args.kv_dir or (analysis .. "/kv")
     -- ns 跟着「实际用的索引目录」走，否则 fallback/analysis_dir 换目录时 ns 还留在 repo 名上，
     -- 查询会一条不中却报 count=0（错误不可自修）。build 侧同样走 paths()，两边一致。
-    local ns = args.ns or marker_ns(analysis) or ns_from_dir(analysis) or ("/code/" .. project)
+    local ns = norm_ns(args.ns) or marker_ns(analysis) or ns_from_dir(analysis)
+        or ("/code/" .. project)
     return repo, project, analysis, kv, ns
 end
 
@@ -867,7 +912,19 @@ local function run_inner(args, ctx)
             check_stage("import", CS.logged("import", logpath, function()
                 return CS.import(analysis, ns, kv, false)
             end), logpath)
-            return "import ok: " .. ns .. " -> " .. kv .. "\n日志: " .. logpath
+            -- 把 ns 钉进 <analysis>/namespace.txt：查询侧优先读它，import 与 query 从此
+            -- 不可能各写一套前缀。已有且不一致时只提示不覆盖（可能是别人有意的另一套）。
+            local note, marker = "", marker_ns(analysis)
+            if marker and marker ~= ns then
+                note = string.format(
+                    "\nWARN: %s/namespace.txt says %s, imported as %s"
+                    .. "\n      queries will still read %s (pass ns= explicitly or fix that file)",
+                    analysis, marker, ns, marker)
+            elseif not marker then
+                local f = io.open(analysis .. "/namespace.txt", "w")
+                if f then f:write(ns, "\n"); f:close(); note = "\nns pinned: " .. analysis .. "/namespace.txt" end
+            end
+            return "import ok: " .. ns .. " -> " .. kv .. note .. "\n日志: " .. logpath
         elseif action == "status" then
             local d = CS.check(analysis)
             if not d then error("codesearch: status failed", 0) end
