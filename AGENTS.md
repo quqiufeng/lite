@@ -325,7 +325,69 @@ libcurl `CURLOPT_USERPWD`，凭据不进 argv/m3u）、`app_<class>_map.lua`（`
 所以「不热插拔」只针对第 2 步的**工具清单**：改插件实现立刻生效（第 5 步重读），
 新建/删除 `.lua` 才需要重启；钩子走 `has_hooks`（`:1366`）旁路，与工具派发无关。
 
-## 7 参考实现（新功能先查）
+## 7 持续自主进化（原理与流程）
+
+**前提**：进化任务由人下达。lite 没有内在目标，也不需要——它不是要变成有意图的主体，
+是**接到任务就能把能力补齐的执行器**。所以「自己发现缺口」不是要求，「缺能力不降级」才是。
+
+### 7.1 闭环四环
+
+| 环 | 动作 | 入口 | 保底 |
+|---|---|---|---|
+| 感知 | 内置工具够吗 / 系统 `.so` 有吗 / `helper/` 已有吗 | `ldconfig -p`、`nm -D --defined-only`、`lite plugins` | 三者都不行才造 |
+| 造 | 现成库 → `ffi.load`；要 C → `native build`；进仓库 → `src/` | §6 选路优先级 | `lua` 内联跑一次 |
+| 验 | 真实输入 + 空/非法/超限三边界 | `native run`、进程外 `./tools/lite-lua -e` | 硬验证推远程实例（`design.md:D10`） |
+| 留 | 一次性 → `helper/`；下个会话也该有 → `tools/` + 测试 + 本文档 | `native wrap` / 手写 `{schema,run}` | `reboot` 让清单可见 |
+
+### 7.2 原理：靠摩擦小，不靠聪明
+
+代价全压到秒级，「缺什么造什么」才是日常动作而不是大工程：
+
+| 环节 | 代价 |
+|---|---|
+| 造 | `native build` 秒级；`helper/*.so` 随仓库走（`!helper/*.so`），clone 下来直接能调 |
+| 试 | 进程外 `lua`（30s 超时），崩了不带崩 agent |
+| 退 | `git checkout` + 重编 + `/reboot`（`build/` 未跟踪，只回源码跑的是旧 `.so`） |
+| 留 | `helper/` 验完升级进 `tools/`，补测试与文档 |
+
+**没有事前判准是选择，不是缺失**：质量好坏由模型判断、由人下任务定义，harness 只负责
+让验证和回退都便宜。试错成本低时不需要精确的 fitness function——所以 `tools/test.sh`
+（68 行）只测契约（能调通、结构对）、不测性能基线，属于正常。
+
+`helper/` 里多版本 `.so` 入库无害：`_helper_so_abs`（`lua/core/tools.lua:1134`）按
+`<name>.json` 清单的 `so` 字段取，**不按时间戳排序**，每次 `native build` 重写清单即自愈。
+本地都会重编，可以不清理。
+
+### 7.3 知识从哪来，冲突听谁的
+
+| 源 | 内容 | 腐坏方式 |
+|---|---|---|
+| **代码** | 唯一真相 | 不错，但会变；注解总落后于它 |
+| **gitlog** | 跨实例、跨会话的推导与坑 | 只增不清 |
+| `AGENTS.md` | 反复踩到才升级的规则 | 落后于代码 |
+| `mem.bin` | 本机、本实例的局部经验 | 陈旧；`recall` 字面匹配，召回失败模型自己看不见 |
+
+- **冲突时代码赢**，然后顺手修注解（§4 要求引用写 `file:symbol` 就是这个桥）。
+- **跨实例知识放 gitlog**：`git pull` 一次即合并、带时间与作者、不可变（改它要改历史）。
+  `mem.bin` **不进 git 是对的**——它是缓存不是真相，各实例局部经验本就该不同。
+- commit 纪律：**subject 做目录，body 记「为什么」和「反着改会踩什么」**，结论标
+  `[static]`/`[verified]`。踩过一次 → 写 body；踩过两次 → 升级进本文档。
+- 现场探查（`nm`/`man`/`ldconfig`/`web`）是获取途径但不写盘：一次性结论别塞 `mem.bin`。
+
+### 7.4 多实例怎么收敛
+
+各实例**最后代码一致**就够；一致 = 源码一致 + 重编 + `reboot`。`build/` 未跟踪，安装版
+`lua/` 是软链而 `build/liblite_*.so` 是 install 时的实体拷贝，只 `build.sh` 会得到
+「新源码配旧二进制」（见 §6 那张表）。
+
+- **单写者**：slave 验过才 commit，master 只 `git pull` + 重编 + `reboot`，不各写一份历史
+  （`design.md:D10`）；两边各自 commit 再合 = 第三份谁都没验过的代码。
+- **长任务开远程实例（分身）**：`LITE_REBOOT_MAX`（默认 3）链上限、进程内临时态（异步
+  bash、连接复用）清零、同目录 `mem.lock` 单写实例这些麻烦自然消失，主工作区与主记忆
+  一个字节不动。`serve` 走 `net.listen(host, port)`（`lua/core/serve.lua:138`）是 TCP
+  而非 unix socket，所以主实例能连上去看 slave 在干什么。
+
+## 8 参考实现（新功能先查）
 
 参考：Pi `/opt/pi-mono`、Reasonix `/opt/reasonix`、opencode `/opt/opencode`；缓存
 `/opt/code_caches/<name>_cache`。逐项目查，不 cross-search，只借鉴思路。
