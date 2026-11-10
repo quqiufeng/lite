@@ -53,8 +53,8 @@ echo "OK cli.json"
 
 echo "== plugins =="
 OUT="$("$ROOT/tools/run.sh" plugins --json || true)"
-if ! echo "$OUT" | grep -q '"name":"codesearch"'; then
-    echo "FAIL plugins.codesearch (helper/codesearch.lua not loaded)" >&2
+if ! echo "$OUT" | grep -q '"name":"lens"'; then
+    echo "FAIL plugins.lens (helper/lens.lua not loaded)" >&2
     exit 1
 fi
 echo "OK plugins.json"

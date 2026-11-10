@@ -4,6 +4,10 @@
 被改造成**一个共享库 + JSON API + LuaJIT FFI + helper 插件**：没有外部 CLI、没有子进程
 流水线，所有入口都在同一进程内完成。
 
+> **命名**：工具名已由 `codesearch` 改为 **`lens`**（`helper/lens.lua`，文件名即工具名）。
+> 本文下方示例里的 `codesearch action=...` 一律读作 `lens action=...`；
+> 模块与产物仍叫 codesearch：`src/codesearch/`、`liblite_codesearch.so`、数据目录 `~/.local/share/lite/codesearch/`。
+
 ```
 ctags 切块 ──► 词频 ──► 调用图 ──► 数据流 ──► KV 导入 ──► 向量化 ──► HNSW
    index      word_freq  callgraph  dataflow    import      vectorize   hnsw
@@ -52,7 +56,7 @@ shell 里（不经过模型）：
 R=/home/quqiufeng/Desktop/lite
 cd /path/to/repo
 $R/tools/lua.sh -e '
-local H = dofile(os.getenv("LITE_ROOT") .. "/helper/codesearch.lua")
+local H = dofile(os.getenv("LITE_ROOT") .. "/helper/lens.lua")
 print(H.run({ action = "build", path = "." }, { cwd = os.getenv("PWD") }))
 '
 ```
@@ -150,7 +154,7 @@ status
 Lua 侧：
 
 - `lua/ffi/codesearch.lua`：FFI 封装，JSON → Lua 表。
-- `helper/codesearch.lua`：agent 工具 `codesearch`，负责路径、编排和文本摘要。
+- `helper/lens.lua`：agent 工具 `lens`（旧名 `codesearch`），负责路径、编排和文本摘要。
 
 构建产物：`build/liblite_codesearch.so`。
 
@@ -185,7 +189,7 @@ namespace 默认是 `/code/<project>`。
 
 **不要重跑 build**：下面 15 份索引都在 `/opt/code_caches/<project>_cache/`，
 按 `project=<name>`（不带 `_cache` 后缀）就能直接用——`paths()` 会在默认目录落空时
-去 `/opt/code_caches/` 里按 `<name>_cache` 匹配（`helper/codesearch.lua:index_candidates`）。
+去 `/opt/code_caches/` 里按 `<name>_cache` 匹配（`helper/lens.lua:index_candidates`）。
 
 | project | 源码根 | chunks | 体积 | KV | 能查什么 |
 |---|---|---|---|---|---|
@@ -436,7 +440,7 @@ codesearch action=build path=/path/to/project
 R=/home/quqiufeng/Desktop/lite
 cd /path/to/project
 $R/tools/lua.sh -e '
-local H = dofile(os.getenv("LITE_ROOT") .. "/helper/codesearch.lua")
+local H = dofile(os.getenv("LITE_ROOT") .. "/helper/lens.lua")
 print(H.run({ action = "build", path = "." }, { cwd = os.getenv("PWD") }))
 '
 ```
@@ -635,7 +639,7 @@ Unchanged: 352294 vectors reused; skip rewrite and HNSW rebuild
 ```bash
 R=/home/quqiufeng/Desktop/lite
 $R/tools/lua.sh -e '
-local H = dofile(os.getenv("LITE_ROOT") .. "/helper/codesearch.lua")
+local H = dofile(os.getenv("LITE_ROOT") .. "/helper/lens.lua")
 local base = { project = "linux_7212",
                analysis_dir = "/opt/code_caches/linux_7212_cache" }
 print(H.run({ action = "symbol", query = "vfs_read", max_results = 1,
@@ -667,7 +671,7 @@ metadata），峰值约 **4.2GB**。之前 KV 打开会扫描整个 mem.bin，�
 R=/home/quqiufeng/Desktop/lite
 LITE_CS_KV_MAX_GB=8 LITE_CS_HNSW_THREADS=6 LITE_CS_HNSW_EF=100 \
 $R/tools/lua.sh -e '
-local H = dofile(os.getenv("LITE_ROOT") .. "/helper/codesearch.lua")
+local H = dofile(os.getenv("LITE_ROOT") .. "/helper/lens.lua")
 print(H.run({
   action = "build",
   path = "/opt/linux/src/linux-7.2.12",
@@ -850,7 +854,7 @@ codesearch action=search query="socket 接收数据路径" max_results=8
 ```bash
 R=/home/quqiufeng/Desktop/lite
 $R/tools/lua.sh -e '
-local H = dofile(os.getenv("LITE_ROOT") .. "/helper/codesearch.lua")
+local H = dofile(os.getenv("LITE_ROOT") .. "/helper/lens.lua")
 print(H.run({
   action = "search",
   query = "compact 怎么触发",
@@ -934,7 +938,7 @@ CS.query({ query = "epoll", repo = "/code/project", type = "search",
 | 项 | /opt/my_db | lite codesearch |
 |---|---|---|
 | 形态 | 多个 CLI + shell 脚本 | 一个 `.so` + JSON API |
-| 调用 | `ai_code_search.sh` / `tools/*` | `helper/codesearch.lua` / FFI |
+| 调用 | `ai_code_search.sh` / `tools/*` | `helper/lens.lua` / FFI |
 | 日志 | stdout / stderr 混用 | 库内日志统一 stderr |
 | 索引并行 | 默认多进程 | 库内默认串行，`fork=true` 显式开 |
 | 临时文件 | 固定 `/tmp` 名 | 带父进程 pid，支持多实例 |

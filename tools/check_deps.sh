@@ -172,7 +172,7 @@ done
 
 # codesearch（可选）：语义搜索需要 tokenizers-cpp 静态库、ONNX Runtime、Jina 模型。
 # 词法/符号/调用图/数据流只需要 ctags + jansson；缺 tokenizers 时 CMake 会跳过
-# lite_codesearch target，helper/codesearch.lua 不可用但其余功能不受影响。
+# lite_codesearch target，helper/lens.lua 不可用但其余功能不受影响。
 CS_TOK="${LITE_CS_TOKENIZERS_DIR:-$ROOT/third_party/codesearch/lib/tokenizers-cpp}"
 if [ -f "$CS_TOK/libtokenizers_c.a" ]; then
     echo "[OK]   codesearch tokenizers $CS_TOK"

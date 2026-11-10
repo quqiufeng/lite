@@ -2,7 +2,7 @@
 
 > 本文是 **code search 系统的使用最佳实践**。
 > 把 codedump《如何阅读源代码》方法论（agent skill: [lichuang/how-to-read-code](https://github.com/lichuang/how-to-read-code)）
-> 作为工作流骨架，把 lite 的 codesearch（`helper/codesearch.lua` + 项目 `kv/`）作为检索底座，
+> 作为工作流骨架，把 lite 的 lens（旧名 codesearch，`helper/lens.lua` + 项目 `kv/`）作为检索底座，
 > 目标：**有纪律、有真相、有横向参照地**探索一个陌生开源项目。
 >
 > lite 的实现、命令和依赖见 `README.md`；本文只讲「怎么用才高效、才不出错」。
@@ -37,40 +37,47 @@
 | 9 | **无产出不算读过** | 每阶段留下图/笔记/repro；最终交付结构化读码报告 |
 | 10 | **索引纪律是前提** | `action=build` 一条龙（index→import→vectorize 配套）、索引任务串行、`batch=128`、老 analysis 目录先 chown，否则搜索结果不可信 |
 
+> **起手式（默认动作）**：`lens action=locate query="<模块/概念>"` —— 命中 + 内联源码窗口
+> 一次拿到，不用再为「读一眼」单独发 `read`。要收窄就 `action=peek path=<file> line=N`；
+> 只有需要**字面/正则**匹配时才 `action=grep pattern=<re> path=<file|dir>`（整仓 grep 会被护栏拒掉）。
+
 ---
 
 ## 2. 命令约定
 
-lite 只有**一个入口**：`codesearch` 工具（实现 `helper/codesearch.lua`，底座 `liblite_codesearch.so`）。
+lite 只有**一个入口**：`lens` 工具（旧名 `codesearch`；实现 `helper/lens.lua`，底座 `liblite_codesearch.so`）。
 仓库里**没有** `ai_code_search.sh` / `tools/cache_query` / `tools/vector_search` / `tools/ctx.py` /
 `tests/validate_tools.sh`，看到旧文档里的这些名字一律按本节映射，不要去调。
 
 ```text
-codesearch action=... query=... path=... project=... [max_results] [depth] [kind] [lang] [file] [json]
+lens action=... query=... path=... project=... [max_results] [depth] [kind] [lang] [file] [json]
 ```
 
 | 字段 | 含义 |
 |---|---|
-| `action` | `build` `index` `import` `search` `symbol` `context` `exact` `dataflow` `status` |
+| `action` | `locate` `peek` `grep` `build` `index` `import` `search` `symbol` `context` `exact` `dataflow` `status` |
 | `path` | 仓库路径（`index`/`build` 用，默认 cwd） |
 | `project` | 项目名（默认仓库目录名）；决定 analysis 目录 `~/.local/share/lite/codesearch/<project>` 与 KV 命名空间 `/code/<project>` |
 | `query` | 符号名 / 自然语言 / `exact` 的完整 KV key |
 | `depth` | `context` 向上展开调用链深度（0–5） |
 | `kind`/`lang`/`file` | 过滤（`function/struct/...`、`c/cpp/python/...`、文件名子串） |
-| `json` | 返回原始 JSON |
+| `json` | 返回原始 JSON（`locate`/`peek`/`grep` 只出文本，源码窗口不适合塞 JSON） |
 
 shell 侧等价写法（一行封装，复制即用；`tools/lua.sh` 是仓库里真实存在的 LuaJIT 入口。
-**在 lite 仓库根下执行**——`loadfile("helper/codesearch.lua")` 是相对路径；换目录用
+**在 lite 仓库根下执行**——`loadfile("helper/lens.lua")` 是相对路径；换目录用
 `LITE_CWD=<lite 仓库根> cs ...`）：
 
 ```bash
-cs() { LITE_LUA_ARGS="$1" ./tools/lua.sh -e 'local j=require("cjson"); local t=assert(loadfile("helper/codesearch.lua"))(); print(t.run(j.decode(os.getenv("LITE_LUA_ARGS")), {cwd=os.getenv("PWD")}))'; }
+cs() { LITE_LUA_ARGS="$1" ./tools/lua.sh -e 'local j=require("cjson"); local t=assert(loadfile("helper/lens.lua"))(); print(t.run(j.decode(os.getenv("LITE_LUA_ARGS")), {cwd=os.getenv("PWD")}))'; }
 cs '{"action":"status","project":"lite"}'
 cs '{"action":"search","query":"event loop epoll","project":"nginx","max_results":10}'
 ```
 
 | 需求 | 调用 |
 |---|---|
+| **一步「搜 + 读」（**首选起手式**，省掉一次 `read` 往返）** | `action=locate query="..." [max_results=3] [lines=40] [before=2] [kind=] [lang=] [file=]` → 命中 + 内联带行号源码窗口 + `-- next --`（context/grep 建议）；语义没命中或没向量时自动退回 `symbol`，top1 `score<0.35` 会显式警告 |
+| **file:line 定点读** | `action=peek path=<file> line=N [lines=40] [before=5]`，或 `query=<fn>` 让工具自己定位定义处 |
+| **作用域 grep（配 cgrep 原生）** | `action=grep pattern=<re> [path=<file|dir>] [fixed=] [ext=] [max_hits=] [per_file=]`；**>3000 文件的目录直接拒扫**（提示先 `locate` 收窄，`LITE_CS_GREP_MAX_FILES` 可放宽） |
 | **探索前置检查**（chunks/向量/HNSW/KV 是否齐） | `action=status project=<p>` |
 | 语义搜索（自然语言→file:line，默认 brief） | `action=search query="..." max_results=N [kind=] [lang=] [file=]` |
 | 单函数完整角色（caller/callee/调用链/dataflow） | `action=context query=<fn> depth=N` |
@@ -132,7 +139,7 @@ jq -r '[ .[] | .calls[] | .function ] | group_by(.) | map({f:.[0], n:length})
 ```
 断点 → bt 得真实调用栈                         # [verified]
    ↓ 对每一帧
-codesearch action=context query=<frame> project=<p> depth=2
+lens action=context query=<frame> project=<p> depth=2
    → 符号 + callers + callees + call_sites + dataflow
    ↓
 「真路径 + 每步角色」→ 报告第 4 节 sequence diagram
@@ -300,7 +307,7 @@ cs "{\"action\":\"dataflow\",\"query\":\"cache_set\",\"project\":\"$P\"}"
 - 路径：`.opencode/skill/how-to-read-code-with-search/SKILL.md`
 - 内容：§4 的 Phase 映射 + §3 证据分级 + §8 报告模板，附 `templates/report-template.md`
 - frontmatter `description` 命中「读一下这个项目 / 分析这个模块 / how does X work internally」
-- 前置探测：`codesearch action=status project=<p>`，无 `chunks_meta.jsonl` / `.hnsw` / `kv/mem.bin` 则提示先 `action=build`
+- 前置探测：`lens action=status project=<p>`，无 `chunks_meta.jsonl` / `.hnsw` / `kv/mem.bin` 则提示先 `action=build`
 
 **一句话**：原 skill 教 agent「怎么读」，本系统给 agent「读得快、看得全、能对比」的检索底座；
 合起来 = **有纪律、有真相、有横向参照的代码探索**。
