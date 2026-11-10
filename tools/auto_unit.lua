@@ -408,6 +408,11 @@ do
         "tool schemas omit empty required objects")
     local okw = t:execute("write", { path = "a.txt", content = "hello\nworld\n" })
     check(okw:find("wrote", 1, true) ~= nil, "tools write")
+    -- append=true：长文档分段落盘（第一次 write，之后 append）
+    local okap = t:execute("write", { path = "a.txt", content = "tail\n", append = true })
+    check(okap:find("appended", 1, true) ~= nil, "tools write append")
+    check(t:execute("read", { path = "a.txt" }):find("tail", 1, true) ~= nil,
+        "tools write append keeps old content")
     local r = t:execute("read", { path = "a.txt" })
     check(r:find("hello", 1, true) ~= nil, "tools read")
     local e = t:execute("edit", { path = "a.txt", old = "world", new = "lite" })
@@ -600,6 +605,9 @@ do
     } } } } }))
     P.feed(p, "data: [DONE]\n\n")
     local msg = P.finish(p)
+    local p2 = P.new_parser()
+    P.feed(p2, chunk({ choices = { { delta = { content = "x" }, finish_reason = "length" } } }))
+    check(P.finish(p2).finish == "length", "provider finish_reason carried")
     check(msg.content == "Hello", "provider content")
     check(table.concat(p.reasoning) == "thinking...", "provider reasoning")
     check(msg.tool_calls and #msg.tool_calls == 1, "provider tool calls")

@@ -131,6 +131,9 @@ function M.finish(p)
         end
         if #tcs > 0 then msg.tool_calls = tcs end
     end
+    -- finish 是本地诊断信息（判断输出是否被 max_tokens 截断），build_request
+    -- 的 strip_local_fields 会把它剔掉，不会发给 provider。
+    if type(p.finish) == "string" and p.finish ~= "" then msg.finish = p.finish end
     return msg
 end
 
@@ -311,12 +314,45 @@ function M.estimate_usage(payload, res)
     }
 end
 
+-- 本地诊断字段（finish / 以下划线开头的键）不能出现在请求体里。只有极少数
+-- 助手消息带它们，按需浅拷贝，其余历史原样复用，长会话不会因此变慢。
+local function strip_local_fields(messages)
+    local out, dirty = nil, false
+    for i = 1, #messages do
+        local m = messages[i]
+        local extra = false
+        for k in pairs(m) do
+            if k == "finish" or (type(k) == "string" and k:sub(1, 1) == "_") then
+                extra = true
+                break
+            end
+        end
+        if extra then
+            if not dirty then
+                out = {}
+                for j = 1, i - 1 do out[j] = messages[j] end
+                dirty = true
+            end
+            local c = {}
+            for k, v in pairs(m) do
+                if k ~= "finish" and not (type(k) == "string" and k:sub(1, 1) == "_") then
+                    c[k] = v
+                end
+            end
+            out[i] = c
+        elseif dirty then
+            out[i] = m
+        end
+    end
+    return out or messages
+end
+
 local function build_request(messages, tools, opts)
     if not opts.api_key or opts.api_key == "" then
         return nil, nil, nil, "missing DEEPSEEK_API_KEY"
     end
 
-    local cleaned, fixed = clean_messages(messages)
+    local cleaned, fixed = clean_messages(strip_local_fields(messages))
     local body = {
         model = opts.model or "deepseek-flash",
         messages = cleaned,

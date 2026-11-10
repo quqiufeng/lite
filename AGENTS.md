@@ -114,8 +114,10 @@ Chrome/WebView/CEF/Electron；不起 `xdotool/wmctrl/import`；不用 `systemd -
 
 工具失败要**可自修**：报错带原参数 + `required` 键 + 退出码语义（`tools.exit_note`：
 124 超时 / 126 不可执行 / 127 未找到），同一调用连续失败第 2 次起追加
-`[this exact call has now failed N times]`，成功时清账。多文件只读用
-`read` 的 `paths` 数组批量读（N 个文件 1 次往返），图片一次一张。
+`[this exact call has now failed N times]`，成功时清账。工具参数 JSON 非法时先看报错里的
+`finish_reason`：`length` = 输出撞了 `LITE_MAX_OUTPUT_TOKENS`，参数被截断，**不是模型写错
+JSON**——把那次调用拆小（长文档用 `write` 的 `append=true` 分段落盘），别原样重试。
+多文件只读用 `read` 的 `paths` 数组批量读（N 个文件 1 次往返），图片一次一张。
 
 ## 6 原生扩展
 

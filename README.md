@@ -45,6 +45,8 @@ export DEEPSEEK_API_KEY=...   # 或写进 .env / ~/.config/lite/.env
 - 失败可自修：报错带原始参数 + `required` 键 + 退出码语义（124 超时 /126 不可执行 /127 未找到）；
   同一调用连续失败第 2 次起追加 `[this exact call has now failed N times]`，成功清账。
 - `read` 支持文本/目录/图片，`paths` 数组一次读 N 个文件（图片一次一张）。
+- `write` 有 `append=true`：长文档分段落盘，`write`(新建) → `write`(append) 循环，
+  别指望一次请求写完（超 `LITE_MAX_OUTPUT_TOKENS` 会把参数 JSON 截断）。
 - `bash` 异步执行，长命令不冻结 TUI，`Ctrl+C` 取消；`--approval ask|deny` 逐次确认。
 
 随包插件（`./tools/run.sh plugins` 看本机实际加载）：
@@ -125,7 +127,7 @@ return {
 | `LITE_CONTEXT_TURNS` | 16 | 摘要尾巴的 user 轮数上限 |
 | `LITE_CONTEXT_WINDOW` | 64000 | 模型窗口 tokens（算触发线与 output limit） |
 | `LITE_RESERVE_TOKENS` | 8192 | 预留输出 tokens |
-| `LITE_MAX_OUTPUT_TOKENS` | 8192 | 单次输出上限 |
+| `LITE_MAX_OUTPUT_TOKENS` | 8192 | 单次输出上限；超限时工具参数 JSON 会被截断（报错里带 `finish_reason=length`，按截断处理而不是当成模型写错 JSON） |
 | `LITE_TOKEN_BUDGET` | 0 | 会话 token 预算，0 不限 |
 | `LITE_COMPACT` | 0 | `1` = 先摘要（有三段式 checkpoint），默认丢弃优先 |
 | `LITE_KEEP_RATIO` | 0.6 | 丢窗口时保留比例（0.3~0.95） |

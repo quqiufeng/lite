@@ -954,14 +954,30 @@ function M:_loop(text, stream)
             if args == nil then
                 -- 把原发参数串和该工具的必填项回传，模型能自己修好这条调用。
                 local raw = tostring(fn.arguments or "")
-                if #raw > 300 then raw = raw:sub(1, 300) .. "..." end
-                result = "error: invalid tool arguments JSON; you sent: " .. raw
+                -- 保留头尾：截断总是发生在尾部，只看开头会误判成"语法写错"。
+                local shown = raw
+                if #raw > 400 then
+                    shown = raw:sub(1, 200) .. " …[" .. #raw .. " bytes]… " .. raw:sub(-160)
+                end
+                result = "error: invalid tool arguments JSON (" .. #raw .. " bytes); you sent: " .. shown
                 local req = {}
                 if self.tools.required_args then req = self.tools:required_args(name) end
                 if #req > 0 then
                     result = result .. "; required: " .. table.concat(req, ", ")
                 end
-                result = result .. ". Send valid JSON with these keys."
+                if assistant.finish == "length" then
+                    -- 真因是 max_tokens 截断，不是语法错误：必须说清楚，否则模型
+                    -- 会把同一段内容原样再发一遍，每次都断在同一位置。
+                    local cap = self.ctx and self.ctx.settings
+                        and self.ctx.settings.max_output_tokens or nil
+                    result = result .. ". THE OUTPUT WAS CUT OFF BY max_tokens"
+                        .. (cap and (" (" .. tostring(cap) .. ")") or "")
+                        .. ": the JSON is incomplete, retrying verbatim will fail again. "
+                        .. "Send a much smaller payload and finish the file in several calls: "
+                        .. "write the first section, then append the rest."
+                else
+                    result = result .. ". Send valid JSON with these keys."
+                end
             else
                 ctx:set_status("tool")
                 ctx:emit("tool_start", name, args)

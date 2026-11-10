@@ -489,12 +489,17 @@ function M:schemas()
             type = "function",
             ["function"] = {
                 name = "write",
-                description = "Write a text file in the workspace.",
+                description = "Write a text file in the workspace. append=true adds to the end "
+                    .. "instead of replacing, for writing long files in several calls.",
                 parameters = {
                     type = "object",
                     properties = {
                         path = { type = "string" },
                         content = { type = "string" },
+                        append = {
+                            type = "boolean",
+                            description = "append to the file instead of overwriting (default false)",
+                        },
                     },
                     required = { "path", "content" },
                 },
@@ -1755,16 +1760,22 @@ function M:lua(args)
     return truncate(out)
 end
 
-function M:write(path, content)
+-- append=true 追加写：长文件分多次落盘（第一次 write，之后 append），
+-- 避免单次输出被 max_tokens 截断时整段内容白写。
+function M:write(path, content, append)
     local abs, err = self:resolve(path)
     if not abs then return "error: " .. err end
     local dir = abs:match("^(.*)/[^/]+$")
     if dir and dir ~= "" then os.execute("mkdir -p " .. shq(dir)) end
-    local f, oerr = io.open(abs, "wb")
+    local mode, how = "wb", "wrote"
+    if append then
+        mode, how = "ab", "appended"
+    end
+    local f, oerr = io.open(abs, mode)
     if not f then return "error: " .. tostring(oerr) end
     f:write(content or "")
     f:close()
-    return string.format("wrote %d bytes to %s", #(content or ""), abs)
+    return string.format("%s %d bytes to %s", how, #(content or ""), abs)
 end
 
 function M:edit(path, old, new)
@@ -1859,7 +1870,7 @@ function M:execute(name, args)
             return self:native(args.action, args.name, args.code, args.lang, args.libs,
                 args.input, args.lua, args.description, args.parameters, args.scope)
         elseif name == "write" then
-            return self:write(args.path, args.content or "")
+            return self:write(args.path, args.content or "", args.append)
         elseif name == "edit" then
             return self:edit(args.path, args.old, args.new)
         elseif name == "remember" then
