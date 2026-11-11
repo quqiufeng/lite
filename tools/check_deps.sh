@@ -141,24 +141,43 @@ else
     echo "[WARN] tmux missing (tui.smoke skipped)"
 fi
 
-# litehtml（可选）：HTML→PNG 渲染后端 liblite_html.so 的外部依赖，不随包
+# litehtml（HTML→PNG 渲染后端 liblite_html.so）：编译期要 /opt/litehtml 的头与库，
+# 运行期靠随包的三件套（build/liblite_html.so + liblitehtml.so.0 + libgumbo.so.0，见
+# tools/package.sh），目标机不需要 /opt/litehtml。所以这里先判「能不能跑」，
+# 再判「源码树里能不能编」——安装版只关心前者。
+if [ -f "$ROOT/build/liblite_html.so" ]; then
+    echo "[OK]   liblite_html $ROOT/build/liblite_html.so"
+    # 私有依赖必须在同一个目录里（$ORIGIN 自解析），缺了就是打包漏件
+    missing_priv=()
+    for so in liblitehtml.so.0 libgumbo.so.0; do
+        [ -f "$ROOT/build/$so" ] || missing_priv+=("$so")
+    done
+    if [ ${#missing_priv[@]} -eq 0 ]; then
+        echo "[OK]   lite_html 私有依赖随包 (liblitehtml.so.0, libgumbo.so.0)"
+    else
+        echo "[WARN] lite_html 缺私有依赖 ${missing_priv[*]} in $ROOT/build → html->png 加载失败"
+        echo "         重装可修：./tools/release.sh（package.sh 会从 /opt/litehtml 拷进来）"
+    fi
+else
+    echo "[INFO] build/liblite_html.so missing (html->png 不可用；./tools/build.sh 生成)"
+fi
 LI_HEAD="${LITEHTML_INC:-/opt/litehtml/include}"
 LI_LIB="${LITEHTML_LIB:-/opt/litehtml/build-pic/liblitehtml.so}"
 if [ -f "$LI_HEAD/litehtml.h" ] && [ -f "$LI_LIB" ]; then
-    echo "[OK]   litehtml $LI_LIB"
+    echo "[OK]   litehtml 编译期 $LI_LIB"
 elif pkg-config --exists cairo 2>/dev/null && [ -f "$LI_LIB" ]; then
-    echo "[OK]   litehtml $LI_LIB (headers under $LI_HEAD)"
+    echo "[OK]   litehtml 编译期 $LI_LIB (headers under $LI_HEAD)"
 else
-    echo "[INFO] litehtml missing (html->png needs /opt/litehtml; LITEHTML_INC/LITEHTML_LIB)"
+    echo "[INFO] litehtml 编译期缺失 (从源码构建 html->png 才需要 /opt/litehtml)"
 fi
-# litehtml 的 HTML 解析器（dlopen 依赖，缺了渲染起不来）
+# litehtml 的 HTML 解析器：编译期用来链接，运行期随包
 LI_GUMBO="${LITEHTML_GUMBO:-/opt/litehtml/build-pic/src/gumbo/libgumbo.so.0}"
-if [ -f "$LI_LIB" ]; then
-    if [ -f "$LI_GUMBO" ]; then
-        echo "[OK]   libgumbo  $LI_GUMBO"
-    else
-        echo "[WARN] libgumbo missing ($LI_GUMBO) → liblite_html.so 加载失败"
-    fi
+if [ -f "$LI_GUMBO" ]; then
+    echo "[OK]   libgumbo  $LI_GUMBO"
+elif [ -f "$ROOT/build/libgumbo.so.0" ]; then
+    echo "[OK]   libgumbo  随包 ($ROOT/build/libgumbo.so.0)"
+else
+    echo "[WARN] libgumbo missing ($LI_GUMBO 与 build/) → liblite_html.so 加载失败"
 fi
 # 随包字体（helper/assets）：cairo 无回退，缺了中文/★ 静默出方框
 for f in DroidSansFallbackFull.ttf DejaVuSansMono.ttf; do

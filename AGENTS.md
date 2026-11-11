@@ -131,6 +131,17 @@ Chrome/WebView/CEF/Electron；不起 `xdotool/wmctrl/import`；不用 `systemd -
   一个完整周期；新会话无快照即关闭态。逻辑与单测见 `lua/tui/watchdog.lua`
   （`state`/`restore`）、`lua/tui/loop.lua:watchdog_save`、`tools/auto_unit.lua:tui watchdog`。
 
+**HTML→PNG 三件套随包**：`md2png`/`web2png`/`trending` 都走 `build/liblite_html.so`，
+它 NEEDED `liblitehtml.so.0` + `libgumbo.so.0`，三者摆**同一目录**靠 `$ORIGIN` 自解析
+（`CMakeLists.txt` 的 lite_html 段已把 gumbo 升成直接 NEEDED）。`tools/package.sh` 会
+`ldd` 出解析路径落在 `$LITEHTML_PREFIX`（默认 `/opt/litehtml`）下的库一起打进 dist 与
+安装目录，**系统库（cairo/fontconfig/X11/freetype）一律用目标机自己那份**——fontconfig
+依赖 `/etc/fonts` 和系统字体目录，随包只会更难排查。所以：源码树要 `/opt/litehtml` 才能
+**编**，安装版不需要它也能**跑**；`./tools/check_deps.sh` 分「能不能跑」（看
+`build/` 三件套全不全）与「能不能编」两行报。缺件时的报错由 `helper/md2png.lua` 给出
+（源码树 `build.sh` / 安装版 `release.sh`），别把 `libgumbo.so.0: cannot open shared object`
+误读成「liblite_html 没编译」。
+
 工具输出 ≤ 32KB；`read` 文本/目录限 workspace，图片可读 `$TMPDIR:/tmp:/var/tmp`；
 `bash` 可异步长跑，TUI 里 `Ctrl+C` 取消。回归测试先在修复前 commit 确认 FAIL。
 

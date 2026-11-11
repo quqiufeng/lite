@@ -60,12 +60,25 @@ set_target_properties(lite_capture PROPERTIES
 add_library(lite_html SHARED src/html/render.cpp)
 target_include_directories(lite_html PRIVATE /opt/litehtml/include)
 target_link_libraries(lite_html PRIVATE /opt/litehtml/build-pic/liblitehtml.so cairo fontconfig)
+# libgumbo 升成 liblite_html.so 的直接 NEEDED。原因：liblitehtml.so.0 自己声明的
+# RUNPATH 是绝对值 /opt/litehtml/build-pic/src/gumbo，目标机没这目录时 dlopen 链会在
+# 它的依赖上断掉（liblitehtml 找到、libgumbo 找不到），随包的 .so 于是不自洽。
+# 直接 NEEDED 后 $ORIGIN 生效，三个 .so 摆同一目录即可自解析。
+# --no-as-needed 必需：render.cpp 不直接引用 gumbo 符号，默认 --as-needed 会把它丢掉。
+set(LITEHTML_GUMBO_DIR "/opt/litehtml/build-pic/src/gumbo" CACHE PATH
+    "Directory containing libgumbo.so.0 (litehtml's HTML parser)")
+set(LITE_HTML_GUMBO "${LITEHTML_GUMBO_DIR}")
+if(EXISTS "${LITE_HTML_GUMBO}/libgumbo.so.0")
+    target_link_libraries(lite_html PRIVATE
+        "-Wl,--no-as-needed" "${LITE_HTML_GUMBO}/libgumbo.so.0" "-Wl,--as-needed")
+    message(STATUS "lite_html: 直接链接 ${LITE_HTML_GUMBO}/libgumbo.so.0（随包自解析）")
+endif()
 target_compile_options(lite_html PRIVATE -O2 -Wall)
 set_target_properties(lite_html PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
     OUTPUT_NAME lite_html
     BUILD_RPATH "$ORIGIN;/opt/litehtml/build-pic"
-    INSTALL_RPATH "${CMAKE_BINARY_DIR}")
+    INSTALL_RPATH "$ORIGIN")
 
 # ---------------- codesearch（从 /opt/my_db 迁移） ----------------
 # 语义搜索需要 tokenizers-cpp 静态库与 ONNX Runtime（运行期 dlopen）。

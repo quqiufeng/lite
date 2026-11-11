@@ -114,6 +114,46 @@ if [ -f "$ROOT/build/liblite_image.so" ]; then
     rm -f "$LDD_TMP"
 fi
 
+# HTML→PNG 渲染后端：liblite_html.so + 它的私有依赖。
+#
+# 目标机没有 /opt/litehtml，而安装版的候选路径恰好是 $LITE_ROOT/build/liblite_html.so
+# （helper/md2png.lua、web2png.lua、trending 都靠它），早先这里只打 cache/codesearch，
+# 安装版一调 md2png 就报「缺 build/liblite_html.so，先跑 ./tools/build.sh」。
+#
+# 收谁：[ldd] 里真实解析路径落在 $LITEHTML_PREFIX（默认 /opt/litehtml）下的库 ——
+# 那正是目标机不会自带的私有依赖（liblitehtml.so.0、libgumbo.so.0）。
+# cairo/fontconfig/X11/freetype 这些一律跳过：它们必须用**目标机自己那份**
+# （fontconfig 依赖 /etc/fonts 与系统字体目录，硬塞一份 2MB 的进包只会更难排查）。
+#
+# 三个 .so 摆同一目录自解析：liblite_html.so 已把 libgumbo 升成直接 NEEDED 且
+# RUNPATH 是 $ORIGIN（见 CMakeLists.txt 的 lite_html 段），liblitehtml 的
+# 绝对 RUNPATH 找不到 gumbo 时由本目录的 $ORIGIN 兜住。
+LITEHTML_PREFIX="${LITEHTML_PREFIX:-/opt/litehtml}"
+if [ -f "$ROOT/build/liblite_html.so" ]; then
+    cp "$ROOT/build/liblite_html.so" "$DIST/build/"
+    LDD_TMP="$(mktemp)"
+    ldd "$ROOT/build/liblite_html.so" >"$LDD_TMP" 2>/dev/null || true
+    bundled=()
+    while read -r so arrow path _; do
+        [ "$arrow" = "=>" ] || continue
+        [ -n "$path" ] && [ -f "$path" ] || continue
+        real="$(realpath "$path" 2>/dev/null || echo "$path")"
+        case "$real" in
+            "$LITEHTML_PREFIX"/*) ;;   # 私有依赖，随包
+            *) continue ;;             # 系统库，用目标机自己的
+        esac
+        cp -L "$path" "$DIST/build/$so"
+        bundled+=("$so")
+    done <"$LDD_TMP"
+    rm -f "$LDD_TMP"
+    if [ ${#bundled[@]} -gt 0 ]; then
+        echo "package: lite_html 随包私有依赖: ${bundled[*]}"
+    else
+        echo "package: [WARN] liblite_html.so 未解析出 $LITEHTML_PREFIX 下的依赖，" >&2
+        echo "         目标机若缺 liblitehtml/libgumbo，html→png 起不来" >&2
+    fi
+fi
+
 for f in lite-lua lua.sh lite run.sh check_deps.sh build.sh test.sh install.sh package.sh release.sh launch.sh \
          ort_link.sh cuda_provider.sh see.lua; do
     [ -f "$ROOT/tools/$f" ] && cp "$ROOT/tools/$f" "$DIST/tools/"

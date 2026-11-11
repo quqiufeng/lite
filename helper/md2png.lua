@@ -172,7 +172,15 @@ local function render_png(html, out, w, h, scale, env)
     local ok, l = pcall(ffi.load, p)
     if ok then lib = l break end
   end
-  if not lib then error("缺 build/liblite_html.so，先跑 ./tools/build.sh") end
+  if not lib then
+    -- 安装版：$LITE_ROOT/build/ 里除了 liblite_html.so 还必须躺着它的私有依赖
+    -- liblitehtml.so.0 + libgumbo.so.0（同一目录 $ORIGIN 自解析，由 tools/package.sh 带入）。
+    -- 只缺后两者时 dlopen 报的是 "libgumbo.so.0: cannot open shared object"，别误判成没编译。
+    error("缺 " .. cands[1] .. " / " .. cands[2] .. "\n"
+      .. "  源码树：./tools/build.sh\n"
+      .. "  安装版：./tools/release.sh（打包会带上 liblitehtml.so.0 + libgumbo.so.0）\n"
+      .. "  自检：./tools/check_deps.sh | grep lite_html")
+  end
   if lib.lite_html_render(html, out, w, h, scale) ~= 0 then
     error("lite_html_render 失败（检查 PNG 路径可写、字体目录 helper/assets 存在）")
   end
