@@ -57,7 +57,7 @@ local function candidate_dotenvs(get, cwd)
         end
     end
 
-    -- 近处优先：cwd → 父目录 → ~/.config/lite/.env → 安装目录。
+    -- 近处优先：cwd → 父目录 → ~/.config/lite/.env → ~/.env → 安装目录。
     local dir = cwd
     for _ = 1, 10 do
         add(dir:gsub("/+$", "") .. "/.env")
@@ -66,7 +66,25 @@ local function candidate_dotenvs(get, cwd)
         dir = parent
     end
     local home = get("HOME")
-    if home and home ~= "" then add(home .. "/.config/lite/.env") end
+    if home and home ~= "" then
+        -- lite 专用在前，通用的 ~/.env 兜底（很多人只维护后者）。
+        add(home .. "/.config/lite/.env")
+        add(home .. "/.env")
+    end
+    -- `sudo lite` 会把 HOME 换成 /root 并按 env_reset 清掉进程环境里的 key，
+    -- 但保留 SUDO_USER。此时补上调用者自己的两份 .env：凭据仍只活在原来那份
+    -- 0600 文件里，既不进命令行参数（ps 可见），也不复制到 /root。
+    local sudo_user = get("SUDO_USER")
+    if sudo_user and sudo_user ~= "" and sudo_user ~= "root" then
+        -- 家目录根可覆盖（/home2、macOS 的 /Users；测试也靠它造夹具）。
+        local base = get("LITE_HOME_ROOT")
+        if not base or base == "" then base = "/home" end
+        local user_home = base:gsub("/+$", "") .. "/" .. sudo_user
+        if user_home ~= home then
+            add(user_home .. "/.config/lite/.env")
+            add(user_home .. "/.env")
+        end
+    end
     local root = get("LITE_ROOT")
     if root and root ~= "" then add(root:gsub("/+$", "") .. "/.env") end
     return out

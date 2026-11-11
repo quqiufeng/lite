@@ -106,8 +106,11 @@ MUST NOT：不用 `python`/`sed -i` 改仓库文件（用 `edit`/`write`）；�
 Chrome/WebView/CEF/Electron；不起 `xdotool/wmctrl/import`；不用 `systemd --user`；
 不用 `pkill -f`；不把 API Key 或 `$ROOT/lib` 写进仓库/`LD_LIBRARY_PATH`。
 
-**密钥规范**：密钥只活在环境变量里。人写 `~/.config/lite/.env`（或 workspace `.env`），
-`tools/lua.sh` / `run.sh` 启动时注入进程环境，脚本和插件一律 `os.getenv` 读；
+**密钥规范**：密钥只活在环境变量里。人写 `~/.config/lite/.env`、通用的 `~/.env` 或
+workspace `.env`（优先级 cwd/上级 → `~/.config/lite/.env` → `~/.env` → `$LITE_ROOT`，
+`$LITE_ENV_FILE` 一给就独占），`tools/lua.sh` / `run.sh` 启动时注入进程环境，脚本和插件一律 `os.getenv` 读；
+`sudo` 下 HOME 变 `/root` 且 env_reset 清环境，靠 `SUDO_USER` 补读
+`$LITE_HOME_ROOT`（默认 `/home`）`/<user>/.config/lite/.env` 与 `/<user>/.env`；
 仓库文件里不出现字面量 key、不 `print` key、不把 key 拼进命令行参数（`ps` 可见）。
 `tools/auto_unit.lua` 里有一条机械检查扫 `helper/` + `lua/` 的 `sk-` 字面量，
 占位符（`sk-test`、`sk-...`）放过。

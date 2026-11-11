@@ -13,9 +13,11 @@
 #      都能命中，同目录的依赖库也靠 SONAME 一起解析到；预加载失败会打到 stderr
 #      （LITE_PRELOAD_WARN=0 可静音），别再靠"库找不到"猜。
 #   4. 读 .env 把 API Key 之类导进环境：脚本里 os.getenv("DEEPSEEK_API_KEY")
-#      直接可用。顺序 = cwd → 上级目录 → ~/.config/lite/.env → $LITE_ROOT/.env，
+#      直接可用。顺序 = cwd → 上级目录 → ~/.config/lite/.env → ~/.env → $LITE_ROOT/.env，
 #      近处优先；**已经存在的进程环境变量优先于任何 .env**（想全关：
 #      LITE_ENV_FILE=/dev/null；想指定单文件：LITE_ENV_FILE=/path/to/.env）。
+#      `sudo` 下 HOME 被换成 /root 且 env_reset 清掉进程环境，改用 SUDO_USER
+#      补读 /home/<user>/.config/lite/.env 与 /home/<user>/.env。
 # 不改 LD_LIBRARY_PATH（会污染 bash 子进程，见 lite-lua 注释）：自带 .so 靠
 # $ORIGIN RUNPATH 找同目录依赖，workspace 依赖靠上面的预加载兜住。
 set -euo pipefail
@@ -72,7 +74,16 @@ else
         _d="$_up"
         _i=$((_i + 1))
     done
-    if [ -n "${HOME:-}" ]; then _lite_dotenv "$HOME/.config/lite/.env"; fi
+    if [ -n "${HOME:-}" ]; then
+        _lite_dotenv "$HOME/.config/lite/.env"
+        _lite_dotenv "$HOME/.env"
+    fi
+    # sudo 换了 HOME 并清掉进程环境，但保留 SUDO_USER：补回调用者那两份。
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        _d="${LITE_HOME_ROOT:-/home}"; _d="${_d%/}"
+        _lite_dotenv "$_d/$SUDO_USER/.config/lite/.env"
+        _lite_dotenv "$_d/$SUDO_USER/.env"
+    fi
     _lite_dotenv "$ROOT/.env"
 fi
 

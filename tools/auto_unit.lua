@@ -119,7 +119,57 @@ do
     hfile:close()
     local merged = require("core.config").load({ HOME = home, PWD = home })
     check(merged.api_key == "sk-global", "config dotenv merge")
-    os.execute("rm -rf " .. shq(root) .. " " .. shq(home))
+
+    -- 只有 ~/.env（没有 ~/.config/lite/）：也得读到
+    local h2 = os.tmpname()
+    os.remove(h2)
+    os.execute("mkdir -p " .. shq(h2))
+    local h2f = io.open(h2 .. "/.env", "w")
+    h2f:write("DEEPSEEK_API_KEY=sk-dotenv-home\n")
+    h2f:close()
+    local dotenv_home = require("core.config").load({ HOME = h2, PWD = "/" })
+    check(dotenv_home.api_key == "sk-dotenv-home", "config dotenv ~/.env only")
+
+    -- lite 专用那份压过通用的 ~/.env
+    local h3 = os.tmpname()
+    os.remove(h3)
+    os.execute("mkdir -p " .. shq(h3 .. "/.config/lite"))
+    local h3g = io.open(h3 .. "/.config/lite/.env", "w")
+    h3g:write("DEEPSEEK_API_KEY=sk-lite-specific\n")
+    h3g:close()
+    local h3f = io.open(h3 .. "/.env", "w")
+    h3f:write("DEEPSEEK_API_KEY=sk-generic\nOTHER=1\n")
+    h3f:close()
+    local prio = require("core.config").load({ HOME = h3, PWD = "/" })
+    check(prio.api_key == "sk-lite-specific", "config dotenv ~/.config/lite wins over ~/.env")
+
+    -- sudo：HOME 变成 /root 且进程环境被清，靠 SUDO_USER 找回发行用户那份
+    local hroot = os.tmpname()
+    os.remove(hroot)
+    os.execute("mkdir -p " .. shq(hroot .. "/alice/.config/lite") .. " " .. shq(hroot .. "/bob"))
+    local af = io.open(hroot .. "/alice/.config/lite/.env", "w")
+    af:write("DEEPSEEK_API_KEY=sk-sudo-alice\n")
+    af:close()
+    local bf = io.open(hroot .. "/bob/.env", "w")
+    bf:write("DEEPSEEK_API_KEY=sk-sudo-bob\n")
+    bf:close()
+    local nobody = require("core.config").load({ HOME = "/root", PWD = "/", LITE_HOME_ROOT = hroot })
+    check(nobody.api_key == nil, "config dotenv no SUDO_USER = no leak")
+    local su = require("core.config").load({
+        HOME = "/root", PWD = "/", LITE_HOME_ROOT = hroot, SUDO_USER = "alice",
+    })
+    check(su.api_key == "sk-sudo-alice", "config dotenv SUDO_USER lite-specific")
+    local su2 = require("core.config").load({
+        HOME = "/root", PWD = "/", LITE_HOME_ROOT = hroot, SUDO_USER = "bob",
+    })
+    check(su2.api_key == "sk-sudo-bob", "config dotenv SUDO_USER ~/.env")
+    -- 发行用户自己的 HOME 已经可读时不再重复加同一份（保留优先级不串）
+    local su3 = require("core.config").load({
+        HOME = hroot .. "/alice", PWD = "/", LITE_HOME_ROOT = hroot, SUDO_USER = "alice",
+    })
+    check(su3.api_key == "sk-sudo-alice", "config dotenv SUDO_USER same HOME")
+    os.execute("rm -rf " .. shq(root) .. " " .. shq(home) .. " " .. shq(h2)
+        .. " " .. shq(h3) .. " " .. shq(hroot))
 end
 
 -- prompt assembly
