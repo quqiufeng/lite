@@ -3738,6 +3738,39 @@ do
     os.execute("rm -rf " .. shq(dir))
 end
 
+-- Session.from_memory: 原 cwd 目录还活着（两个项目共用一份 mem.bin）→ 不许认领
+do
+    local dir = os.tmpname()
+    os.remove(dir)
+    os.execute("mkdir -p " .. shq(dir))
+    local Context = require("context")
+    local Session = require("core.session")
+    local Memory = require("core.memory")
+
+    local alive = dir .. "-alive"
+    os.execute("mkdir -p " .. shq(alive))
+    local mem = assert(Memory.new({ dir = dir, max_mb = 16 }))
+    local ctx = Context.new({ cwd = alive, id = "other-proj" })
+    mem:ensure_session("other-proj", alive, "m")
+    local s = Session.new(ctx, { dir = dir, memory = mem })
+    s:append({ role = "user", content = "other project turn" })
+    s:append({ role = "assistant", content = "other project answer" })
+
+    -- 从另一个目录找：别的会话的 cwd 还在磁盘上 → 不抢
+    check(Session.from_memory(mem, "/tmp/somewhere-else", 5, dir) == nil,
+        "from_memory: live foreign cwd is not claimed")
+    local meta = mem:session_meta("other-proj")
+    check(meta and meta.cwd == alive, "from_memory: foreign meta.cwd untouched")
+
+    -- 原目录消失（真搬家）→ 才认领
+    os.execute("rm -rf " .. shq(alive))
+    local prev = Session.from_memory(mem, "/tmp/after-move", 5, dir)
+    check(prev ~= nil and prev.id == "other-proj" and prev.claimed == true,
+        "from_memory: vanished cwd is claimed")
+    mem:close()
+    os.execute("rm -rf " .. shq(dir))
+end
+
 -- session for_cwd: 父目录不得命中子目录的会话（子串匹配的老 bug）
 do
     local dir = os.tmpname()

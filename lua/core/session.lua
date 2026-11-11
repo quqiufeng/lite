@@ -206,19 +206,33 @@ function M.from_memory(memory, cwd, limit, jsonl_dir)
     local hit = pick(memory:list_sessions(cwd, limit or 5))
     if hit then return hit end
 
-    -- 2) 兜底：cwd 名下没有可恢复的会话，但 mem.bin 里还有别的会话（搬了目录、
-    --    或只留下一个 turns=0 的空壳）。mem 文件跟着目录走，会话也该跟着接上，
-    --    所以取最近一条有消息的会话，并把它的 meta.cwd 改写成本目录（认领），
-    --    下次直接走路径 1。
+    -- 2) 兜底认领，但只认「原 cwd 目录已经不在磁盘上」的会话（真搬家/改名）。
+    --    同一个 mem.bin 里可以躺着好几个 cwd 的会话（多项目共用一份库、或库被
+    --    cp 到别处），原目录还活着就绝不能动 —— 否则在两个项目里来回启动会互相
+    --    抢对方的会话，还会把 meta.cwd 永久改写，历史从此错位。
+    local function orphaned(p)
+        if p == nil or p == "" then return true end  -- 没记 cwd 的会话本就没有归属
+        return os.rename(p, p) == nil                 -- 路径不存在
+    end
     local recent
     if type(memory.list_all_sessions) == "function" then
-        recent = pick(memory:list_all_sessions(20))
+        for _, meta in ipairs(memory:list_all_sessions(20) or {}) do
+            if orphaned(meta.cwd) then
+                recent = pick({ meta })
+                if recent then break end
+            end
+        end
     end
     if recent then
-        if memory.touch_session and recent.cwd ~= cwd then
+        local from = recent.cwd
+        if memory.touch_session and from ~= cwd then
             memory:touch_session(recent.id, cwd)
         end
-        recent.claimed = recent.cwd ~= cwd
+        recent.claimed = from ~= cwd
+        if recent.claimed then
+            io.stderr:write(string.format("lite: claimed session %s (was %s)\n",
+                tostring(recent.id), tostring(from or "-")))
+        end
         return recent
     end
 
