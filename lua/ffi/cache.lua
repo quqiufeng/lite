@@ -49,20 +49,10 @@ size_t cache_purge_expired(cache_t* cache);
 int cache_check(const char* db_dir);
 ]]
 
-local root = os.getenv("LITE_ROOT") or "."
-local candidates = {
-    root .. "/build/liblite_cache.so",
-    "./build/liblite_cache.so",
-    "liblite_cache.so",
-}
-local lib, load_err
-for _, p in ipairs(candidates) do
-    local ok, h = pcall(ffi.load, p)
-    if ok then lib = h; break end
-    load_err = h
-end
+-- 候选顺序统一在 ffi/libfind.lua：$LITE_ROOT/build → $LITE_ROOT/lib → 源码树 → ./build → 裸名
+local lib, lib_path, load_err = require("ffi.libfind").load("liblite_cache.so")
 if not lib then
-    error("cannot load liblite_cache.so: " .. tostring(load_err))
+    error(load_err)
 end
 
 local M = {}

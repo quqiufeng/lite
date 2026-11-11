@@ -65,10 +65,13 @@ M.display = display
 
 local function capture_lib()
     if M._capture_lib ~= nil then return M._capture_lib or nil end
+    -- 顺序与 ffi/libfind.lua 一致（$LITE_ROOT/build → lib → 老布局绝对路径 → 裸名），
+    -- 但本文件要能整对拷给别的项目，所以候选表内联，不 require lite 的模块。
     local root = os.getenv("LITE_ROOT")
     local candidates = {
-        root and (root:gsub("/+$", "") .. "/lib/liblite_capture.so"),
         root and (root:gsub("/+$", "") .. "/build/liblite_capture.so"),
+        root and (root:gsub("/+$", "") .. "/lib/liblite_capture.so"),
+        "/usr/local/share/lite/build/liblite_capture.so",
         "/usr/local/share/lite/lib/liblite_capture.so",
         "liblite_capture.so",
     }

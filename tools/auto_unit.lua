@@ -2417,6 +2417,34 @@ do
         "preload failure is reported")
     check(shrun("LITE_PRELOAD_WARN=0 LITE_PRELOAD=/nonexistent/liblite_zzz.so " .. shq(lroot .. "/tools/lite-lua")
         .. " -e " .. shq('print("ran")')) == "ran", "LITE_PRELOAD_WARN=0 silences it")
+    -- ffi/libfind.lua：所有 liblite_*.so 用同一套候选顺序（$LITE_ROOT/build → lib → 源码树 → ./build → 裸名）。
+    -- tools/lua.sh 会把 LITE_ROOT 钉成它自己的安装根（见上面 preload 段），
+    -- 所以要验优先级只能起裸 luajit（仓库自带那份在 PATH 里）。
+    local fake = dir .. "/fakeroot"
+    os.execute("mkdir -p " .. shq(fake .. "/build") .. " " .. shq(fake .. "/lib"))
+    local fake_so = fake .. "/build/liblite_image.so"
+    local function libfind_probe()
+        return shrun("cd " .. shq(lroot) .. " && LITE_ROOT=" .. shq(fake) .. " luajit -e "
+            .. shq('package.path="lua/?.lua;" .. package.path; local lf = require("ffi.libfind"); '
+                .. 'local c = lf.candidates("liblite_image.so"); '
+                .. 'local h, p = lf.load("liblite_image.so"); '
+                .. 'io.write(c[1] .. "|" .. c[2] .. "|" .. tostring(c[#c]) .. "|P=" .. tostring(p))'))
+    end
+    local function tail_of(probe) return (probe:match("P=(%S*)") or "") end
+    os.execute("rm -f " .. shq(fake_so))
+    local probe = libfind_probe()
+    check(probe:find(fake .. "/build/liblite_image.so", 1, true) ~= nil,
+        "libfind puts $LITE_ROOT/build first")
+    check(probe:find("|liblite_image.so|", 1, true) ~= nil, "libfind falls back to bare name")
+    check(tail_of(probe):sub(-#"/build/liblite_image.so") == "/build/liblite_image.so"
+        and tail_of(probe):find(fake, 1, true) == nil,
+        "libfind loads a real build copy when $LITE_ROOT has none")
+    -- 新旧混编（只 build.sh 没 release.sh）要吭声：假 LITE_ROOT 里放个坏库，跳过它并警告
+    os.execute("head -c 4096 /dev/urandom > " .. shq(fake_so))
+    local probe2 = libfind_probe()
+    check(probe2:find("新旧混编", 1, true) ~= nil, "libfind warns when two copies differ")
+    check(tail_of(probe2):sub(-#"/build/liblite_image.so") == "/build/liblite_image.so",
+        "libfind skips a broken copy and keeps going")
 
     -- 仓库内部调用（run.sh/test.sh/check_deps.sh）保持精简，不带 workspace 路径与预加载
     check(shrun(shq(lroot .. "/tools/lite-lua") .. " -e "

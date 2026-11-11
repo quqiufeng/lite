@@ -46,6 +46,11 @@ AI-native harness：记忆、工具、FFI、X11。
   **lite 仓库自身不做索引**（`~/.local/share/lite/codesearch/` 下不保留 `lite` 那一份）：
   自己改自己就 `read`/`cgrep`/`edit`，语义检索丢给 `cgrep` + 代码地图，别为查自己跑
   `lens build`（几十分钟换不到有用信息，还占几百 M）。`lens` 只服务于**外部**项目。
+- `lua/ffi/libfind.lua`：`liblite_*.so` 的**唯一**解析顺序，
+  `$LITE_ROOT/build/` → `$LITE_ROOT/lib/` → 模块所在树 → `./build|lib` → 裸名；
+  cache/codesearch/image 都走它（只有 `x11.lua` 因自包含约束内联同样的顺序）。
+  命中后若另一份候选长度不同就往 stderr 打一行警告——「只 `build.sh` 没 `release.sh`」
+  的新旧混编由此暴露，别再各自维护候选表。
 - `lua/ffi/x11.lua` + `xdo.lua`：**自包含单文件**（只用 LuaJIT `ffi` + 系统 libX11/libxdo，不引用 lite 代码、不注册工具），可整对拷给别的项目；`x11.lua` 靠 `require("ffi.xdo")` 找同伴，换布局要同步改这一行
 - `lua/tui/mouse.lua` + `clipboard.lua`：拖选/剪贴板；选区在 `screen.lua`
 

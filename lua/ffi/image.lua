@@ -6,25 +6,11 @@ int lite_image_resize(const char *src, const char *dst, int width, int height, i
 const char *lite_image_error(void);
 ]]
 
-local root = os.getenv("LITE_ROOT")
-local candidates = {
-    root and (root:gsub("/+$", "") .. "/lib/liblite_image.so"),
-    root and (root:gsub("/+$", "") .. "/build/liblite_image.so"),
-    "liblite_image.so",
-    "/usr/local/share/lite/lib/liblite_image.so",
-    "/usr/local/lib/liblite_image.so",
-}
-
-local lib, load_err
-for _, path in ipairs(candidates) do
-    if path then
-        local ok, h = pcall(ffi.load, path)
-        if ok then lib = h; break end
-        load_err = h
-    end
-end
-
-if lib then load_err = nil end
+-- 候选顺序统一在 ffi/libfind.lua：$LITE_ROOT/build → $LITE_ROOT/lib → 源码树 → ./build → 裸名；
+-- 末尾两个绝对路径只是老安装布局的兜底。
+local lib, lib_path, load_err = require("ffi.libfind").load("liblite_image.so", {
+    extra = { "/usr/local/share/lite/lib/liblite_image.so", "/usr/local/lib/liblite_image.so" },
+})
 
 local M = {}
 

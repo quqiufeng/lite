@@ -41,60 +41,13 @@ local function env(name)
     return nil
 end
 
-local function self_root()
-    local src = (debug.getinfo(1, "S") or {}).source or ""
-    local path = src:match("^@(.+)$")
-    local dir = path and path:match("^(.*)/[^/]+$")
-    local root = dir and dir:match("^(.*)/[^/]+/[^/]+$")
-    if root and root ~= "" then return root end
-end
-
-local ROOTS = {}
-for _, r in ipairs({ self_root(), ".", env("LITE_ROOT") }) do
-    r = (r or ""):gsub("/+$", "")
-    if r ~= "" and r ~= "/" then ROOTS[#ROOTS + 1] = r end
-end
-
-local function exists(p)
-    local f = io.open(p, "rb")
-    if f then f:close(); return true end
-    return false
-end
-
--- 有源码的 root（含 src/codesearch/）优先：那里的 build/*.so 一定是刚编出来的新库。
--- 安装目录（$LITE_ROOT）只有 build/ 没有源码，排后面兜底。不这么分会被软链坑到：
--- lua/ 软链到源码时模块路径是 /usr/local/share/lite/lua/...，self_root() 解析出的是
--- 安装目录，于是老库永远先命中（踩过：symbol 查询返回空，实际跑的是几天前的旧 .so）。
-local SOURCE_TREES, OTHER_TREES = {}, {}
-for _, base in ipairs(ROOTS) do
-    local t = exists(base .. "/src/codesearch/api.c") and SOURCE_TREES or OTHER_TREES
-    t[#t + 1] = base
-end
-
-local function first_file(paths)
-    for _, p in ipairs(paths) do
-        if exists(p) then return p end
-    end
-end
-
-local LIB
-local load_err
-local explicit = env("LITE_CS_LIB")
-local candidates = {}
-if explicit then candidates[#candidates + 1] = explicit end
-for _, t in ipairs({ SOURCE_TREES, OTHER_TREES }) do
-    for _, base in ipairs(t) do
-        candidates[#candidates + 1] = base .. "/build/liblite_codesearch.so"
-        candidates[#candidates + 1] = base .. "/lib/liblite_codesearch.so"
-    end
-end
-candidates[#candidates + 1] = "liblite_codesearch.so"
-
-local path = first_file(candidates)
-if path then
-    local ok, h = pcall(ffi.load, path)
-    if ok then LIB = h else load_err = h end
-end
+-- 候选顺序统一在 ffi/libfind.lua：$LITE_ROOT/build → $LITE_ROOT/lib → 源码树 → ./build → 裸名。
+-- LITE_CS_LIB 显式指定仍然排第一（调试单个 .so 用）。
+-- 顺序统一后要留心：只跑 ./tools/build.sh 没跑 release.sh 时，源码树的新库会被
+-- 安装目录的旧副本遮蔽——libfind 会在长度不一致时往 stderr 打一行警告。
+local LIB, path, load_err = require("ffi.libfind").load("liblite_codesearch.so", {
+    explicit = env("LITE_CS_LIB"),
+})
 
 local M = { available = LIB ~= nil, lib = LIB, path = path }
 
