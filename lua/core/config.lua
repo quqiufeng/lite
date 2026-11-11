@@ -85,9 +85,12 @@ local function load_dotenv_merged(get, cwd)
 end
 
 -- 优先级：注入 env / 进程环境 > .env > ~/.config/lite/config.lua > 默认值。
+-- 传了 env 表 = 由它**完全接管**环境读取（不再回落到 os.getenv）：否则调用方
+-- 无法表达「这个键就是没有」，宿主 shell 里的 DEEPSEEK_API_KEY 会把夹具里的
+-- .env 值盖掉，测试永远拿不到自己写的那份。生产路径都是无参 load()。
 function M.load(env)
     local function get(k)
-        if env and env[k] ~= nil then return env[k] end
+        if env then return env[k] end
         return os.getenv(k)
     end
 
