@@ -3656,7 +3656,7 @@ do
     os.execute("rm -rf " .. shq(dir))
 end
 
--- Session.from_memory: 恢复只认 mem.bin；KV 空时即使全局 JSONL 有同名会话也不返回
+-- Session.from_memory: KV 一条会话都没有（mem.bin 损坏被重建/被截断）→ 用 JSONL 备份兜底
 do
     local dir = os.tmpname()
     os.remove(dir)
@@ -3666,18 +3666,75 @@ do
     local Memory = require("core.memory")
     local ctx = Context.new({ cwd = "/tmp/kvonly", id = "kv1" })
 
-    -- 只写 JSONL，不写 KV
+    -- 只写 JSONL，不写 KV：就是 cache.c 把坏 mem.bin 改名后重建空库的现场
     local s = Session.new(ctx, { dir = dir, id = "kv1" })
     s:append({ role = "system", content = "<cwd>\n/tmp/kvonly\n</cwd>" })
     s:append({ role = "user", content = "jsonl only" })
+    s:append({ role = "assistant", content = "ok" })
 
-    local mem = Memory.new({ dir = dir, max_mb = 32 })
+    local mem = Memory.new({ dir = dir .. "/kv", max_mb = 32 })
     check(mem ~= nil, "from_memory: memory open")
     if mem then
-        check(Session.from_memory(mem, "/tmp/kvonly", 5) == nil,
-            "from_memory: ignores jsonl only")
+        local prev = Session.from_memory(mem, "/tmp/kvonly", 5, dir)
+        check(prev ~= nil and prev.id == "kv1", "from_memory: recovers from jsonl backup")
+        check(prev ~= nil and prev.from_jsonl == true, "from_memory: marks from_jsonl")
+        check(prev ~= nil and #prev.messages == 3 and prev.turn == 1,
+            "from_memory: jsonl backup messages + turn")
+
+        -- 恢复时回写 KV：第二次直接走正常路径，不再标 from_jsonl
+        local again = Session.from_memory(mem, "/tmp/kvonly", 5, dir)
+        check(again ~= nil and again.id == "kv1" and not again.from_jsonl,
+            "from_memory: backup re-imported into kv")
+        check(again ~= nil and #again.messages == 3, "from_memory: re-import keeps messages")
+
+        -- 回写之后 append 必须接着原 seq 往后写，不能从 msg/00000001 覆盖旧消息
+        local s2 = Session.new(ctx, { dir = dir, memory = mem, id = "kv1" })
+        s2:append({ role = "user", content = "next" })
+        local after = mem:session_messages("kv1", 50)
+        local texts = {}
+        for _, m in ipairs(after) do texts[#texts + 1] = tostring(m.content) end
+        check(#after == 4 and texts[4] == "next", "from_memory: append continues after restore")
+        check(texts[2] == "jsonl only", "from_memory: restore keeps old msgs")
         mem:close()
     end
+    os.execute("rm -rf " .. shq(dir))
+end
+
+-- Session.from_memory: 换了目录但 mem.bin 还是那份 → 兜底认领最近的会话
+do
+    local dir = os.tmpname()
+    os.remove(dir)
+    os.execute("mkdir -p " .. shq(dir))
+    local Context = require("context")
+    local Session = require("core.session")
+    local Memory = require("core.memory")
+
+    local mem = assert(Memory.new({ dir = dir, max_mb = 16 }))
+    local ctx = Context.new({ cwd = "/tmp/oldcwd", id = "moved" })
+    mem:ensure_session("moved", "/tmp/oldcwd", "m")
+    local s = Session.new(ctx, { dir = dir, memory = mem })
+    s:append({ role = "user", content = "old turn" })
+    s:append({ role = "assistant", content = "old answer" })
+
+    local prev = Session.from_memory(mem, "/tmp/newcwd", 5)
+    check(prev ~= nil and prev.id == "moved", "from_memory: falls back across cwd")
+    check(prev and #prev.messages == 2, "from_memory: fallback restores messages")
+    check(prev and prev.claimed == true, "from_memory: fallback marks claimed")
+    -- 认领后 meta.cwd 改写成本目录，下次直接命中路径 1
+    local again = Session.from_memory(mem, "/tmp/newcwd", 5)
+    check(again ~= nil and again.id == "moved" and not again.claimed,
+        "from_memory: claimed session matches cwd next time")
+    -- 库里空无一物 + 没有 JSONL 备份时返回 nil
+    mem:close()
+    local empty = os.tmpname(); os.remove(empty); os.execute("mkdir -p " .. shq(empty))
+    local mem2 = assert(Memory.new({ dir = empty, max_mb = 16 }))
+    check(Session.from_memory(mem2, "/tmp/newcwd", 5, empty) == nil,
+        "from_memory: empty kv stays nil")
+    -- 备份目录里有 JSONL，但属于别的 cwd → 也不能捞回来
+    check(Session.from_memory(mem2, "/tmp/othercwd", 5, dir) == nil,
+        "from_memory: jsonl backup for other cwd ignored")
+    mem2:close()
+    os.execute("rm -rf " .. shq(empty))
     os.execute("rm -rf " .. shq(dir))
 end
 

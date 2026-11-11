@@ -470,8 +470,13 @@ elseif cmd == "--tui" or cmd == "--gui" then
         plugins = config.plugins,
     })
 
-    -- 只从当前目录的 mem.bin 恢复；全局 JSONL 不参与（见 Session.from_memory）。
+    -- 只从当前目录的 mem.bin 恢复；只有 KV 一条会话都没有时，才由
+    -- Session.from_memory 第 3 步从全局 JSONL 备份兜底（mem.bin 损坏/被截断）。
     local prev = Session.from_memory(memory, config.cwd, 5)
+    if prev and prev.from_jsonl then
+        io.stderr:write("lite: mem.bin has no session, recovered from JSONL backup "
+            .. tostring(prev.id) .. " (" .. tostring(prev.path) .. ")\n")
+    end
     local restored, restored_id, restored_turn = {}, nil, 0
     if prev then
         restored = prev.messages

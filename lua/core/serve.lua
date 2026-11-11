@@ -106,13 +106,15 @@ function M.run(opts)
     if logger then ctx.settings.debug = logger end
 
     local restored_turn = 0
-    for _, meta in ipairs(memory:list_sessions(config.cwd, 1)) do
-        local msgs, max_turn = memory:session_messages(meta.id, 50)
-        if #msgs > 0 then
-            ctx.session.id = meta.id
-            ctx.session.messages = msgs
-            restored_turn = max_turn or meta.turns or 0
-            break
+    -- 恢复走和 TUI/once 同一条路径（含 mem.bin 损坏时从 JSONL 备份兜底）。
+    local prev = Session.from_memory(memory, config.cwd, 1)
+    if prev then
+        ctx.session.id = prev.id
+        ctx.session.messages = prev.messages
+        restored_turn = prev.turn or 0
+        if prev.from_jsonl then
+            io.stderr:write("lite: mem.bin has no session, recovered from JSONL backup "
+                .. tostring(prev.id) .. " (" .. tostring(prev.path) .. ")\n")
         end
     end
     ctx.session.turn = restored_turn

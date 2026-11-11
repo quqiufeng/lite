@@ -180,18 +180,85 @@ function M.for_cwd(cwd, limit, dir)
     return out
 end
 
--- 启动/切换会话时恢复上下文：只认当前目录 mem.bin（KV）里的会话。
--- 全局 JSONL 仅作镜像备份，不参与恢复——否则删掉目录下的 mem.bin 后
--- 旧对话仍会从 ~/.local/share/lite/sessions 里被拉回来，违背「记忆跟着目录走」。
-function M.from_memory(memory, cwd, limit)
+-- 启动/切换会话时恢复上下文：认当前目录 mem.bin（KV）里的会话。
+-- JSONL（~/.local/share/lite/sessions/*.jsonl）是镜像备份，只在 KV 一条会话都没有时
+-- 兜底启用（见第 3 步）：mem.bin 是二进制的，坏了/被截断/被换掉都可能一夜间清空，
+-- 而 JSONL 是逐行追加的纯文本，几乎不会一起坏。KV 里只要还有任意会话就不读它，
+-- 正常路径仍然「记忆跟着目录走」。
+-- mem.bin 被搬到新目录时，里面的会话还挂着旧的 meta.cwd；此时按 cwd 找不到，
+-- 兜底取库里最近一条有消息的会话并认领到当前目录（见下方第 2 步）。
+-- jsonl_dir：JSONL 备份目录，默认 default_dir()（测试/多实例可覆盖）。
+function M.from_memory(memory, cwd, limit, jsonl_dir)
     if not memory or type(memory.list_sessions) ~= "function" then return nil end
-    for _, meta in ipairs(memory:list_sessions(cwd, limit or 5)) do
-        local msgs, max_turn = memory:session_messages(meta.id, 50)
-        if msgs and #msgs > 0 then
-            return { id = meta.id, messages = msgs, turn = max_turn or meta.turns or 0 }
+
+    local function pick(list)
+        for _, meta in ipairs(list or {}) do
+            local msgs, max_turn = memory:session_messages(meta.id, 50)
+            if msgs and #msgs > 0 then
+                return { id = meta.id, messages = msgs, turn = max_turn or meta.turns or 0,
+                         cwd = meta.cwd }
+            end
+        end
+        return nil
+    end
+
+    -- 1) 当前 cwd 名下的会话（正常路径）
+    local hit = pick(memory:list_sessions(cwd, limit or 5))
+    if hit then return hit end
+
+    -- 2) 兜底：cwd 名下没有可恢复的会话，但 mem.bin 里还有别的会话（搬了目录、
+    --    或只留下一个 turns=0 的空壳）。mem 文件跟着目录走，会话也该跟着接上，
+    --    所以取最近一条有消息的会话，并把它的 meta.cwd 改写成本目录（认领），
+    --    下次直接走路径 1。
+    local recent
+    if type(memory.list_all_sessions) == "function" then
+        recent = pick(memory:list_all_sessions(20))
+    end
+    if recent then
+        if memory.touch_session and recent.cwd ~= cwd then
+            memory:touch_session(recent.id, cwd)
+        end
+        recent.claimed = recent.cwd ~= cwd
+        return recent
+    end
+
+    -- 3) 最后兜底：KV 里一条会话都没有——mem.bin 损坏被 cache.c 改名成
+    --    mem.bin.corrupt-* 后重建了空库、被截断、或者目录里换了一份空库。此时才读
+    --    sessions/<id>.jsonl 这份纯文本镜像，取最近一条属于本 cwd 的会话。
+    --    恢复出来的消息顺手回写 KV，让下一条 append 接着原 seq 往后写，
+    --    而不是从 msg/00000001 覆盖（只读实例跳过回写，恢复本身仍然生效）。
+    local bak = M.for_cwd(cwd, 1, jsonl_dir)
+    local from_jsonl = bak and bak[1]
+    if not from_jsonl or #from_jsonl.messages == 0 then return nil end
+
+    local msgs = from_jsonl.messages
+    local turn = 0
+    for _, m in ipairs(msgs) do
+        if m.role == "assistant" then turn = turn + 1 end
+    end
+    if not memory.readonly and type(memory.put) == "function" then
+        local ttl = memory.TTL or {}
+        memory:ensure_session(from_jsonl.id, cwd, nil, from_jsonl.preview)
+        for i, m in ipairs(msgs) do
+            memory:put("/agent/session",
+                string.format("%s/msg/%08d", from_jsonl.id, i), m, ttl.long or 0)
+        end
+        local meta = memory:session_meta(from_jsonl.id)
+        if meta then
+            meta.messages = #msgs
+            meta.updated = os.time()
+            meta.turns = math.max(tonumber(meta.turns) or 0, turn)
+            memory:put("/agent/session", from_jsonl.id .. "/meta", meta, ttl.permanent or 0)
         end
     end
-    return nil
+    return {
+        id = from_jsonl.id,
+        messages = msgs,
+        turn = turn,
+        cwd = cwd,
+        path = from_jsonl.path,
+        from_jsonl = true,
+    }
 end
 
 function M.new(ctx, opts)

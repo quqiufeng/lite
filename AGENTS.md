@@ -51,7 +51,15 @@ AI-native harness：记忆、工具、FFI、X11。
 
 ## 3 记忆
 
-每个目录一份 `mem.bin` + `mem.idx`；删掉=清空该目录记忆。
+每个目录一份 `mem.bin` + `mem.idx`；删掉=清空该目录记忆。但 `mem.bin` 是二进制，
+坏了/被截断会被 `cache_open` 改名成 `mem.bin.corrupt-<ts>` 后重建空库，所以另有一份
+**JSONL 镜像**（`~/.local/share/lite/sessions/<id>.jsonl`，逐行追加的纯文本）：
+`Session.from_memory` 只在 KV 一条会话都没有时才拿它兜底（`lua/core/session.lua` 第 3 步），
+按 `<cwd>` 段精确匹配本目录的最近一条，消息回写进 KV（下一条 `append` 接着原 seq 写）。
+KV 里只要还有任意会话就不读 JSONL，正常路径仍然「记忆跟着目录走」。
+**真要清空**：`rm mem.bin mem.idx` + 删掉 `sessions/<id>.jsonl`，否则下次启动还会从那唯一
+一条备份里捞回来（打印 `recovered from JSONL backup`）。JSONL 受 `RAW_KEEP` 裁剪，
+只有 user 原文 + 最近 200 条，是备份不是完整历史。
 
 - `/agent/knowledge/*`：长期事实；`/agent/session/<id>/*`：消息/摘要/工作态/todo
 - `/agent/working/*`：wake 等运行态，不注入 prompt

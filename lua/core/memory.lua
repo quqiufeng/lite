@@ -255,6 +255,28 @@ function M:list_sessions(cwd, limit)
     return out
 end
 
+-- 全库会话（跨 cwd），按最近更新降序。给「换了目录但 mem.bin 还是那份」兜底用：
+-- 会话的 meta.cwd 是创建时写死的绝对路径，文件搬走后按 cwd 找不到它，
+-- 但数据还在库里，得有个不看 cwd 的入口把它捞出来。
+function M:list_all_sessions(limit)
+    limit = limit or 20
+    local out, seen = {}, {}
+    for _, r in ipairs(self:search_prefix("/agent/session/", { max_results = limit * 4 })) do
+        local id = tostring(r.key):match("/session/([^/]+)/meta$")
+        if id and not seen[id] then
+            local meta = self:session_meta(id)
+            if type(meta) == "table" then
+                seen[id] = true
+                meta.id = id
+                out[#out + 1] = meta
+            end
+        end
+    end
+    table.sort(out, function(a, b) return (a.updated or 0) > (b.updated or 0) end)
+    while #out > limit do table.remove(out) end
+    return out
+end
+
 function M:remember_fact(key, content, tags, ttl)
     return self:put("/agent/knowledge", key, {
         t = "fact",
