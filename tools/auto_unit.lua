@@ -5063,6 +5063,84 @@ do
     check(okrun == false and tostring(err):find("port") ~= nil, "probe run: port required")
 end
 
+-- trace/render 覆盖率：分母必须是阻塞总权重，不是 incl_w 求和
+-- （包含权重沿调用链层层累加，求和会把总量放大到吓人的倍数，百分比才会 >100%）
+do
+    local R = dofile(root .. "/lua/trace/render.lua")
+    local svg = os.tmpname()
+    local j = {
+        unit = "ms", frame_dir = "root-first",
+        overall = { blocked_ms = 4000 },
+        top = {
+            { stack = "a;b;c", total_ms = 2000, count = 4 },
+            { stack = "a;b", total_ms = 1000, count = 2 },
+            { stack = "a", total_ms = 1000, count = 2 },
+        },
+    }
+    local okr, d = R.render("rank", j, svg, "t")
+    check(okr == true, "trace render rank ok")
+    check(type(d) == "table" and d.coverage <= 100.0,
+        "trace render rank coverage <= 100%")
+    -- 同一个函数名在多个栈里出现，热力图的包含权重也必须按采样总权重归一
+    local okh, dh = R.render("heat", j, svg, "t")
+    check(okh == true and dh.total == 4000, "trace render heat total = 阻塞总权重")
+    os.remove(svg)
+end
+
+-- trace 插件层：参数归一（build_argv）与摘要（summary）都是纯函数，直接测
+do
+    local T = dofile(root .. "/helper/trace.lua")
+    local function argv(a)
+        local r = T.build_argv(a)
+        local s = table.concat(r, " ")
+        return s
+    end
+
+    -- count：探针必填、duration 夹紧、ring_size 不自动加
+    local s = argv({ mode = "count", probe = "kprobe:do_sys_openat2", duration = 0.01 })
+    check(s:find("--mode count", 1, true) ~= nil and s:find("--probe kprobe:do_sys_openat2", 1, true) ~= nil,
+        "trace build_argv count probe")
+    check(s:find("--duration 0.1", 1, true) ~= nil, "trace build_argv duration floor")
+    check(s:find("--ring-size", 1, true) == nil, "trace build_argv count keeps default ring")
+    check(argv({ mode = "count", probe = "x", duration = 999 }):find("--duration 120", 1, true) ~= nil,
+        "trace build_argv duration ceil")
+
+    -- 出图三档默认 64 页 ring（sched_switch 高频，8 页必溢出）
+    for _, m in ipairs({ "oncpu", "offcpu", "folded" }) do
+        local s2 = argv({ mode = m, probe = "tracepoint:sched:sched_switch" })
+        check(s2:find("--ring-size 64", 1, true) ~= nil, "trace build_argv " .. m .. " default ring 64")
+    end
+    check(argv({ mode = "offcpu", probe = "p", ring_size = 16 }):find("--ring-size 16", 1, true) ~= nil,
+        "trace build_argv explicit ring wins")
+
+    -- latency 要 entry+exit；缺了报可自修的错
+    local ok, err = pcall(T.build_argv, { mode = "latency", entry = "a" })
+    check(ok == false and tostring(err):find("entry", 1, true) ~= nil, "trace build_argv latency needs entry+exit")
+
+    -- 未知 mode 的报错要带上收到的值，模型才知道改什么
+    local ok2, err2 = pcall(T.build_argv, { mode = "hotness", probe = "p" })
+    check(ok2 == false and tostring(err2):find("mode=", 1, true) ~= nil, "trace build_argv unknown mode error")
+
+    -- summary：各模式一句话 + 顶层条目，不崩
+    local S = require("trace.summary")
+    check(S.render("count", { probes = { "p" }, count = 10, duration = 1, rate = 10 })
+        :find("10 次", 1, true) ~= nil, "trace summary count")
+    local lat = S.render("latency", {
+        probes = { "e" }, events = 4, paired = 4, unpaired = 0,
+        overall = { count = 4, avg_us = 2, p50_us = 1, p99_us = 5, max_us = 6 },
+        top = { { key = "openat", count = 4, avg_us = 2, p99_us = 5 } },
+    })
+    check(lat:find("p99=5us", 1, true) ~= nil and lat:find("openat", 1, true) ~= nil,
+        "trace summary latency top")
+    check(S.render("offcpu", { events = 10, matched = 9, blocked = 3, unmatched = 1 })
+        :find("阻塞=3", 1, true) ~= nil, "trace summary offcpu")
+    check(S.render("oncpu", { freq = 99, events = 1000, stacks = 20 })
+        :find("99Hz", 1, true) ~= nil, "trace summary oncpu")
+    check(S.render("folded", { events = 500, stacks = 7 }):find("500", 1, true) ~= nil,
+        "trace summary folded")
+    check(S.render("count", nil):find("没给出", 1, true) ~= nil, "trace summary bad json")
+end
+
 -- entry
 check(loadfile(root .. "/lua/main.lua") ~= nil, "load lua/main.lua")
 

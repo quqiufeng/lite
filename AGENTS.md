@@ -53,6 +53,11 @@ AI-native harness：记忆、工具、FFI、X11。
   的新旧混编由此暴露，别再各自维护候选表。
 - `lua/ffi/x11.lua` + `xdo.lua`：**自包含单文件**（只用 LuaJIT `ffi` + 系统 libX11/libxdo，不引用 lite 代码、不注册工具），可整对拷给别的项目；`x11.lua` 靠 `require("ffi.xdo")` 找同伴，换布局要同步改这一行
 - `lua/tui/mouse.lua` + `clipboard.lua`：拖选/剪贴板；选区在 `screen.lua`
+- `lua/trace/`：动态追踪（纯 LuaJIT，零 perf/bcc）：`engine.lua` 走 perf_event_open + tracefs
+  探针（count/samples/latency/folded/oncpu/offcpu），`render.lua` 出 flame/heat/rank SVG，
+  `svgpng.lua` 用 cairo+librsvg 转 PNG，`summary.lua` 出人读摘要；工具入口是
+  `helper/trace.lua`（action=run/render/status，非 root 自动 `sudo -n`，要密码就报错不弹 tty）。
+  纪律与权限自查见 `lua/trace/README.md`，先 `action=status` 再 `count` 验探针，别拿 count 当采样。
 
 ## 3 记忆
 
@@ -194,7 +199,8 @@ JSON**——把那次调用拆小（长文档用 `write` 的 `append=true` 分�
 
 注意发现机制：插件只扫 `<cwd>/helper` → `$LITE_ROOT/helper`（`lua/core/tools.lua:_helper_roots`），
 **`tools/` 里的 `.lua` 不会被当插件加载**（那是 build/test/run/release 这类仓库脚本）。
-现有 adb/wechat/music/search/fetch/tokens/uimap/usb 八个住 `helper/`，因为发现只认那里。
+现有 adb/wechat/music/search/fetch/tokens/uimap/usb/cgrep/lens/md2png/pdftext/trending/trace/web2png
+住 `helper/`，因为发现只认那里；重活（codesearch、trace）的实现在 `lua/` + `src/`，插件只做编排。
 
 **改过 C/C++ 就必须重编，然后 `/reboot` 才算测得上**（硬规矩，适用于 `tools/` 与 `helper/`
 两条通道）。`reboot` 只重启进程、**不编译**；Lua 侧 `ffi.load` 的 `build/liblite_*.so` 是进程内
