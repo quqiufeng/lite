@@ -49,6 +49,7 @@ luac.out
 build/
 dist/
 artifacts/
+cluster-out/
 mem.bin
 mem.idx
 mem.lock

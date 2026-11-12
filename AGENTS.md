@@ -135,7 +135,18 @@ workspace `.env`（优先级 cwd/上级 → `~/.config/lite/.env` → `~/.env` �
 ./tools/run.sh --tui --snapshot out.txt
 ./tools/run.sh --gui           # 自绘 GUI（SDL2+SDL2_ttf，见 lua/gui/，可选依赖）
 ./tools/release.sh             # build + package + install；源码安装软链 lua/
+
+./tools/cluster.sh [--dry-run] [--jobs N] [--out DIR] tasks.tsv  # 并行派活（ssh + --once --json）
 ```
+
+**`tools/cluster.sh`：集群 = 槽 = 目录**。因为 `mem.lock` 只允许同目录一个写实例，
+并发度 = 机器数 × 每台目录数，不是进程数。`tasks.tsv` 一行一槽：
+`<box>\t<dir>\t<prompt>[\t<task>]`，`box` 为 ssh 目标，`local`/`-` 表示本机跑（本机多槽并行也用它）。
+`prompt` 走 base64 过 ssh（避开引号），`~/x` 留给远端 `$HOME` 展开；每个任务落
+`out/<task>.{jsonl,rc,sec,err}`，退出码 0=全 ok、1=有任务失败（rc≠0 或 JSONL 里没有
+`done ok:true`）、2=用法错误。汇总表从 JSONL 里取最后一条 `assistant` + `tool_start` 计数，
+所以「谁交付了什么」直接看表，不用翻文件。任务身份只到 `task` 名这一层，
+真正的任务编号写进 prompt 或 task 名里。
 
 **TUI 斜杠外的两个 `#` 开关**（`submit()` 里先拦，不进模型）：
 

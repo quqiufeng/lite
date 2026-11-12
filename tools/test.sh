@@ -62,6 +62,27 @@ fi
 rm -rf "$TMPD"
 echo "OK cli.json"
 
+echo "== cluster =="
+# 只验「派活 → 落盘 → 判定」这条链：dry-run 不执行、无 key 时如实报失败（离线可跑）。
+TMPD="$(mktemp -d)"
+printf 'local\t%s\tnoop\tnokey\n' "$TMPD/w1" > "$TMPD/t.tsv"
+OUT="$(LITE_CLUSTER_LITE="$ROOT/tools/run.sh" "$ROOT/tools/cluster.sh" --dry-run "$TMPD/t.tsv" || true)"
+if ! echo "$OUT" | grep -q '\[nokey\] local'; then
+    echo "FAIL cluster.dry_run" >&2; rm -rf "$TMPD"; exit 1
+fi
+rc=0
+env -u DEEPSEEK_API_KEY LITE_ENV_FILE=/dev/null HOME=/tmp LITE_CLUSTER_LITE="$ROOT/tools/run.sh" \
+    "$ROOT/tools/cluster.sh" --out "$TMPD/o" "$TMPD/t.tsv" >"$TMPD/log" 2>&1 || rc=$?
+if [ "$rc" -ne 1 ]; then
+    echo "FAIL cluster.rc (no-key 任务应让 cluster 以 1 退出，实得 $rc)" >&2
+    cat "$TMPD/log" >&2; rm -rf "$TMPD"; exit 1
+fi
+if ! grep -q '"type":"error"' "$TMPD/o/nokey.jsonl"; then
+    echo "FAIL cluster.jsonl (任务输出没落盘)" >&2; rm -rf "$TMPD"; exit 1
+fi
+rm -rf "$TMPD"
+echo "OK cluster"
+
 echo "== plugins =="
 OUT="$("$ROOT/tools/run.sh" plugins --json || true)"
 if ! echo "$OUT" | grep -q '"name":"lens"'; then
