@@ -48,6 +48,17 @@ OUT="$( cd "$TMPD" && LITE_CWD="$TMPD" LITE_MEMORY_DIR="$TMPD" "$ROOT/tools/run.
 if ! echo "$OUT" | grep -q '"type":"sessions"'; then
     echo "FAIL cli.sessions.json" >&2; rm -rf "$TMPD"; exit 1
 fi
+# 共享记忆库：手写一行 jsonl（= 另一个 agent 的 append），确认 --memdb 统计和 --memdb-search 都能读到
+TMPD="$(mktemp -d)"
+printf '%s\n' '{"k":"port","v":"ollama 端口 11434","o":"box-other","ts":100}' > "$TMPD/box-other.jsonl"
+OUT="$(LITE_MEMDB_DIR="$TMPD" "$ROOT/tools/run.sh" --memdb --json || true)"
+if ! echo "$OUT" | grep -q '"by_origin":{"box-other":1}'; then
+    echo "FAIL cli.memdb.json" >&2; rm -rf "$TMPD"; exit 1
+fi
+OUT="$(LITE_MEMDB_DIR="$TMPD" "$ROOT/tools/run.sh" --memdb-search "ollama 端口" --json || true)"
+if ! echo "$OUT" | grep -q '"origin":"box-other"'; then
+    echo "FAIL cli.memdb_search.json" >&2; rm -rf "$TMPD"; exit 1
+fi
 rm -rf "$TMPD"
 echo "OK cli.json"
 

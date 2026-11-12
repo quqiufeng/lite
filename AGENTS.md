@@ -122,6 +122,10 @@ workspace `.env`（优先级 cwd/上级 → `~/.config/lite/.env` → `~/.env` �
 ./tools/test.sh
 ./tools/run.sh                 # TUI；另见 --once/--recall/state/sessions/serve/attach
 ./tools/run.sh --once --json "prompt"
+./tools/run.sh --memory-export kb.jsonl [--all] [--prefix P]   # 记忆 → JSONL（- 或省略=stdout）
+./tools/run.sh --memory-import kb.jsonl [--dry-run]            # JSONL → 当前目录 mem.bin
+./tools/run.sh --memdb                                         # 共享记忆库：目录/条数/每个 agent 写了多少
+./tools/run.sh --memdb-search "关键词"                          # 搜共享库（别人的记忆也在里面）
 ./tools/run.sh plugins [--json]   # helper/ 插件清单 + 加载错误（只读快照）
 ./tools/run.sh --tui --snapshot out.txt
 ./tools/run.sh --gui           # 自绘 GUI（SDL2+SDL2_ttf，见 lua/gui/，可选依赖）

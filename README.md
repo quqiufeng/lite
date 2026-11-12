@@ -24,6 +24,8 @@ export DEEPSEEK_API_KEY=...   # 或写进 .env / ~/.config/lite/.env
 ./tools/run.sh --tui --thinking --reasoning-effort high
 ./tools/run.sh --once --json "解释这个项目"    # 无 UI 一轮，JSONL 事件
 ./tools/run.sh --recall "关键词"               # 查当前目录的本地记忆
+./tools/run.sh --memory-export kb.jsonl        # 知识层导出成 JSONL（省略文件 / - 打 stdout）
+./tools/run.sh --memory-import kb.jsonl        # 导入合并进当前目录 mem.bin（加 --dry-run 先看）
 ./tools/run.sh plugins --json                  # helper/ 插件清单 + 加载错误
 ./tools/run.sh serve --port 8765               # headless 服务端
 ./tools/run.sh attach --port 8765              # 任意终端/tmux tab attach
@@ -102,8 +104,48 @@ return {
 - 局部记忆：召回 query 用 ASCII 词 + 中文 bigram，短追问会拼上一轮 user 改善「继续/那个」。
 - 每条消息镜像进 `/msg/<seq>`，只保留最近 `LITE_SESSION_RAW_KEEP`（200）条非 user 原文，
   user 永久保留；tool 结果入库截到 `LITE_TOOL_RESULT_CHARS`（8192）。更老的靠 turn 摘要和 `recall`。
-- `mem.lock`：写实例持锁，`--recall` / `state` / `sessions` 只读不加锁，运行中也能诊断。
+- `mem.lock`：写实例持锁，`--recall` / `--memory-export` / `state` / `sessions` 只读不加锁，运行中也能诊断。
 - 删除 `mem.bin` = 清空该目录记忆。
+
+### 共享记忆库 `memdb/`（跨 agent）
+
+`mem.bin` 是本机私有脑，`memdb/` 是公共告示板：**每个 agent 一个 `<origin>.jsonl`，只 append，
+不加锁、不合并、不覆盖**。冗余是设计选择——同一条事实被三个 agent 各写一遍很正常，
+去重和判断可信度是读的人的事。
+
+```bash
+export LITE_MEMDB_DIR=/srv/lite-memdb            # 指到共享盘（NFS/WebDAV 挂载点）就天然多机共享
+export LITE_AGENT_NAME=box-a                     # 可选，缺省 = <hostname>-<cwd 名>
+./tools/run.sh --memdb                           # 有多少条、谁写的
+./tools/run.sh --memdb-search "ollama 端口"       # 全库搜（ASCII 词 + 中文 bigram）
+```
+
+- `remember` 写完 `mem.bin` 后顺手 append 进共享库；`recall` 先给本地结果，
+  再补最多 3 条 `shared@<origin>`（和本地重复的、自己刚写的都会先剔掉）。
+- 写入靠 `O_APPEND` 单行原子性：40 个进程并发写同一文件，实测 200/200 行完好、无交织。
+- 读到半行/坏行直接跳过，别人正在写的文件不会拖垮整次读取。
+- 搬迁想用 SQL/全文索引再说；现在这套的定位是「便宜、能 grep、能 git diff、坏了只丢一行」。
+
+### 记忆搬家（JSONL）
+
+`mem.bin` 是 mmap 的二进制，还带指针偏移，不能跨机器/跨版本直接拷。要搬就过一遍 JSONL：
+
+```bash
+./tools/run.sh --memory-export                     # 只导 /agent/knowledge/，打到 stdout
+./tools/run.sh --memory-export kb.jsonl --all      # 连 session/working 一起导
+./tools/run.sh --memory-export kb.jsonl --prefix /agent/session/ --prefix /agent/knowledge/lite/
+./tools/run.sh --memory-import kb.jsonl --dry-run  # 只报数，不落盘
+./tools/run.sh --memory-import kb.jsonl            # 同 key 覆盖，逐行容错
+```
+
+- 行格式一行一条，可 `grep`、可 `git diff`、能手写：
+  `{"k":"/agent/knowledge/lite/hand/edit","v":"纯文本","ttl":0}`，
+  `v` 也可以是 `{"text":"...","tags":[...]}` 这样的表。
+- 手写时 key 不带命名空间（直接写 `lite/hand/edit`）会自动补 `/agent/knowledge/`，
+  否则落在根上，`recall` 和导出都扫不到。
+- `ttl` 固定导 0：C 层没有剩余寿命查询，且值得搬的 fact 本来就该永久。
+- 导入只写目标库，**不是**双向同步；`--dry-run` 报 `new/overwrite` 数，出错行进 stderr 不影响其余行。
+- 语义回环稳定：导出 → 导入 → 再导出，内容一致（表内键序可能不同）。
 
 上下文预算默认 `LITE_CONTEXT_CHARS=64000`：跨过触发线（预算 85%）就从最新往回装窗口、
 更老的整条丢，`session.messages` 和记忆一条不删 —— 「压缩」在这里只是缩小发出去的窗口。

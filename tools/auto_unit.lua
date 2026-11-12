@@ -4801,6 +4801,48 @@ do
     check(W.new(60):restore({ on = "yes" }, 0).on == false, "watchdog restore junk stays off")
 end
 
+-- memdb：共享记忆库（append-only jsonl，多 agent 各写各的文件）
+do
+    local Memdb = require("core.memdb")
+    local dir = "/tmp/lite-memdb-unit-" .. tostring(os.time()) .. "-" .. tostring(math.random(1e6))
+    os.execute("rm -rf " .. shq(dir))
+
+    check(Memdb.append({ key = "a", text = "" }, { dir = dir }) == nil, "memdb rejects empty text")
+    check(Memdb.append({ key = "", text = "x" }, { dir = dir }) == nil, "memdb rejects empty key")
+
+    check(Memdb.append({ key = "port", text = "ollama 端口 11434" }, { dir = dir, origin = "box-a" }) == true,
+        "memdb append ok")
+    Memdb.append({ key = "other", text = "webdav 曲库在 5005" }, { dir = dir, origin = "box-b", ts = 200 })
+    -- 同一句事实被另一个 agent 又写一遍（key 不同）：读的时候只出一条
+    Memdb.append({ key = "port-copy", text = "ollama 端口 11434" }, { dir = dir, origin = "box-c", ts = 100 })
+
+    local rows = Memdb.scan({ dir = dir })
+    check(#rows == 3, "memdb scan sees every agent file")
+    local origins = {}
+    for _, r in ipairs(rows) do origins[r.origin] = true end
+    check(origins["box-a"] and origins["box-b"] and origins["box-c"], "memdb scan keeps origin")
+
+    local hits, scanned = Memdb.search("ollama 端口", 5, { dir = dir })
+    check(scanned == 3, "memdb search reports scanned")
+    check(#hits == 1, "memdb search dedupes same text")
+    check(hits[1] and hits[1].origin == "box-c", "memdb dedupe keeps earliest copy")
+    check(#(select(1, Memdb.search("webdav 5005", 5, { dir = dir }))) == 1, "memdb search matches cjk+ascii")
+    check(#(select(1, Memdb.search("完全无关的词", 5, { dir = dir }))) == 0, "memdb search drops non-matches")
+
+    local newest = Memdb.search("", 2, { dir = dir })
+    check(#newest == 2 and newest[1].ts >= newest[2].ts, "memdb empty query = newest first")
+
+    -- 半行 / 手滑：坏行跳过，不影响其它行
+    local f = io.open(dir .. "/box-broken.jsonl", "a")
+    f:write('{"k":"half","v":"写到一半\nnot-json\n{"k":"ok","v":"完整的一条"}\n')
+    f:close()
+    local rows2 = Memdb.scan({ dir = dir })
+    check(#rows2 == 4, "memdb scan skips torn lines")
+    check(Memdb.stats({ dir = dir }).entries == 4, "memdb stats counts entries")
+
+    os.execute("rm -rf " .. shq(dir))
+end
+
 -- entry
 check(loadfile(root .. "/lua/main.lua") ~= nil, "load lua/main.lua")
 

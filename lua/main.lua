@@ -25,6 +25,14 @@ lite — DeepSeek 终端 coding agent
   lite --check                 检查运行依赖
   lite --once "<prompt>"       无 UI 单轮/工具循环（流式输出）
   lite --recall "<query>"      查询当前目录的本地记忆
+  lite --memory-export [f.jsonl] [--prefix P]... [--all]
+                               把知识层记忆导出成 JSONL（省略文件则打到 stdout）
+  lite --memory-import f.jsonl [--dry-run]
+                               从 JSONL 导入/合并记忆（同 key 覆盖，逐行容错）
+  lite --memdb [--json]        共享记忆库：目录、总条数、每个 agent 写了多少
+  lite --memdb-search "<query>"
+                               搜共享库（其他 agent 的记忆也在里面；空 query = 最近写的）
+                               LITE_MEMDB_DIR 指到共享盘即多机共享，LITE_AGENT_NAME 改自己的署名
   lite --version               版本
   lite --help                  帮助
 
@@ -79,6 +87,8 @@ local SUBCOMMANDS = {
     state = true, ["--state"] = true, sessions = true, ["--sessions"] = true,
     plugins = true, ["--plugins"] = true,
     ["--check"] = true, ["--recall"] = true, ["--tui"] = true, ["--once"] = true,
+    ["--memory-export"] = true, ["--memory-import"] = true,
+    ["--memdb"] = true, ["--memdb-search"] = true,
     ["--gui"] = true,
 }
 
@@ -386,6 +396,134 @@ elseif cmd == "--recall" then
     end
     memory:close()
     os.exit(0)
+elseif cmd == "--memdb" or cmd == "--memdb-search" then
+    -- 共享记忆库只有一个操作模型：谁都能 append，谁都能扫全库自己筛。
+    -- 所以 CLI 也只给两个动作——看有什么、搜一下。
+    local Memdb = require("core.memdb")
+    if cmd == "--memdb-search" then
+        local query = table.concat(rest, " ")
+        local hits, scanned = Memdb.search(query, 20)
+        if json then
+            emit({ type = "memdb_search", dir = Memdb.dir(), scanned = scanned, items = hits })
+        elseif #hits == 0 then
+            print(string.format("no match in %s (%d entries scanned)", Memdb.dir(), scanned))
+        else
+            for _, r in ipairs(hits) do
+                print(string.format("[%s] %s\n  %s", tostring(r.origin or "?"),
+                    tostring(r.key), tostring(r.text)))
+            end
+        end
+    else
+        local st = Memdb.stats()
+        if json then
+            emit({ type = "memdb", dir = st.dir, entries = st.entries,
+                   by_origin = st.by_origin })
+        else
+            print("memdb: " .. st.dir)
+            print(string.format("%d entries", st.entries))
+            local names = {}
+            for name in pairs(st.by_origin) do names[#names + 1] = name end
+            table.sort(names)
+            for _, name in ipairs(names) do
+                print(string.format("  %-32s %d", name, st.by_origin[name]))
+            end
+        end
+    end
+    os.exit(0)
+elseif cmd == "--memory-export" or cmd == "--memory-import" then
+    local config = require("core.config").load()
+    local Memory = require("core.memory")
+    local mio = require("core.memory_io")
+    local exporting = cmd == "--memory-export"
+
+    -- 手写解析：这两个子命令的参数很少，走 parse_flags 反而要加一堆分支
+    local path, prefixes, dry_run, all = nil, {}, false, false
+    local i = 1
+    while i <= #rest do
+        local a = rest[i]
+        if a == "--prefix" then
+            local v = rest[i + 1]
+            if not v then io.stderr:write("lite: --prefix needs a value\n") os.exit(2) end
+            prefixes[#prefixes + 1] = v
+            i = i + 2
+        elseif a == "--all" then
+            all = true i = i + 1
+        elseif a == "--dry-run" then
+            dry_run = true i = i + 1
+        elseif a:sub(1, 1) == "-" and a ~= "-" then
+            io.stderr:write("lite: unknown option " .. a .. "\n") os.exit(2)
+        else
+            path = a i = i + 1
+        end
+    end
+    if all and #prefixes == 0 then
+        prefixes = { "/agent/knowledge/", "/agent/session/", "/agent/working/" }
+    end
+
+    local memory, merr = Memory.new({
+        dir = config.memory_dir or config.cwd,
+        max_mb = config.memory_mb,
+        flush_sec = config.memory_flush,
+        readonly = exporting,
+    })
+    if not memory then
+        if json then emit({ type = "error", error = tostring(merr) })
+        else io.stderr:write("lite: " .. tostring(merr) .. "\n") end
+        os.exit(2)
+    end
+
+    if exporting then
+        local lines, rows = mio.export_lines(memory, { prefixes = prefixes })
+        if path and path ~= "-" then
+            local f, ferr = io.open(path, "w")
+            if not f then
+                io.stderr:write("lite: cannot write " .. tostring(ferr) .. "\n")
+                os.exit(2)
+            end
+            for _, line in ipairs(lines) do f:write(line, "\n") end
+            f:close()
+        else
+            for _, line in ipairs(lines) do print(line) end
+        end
+        if json then
+            emit({ type = "memory_export", dir = memory.dir, file = path, count = #rows })
+        elseif path and path ~= "-" then
+            io.stderr:write(string.format("exported %d entries -> %s\n", #rows, path))
+        end
+        memory:close()
+        os.exit(0)
+    end
+
+    if not path then
+        if json then emit({ type = "error", error = "--memory-import needs a file" })
+        else io.stderr:write("lite: --memory-import needs a file\n") end
+        os.exit(2)
+    end
+    if memory.readonly then
+        local msg = "memory is read-only (another lite holds mem.lock); close it first"
+        if json then emit({ type = "error", error = msg })
+        else io.stderr:write("lite: " .. msg .. "\n") end
+        os.exit(3)
+    end
+    local rep, ierr = mio.import_file(memory, path, { dry_run = dry_run })
+    if not rep then
+        if json then emit({ type = "error", error = tostring(ierr) })
+        else io.stderr:write("lite: " .. tostring(ierr) .. "\n") end
+        os.exit(2)
+    end
+    if json then
+        emit({ type = "memory_import", dir = memory.dir, file = path,
+               total = rep.total, added = rep.added, updated = rep.updated,
+               skipped = rep.skipped, failed = rep.failed,
+               dry_run = rep.dry_run, errors = rep.errors })
+    else
+        print(string.format("%s %d entries (new %d, overwrite %d), skipped %d, failed %d",
+            rep.dry_run and "would import" or "imported",
+            rep.total, rep.added, rep.updated, rep.skipped, rep.failed))
+        for _, e in ipairs(rep.errors) do io.stderr:write("  " .. e .. "\n") end
+    end
+    memory:close()
+    os.exit(rep.failed > 0 and 1 or 0)
 elseif cmd == "--tui" or cmd == "--gui" then
     local flags, pos = parse_flags(rest)
     -- 无子命令时未知选项会落到这里（见上面 SUBCOMMANDS 那段），别静默吞掉

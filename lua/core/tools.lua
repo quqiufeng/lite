@@ -5,6 +5,7 @@ local Sandbox = require("core.sandbox")
 local Proc = require("core.proc")
 local Text = require("core.text")
 local http = require("core.http")
+local Memdb = require("core.memdb")
 
 -- 路径操作用 libc 直达：realpath/test -d 原先每次都 fork 两个 shell，
 -- agent 探索期一次几十次 resolve，代价明显。FFI 不可用时退回 popen。
@@ -1885,7 +1886,17 @@ function M:execute(name, args)
             if not ok then
                 return "error: remember failed: " .. tostring(rerr or "unknown reason")
             end
-            return "remembered " .. tostring(args.key)
+            -- 同一句话顺手灌进共享库（memdb/）：私有 mem.bin 是本机脑，memdb 是公共告示板。
+            -- 写失败只提示、不报错——共享盘没挂不该让记忆功能整体失败。
+            local shared, serr = Memdb.append({
+                key = args.key, text = args.content, tags = args.tags,
+                cwd = self.ctx and self.ctx.session and self.ctx.session.cwd,
+            })
+            if not shared then
+                return string.format("remembered %s (shared db unavailable: %s)",
+                    tostring(args.key), tostring(serr or "unknown"))
+            end
+            return "remembered " .. tostring(args.key) .. " (local + shared)"
         elseif name == "recall" then
             if not self.memory then return "error: memory disabled" end
             -- 显式 recall 才允许翻原始 transcript，并带上当前会话 id（否则跨会话扫）。
@@ -1898,7 +1909,26 @@ function M:execute(name, args)
                 { session_id = sid, transcript = true, item_chars = item_chars,
                   kind = args.kind,
                   cwd = self.ctx and self.ctx.session and self.ctx.session.cwd })
-            if #items == 0 then return "no memory found" end
+            -- 共享库（其他 agent 写的）单独算，排在本地结果后面：本地是本机亲眼所见，
+            -- 可信度天然更高。共享库的冗余、过期、互相矛盾是常态，读的人自己筛。
+            local shared, scanned = Memdb.search(args.query, 3)
+            local mine = {}
+            for _, it in ipairs(items) do mine[(it.text or ""):gsub("%s+", " "):lower()] = true end
+            for _, r in ipairs(shared) do
+                -- 自己刚写进去的那份：本地已经有了，别再占一行上下文
+                if not mine[(r.text or ""):gsub("%s+", " "):lower()] then
+                    items[#items + 1] = {
+                        key = "shared@" .. tostring(r.origin or "?"),
+                        text = string.format("%s: %s", tostring(r.key), tostring(r.text)),
+                    }
+                end
+            end
+            if #items == 0 then
+                if scanned and scanned > 0 then
+                    return string.format("no memory matched (%d shared entries scanned)", scanned)
+                end
+                return "no memory found"
+            end
             local out, used = {}, 0
             for _, it in ipairs(items) do
                 local line = string.format("[%s] %s", it.key, it.text)
