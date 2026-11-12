@@ -541,12 +541,18 @@ function M:schemas()
             type = "function",
             ["function"] = {
                 name = "recall",
-                description = "Search local context memory for relevant facts or past turns.",
+                description = "Search local context memory for relevant facts or past turns. "
+                    .. "kind 可把范围收窄到某一层（fact/epoch/working/turn/user）："
+                    .. "问已定结论用 fact 或 epoch，查原始表述用 turn。",
                 parameters = {
                     type = "object",
                     properties = {
                         query = { type = "string" },
                         limit = { type = "integer" },
+                        item_chars = { type = "integer" },
+                        max_chars = { type = "integer" },
+                        kind = { type = "string",
+                            description = "只召回某一层：fact | epoch | working | turn | user" },
                     },
                     required = { "query" },
                 },
@@ -1882,12 +1888,25 @@ function M:execute(name, args)
             if not self.memory then return "error: memory disabled" end
             -- 显式 recall 才允许翻原始 transcript，并带上当前会话 id（否则跨会话扫）。
             local sid = self.ctx and self.ctx.session and self.ctx.session.id
+            -- 工具返回同样受预算约束：自动注入走 memory_block（400 字/条、2400 总），
+            -- 显式 recall 早先无上限，5 条 turn 就能吐 7KB 进上下文。
+            local item_chars = tonumber(args.item_chars) or 900
+            local total_chars = tonumber(args.max_chars) or 4000
             local items = self.memory:recall(args.query, args.limit or 5,
-                { session_id = sid, transcript = true, cwd = self.ctx and self.ctx.session and self.ctx.session.cwd })
+                { session_id = sid, transcript = true, item_chars = item_chars,
+                  kind = args.kind,
+                  cwd = self.ctx and self.ctx.session and self.ctx.session.cwd })
             if #items == 0 then return "no memory found" end
-            local out = {}
+            local out, used = {}, 0
             for _, it in ipairs(items) do
-                out[#out + 1] = string.format("[%s] %s", it.key, it.text)
+                local line = string.format("[%s] %s", it.key, it.text)
+                if used + #line + 1 > total_chars then
+                    out[#out + 1] = string.format("…（还有 %d 条未展开：缩小 query 或调大 max_chars）",
+                        #items - #out)
+                    break
+                end
+                out[#out + 1] = line
+                used = used + #line + 1
             end
             return table.concat(out, "\n")
         elseif name == "todo" then

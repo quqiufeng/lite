@@ -1275,6 +1275,76 @@ do
         end
         check(not leaked, "memory session scope")
 
+        -- turn 落盘是头尾拼接而非纯头部截断：结论/代码块几乎总在尾部，
+        -- 从头砍会把最有用的部分丢掉（旧行为实测：1536 字节内看不到结论）。
+        local long_head = "开头背景。" .. string.rep("无关前言，", 300)
+        local long_tail = "**结论：保留这一句。**"
+        mem:remember_turn("s1", 9, "长回答问题", long_head .. long_tail)
+        local tv = mem:get("/agent/session", "s1/turn/9")
+        check(tv.a:find("结论：保留这一句", 1, true) ~= nil, "memory turn keeps tail")
+        check(tv.a:sub(1, #"开头背景。") == "开头背景。", "memory turn keeps head")
+        check(tv.a:find("中间略", 1, true) ~= nil, "memory turn marks elision")
+        check(#tv.a <= 1536, "memory turn stays within budget")
+        -- 短内容不该被标记污染
+        mem:remember_turn("s1", 10, "短问", "短答")
+        local sv = mem:get("/agent/session", "s1/turn/10")
+        check(sv.a == "短答" and sv.u == "短问", "memory turn short untouched")
+        -- turn 是提炼层，必须 permanent(0)：跟着 msg/ 原文用 24h 会让会话
+        -- 隔天变成「meta 还在、摘要在 0 条」的空壳。
+        local cap_ttl
+        local orig_put = mem.put
+        mem.put = function(self2, ns, key, value, ttl)
+            if key:match("/turn/%d+$") then cap_ttl = ttl end
+            return orig_put(self2, ns, key, value, ttl)
+        end
+        mem:remember_turn("s1", 11, "问", "答")
+        mem.put = orig_put
+        check(cap_ttl == 0, "memory turn stored permanent")
+        -- 原文仍是热区：msg/ 该继续用 short TTL，别一起被改成永久
+        check(mem.TTL.long > 0 and mem.TTL.long <= 24 * 3600 * 1000,
+              "memory raw transcript stays short-lived")
+
+        -- 工具轮落盘摘要：只留「抓手」字段（命令/路径/查询词），截断到 40 字节。
+        -- 工具名单独一条（"bash"）等于没说，完整参数又是最大噪音源。
+        mem:remember_turn("s1", 12, "跑个压测", "峰值 12000 QPS。", {
+            { name = "bash", args = '{"command":"wrk -t8 -c400 -d30s http://x"}' },
+            { name = "read", args = '{"path":"lua/core/memory.lua"}' },
+            { name = "third", args = '{"path":"should-be-dropped"}' },
+        })
+        local dv = mem:get("/agent/session", "s1/turn/12")
+        check(type(dv.ta) == "table" and #dv.ta == 2, "memory turn keeps 2 tool digests")
+        check(dv.ta[1]:find("bash: wrk", 1, true) == 1, "memory tool digest keeps command")
+        check(dv.ta[2]:find("read: lua/core/memory.lua", 1, true) == 1, "memory tool digest keeps path")
+        check(#dv.ta[1] <= 60, "memory tool digest stays short")
+        check(#dv.tools == 3, "memory tool names still complete")
+
+        -- epoch 折叠：工具轮用「摘要 + 末句」，普通轮用首句；噪声轮不进。
+        mem:remember_turn("ep", 1, "压测结果", "好的，我先跑一下。\n峰值 12000 QPS，WAL 确认采用。",
+            { { name = "bash", args = '{"command":"wrk -t8 -c400"}' } })
+        mem:remember_turn("ep", 2, "架构定了吗", "定了：用 WAL，QPS 提升 4 倍。")
+        mem:remember_turn("ep", 3, "好的", "收到。")
+        for i = 4, 8 do mem:remember_turn("ep", i, "第" .. i .. "轮推进", "已推进。") end
+        local ev = mem:get("/agent/session", "ep/epoch/1-8")
+        check(type(ev) == "table", "memory epoch folded at boundary")
+        local c = ev and ev.c or ""
+        check(c:find("7/8 轮有信息", 1, true) ~= nil, "memory epoch counts noise turns")
+        check(c:find("（bash: wrk -t8 -c400）", 1, true) ~= nil, "memory epoch tool digest")
+        -- 工具轮取末句而不是"好的，我先跑一下"
+        check(c:find("WAL 确认采用", 1, true) ~= nil, "memory epoch tool turn keeps tail")
+        -- 普通轮仍走首句
+        check(c:find("定了：用 WAL", 1, true) ~= nil, "memory epoch plain turn keeps head")
+        check(c:find("收到。", 1, true) == nil, "memory epoch drops noise turn")
+        -- 幂等：重复折叠不重写
+        local again = mem:fold_epoch("ep", 1, 8)
+        check(again == false, "memory epoch fold idempotent")
+        -- kind 白名单：epoch 层不混入 turn
+        local ep_only = mem:recall("WAL 压测", 10, { session_id = "ep", kind = "epoch" })
+        local ok_kind = #ep_only > 0
+        for _, it in ipairs(ep_only) do
+            if it.kind ~= "epoch" then ok_kind = false end
+        end
+        check(ok_kind, "memory recall kind narrows to epoch")
+
         -- 工作记忆：会话级隔离；目录级 /agent/working（wake 等运行态）不进 recall
         mem:remember_working("wtask", "s1 的临时任务 zebra", nil, "s1")
         mem:put("/agent/working", "wake", { runs = 9, last_answer = "zebra wake" }, 0)

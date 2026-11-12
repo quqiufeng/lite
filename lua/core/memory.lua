@@ -299,8 +299,15 @@ function M:remember_working(key, content, ttl, session_id)
     return self:put("/agent/working", key, value, ttl or TTL.working)
 end
 
--- 单轮对话落盘上限：assistant 侧可能是整段工具循环输出，原样存会让一条 turn
--- 赶上几十 KB（实测 63KB），召回预算被一条记录吃光。截断而不是丢弃。
+-- 单轮对话落盘上限。最初的理由是"assistant 可能是整段工具循环输出，实测 63KB"，
+-- 但工具输出正文根本进不了 turn（tool_names 只留名字，见下），63KB 只出现在
+-- 工具循环被迫停止的那条异常路径（agent.lua:759）；主路径存的是最终回答
+-- （agent.lua:939），干净且短。所以这里真正要防的不是"大"，而是"长回答里的
+-- 结论被砍掉"——早期用 clip_utf8 从头截断，把答案、代码块、表格这些几乎总在
+-- 尾部的东西整段丢掉，且几乎没有兜底：msg/ 全文过了 raw_keep 会被 prune，自动
+-- 注入也只要 user 原话（assistant 只有显式 recall transcript=true 才看得到），
+-- turn 自身现在虽是永久，但它逐轮独立、从不合并，跨轮结论无人承载。
+-- 所以 turn 必须自己存全，并靠下面的 epoch 折叠层补跨轮视图。
 local TURN_USER_MAX = 800
 local TURN_ASSIST_MAX = 1536
 
@@ -315,6 +322,103 @@ local function clip_utf8(s, max)
         cut = cut - 1
     end
     return s:sub(1, cut) .. "…"
+end
+
+-- 取首句：折叠成 epoch 时每轮只留一句。确定性（同一份 turn 永远得到同一段文本，
+-- 不像模型摘要每次措辞都不一样），长度可控，且能在 clip 前保住句读。
+local function first_sentence(s, max)
+    s = tostring(s or ""):gsub("%s+", " ")
+    s = s:match("^%s*(.-)%s*$") or s
+    if s == "" then return "" end
+    local best
+    for _, pat in ipairs({ "%.[%s]", "%。", "！", "？", "!", "?" }) do
+        local _, en = s:find(pat)
+        if en and (not best or en < best) then best = en end
+    end
+    if best then s = s:sub(1, best) end
+    return clip_utf8(s, max)
+end
+
+-- 头尾拼接截断：保留开头和结尾，中间用省略标记接起来。
+--
+-- turn 落盘用它而不是 clip_utf8 的纯头部截断：对话的结论、代码块、表格几乎都在
+-- 尾部，砍掉头留着尾或砍掉尾留着头都是丢关键信息。带上"略 N 字"的标记而不是
+-- 静默拼接，是为了让读到的模型知道这段不连续——否则它会把首尾当成相邻内容。
+local function utf8_count(s, from, to)
+    local n, i = 0, from
+    while i <= to do
+        local b = s:byte(i)
+        i = i + ((b < 0x80) and 1 or ((b < 0xE0) and 2 or ((b < 0xF0) and 3 or 4)))
+        n = n + 1
+    end
+    return n
+end
+
+-- head_ratio：开头占比。assistant 结论在尾 → 1/3；user 提问通常在首 → 2/3。
+local function clip_head_tail(s, max, head_ratio)
+    s = tostring(s or "")
+    if max <= 0 or #s <= max then return s end
+    head_ratio = head_ratio or 0.5
+    -- 给"…（中间略 N 字）…"留位置：固定 28 字节 + 最多 7 位数字
+    local reserve = 40
+    local room = max - reserve
+    if room < 64 then return clip_utf8(s, max) end
+    local hlen = math.floor(room * head_ratio)
+    local tlen = room - hlen
+
+    -- 两端退到 UTF-8 起始字节，避免劈开多字节字符（与 clip_window 同规则）
+    local hstop = hlen
+    while hstop > 0 do
+        local b = s:byte(hstop + 1)
+        if not b or b < 0x80 or b >= 0xC0 then break end
+        hstop = hstop - 1
+    end
+    local tstart = #s - tlen + 1
+    if tstart < 1 then tstart = 1 end
+    while tstart <= #s do
+        local b = s:byte(tstart)
+        if not b or b < 0x80 or b >= 0xC0 then break end
+        tstart = tstart + 1
+    end
+    if tstart <= hstop then return s end
+
+    local dropped = utf8_count(s, hstop + 1, tstart - 1)
+    return s:sub(1, hstop) .. "…（中间略 " .. dropped .. " 字）…" .. s:sub(tstart)
+end
+
+-- 命中窗口裁剪：长文本只取命中词周围一段，而不是从头部截断。
+-- turn/working 的正文可能几千字，答案常在尾部；头部截断等于把 token 花在
+-- 与查询无关的前言上。terms 是小写词表，按 UTF-8 边界取 ±max/3 的窗口。
+local function clip_window(s, max, terms)
+    s = tostring(s or "")
+    if max <= 0 or #s <= max then return s end
+    local low = s:lower()
+    local best
+    for _, w in ipairs(terms or {}) do
+        local pos = low:find(w, 1, true)
+        if pos and (not best or pos < best) then best = pos end
+    end
+    local start = 1
+    if best then
+        start = best - math.floor(max / 3)
+        if start < 1 then start = 1 end
+    end
+    -- 两端都退到 UTF-8 起始字节，避免劈开多字节字符
+    while start > 1 do
+        local b = s:byte(start)
+        if not b or b < 0x80 or b >= 0xC0 then break end
+        start = start - 1
+    end
+    local stop = start + max - 1
+    if stop > #s then stop = #s end
+    while stop < #s do
+        local b = s:byte(stop + 1)
+        if not b or b < 0x80 or b >= 0xC0 then break end
+        stop = stop - 1
+    end
+    local head = start > 1 and "…" or ""
+    local tail = stop < #s and "…" or ""
+    return head .. s:sub(start, stop) .. tail
 end
 
 -- tools 只留名字：参数（大段文件内容/命令输出）是纯噪音，且体积最大。
@@ -336,6 +440,67 @@ local function tool_names(tools)
     return #out > 0 and out or nil
 end
 
+-- 参数摘要：工具名单独一条信息量太低（"bash" 等于没说），但完整参数（文件内容、
+-- 命令输出）又是最大的噪音源。取折中：每个工具挑一个「抓手」字段——执行了什么
+-- 命令、改了哪个文件、搜了什么词——截到 40 字节。纯白名单解析，不做推理。
+-- 只影响 epoch 的拼装，不影响原始 msg/（那边是完整记录）。
+local ARG_KEYS = { "command", "cmd", "path", "file", "file_path", "filename",
+                   "pattern", "query", "url", "code" }
+local function tool_digests(tools)
+    if type(tools) ~= "table" then return nil end
+    local out = {}
+    for _, t in ipairs(tools) do
+        if type(t) == "table" then
+            local name = tostring(t.name or t.tool or t[1] or "tool")
+            local args = t.args or t.arguments or t[2]
+            local grab
+            if type(args) == "string" and args ~= "" then
+                local ok, d = pcall(cjson.decode, args)
+                args = ok and type(d) == "table" and d or nil
+            end
+            if type(args) == "table" then
+                for _, k in ipairs(ARG_KEYS) do
+                    local v = args[k]
+                    if type(v) == "string" and v ~= "" then grab = v; break end
+                    if type(v) == "number" then grab = tostring(v); break end
+                end
+            end
+            if grab then
+                grab = grab:gsub("%s+", " "):gsub("^ ", ""):gsub(" $", "")
+                out[#out + 1] = name .. ": " .. clip_utf8(grab, 40)
+            else
+                out[#out + 1] = name
+            end
+        else
+            out[#out + 1] = tostring(t)
+        end
+        if #out >= 2 then break end   -- 一轮调十个工具只留头两个，够定位了
+    end
+    return #out > 0 and out or nil
+end
+
+-- 末句：工具轮的开场白（"好的，我看一下"）没有信息，结论写在最后一句。
+-- 用 plain find 找最后一个句末标点的起点，比按 UTF-8 字节猜可靠得多。
+local SENT_END = { "。", "！", "？", "!", "?", "\n" }
+local function last_sentence(s, max)
+    s = tostring(s or ""):gsub("%s+$", "")
+    if s == "" then return "" end
+    local best = 0
+    for _, e in ipairs(SENT_END) do
+        local from = 1
+        while true do
+            local a, b = s:find(e, from, true)
+            if not a then break end
+            if b + 1 > best and b < #s then best = b + 1 end
+            from = b + 1
+        end
+    end
+    if best > 1 then s = s:sub(best) end
+    s = s:gsub("^%s+", "")
+    if s == "" then return "" end
+    return clip_utf8(s, max)
+end
+
 function M:remember_turn(session_id, turn, user, assistant, tools)
     local sid = tostring(session_id or "session")
     local meta = self:session_meta(sid)
@@ -348,13 +513,75 @@ function M:remember_turn(session_id, turn, user, assistant, tools)
     local key = string.format("%s/turn/%d", sid, turn)
     local ok = self:put("/agent/session", key, {
         t = "turn",
-        u = clip_utf8(user, TURN_USER_MAX),
-        a = clip_utf8(assistant, TURN_ASSIST_MAX),
+        u = clip_head_tail(user, TURN_USER_MAX, 2 / 3),
+        a = clip_head_tail(assistant, TURN_ASSIST_MAX, 1 / 3),
         tools = tool_names(tools),
+        ta = tool_digests(tools),
         ts = os.time(),
-    }, TTL.long)
+    -- 存 permanent：turn 是「提炼层」，msg/ 原文才是 24h 热区。早先这里跟着
+    -- 原文一起用 long，一天后 meta 还在、会话还能列出来，点进去却一条摘要都没有
+    -- ——会话空壳。和 usage/meta 同理，摘要必须跟着会话走。
+    }, TTL.permanent)
     self:touch_session(sid, nil, nil, user, turn)
+    -- 每 EPOCH_EVERY 轮折一层 epoch：跨轮结论只有合并后才可检索，逐轮 turn
+    -- 各说各话，谁也不会承载「这个项目最后定了什么」。
+    if M.EPOCH_EVERY > 0 and turn % M.EPOCH_EVERY == 0 then
+        pcall(self.fold_epoch, self, sid, turn - M.EPOCH_EVERY + 1, turn)
+    end
     return ok
+end
+
+-- ── epoch：确定性的跨轮折叠层 ──────────────────────────────────────────
+-- 为什么不用模型摘要：同一段记忆两次摘要措辞不同 → 召回结果不稳定、不可复现，
+-- 而且每轮都要多一次调用。这里要的不是「压缩比」，是「可检索性」，所以用
+-- 首句 + 工具名做纯文本拼装：零模型参与、可复现、可 diff。
+M.EPOCH_EVERY = 8
+-- 一轮 u+a 合计短于这个字节数、且没调工具 → 视为无信息轮，不进 epoch。
+local EPOCH_MIN_INFO = 24
+
+function M:fold_epoch(session_id, from, to)
+    local sid = tostring(session_id or "session")
+    from, to = tonumber(from), tonumber(to)
+    if not from or not to or to < from then return false end
+    local key = string.format("%s/epoch/%d-%d", sid, from, to)
+    if self:get("/agent/session", key) then return false end  -- 幂等：重复触发不重写
+    local lines, tools_all, got = {}, {}, 0
+    for i = from, to do
+        local d = self:get("/agent/session", string.format("%s/turn/%d", sid, i))
+        if type(d) == "table" then
+            got = got + 1
+            local u = first_sentence(d.u, 120)
+            local a = first_sentence(d.a, 200)
+            -- 确定性去噪：寒暄/确认类轮次（"好的"、"继续"、"收到"）塞进 epoch
+            -- 只会稀释信号、吃掉召回窗口。规则很死：两边都短于 12 字节且没用
+            -- 工具 = 没有新信息。不用模型判断，才不会出现同一批 turn 两种折法。
+            local tl = table.concat(d.tools or {}, ",")
+            if #u + #a >= EPOCH_MIN_INFO or tl ~= "" then
+                if tl ~= "" then
+                    -- 工具轮：抓手是"对什么做了什么"，加上结论（末句）。
+                    -- 首句在这里基本是"好的，我先看下"，占了 200 字节预算却零信息。
+                    local dig = table.concat(d.ta or d.tools or {}, "; ")
+                    local tail = last_sentence(d.a, 120)
+                    lines[#lines + 1] = string.format("[%d] %s →（%s）%s", i, u, dig, tail)
+                else
+                    lines[#lines + 1] = string.format("[%d] %s → %s", i, u, a)
+                end
+            end
+            for _, t in ipairs(d.tools or {}) do tools_all[t] = true end
+        end
+    end
+    if got == 0 or #lines == 0 then return false end
+    local tags = {}
+    for t in pairs(tools_all) do tags[#tags + 1] = t end
+    table.sort(tags)
+    return self:put("/agent/session", key, {
+        t = "epoch",
+        c = string.format("第%d-%d轮（%d/%d 轮有信息）：\n%s", from, to, #lines, got,
+            table.concat(lines, "\n")),
+        from = from, to = to,
+        tags = tags,
+        ts = os.time(),
+    }, TTL.permanent)
 end
 
 -- usage 落盘：进程一退，会话级命中率就没了，事后再想复盘"这一晚到底发了多少请求、
@@ -663,6 +890,9 @@ function M:recall(query, limit, opts)
             local rest = key:sub(#SESS + 1)
             local kind = rest:match("^[^/]+/([^/]+)/")
             if kind == "turn" then return "turn" end
+            -- epoch：每 N 轮折叠出的跨轮结论。它的存在就是为了「一次 recall 就能
+            -- 拿到阶段性答案」，所以直连白名单，权重也高于单轮 turn。
+            if kind == "epoch" then return "epoch" end
             if kind == "working" then return "working" end
             -- 原始 transcript：自动注入只放 user 原文（用户自己的话不过期）；
             -- 显式 recall 时额外放 assistant/tool（kind="trunc"，低权重、有截断），
@@ -673,7 +903,18 @@ function M:recall(query, limit, opts)
         return nil
     end
 
-    local WEIGHT = { fact = 1.0, working = 0.9, user = 0.8, turn = 0.6, trunc = 0.35 }
+    -- epoch 排在 fact 与 working 之间：它比单轮 turn 更值钱（跨轮结论），
+    -- 但仍不该盖过人工 remember 下来的长期事实。
+    -- kinds：显式收窄到某一层。recall(query, kind="fact") 这种指令不该被
+    -- turn 的同词命中稀释——模型问「之前定的结论」，要的就是结论层。
+    local kinds
+    if opts.kind and opts.kind ~= "" then
+        kinds = {}
+        for _, k in ipairs(type(opts.kind) == "table" and opts.kind or { opts.kind }) do
+            kinds[tostring(k)] = true
+        end
+    end
+    local WEIGHT = { fact = 1.0, epoch = 0.85, working = 0.9, user = 0.8, turn = 0.6, trunc = 0.35 }
 
     local function add(r)
         -- 目录级 /agent/working（wake 调度状态、todos 兜底）属于运行态：
@@ -681,6 +922,9 @@ function M:recall(query, limit, opts)
         if r.key:sub(1, #working_prefix) == working_prefix then return end
         local kind = allowed(r.key)
         if not kind then return end
+        -- kind 过滤放在 add()：白名单外的类别根本不进候选池。这样 df/IDF 也只在
+        -- 同一层里估，不会被另一层的词频带偏（fact 里的「文件」不该压低 turn 里
+        -- 同一个词的权重）。
         if want_session and r.key:sub(1, #session_prefix) == session_prefix then
             if r.key:sub(1, #want_session) ~= want_session then return end
         end
@@ -699,6 +943,7 @@ function M:recall(query, limit, opts)
                 return
             end
         end
+        if kinds and not kinds[kind] then return end
         if kind == "user" and cutoff_seq then
             local seq = tonumber(r.key:match("/(%d+)$") or "")
             if seq and seq > cutoff_seq then return end
@@ -730,20 +975,31 @@ function M:recall(query, limit, opts)
     -- 扫描分槽：knowledge 一次；会话内按 turn/ working/ msg/ 分开扫。
     -- 旧版按 "/agent/session/<sid>/" 整棵前缀扫，字典序 msg<turn<working，
     -- 长会话里 msg 把候选窗口吃满，turn/working 永远进不了候选。
+    -- 候选池：IDF 的 df 是在候选池上估的，池子只比 limit 大一点时，
+    -- df 估计方差极大（一个词在全库很常见，在小池子里可能只出现 1 次 → 被当成
+    -- 稀有词重奖），而长尾的相关轮次压根进不了池。旧版 limit*8，limit=6 时
+    -- 候选只有 48 条，等于在 48 条上给全库打分。放到底线 160、随 limit 线性放宽，
+    -- 再设上限防止大 limit 把扫描次数炸掉；最终条数仍由 limit 卡。
+    local cand = tonumber(opts.candidates)
+    if not cand or cand <= 0 then
+        cand = math.max(limit * 8, 160)
+        if cand > 600 then cand = 600 end
+    end
     local scans = 0
     local function scan(p, n)
         scans = scans + 1
-        for _, r in ipairs(self:search_prefix(p, { max_results = n or limit * 8 })) do
+        for _, r in ipairs(self:search_prefix(p, { max_results = n or cand })) do
             add(r)
         end
     end
     scan("/agent/knowledge/")
     if want_session then
         scan(want_session .. "turn/")
+        scan(want_session .. "epoch/")
         scan(want_session .. "working/")
         -- msg/ 也扫：user 原文永久保留（add() 按 role 过滤掉 assistant/tool）。
         -- 单独一槽 + 有界，不会像旧版整棵前缀扫那样把 turn/working 挤掉。
-        scan(want_session .. "msg/", limit * 4)
+        scan(want_session .. "msg/", math.floor(cand / 2))
     else
         -- 跨会话召回（recall 工具）：按 cwd 索引取最近几个会话，逐个扫 turn/ 与
         -- working/，每个槽有界，不会被 msg/meta 挤掉。
@@ -752,8 +1008,9 @@ function M:recall(query, limit, opts)
             for _, meta in ipairs(list) do
                 if type(meta) == "table" and meta.id then
                     local base = session_prefix .. meta.id .. "/"
-                    scan(base .. "turn/", limit * 4)
-                    scan(base .. "working/", limit * 2)
+                    scan(base .. "turn/", math.floor(cand / 4))
+                    scan(base .. "epoch/", math.floor(cand / 6))
+                    scan(base .. "working/", math.floor(cand / 8))
                 end
             end
         end
@@ -763,7 +1020,7 @@ function M:recall(query, limit, opts)
     -- 前 8 个 term 覆盖绝大部分命中，长尾丢掉换扫描次数。
     for i = 1, math.min(#terms, 8) do
         scans = scans + 1
-        for _, r in ipairs(cache.search_tag(self.h, terms[i], { max_results = limit * 4 })) do
+        for _, r in ipairs(cache.search_tag(self.h, terms[i], { max_results = math.floor(cand / 2) })) do
             add(r)
         end
     end
@@ -782,7 +1039,13 @@ function M:recall(query, limit, opts)
         tstat[w].w = math.log(1 + (n + 1) / (tstat[w].df + 1))
     end
     local now = os.time()
+    -- 衰减半径按 kind 分开。原先一律 30 天减半，等于把刚做的「turn 永久化」在
+    -- 打分阶段又抵消掉：存了 90 天的 turn decay≈0.25，同分必被新 turn 挤掉，
+    -- 库里永久存在、召回里等于不存在。提炼层（turn/epoch）比原始对话慢一个
+    -- 数量级老化，原始 transcript 反而该掉得更快。
+    local DECAY_DAYS = { turn = 180, epoch = 365, trunc = 14 }
     st.candidates = st.candidates + #out
+    st.scans = (st.scans or 0) + scans
     local kept = {}
     for _, it in ipairs(out) do
         local hits, tot = 0, 0
@@ -796,9 +1059,11 @@ function M:recall(query, limit, opts)
             end
         end
         if hits > 0 then
-            local lenpen = 1 / (1 + math.log(1 + #it.text / 600))
+            -- epoch 天生比单轮长（多轮拼装），长度惩罚会把「信息多」当成
+            -- 「注水多」来罚，正好罚反。它的长度是结构性的，给满分。
+            local lenpen = it.kind == "epoch" and 1 or (1 / (1 + math.log(1 + #it.text / 600)))
             local age = it.ts and math.max(0, now - it.ts) or 0
-            local decay = 1 / (1 + age / (30 * 86400))
+            local decay = 1 / (1 + age / ((DECAY_DAYS[it.kind] or 30) * 86400))
             it.score = (hits / math.max(tot, 1e-9)) * lenpen * decay * (WEIGHT[it.kind] or 1.0)
             kept[#kept + 1] = it
         end
@@ -815,11 +1080,16 @@ function M:recall(query, limit, opts)
     -- 最多两条 transcript：轮次权重已经调低，但同分时仍可能挤满整块，
     -- 而重复的旧对话对下一轮几乎没有信息量。事实/工作笔记不受此限。
     local keep = {}
-    local users_kept, truncs_kept = 0, 0
+    local users_kept, truncs_kept, epochs_kept = 0, 0, 0
     for _, it in ipairs(out) do
         if it.kind == "turn" then
             turns_kept = turns_kept + 1
             if turns_kept > 2 then goto continue end
+        elseif it.kind == "epoch" then
+            -- epoch 是本层最值钱的条目，但也别让它把整块记忆占满：两段就能
+            -- 交代一个阶段的来龙去脉，再多就该收紧查询词了。
+            epochs_kept = epochs_kept + 1
+            if epochs_kept > 2 then goto continue end
         elseif it.kind == "user" then
             users_kept = users_kept + 1
             if users_kept > 4 then goto continue end
@@ -831,6 +1101,14 @@ function M:recall(query, limit, opts)
         end
         keep[#keep + 1] = it
         ::continue::
+    end
+    -- 返回预算：显式 recall 的每条文本按 item_chars 取命中窗口（不是头部截断）。
+    -- 0/未给 = 不限，保持旧行为。
+    local item_chars = tonumber(opts.item_chars) or 0
+    if item_chars > 0 then
+        for _, it in ipairs(keep) do
+            it.text = clip_window(it.text, item_chars, terms)
+        end
     end
     st.injected = st.injected + #keep
     st.dropped = st.dropped + math.max(0, #out - #keep)
@@ -862,6 +1140,7 @@ function M:stats()
         max = cache.memory_max(self.h),
         recall_calls = st.calls or 0,
         recall_candidates = st.candidates or 0,
+        recall_scans = st.scans or 0,
         recall_injected = st.injected or 0,
         recall_dropped = st.dropped or 0,
     }
