@@ -155,7 +155,7 @@ if [ -f "$ROOT/build/liblite_html.so" ]; then
 fi
 
 for f in lite-lua lua.sh lite run.sh check_deps.sh build.sh test.sh install.sh package.sh release.sh launch.sh \
-         ort_link.sh cuda_provider.sh see.lua; do
+         ort_link.sh cuda_provider.sh see.lua cluster.sh; do
     [ -f "$ROOT/tools/$f" ] && cp "$ROOT/tools/$f" "$DIST/tools/"
 done
 cp "$ROOT/tools/auto_unit.lua" "$DIST/tools/"
@@ -167,7 +167,8 @@ cp "$ROOT/third_party/cjson/lua/5.1/cjson.so" "$DIST/third_party/cjson/lua/5.1/"
 chmod +x "$DIST/tools/lite-lua" "$DIST/tools/lua.sh" "$DIST/tools/lite" "$DIST/tools/run.sh" \
     "$DIST/tools/check_deps.sh" "$DIST/tools/build.sh" "$DIST/tools/test.sh" \
     "$DIST/tools/install.sh" "$DIST/tools/package.sh" "$DIST/tools/release.sh" \
-    "$DIST/tools/launch.sh" "$DIST/tools/ort_link.sh" "$DIST/tools/cuda_provider.sh"
+    "$DIST/tools/launch.sh" "$DIST/tools/ort_link.sh" "$DIST/tools/cuda_provider.sh" \
+    "$DIST/tools/cluster.sh"
 
 if command -v strip >/dev/null 2>&1; then
     strip --strip-unneeded "$DIST/third_party/luajit/src/luajit" 2>/dev/null || true
