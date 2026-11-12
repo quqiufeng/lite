@@ -175,6 +175,14 @@ workspace `.env`（优先级 cwd/上级 → `~/.config/lite/.env` → `~/.env` �
 （源码树 `build.sh` / 安装版 `release.sh`），别把 `libgumbo.so.0: cannot open shared object`
 误读成「liblite_html 没编译」。
 
+`src/html/prepass.{h,cpp}` 是进 litehtml **之前**的 CSS 改写层（litehtml 无元素钩子，
+`opacity`/`box-shadow`/`transform:translate` 它全不认）：把这三样烧进 HTML（opacity→
+预混 rgba 前景、translate→给元素加 margin、shadow→记进 `shadow_spec` 由
+`render.cpp:paint_shadow` 按 erfc 模糊剖面画环）。改 `paint_shadow` 的坑：采样区间要往
+「平移量 + 3σ」内延伸、挖洞只挖元素自身盒子，否则 offset 阴影与卡片之间留一条背景色亮缝；
+`tools/auto_unit.lua` 的 `html prepass` 段逐像素验这三项。
+仍不支持：`grid`（上游无布局）、`transform: rotate/scale/matrix`、`background-image`。
+
 工具输出 ≤ 32KB；`read` 文本/目录限 workspace，图片可读 `$TMPDIR:/tmp:/var/tmp`；
 `bash` 可异步长跑，TUI 里 `Ctrl+C` 取消。回归测试先在修复前 commit 确认 FAIL。
 

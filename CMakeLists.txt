@@ -57,7 +57,7 @@ set_target_properties(lite_capture PROPERTIES
     BUILD_RPATH "$ORIGIN"
     INSTALL_RPATH "$ORIGIN")
 
-add_library(lite_html SHARED src/html/render.cpp)
+add_library(lite_html SHARED src/html/render.cpp src/html/prepass.cpp)
 target_include_directories(lite_html PRIVATE /opt/litehtml/include)
 target_link_libraries(lite_html PRIVATE /opt/litehtml/build-pic/liblitehtml.so cairo fontconfig)
 # libgumbo 升成 liblite_html.so 的直接 NEEDED。原因：liblitehtml.so.0 自己声明的

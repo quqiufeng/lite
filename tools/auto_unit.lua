@@ -5479,6 +5479,78 @@ do
     os.execute("rm -rf " .. base)
 end
 
+-- html prepass：opacity / box-shadow / transform:translate 在进 litehtml 之前被改写
+-- （每次落盘再标量一个像素，比只验"没崩"更能挡住回归）
+do
+    local ffi = require("ffi")
+    local so = root .. "/build/liblite_html.so"
+    local f = io.open(so, "rb")
+    if f then
+        f:close()
+        local bok = pcall(ffi.cdef, [[
+            int lite_html_render(const char*, const char*, int, int, double); ]])
+        local lib = bok and ffi.load(so) or nil
+        ffi.cdef[[
+            typedef struct _cairo_surface cairo_surface_t;
+            cairo_surface_t *cairo_image_surface_create_from_png(const char *filename);
+            int cairo_image_surface_get_width(cairo_surface_t *surface);
+            int cairo_image_surface_get_height(cairo_surface_t *surface);
+            int cairo_image_surface_get_stride(cairo_surface_t *surface);
+            unsigned char *cairo_image_surface_get_data(cairo_surface_t *surface);
+            int cairo_surface_status(cairo_surface_t *surface);
+            void cairo_surface_destroy(cairo_surface_t *surface);
+        ]]
+        local cairo = ffi.load("cairo")
+        local html = "<html><body style='margin:0;background:#ffffff'>"
+            .. "<div style='width:200px;height:60px;margin:10px;background:#ff0000;opacity:.5'></div>"
+            .. "<div style='width:200px;height:60px;margin:10px;background:#00ff00;"
+            .. "box-shadow:0 0 10px rgba(0,0,255,1)'></div>"
+            .. "<div style='width:200px;height:60px;margin:10px;background:#0000ff;"
+            .. "transform:translate(40px,0)'></div>"
+            .. "</body></html>"
+        local out = (os.getenv("TMPDIR") or "/tmp") .. "/lite-prepass-test.png"
+        local buf = ffi.new("char[?]", #html + 1, html)
+        check(lib ~= nil and lib.lite_html_render(buf, out, 400, 0, 1) == 0, "html render box-shadow html")
+        local surf = cairo.cairo_image_surface_create_from_png(out)
+        if cairo.cairo_surface_status(surf) == 0 then
+            local w, h = cairo.cairo_image_surface_get_width(surf), cairo.cairo_image_surface_get_height(surf)
+            local stride = cairo.cairo_image_surface_get_stride(surf)
+            local data = cairo.cairo_image_surface_get_data(surf)
+            -- premultiplied ARGB32 小端：字节序 B,G,R,A；对白底把 alpha 预制回去
+            local function px(x, y)
+                if x < 0 or y < 0 or x >= w or y >= h then return 255, 255, 255 end
+                local o = y * stride + x * 4
+                local b, g, r, a = data[o], data[o + 1], data[o + 2], data[o + 3]
+                local u = 255 - a
+                return math.floor(r * 255 / 255 + u + 0.5), math.floor(g + u + 0.5), math.floor(b + u + 0.5)
+            end
+            -- div1 在 y10..70：半透明红叠白 → (255,127,127)
+            local r, g, b = px(100, 40)
+            check(r > 240 and g > 100 and g < 165 and b > 100 and b < 165, "html prepass opacity")
+            -- div2 在 y80..140：左侧 box-shadow 是蓝的（白底上 b 恒 255，看 r/g 被压下去多少）
+            local r2, g2, b2 = px(4, 110)
+            check(b2 > 240 and g2 < 235 and b2 - g2 > 20 and math.abs(r2 - g2) < 6,
+                "html prepass box-shadow painted")
+            local sentinel = false
+            for y = 0, h - 1, 2 do
+                for x = 0, w - 1, 2 do
+                    local rr, gg = px(x, y)
+                    if rr == 254 and gg == 1 then sentinel = true end
+                end
+            end
+            check(not sentinel, "html prepass sentinel color hidden")
+            -- div3 在 y150..210，translate(40px) 后应出现在 x≈50 之后
+            local _, _, b3 = px(60, 180)
+            local r4 = px(15, 180)
+            check(b3 > 200 and r4 > 240, "html prepass translate")
+        else
+            check(false, "html render png readable")
+        end
+        cairo.cairo_surface_destroy(surf)
+        os.remove(out)
+    end
+end
+
 -- entry
 check(loadfile(root .. "/lua/main.lua") ~= nil, "load lua/main.lua")
 
