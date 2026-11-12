@@ -191,6 +191,18 @@ do
     check(sp:find("<rules>", 1, true) ~= nil, "prompt rules")
     local sec = Prompt.sections(ctx, { tools = tools })
     check(#sec.tools < 400, "tools section stays a compact roster")
+    -- 工具名单**不能**进 system：helper 增删一个插件就让这段字节变一次，
+    -- 整段前缀缓存跟着作废。名字改由 runtime_block 播报（每轮末尾）。
+    local other_tools = { { ["function"] = { name = "zzz_new_plugin" } } }
+    local sec_a = Prompt.sections(ctx, { tools = tools })
+    local sec_b = Prompt.sections(ctx, { tools = other_tools })
+    check(sec_a.tools == sec_b.tools, "tools section is independent of the tool set")
+    check(Prompt.system_prompt(ctx, { tools = tools })
+        == Prompt.system_prompt(ctx, { tools = other_tools }),
+        "system prompt is byte-identical after a helper changed the tool list")
+    local rt_names = Prompt.runtime_block(ctx, { turn = 1, max_turns = 9, tools = other_tools })
+    check(rt_names:find("zzz_new_plugin", 1, true) ~= nil,
+        "runtime block names the tools of this process")
     check(#sec.rules < 1900, "rules section stays compact")
     -- RULES 里曾整段复述 <native> 的自造工具流程（一次请求付两遍）。
     check(sec.rules:find("lite_helper", 1, true) == nil, "rules do not repeat the native flow")
@@ -798,6 +810,51 @@ do
     -- 缺 cache_miss 字段时按 prompt-hit 推
     ctx:add_usage({ prompt = 1000, cache_hit = 250 })
     check(ctx.session.usage.cache_miss == 9750, "usage miss derived from prompt")
+
+    -- 没有真 usage 的请求（provider 的 estimated 兜底）不该被算成"全 miss"：
+    -- 网关不返 usage 的晚上会把命中率凭空压到 0%。只记 requests/prompt/完成量。
+    local before_hit, before_miss = ctx.session.usage.cache_hit, ctx.session.usage.cache_miss
+    local before_denom = ctx.session.usage.prefix_denom or 0
+    ctx:add_usage({ prompt = 5000, completion = 20, estimated = true })
+    check(ctx.session.usage.cache_hit == before_hit, "estimated usage adds no cache hit")
+    check(ctx.session.usage.cache_miss == before_miss, "estimated usage adds no cache miss")
+    check((ctx.session.usage.prefix_denom or 0) == before_denom,
+        "estimated usage adds no prefix denom")
+    check(ctx.session.usage.requests == 4, "estimated usage still counts a request")
+    check(ctx.session.usage.usage_unknown == 1, "estimated usage is counted as unknown")
+    check(ctx.session.usage.last.cache_unknown == true, "estimated last marks cache_unknown")
+
+    -- reset 分账：fold / hard_window / window 各记各的，命中率抖动才能归因。
+    ctx:note_cache_reset("fold", { dropped = 3, chars = 900 })
+    ctx:note_cache_reset("hard_window", { dropped = 7 })
+    ctx:note_cache_reset("window", { dropped = 2 })
+    check(ctx.session.usage.reset_fold == 1 and ctx.session.usage.reset_hard == 1
+        and ctx.session.usage.reset_window == 1, "cache resets are counted per cause")
+    check(ctx.session.usage.last_reset.kind == "window"
+        and ctx.session.usage.last_reset.dropped == 2, "last cache reset is recorded")
+
+    -- 落盘再恢复：分账计数要跨进程活下来。
+    local Mem = require("core.memory")
+    local mdir = os.tmpname()
+    os.remove(mdir)
+    os.execute("mkdir -p " .. shq(mdir))
+    local mem = assert(Mem.new({ dir = mdir }))
+    ctx.session.usage.reset_fold = 4
+    ctx.session.usage.reset_hard = 2
+    check(mem:save_usage(ctx.session.id, ctx.session.usage), "usage saved")
+    local loaded = mem:load_usage(ctx.session.id)
+    check(loaded and loaded.reset_fold == 4 and loaded.reset_hard == 2,
+        "cache reset counters persist")
+    check(loaded and type(loaded.last_reset) == "table"
+        and loaded.last_reset.kind == "window", "last cache reset persists")
+    local back = Ctx.new({ api_key = "x" })
+    check(back:restore_usage(loaded), "usage restored")
+    check(back.session.usage.reset_fold == 4 and back.session.usage.reset_window == 1,
+        "cache reset counters restored")
+    check(back.session.usage.last_reset and back.session.usage.last_reset.kind == "window",
+        "last cache reset restored")
+    mem:close()
+    os.execute("rm -rf " .. shq(mdir))
 end
 
 -- 可复用前缀命中率：hit / min(上一轮 prompt, 本轮 prompt)

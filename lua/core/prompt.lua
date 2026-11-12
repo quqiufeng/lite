@@ -74,18 +74,12 @@ function M.sections(ctx, opts)
     opts = opts or {}
     local cwd = ctx.session.cwd or "."
 
-    local tool_names = {}
-    for _, schema in ipairs(opts.tools or {}) do
-        local fn = schema["function"] or {}
-        if fn.name then tool_names[#tool_names + 1] = fn.name end
-    end
-    -- 描述/参数/默认值已在 API 的 tools 字段逐字发出；这里再抄一遍是纯重复，
-    -- 还占着每个请求都要付的前缀 token。只留一张名字表 + 权威来源指路。
-    local tools = "(none)\nAdditional tools may be available."
-    if #tool_names > 0 then
-        tools = "Names only; each tool's description, parameters, and defaults are sent in the API " ..
-            "`tools` field, which is authoritative:\n" .. table.concat(tool_names, ", ")
-    end
+    -- 工具**名单**不进 system：helper 增删一个插件就会让这段字节变一次，
+    -- 于是 system prompt 整段前缀缓存作废（一次 helper 变动 = 整晚 miss）。
+    -- 名字表改由 runtime_block 追加在本轮末尾（见 M.runtime_block），
+    -- system 因此与工具集无关，可以做到逐字节常量。
+    local tools = "Each tool's name, description, parameters, and defaults are sent in the API " ..
+        "`tools` field, which is authoritative. Use exactly those names."
 
     local rules = {}
     for _, r in ipairs(RULES) do rules[#rules + 1] = "- " .. r end
@@ -152,6 +146,16 @@ end
 function M.runtime_block(ctx, opts)
     opts = opts or {}
     local lines = { "Current local date/time: " .. os.date("%Y-%m-%d %A %H:%M:%S %Z") .. "." }
+    -- 工具名单放这里而不是 system：这块本来每轮都在变（时钟），多一行名字不多付
+    -- 一次缓存；而 system 因为不再含名单而变成常量，helper 增删插件也不会再把它打散。
+    local names = {}
+    for _, schema in ipairs(opts.tools or {}) do
+        local fn = schema["function"] or {}
+        if fn.name then names[#names + 1] = fn.name end
+    end
+    if #names > 0 then
+        lines[#lines + 1] = "Tool names available in this process: " .. table.concat(names, ", ") .. "."
+    end
     local turn = tonumber(opts.turn)
     local max_turns = tonumber(opts.max_turns)
         or tonumber(ctx and ctx.settings and ctx.settings.max_turns)

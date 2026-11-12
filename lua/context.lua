@@ -129,12 +129,39 @@ M.PREFIX_WARN_MIN_PROMPT = 1500
 -- 前者会被"相对上一轮新增的部分"稀释 —— 一次 9KB 工具结果 ≈2.6k tokens 全部
 -- 按 miss 计价，命中率自然掉到 50%，但前缀其实没坏。后者只看"上一轮那截里
 -- 命中了多少"，掉下去才真的说明 system/tools/历史前缀被动过。
+-- u.cache_hit/cache_miss 只有 provider 真回了 usage 才有；走 estimate_usage 兜底
+-- 的那份（estimated=true，见 provider.lua）压根不知道命中了多少。这时把它当成
+-- "全 miss" 会把命中率凭空拉低（网关不返 usage 的晚上能显示成 0%），所以：
+-- 没拿到真值的请求只计 requests/prompt/completion，缓存两栏**不记**。
+local function cache_known(u)
+    if type(u) ~= "table" or u.estimated then return false end
+    return u.cache_hit ~= nil or u.cache_miss ~= nil
+end
+
 function M:add_usage(u)
     if type(u) ~= "table" then return end
     local s = self.session.usage
     if not s then return end
     local prompt = tonumber(u.prompt) or 0
-    local hit = tonumber(u.cache_hit) or 0
+    local known = cache_known(u)
+    local hit = known and (tonumber(u.cache_hit) or 0) or 0
+    if not known then
+        -- 保留"这一轮有多少次请求没拿到 usage"的可见性，别让统计变成无声的谎。
+        s.usage_unknown = (s.usage_unknown or 0) + 1
+        s.requests = s.requests + 1
+        s.prompt = s.prompt + prompt
+        s.completion = s.completion + (tonumber(u.completion) or 0)
+        local last = {
+            prompt = prompt,
+            completion = tonumber(u.completion) or 0,
+            estimated = true,
+            cache_unknown = true,
+            prev_prompt = s.last and s.last.prompt or nil,
+        }
+        s.last = last
+        self:emit("usage", last, s)
+        return
+    end
     local miss = tonumber(u.cache_miss) or (prompt - hit)
     if miss < 0 then miss = 0 end
     local prev_prompt = s.last and s.last.prompt or nil
@@ -185,6 +212,35 @@ function M:add_usage(u)
     end
 end
 
+-- 前缀被 reset 的原因分两类，代价与频率完全不同，统计时必须分开看：
+--   fold        —— 摘要压缩（LITE_COMPACT=1 的老策略），低频、一次性，压完还能命中新基座；
+--   hard_window —— 丢弃优先（默认）下的硬上限兜底，直接把窗口从最新往回装，整窗 miss；
+--   window      —— 手动 /compact N 的窗口滑动，每个请求都在动，命中率必然低。
+-- 混成一个数的话，命中率一抖根本看不出是哪种，也就无从判断该调哪个旋钮。
+function M:note_cache_reset(kind, info)
+    local s = self.session and self.session.usage
+    if not s then return false end
+    local k = tostring(kind or "?")
+    if k == "fold" then
+        s.reset_fold = (s.reset_fold or 0) + 1
+    elseif k == "hard_window" then
+        s.reset_hard = (s.reset_hard or 0) + 1
+    elseif k == "window" then
+        s.reset_window = (s.reset_window or 0) + 1
+    else
+        s.reset_other = (s.reset_other or 0) + 1
+    end
+    info = type(info) == "table" and info or {}
+    s.last_reset = {
+        kind = k,
+        dropped = tonumber(info.dropped) or 0,
+        chars = tonumber(info.chars) or 0,
+        ts = os.time(),
+        turn = self.session.turn,
+    }
+    return true
+end
+
 -- 把落盘的 usage 接回来（或清空：u 为 nil）。不这么做的话，恢复会话后状态栏
 -- 从 0 开始算，"这一晚总共发了 700 次请求、前缀命中 99%"这种账目就跨不过进程边界。
 -- 只接累计值 + 上一轮 prompt（给 add_usage 算可复用前缀的分母用），不接 last 里的
@@ -194,11 +250,13 @@ function M:restore_usage(u)
     if not s then return false end
     local src = type(u) == "table" and u or {}
     for _, k in ipairs({ "requests", "prompt", "completion", "cache_hit",
-        "cache_miss", "prefix_hit", "prefix_denom" }) do
+        "cache_miss", "prefix_hit", "prefix_denom",
+        "reset_fold", "reset_hard", "reset_window", "reset_other", "usage_unknown" }) do
         s[k] = math.floor(tonumber(src[k]) or 0)
     end
     local prev = math.floor(tonumber(src.last_prompt) or 0)
     s.last = prev > 0 and { prompt = prev, restored = true } or nil
+    s.last_reset = type(src.last_reset) == "table" and src.last_reset or nil
     self:emit("usage", s.last, s)
     return true
 end

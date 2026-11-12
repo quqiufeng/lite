@@ -432,6 +432,30 @@ elseif cmd == "state" or cmd == "--state" or cmd == "sessions" or cmd == "--sess
         -- 实例正占着 mem.lock（那意味着本进程的写全被丢掉）。
         out.memory_lock = memory:status()
         out.wake = memory:get("/agent/working", "wake")
+        -- 缓存账本：命中率抖动要能归因。fold（摘要压缩）与 hard_window（丢弃兜底）
+        -- / window（/compact N 手动滑窗）成因完全不同，分开摆出来才看得出该调哪个。
+        local usage = sid and memory:load_usage(sid) or nil
+        if type(usage) == "table" then
+            local hit, miss = tonumber(usage.cache_hit) or 0, tonumber(usage.cache_miss) or 0
+            out.usage = {
+                requests = tonumber(usage.requests) or 0,
+                prompt = tonumber(usage.prompt) or 0,
+                completion = tonumber(usage.completion) or 0,
+                cache_hit = hit,
+                cache_miss = miss,
+                cache_ratio = (hit + miss) > 0 and (hit / (hit + miss)) or nil,
+                prefix_ratio = (tonumber(usage.prefix_denom) or 0) > 0
+                    and ((tonumber(usage.prefix_hit) or 0) / usage.prefix_denom) or nil,
+                usage_unknown = tonumber(usage.usage_unknown) or 0,
+                resets = {
+                    fold = tonumber(usage.reset_fold) or 0,
+                    hard_window = tonumber(usage.reset_hard) or 0,
+                    window = tonumber(usage.reset_window) or 0,
+                    other = tonumber(usage.reset_other) or 0,
+                },
+                last_reset = usage.last_reset,
+            }
+        end
     end
 
     if json then
@@ -454,6 +478,22 @@ elseif cmd == "state" or cmd == "--state" or cmd == "sessions" or cmd == "--sess
                 print("memory lock  free (no writable instance holds it)")
             else
                 print("memory lock  unknown")
+            end
+            local u = out.usage
+            if u then
+                print(string.format(
+                    "usage req=%d cache=%s prefix=%s unknown=%d  resets fold=%d hard_window=%d window=%d",
+                    u.requests,
+                    u.cache_ratio and string.format("%.0f%%", u.cache_ratio * 100) or "-",
+                    u.prefix_ratio and string.format("%.0f%%", u.prefix_ratio * 100) or "-",
+                    u.usage_unknown,
+                    u.resets.fold, u.resets.hard_window, u.resets.window))
+                if u.last_reset then
+                    print(string.format("last cache reset  %s  dropped=%d  %s",
+                        tostring(u.last_reset.kind or "?"),
+                        tonumber(u.last_reset.dropped) or 0,
+                        u.last_reset.ts and os.date("%Y-%m-%d %H:%M:%S", u.last_reset.ts) or "-"))
+                end
             end
             for _, t in ipairs(todos) do
                 print(string.format("[%s] %s", tostring(t.status), tostring(t.content)))
@@ -976,6 +1016,16 @@ elseif cmd == "--once" then
                 reuse = u.reuse,
                 prefix_ratio = total and total.prefix_denom and total.prefix_denom > 0
                     and (total.prefix_hit / total.prefix_denom) or nil,
+                -- 没有真 usage 的请求（estimated 兜底）不进 cache 两栏，单独报数。
+                cache_unknown = u.cache_unknown or nil,
+                usage_unknown = total and total.usage_unknown or nil,
+                -- cache reset 分账：fold（摘要压缩）/ hard_window（丢弃兜底）/ window（/compact N）。
+                resets = total and {
+                    fold = total.reset_fold or 0,
+                    hard_window = total.reset_hard or 0,
+                    window = total.reset_window or 0,
+                    other = total.reset_other or 0,
+                } or nil,
             })
         end)
     else

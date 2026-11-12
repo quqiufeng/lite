@@ -496,6 +496,11 @@ function M:maybe_compact(stream, reserve, force)
         ok = true, stats = res.stats, baseline = res.baseline,
         rearm_chars = res.rearm_chars,
     })
+    -- fold 也是 cache reset：digest 一换，后面整段历史都不在缓存里了。
+    self.ctx:note_cache_reset("fold", {
+        dropped = res.stats and res.stats.dropped_user,
+        chars = res.stats and res.stats.region_chars,
+    })
     -- 压缩后历史变短，插件若在外部存了索引/镜像，这里重建一次。
     if self:has_hooks("on_compact") then
         self.tools:on_compact({ stats = res.stats, baseline = res.baseline })
@@ -587,8 +592,11 @@ function M:request_messages(text, stream, opts)
 
     local reserve = #block + 200
     -- 时钟 + 轮次预算：每轮都变，只能放末尾（见下）。
+    -- 工具名单只在每个用户轮的**第一次**请求里播报（此时 inject=true）：模型已经在
+    -- system 里被告知去 API tools 字段核对，工具循环的后续请求再抄一遍纯属白付 token。
     local rt = self.prompt.runtime_block(self.ctx, {
         turn = opts.turn, max_turns = opts.max_turns,
+        tools = inject and self.tools:schemas() or nil,
     })
     reserve = reserve + #rt + 4
     self:maybe_compact(stream, reserve, opts.force_compact)
@@ -614,8 +622,13 @@ function M:request_messages(text, stream, opts)
         msgs, trimmed, dropped = self:hard_window(msgs,
             math.floor(c.budget * keep))
         if trimmed then
+            -- 手动窗口（/compact N）每轮都在滑动 → 每次都是整段 miss；它和自动硬上限
+            -- 是两回事，分账记，否则看不出命中率是被窗口模式拖的还是被兜底拖的。
+            local reset = self._window_keep and "window" or "hard_window"
+            self.ctx:note_cache_reset(reset, { dropped = dropped })
             self.ctx:emit("compact", {
                 ok = false, reason = "hard ceiling", dropped = dropped,
+                reset = reset,
                 kept_digest = (self:compact_state() ~= nil),
             })
         end

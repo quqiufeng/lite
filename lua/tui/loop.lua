@@ -272,6 +272,13 @@ function M.run(ctx, agent, memory, opts)
                     "窗口滑到 %d%%（%d chars → %d chars，丢 %d 条只影响本次请求；"
                         .. "历史 %d 条仍在记忆里，需要时 recall）",
                     math.floor(r.keep * 100), r.before, r.after, r.dropped, r.total))
+                -- 窗口模式是"每轮都滑"：前缀缓存命中率会掉、cache% 必然低，
+                -- 不说清楚就会被当成 bug 排查。要恢复命中率用 /compact off。
+                if r.keep and r.keep < 1 then
+                    transcript:add("info", "注意：窗口模式每个请求都重新切前缀，"
+                        .. "prefix cache 命中率会明显下降（这是预期行为，不是回归）。"
+                        .. "恢复正常命中率：/compact off")
+                end
             end
         elseif name == "reload" then
             if busy then

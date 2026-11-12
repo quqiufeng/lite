@@ -101,8 +101,14 @@ KV 里只要还有任意会话就不读 JSONL，正常路径仍然「记忆跟�
   不存"某文件在第几行"。
 
 system prompt 必须**字节稳定**（时钟/轮次/预算都追加在消息末尾的同一个尾部块，走
-`prompt.runtime_block` / `prompt.budget_block`），否则前缀缓存全丢；工具清单在 system 里
-只列名字，schema 以 API `tools` 字段为准。会话结束 `session_end` 把"反复失败未恢复"
+`prompt.runtime_block` / `prompt.budget_block`），否则前缀缓存全丢。工具**名字**也不在
+system 里（helper 增删插件会把它整段打散）：名字由 `runtime_block` 在每个用户轮的第一次
+请求播报（`tools=inject and schemas()`），schema 一律以 API `tools` 字段为准。
+前缀 reset 按原因分账（`context:note_cache_reset`）：`fold`/`hard_window`/`window`，
+计数落 `/agent/session/<id>/usage`，`lite state` 的 `usage … resets fold=… hard_window=…
+window=…` 一行就能看出命中率抖动是谁干的。没拿到真 usage 的请求（provider 的
+`estimated` 兜底）只计 requests/prompt/completion，不进 cache 两栏、单记 `usage_unknown`，
+否则网关不返 usage 时命中率会被凭空压成 0%。会话结束 `session_end` 把"反复失败未恢复"
 （同 tool+args 失败 ≥2 次）写成 `fail/<ts>` 事实。
 
 ## 4 铁律

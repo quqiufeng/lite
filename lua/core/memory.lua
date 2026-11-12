@@ -714,6 +714,11 @@ end
 local USAGE_FIELDS = {
     "requests", "prompt", "completion", "cache_hit", "cache_miss",
     "prefix_hit", "prefix_denom",
+    -- 前缀 reset 按原因分账：fold（摘要压缩）与 hard_window（丢弃兜底）代价不同，
+    -- 混算的话命中率抖动无法归因。
+    "reset_fold", "reset_hard", "reset_window", "reset_other",
+    -- 没拿到真 usage（estimated 兜底）的请求数，不计入 cache_hit/cache_miss。
+    "usage_unknown",
 }
 
 function M:save_usage(session_id, usage)
@@ -726,6 +731,7 @@ function M:save_usage(session_id, usage)
     local last = type(usage.last) == "table" and usage.last or {}
     out.last_prompt = math.floor(tonumber(last.prompt) or 0)
     out.last_reuse = tonumber(last.reuse)
+    out.last_reset = type(usage.last_reset) == "table" and usage.last_reset or nil
     out.ts = os.time()
     return self:put("/agent/session", sid .. "/usage", out, TTL.permanent)
 end
