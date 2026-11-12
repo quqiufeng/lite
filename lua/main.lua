@@ -12,7 +12,10 @@ lite — DeepSeek 终端 coding agent
 用法:
   lite                         交互式终端 UI（默认，等价于 --tui）
   lite --tui                   同上，显式写法
-  lite serve --port 8765       启动 headless 服务端（TCP JSONL）
+  lite serve --port 8765       启动 headless 服务端（TCP JSONL + 两个 HTTP 端点）
+                               GET  /health              探活（免鉴权）
+                               POST /prompt {"prompt":"..."}  直接下指令给 lite 执行
+  lite serve --host 0.0.0.0    给局域网里的应用当大脑（不做鉴权，靠 host 控制暴露面）
   lite serve --port 8765 --wake 300 --task "检查 CI"   定时唤醒
   lite attach --port 8765      连接服务端并显示 TUI
   lite attach --port 8765 --tmux  在新 tmux 窗口 attach
@@ -118,6 +121,9 @@ local function parse_flags(list)
             i = i + 2
         elseif a == "--host" then
             flags.host = list[i + 1]
+            i = i + 2
+        elseif a == "--http-timeout" then
+            flags.http_timeout = tonumber(list[i + 1])
             i = i + 2
         elseif a == "--tmux" then
             flags.tmux = true
@@ -295,6 +301,7 @@ elseif cmd == "serve" or cmd == "--serve" then
     local ok, err, stop = require("core.serve").run({
         host = flags.host,
         port = port,
+        http_timeout = flags.http_timeout,
         config = config,
         wake = flags.wake,
         max_runs = flags.wake_max,

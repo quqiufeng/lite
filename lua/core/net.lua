@@ -48,6 +48,7 @@ local F_SETFL = 4
 local O_NONBLOCK = 0x800
 local POLLIN = 1
 local MSG_NOSIGNAL = 0x4000
+local MSG_PEEK = 0x2
 
 local function addr(host, port)
     local a = ffi.new("struct sockaddr_in")
@@ -126,11 +127,18 @@ function M.poll(fds, timeout_ms)
     return tonumber(rc), out
 end
 
+function M.set_nonblock(fd)
+    local flags = ffi.C.fcntl(fd, F_GETFL, 0)
+    if flags >= 0 then ffi.C.fcntl(fd, F_SETFL, bit.bor(flags, O_NONBLOCK)) end
+end
+
 function M.accept(server)
     local fd = ffi.C.accept(server.fd, nil, nil)
     if fd < 0 then return nil end
     local one = ffi.new("int[1]", 1)
     ffi.C.setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, one, ffi.sizeof(one))
+    -- 非阻塞：serve 在首包嗅探时会不带 poll 直接 peek，阻塞 fd 会卡住整个循环。
+    M.set_nonblock(fd)
     return fd
 end
 
@@ -142,6 +150,15 @@ function M.recv(fd)
     local e = ffi.errno()
     if e == 11 or e == 4 then return nil, "again" end
     return nil, "recv: " .. tostring(e)
+end
+
+-- 看一眼还没读的字节（不消费），serve 用它区分 HTTP 与 JSONL 客户端。
+function M.peek(fd, len)
+    len = len or 8192
+    local buf = ffi.new("char[?]", len)
+    local n = ffi.C.recv(fd, buf, len, MSG_PEEK)
+    if n > 0 then return ffi.string(buf, tonumber(n)) end
+    return nil
 end
 
 function M.send(fd, data)

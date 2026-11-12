@@ -4897,6 +4897,61 @@ do
         "serve stop_reason: shutdown wins over reboot")
 end
 
+-- serve 的 HTTP 前端（core/serve_http.lua）：两个端点 GET /health + POST /prompt
+do
+    local Http = require("core.serve_http")
+    check(Http.looks_like_http("GET /health HTTP/1.1\r\n") == true, "http sniff: GET")
+    check(Http.looks_like_http("POST /prompt HTTP/1.1\r\n") == true,
+        "http sniff: POST")
+    check(Http.looks_like_http('{"type":"submit","text":"hi"}\n') == false,
+        "http sniff: jsonl frame is not http")
+    check(Http.looks_like_http("") == false, "http sniff: empty buffer")
+    check(Http.looks_like_http(nil) == false, "http sniff: nil buffer")
+
+    local req = Http.parse("GET /health?x=1 HTTP/1.1\r\nHost: a\r\nAccept: */*\r\n\r\n")
+    check(req and req.method == "GET" and req.path == "/health" and req.query == "x=1",
+        "http parse: request line + query")
+    check(req and req.headers["host"] == "a", "http parse: headers lowercased")
+
+    local body = '{"prompt":"hi"}'
+    local raw = "POST /prompt HTTP/1.1\r\nContent-Length: " .. #body .. "\r\n\r\n" .. body
+    local r1, e1 = Http.parse(raw:sub(1, 20))
+    check(r1 == nil and e1 == "more", "http parse: partial head = more")
+    local r2, e2 = Http.parse(raw:sub(1, #raw - 2))
+    check(r2 == nil and e2 == "more", "http parse: partial body = more")
+    local r3 = Http.parse(raw)
+    check(r3 and r3.method == "POST" and r3.body == body, "http parse: full body")
+
+    local bad, berr = Http.parse("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n")
+    check(bad == nil and tostring(berr):find("chunked") ~= nil,
+        "http parse: chunked rejected")
+
+    check(Http.authorized == nil, "http: no auth layer (local/lan use)")
+
+    local resp = Http.json(200, { ok = true })
+    check(resp:find("^HTTP/1.1 200 OK\r\n") == 1, "http json: status line")
+    check(resp:find("Content-Length: 11", 1, true) ~= nil, "http json: content-length")
+    check(resp:find("Access%-Control%-Allow%-Origin: %*") ~= nil, "http json: cors")
+    check(resp:find('{"ok":true}', 1, true) ~= nil, "http json: body")
+
+    -- POST /prompt 的请求体：JSON prompt 优先，裸文本也认
+    check(Http.prompt_of('{"prompt":"看下磁盘"}') == "看下磁盘", "prompt: json prompt")
+    check(Http.prompt_of('{"text":"跑测试"}') == "跑测试", "prompt: text alias")
+    check(Http.prompt_of("裸文本指令") == "裸文本指令", "prompt: raw body")
+    local none, nerr = Http.prompt_of('{"prompt":""}')
+    check(none == nil and type(nerr) == "string", "prompt: empty = error")
+    local empty, eerr = Http.prompt_of("")
+    check(empty == nil and type(eerr) == "string", "prompt: no body = error")
+
+    local nf = Http.not_found("/v1/chat/completions")
+    check(nf:find("^HTTP/1.1 404 Not Found\r\n") == 1, "http 404: status line")
+    -- cjson 会把 `/` 转义成 `\/`，所以这里只查不含斜杠的片段
+    check(nf:find("only GET", 1, true) ~= nil and nf:find("prompt", 1, true) ~= nil,
+        "http 404: points at /prompt")
+    check(nf:find('"ok":false', 1, true) ~= nil, "http error: ok=false")
+
+end
+
 -- entry
 check(loadfile(root .. "/lua/main.lua") ~= nil, "load lua/main.lua")
 

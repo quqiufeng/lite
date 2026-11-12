@@ -256,8 +256,32 @@ tool 结果在盘上是截断版（`LITE_TOOL_RESULT_CHARS`，默认 8192，`ses
 （插件扫描 + mmap + JSONL 回放）是毫秒级。连续重启**不设次数上限**（旧的
 `LITE_REBOOT_MAX` 已去掉：自我演进常常连着重启几次，一刀切会打断长任务），
 `LITE_REBOOT_CHAIN` 也不再注入子进程环境。
-`shutdown` 才是真停（不自动接续）；serve/attach 只认 JSONL 请求、不跑斜杠命令，
-外部客户端要重启就自己 kill 再拉。
+`shutdown` 才是真停（不自动接续）；serve/attach 不跑斜杠命令（attach 走 JSONL 请求，
+HTTP 客户端走 `POST /prompt`），外部客户端要重启就自己 kill 再拉。
+
+**serve 的 HTTP 前端（`lua/core/serve_http.lua`）只开两个端点**：同一个端口同时服务两种
+协议，靠首包嗅探分流——`{` 开头是 JSONL（attach），`GET/POST …` 开头是 HTTP，互不影响（`accept_conn`
+里 peek 最多等 50ms，没字节按 JSONL 处理）。HTTP 请求**复用 serve 的同一条队列**：它就是
+一条用户消息，轮到自己时跑一轮，跑完（`on_resume` 协程 dead）再把答案回写那条连接，
+所以 HTTP 客户端和 TUI/attach 共享同一个 agent 与记忆，谁先来谁先答。
+
+| 端点 | 说明 |
+|---|---|
+| `GET /health` | 探活，**不鉴权**，回 `{"ok":true,"live":true,"busy":…,"queued":…}`，不排队 |
+| `POST /prompt` | `{"prompt":"..."}`（也收 `{"text":…}` 或裸文本体）下指令，跑完回 `{"ok":true,"text":"…"}` |
+
+**不做鉴权**：两端点都开放（本机自用，或 `--host 0.0.0.0` 给局域网里的应用调用）。
+暴露面由 `--host` 控制——默认 `127.0.0.1`，要给别人用才显式绑 `0.0.0.0`。
+超时 `LITE_SERVE_HTTP_TIMEOUT`（默认 900s）到点回 504，
+那一轮仍会跑完（结果进记忆，只是没人收）。没有 SSE、没有 OpenAI/Anthropic 兼容层、不摊平
+`messages[]`——要上下文就把话说全，历史靠 lite 自己的记忆。**响应恒为 `Connection: close`**：
+没有 keep-alive 状态机，客户端每请求一条连接。
+
+```bash
+./tools/run.sh serve --host 0.0.0.0 --port 8765
+curl -s localhost:8765/health                     # {"ok":true,"live":true,...}
+curl -s localhost:8765/prompt -d '{"prompt":"北京时间现在几点"}'
+```
 
 **选路优先级（从省力到费劲，别跳级）**：
 

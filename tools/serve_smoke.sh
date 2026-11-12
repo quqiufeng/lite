@@ -69,6 +69,20 @@ done
 "$ROOT/tools/lite-lua" "$ROOT/tools/serve_probe.lua" 127.0.0.1 "$PORT" \
     || fail "protocol probe"
 
+# HTTP 前端：探活 + 未知端点 404（/prompt 要真模型，冒烟里不跑）
+if command -v curl >/dev/null 2>&1; then
+    HEALTH="$(curl -s -m 5 "http://127.0.0.1:$PORT/health" || true)"
+    case "$HEALTH" in
+        *'"live":true'*) ;;
+        *) fail "GET /health: $HEALTH" ;;
+    esac
+    CODE="$(curl -s -o /dev/null -w '%{http_code}' -m 5 \
+        -d '{"prompt":"hi"}' "http://127.0.0.1:$PORT/v1/chat/completions" || true)"
+    [ "$CODE" = "404" ] || fail "old /v1 endpoint should be 404, got $CODE"
+else
+    echo "SKIP serve.http (curl missing)"
+fi
+
 if command -v tmux >/dev/null 2>&1; then
     tmux new-session -d -s "$S" -x 120 -y 30 -c "$TMP" \
         "env LITE_CWD=$TMP $ROOT/tools/run.sh attach --port $PORT"

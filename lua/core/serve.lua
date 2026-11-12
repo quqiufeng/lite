@@ -1,4 +1,6 @@
 -- lite serve：headless agent + TCP JSONL 事件广播；attach 客户端消费。
+-- 同一个端口还挂着一个 HTTP 前端（core/serve_http.lua）：任何智能应用都能用
+-- OpenAI/Anthropic 的 `/v1/chat/completions` 直接把它当大脑使。
 local cjson = require("cjson")
 local Context = require("context")
 local Tools = require("core.tools")
@@ -12,6 +14,7 @@ local Scheduler = require("core.scheduler")
 local Inputs = require("core.inputs")
 local Signal = require("core.signal")
 local Text = require("core.text")
+local Http = require("core.serve_http")
 
 local M = {}
 
@@ -60,6 +63,10 @@ function M.run(opts)
     local config = opts.config or require("core.config").load()
     local host = opts.host or "127.0.0.1"
     local port = tonumber(opts.port) or 8765
+
+    -- HTTP 前端共享这个端口；不做鉴权（本机/局域网自用），只靠 host 控制暴露面。
+    local http_timeout = tonumber(opts.http_timeout)
+        or tonumber(os.getenv("LITE_SERVE_HTTP_TIMEOUT")) or 900
 
     local wake = tonumber(opts.wake) or tonumber(os.getenv("LITE_WAKE_SEC")) or 0
     local wake_max = tonumber(opts.max_runs) or tonumber(os.getenv("LITE_WAKE_MAX")) or 0
@@ -167,11 +174,19 @@ function M.run(opts)
 
     io.write(string.format("lite serve listening on %s:%d\n", server.host, server.port))
     io.write(string.format("PORT=%d\n", server.port))
+    io.write("http  GET /health | POST /prompt {\"prompt\":\"...\"}\n")
+    io.write(string.format("http  timeout %ds | jsonl attach 同端口\n", http_timeout))
     io.flush()
 
     local clients = {}
     local replay = {}
     local queue = {}
+    -- HTTP 前端的状态：每个连接一条，busy_http 是「正在为哪条连接跑这一轮」。
+    local http_conns = {}
+    local busy_http
+    local finish_http
+    local http_close
+    local accept_conn
     local inputs = Inputs.new(memory, ctx.session.id)
     local busy = false
     local co, active_req
@@ -210,6 +225,7 @@ function M.run(opts)
         broadcast(ev)
     end
 
+    -- HTTP 只有一问一答：delta/reasoning 只喂 JSONL 客户端，答案走 finish_http。
     ctx:on("delta", function(text) push({ type = "delta", text = text }) end)
     ctx:on("reasoning", function(text) push({ type = "reasoning", text = text }) end)
     ctx:on("assistant", function(msg)
@@ -221,7 +237,11 @@ function M.run(opts)
     ctx:on("tool_result", function(name, result)
         push({ type = "tool_result", name = name, result = tostring(result or ""):sub(1, 8000) })
     end)
-    ctx:on("error", function(err) push({ type = "error", error = tostring(err) }) end)
+    ctx:on("error", function(err)
+        push({ type = "error", error = tostring(err) })
+        -- 这一轮如果是 HTTP 请求要的，把错误留给 finish_http 报给客户端。
+        if busy_http then busy_http.error = tostring(err) end
+    end)
     ctx:on("status", function(status) push({ type = "status", status = status }) end)
     ctx:on("turn_start", function(turn) push({ type = "turn_start", turn = turn }) end)
     ctx:on("turn_end", function(turn) push({ type = "turn_end", turn = turn }) end)
@@ -286,6 +306,7 @@ function M.run(opts)
             active_req = nil
             if scheduler then scheduler:set_answer("error: " .. tostring(y)) end
             push({ type = "error", error = tostring(y) })
+            finish_http(nil, tostring(y))
             memory:sync()
             push(state_obj())
             start_next()
@@ -297,6 +318,8 @@ function M.run(opts)
             busy = false
             co = nil
             active_req = nil
+            -- 先把结果交回 HTTP 客户端（它在等这一轮的答案），再发状态/起下一条。
+            finish_http(answer)
             memory:sync()
             push(state_obj())
             local stop = stop_requested()
@@ -338,6 +361,10 @@ function M.run(opts)
         local text = type(item) == "table" and item.text or item
         if type(item) == "table" and item.seq then inputs:remove(item.seq) end
         busy = true
+        -- 排队是一条队列：谁被 pop 出来，这一轮就为谁答（HTTP 请求按 FIFO 轮到）。
+        if type(item) == "table" and item.http then
+            busy_http = { fd = item.fd }
+        end
         co = agent:run_async(text)
         resume_agent()
     end
@@ -348,7 +375,9 @@ function M.run(opts)
         if not (meta and meta.quiet) then
             push({ type = "user", text = text })
         end
-        queue[#queue + 1] = { seq = seq, text = text }
+        -- meta.http + meta.fd：这条消息同时是某个 HTTP 请求的答案，跑完要回写那一条连接。
+        queue[#queue + 1] = { seq = seq, text = text, http = meta and meta.http,
+            fd = meta and meta.fd }
         start_next()
     end
 
@@ -388,6 +417,7 @@ function M.run(opts)
             active_req = nil
             resume_agent(nil, "cancelled")
         elseif busy then
+            finish_http(nil, "cancelled by client")
             push({ type = "info", text = "tool 执行中，无法中断" })
         end
     end
@@ -434,6 +464,102 @@ function M.run(opts)
         send_obj(fd, state_obj())
     end
 
+    -- ── HTTP 前端 ─────────────────────────────────────────────────────
+    -- 与 JSONL 共用一条队列：HTTP 请求也是一条「用户消息」，跑完再把答案回写给
+    -- 那条连接（流式边跑边推 SSE）。这样 HTTP 客户端和 TUI/attach 看到的是同一
+    -- 个 agent、同一份记忆，谁先来谁先答。
+    local function http_drop(fd)
+        http_conns[fd] = nil
+        if busy_http and busy_http.fd == fd then
+            -- 客户端先走了：这一轮照样跑完（记忆/日志仍完整），只是不再回写。
+            busy_http = nil
+        end
+        net.close(fd)
+    end
+
+    http_close = function(fd, payload)
+        if payload then net.send(fd, payload) end
+        http_drop(fd)
+    end
+
+    local function http_route(fd, req)
+        local c = http_conns[fd]
+        if not c then return end
+        if req.method == "OPTIONS" then
+            return http_close(fd, Http.response(204, {}, ""))
+        end
+        -- /health 不鉴权：探活用，不回工作区信息，也不排队。
+        if req.path == "/health" or req.path == "/healthz" then
+            return http_close(fd, Http.json(200,
+                { ok = true, live = true, busy = busy, queued = #queue }))
+        end
+        if req.path ~= "/prompt" then
+            return http_close(fd, Http.not_found(req.path))
+        end
+        if req.method ~= "POST" then
+            return http_close(fd, Http.error(405, "only POST /prompt", "method_not_allowed"))
+        end
+        local prompt, perr = Http.prompt_of(req.body)
+        if not prompt then
+            return http_close(fd, Http.error(400, perr or "bad request", "bad_request"))
+        end
+        -- 进同一条队列，轮到自己跑一轮，跑完 finish_http 回 {"ok":true,"text":...}。
+        c.waiting = true
+        submit(prompt, { http = true, fd = fd })
+    end
+
+    local function http_read(fd)
+        local c = http_conns[fd]
+        if not c then return end
+        local data, rerr = net.recv(fd)
+        if data then
+            c.buf = (c.buf or "") .. data
+            if #c.buf > 9 * 1024 * 1024 then
+                return http_close(fd, Http.error(413, "request body too large"))
+            end
+            local req, perr = Http.parse(c.buf)
+            if req then
+                c.buf = ""
+                http_route(fd, req)
+            elseif perr ~= "more" then
+                http_close(fd, Http.error(400, tostring(perr):gsub("^bad:%s*", "")))
+            end
+        elseif rerr == "closed" then
+            http_drop(fd)
+        end
+    end
+
+    -- 一轮跑完：把这一轮的最终答案回写给那条 HTTP 连接，然后关掉它。
+    finish_http = function(answer, err)
+        local b = busy_http
+        busy_http = nil
+        if not b then return end
+        local c = http_conns[b.fd]
+        if not c then return end
+        c.waiting = nil
+        local text = type(answer) == "string" and answer or ""
+        local aerr = type(err) == "string" and err or b.error
+        if aerr and aerr ~= "" and text == "" then
+            return http_close(b.fd, Http.error(500, aerr, "agent_error"))
+        end
+        http_close(b.fd, Http.json(200, { ok = true, text = text }))
+    end
+
+    -- 首包嗅探：HTTP 客户端连上就发请求行；attach 客户端啥也不发、等 hello。
+    -- 所以最多等 50ms 看有没有字节，没有就按 JSONL 处理（不会误伤 attach）。
+    accept_conn = function(fd)
+        local data = net.peek(fd)
+        if not data then
+            net.poll({ fd }, 50)
+            data = net.peek(fd)
+        end
+        if Http.looks_like_http(data) then
+            http_conns[fd] = { buf = "", created = os.time() }
+            return
+        end
+        attach_client(fd)
+    end
+
     local function restore_history()
         for _, m in ipairs(ctx.session.messages or {}) do
             if m.role == "user" then
@@ -474,11 +600,31 @@ function M.run(opts)
                 resume_agent("reject")
             end
 
+            -- HTTP 请求有超时线：等太久就回 504 收掉连接（那一轮仍会跑完，只是没人收）。
+            if http_timeout > 0 then
+                local now = os.time()
+                for fd, c in pairs(http_conns) do
+                    if c.waiting and c.created and now - c.created > http_timeout then
+                        c.waiting = nil
+                        if busy_http and busy_http.fd == fd then busy_http = nil end
+                        http_close(fd, Http.error(504,
+                            "agent timed out after " .. http_timeout .. "s",
+                            "server_error", "timeout"))
+                    end
+                end
+            end
+
             local fds = { server.fd }
             local conns = {}
             for fd in pairs(clients) do
                 fds[#fds + 1] = fd
                 conns[#conns + 1] = fd
+            end
+            -- HTTP 连接排在 JSONL 之后、sigfd 之前：索引好算（+2 起）。
+            local hconns = {}
+            for fd in pairs(http_conns) do
+                fds[#fds + 1] = fd
+                hconns[#hconns + 1] = fd
             end
             local sig_index
             if sigfd then
@@ -496,7 +642,13 @@ function M.run(opts)
                 while true do
                     local cfd = net.accept(server)
                     if not cfd then break end
-                    attach_client(cfd)
+                    accept_conn(cfd)
+                end
+            end
+
+            for i, fd in ipairs(hconns) do
+                if revs[#conns + i + 1] and revs[#conns + i + 1] ~= 0 then
+                    http_read(fd)
                 end
             end
 
@@ -566,6 +718,7 @@ function M.run(opts)
 
     if active_proc then active_proc:cancel() end
     for fd in pairs(clients) do net.close(fd) end
+    for fd in pairs(http_conns) do net.close(fd) end
     net.close(server.fd)
     if sigfd then net.close(sigfd) end
     if logger then logger:close() end
