@@ -71,6 +71,11 @@ KV 里只要还有任意会话就不读 JSONL，正常路径仍然「记忆跟�
 
 最近 `LITE_SESSION_RAW_KEEP`（默认 200）条非 user 原文 + user 永久；tool 结果入库截到
 `LITE_TOOL_RESULT_CHARS`（默认 8192），旧内容靠 turn 摘要/`recall`。写实例持 `mem.lock`。
+抢不到锁**不再静默降级**：`--tui` / `--once` / `serve` 直接报「被 pid N (comm) 占着」并以退出码 3
+拒绝启动（旧版只打一行 stderr 就照跑，整轮对话不落盘，下次启动才发现历史缺一段）。
+明知不落盘也照跑就 `--readonly` 或 `LITE_ALLOW_READONLY=1`，状态栏会显示 `mem:N RO!`；
+`lite state` 多一行 `memory lock`（free / busy + 占锁进程），JSON 里是 `memory_lock`。
+只读实例（快照/导出/state）不持 fd，`probe_lock` 才能探出锁到底空没空。
 
 **取**（下面这些在代码里，别靠猜）：
 

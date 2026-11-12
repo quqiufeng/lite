@@ -9,6 +9,7 @@ local net = require("core.net")
 pcall(ffi.cdef, [[
 int open(const char *pathname, int flags, unsigned int mode);
 int flock(int fd, int operation);
+int getpid(void);
 ]])
 
 local O_CREAT = 0x40
@@ -42,6 +43,37 @@ local function join(ns, key)
     return ns .. tostring(key or "")
 end
 
+-- mem.lock 里写下"谁占着"（pid + 启动时间），抢锁失败的一方才能直接报出
+-- 「被 pid 4242 (lite) 占着」，而不是一句 "another lite holds mem.lock"
+-- 让用户自己去 ps 里翻。只在已经持有锁之后写，不会踩到别人。
+local function write_owner(path)
+    local f = io.open(path, "w")
+    if not f then return end
+    f:write(string.format("%d %d\n", ffi.C.getpid(), os.time()))
+    f:close()
+end
+
+-- 读锁文件里的持有者信息。老版本留下的空文件 / 残破内容一律返回 nil，
+-- 调用方按"未知进程"处理，不能因此崩掉。
+function M:owner()
+    local f = io.open(self.lock_path, "r")
+    if not f then return nil end
+    local line = f:read("*l")
+    f:close()
+    if not line then return nil end
+    local pid, ts = line:match("^(%d+)%s*(%d*)")
+    pid = tonumber(pid)
+    if not pid or pid <= 0 then return nil end
+    local comm
+    local cf = io.open("/proc/" .. pid .. "/comm", "r")
+    if cf then
+        comm = cf:read("*l")
+        cf:close()
+        if comm then comm = comm:gsub("%s+$", "") end
+    end
+    return { pid = pid, started = tonumber(ts) or nil, comm = comm, alive = comm ~= nil }
+end
+
 local function hash_str(s)
     local h = 5381
     for i = 1, #s do
@@ -69,7 +101,12 @@ function M.new(opts)
     -- 写进程持独占锁；只读诊断命令不加锁，允许在 TUI/serve 运行时读取。
     local readonly = opts.readonly and true or false
     local lock_busy = false
-    if not readonly and ffi.C.flock(lock_fd, bit.bor(LOCK_EX, LOCK_NB)) ~= 0 then
+    if readonly then
+        -- 只读实例连 fd 都不留：留着 fd 既白漏一个句柄，又会让 probe_lock 误判
+        -- "锁是我自己占着的"（cdata 恒真），诊断就永远报 busy。
+        net.close(lock_fd)
+        lock_fd = nil
+    elseif ffi.C.flock(lock_fd, bit.bor(LOCK_EX, LOCK_NB)) ~= 0 then
         -- 抢不到锁：降级为只读实例，进程继续跑（不写记忆、不刷盘）。
         ffi.C.flock(lock_fd, LOCK_UN)
         net.close(lock_fd)
@@ -80,10 +117,14 @@ function M.new(opts)
 
     local h = cache.open(base, (opts.max_mb or 100) * 1024 * 1024)
     if not h then
-        ffi.C.flock(lock_fd, LOCK_UN)
-        net.close(lock_fd)
+        if lock_fd then
+            ffi.C.flock(lock_fd, LOCK_UN)
+            net.close(lock_fd)
+        end
         return nil, "cache_open failed: " .. base
     end
+    -- 抢到锁才写持有者：写实例的 pid 落在 mem.lock 里，后来者能指名道姓。
+    if not readonly then write_owner(base .. "/mem.lock") end
     return setmetatable({
         h = h,
         dir = base,
@@ -117,7 +158,40 @@ function M:reclaim(now_ms)
     self.lock_fd, self.readonly, self.lock_busy = fd, false, false
     self.lock_retry_at = nil
     self.reclaimed = (self.reclaimed or 0) + 1
+    write_owner(self.lock_path)
     return true
+end
+
+-- 探一下写锁此刻是否空着（开→NB flock→放），不改自身状态。
+-- 只读诊断命令（`lite state`）用它回答"现在有没有别的实例在写"：
+-- 自己没抢锁的实例靠 readonly 字段是看不出别人占没占的。
+function M:probe_lock()
+    if self.lock_fd then return { free = false, self_held = true, lock = self:owner() } end
+    local fd = ffi.C.open(self.lock_path, bit.bor(O_CREAT, O_RDWR, O_CLOEXEC), 420)
+    if fd < 0 then return { free = nil } end
+    local ok = ffi.C.flock(fd, bit.bor(LOCK_EX, LOCK_NB)) == 0
+    if ok then ffi.C.flock(fd, LOCK_UN) end
+    net.close(fd)
+    return { free = ok, lock = ok and nil or self:owner() }
+end
+
+-- 一次性快照：状态栏 / `lite state` 用它判断"我现在到底能不能落盘"。
+-- readonly 曾经是启动时定死又没人看的私有字段，用户只能在半天后发现
+-- 历史缺了一段；这里把它变成可观测的东西，顺带带上占锁进程和写失败次数。
+function M:status()
+    local probe = self:probe_lock()
+    local lock = nil
+    if self.lock_busy or probe.free == false then lock = self:owner() end
+    return {
+        dir = self.dir,
+        readonly = self.readonly and true or false,
+        lock_busy = self.lock_busy and true or false,
+        writable = self.lock_fd ~= nil,
+        free = probe.free,
+        lock = lock,
+        write_failures = self.write_failures or 0,
+        reclaimed = self.reclaimed or 0,
+    }
 end
 
 function M:close()
@@ -166,9 +240,23 @@ function M:tick(now_ms)
     return false
 end
 
+-- 抢不到锁时的统一说法：谁占着、在哪个目录。写失败、启动拒绝、
+-- `lite state` 三处共用一份文案，别再各写一句让人对不上号。
+function M.lock_message(dir, owner)
+    local who = "another lite process"
+    if owner and owner.pid then
+        who = string.format("pid %d", owner.pid)
+        if owner.comm and owner.comm ~= "" then who = who .. " (" .. owner.comm .. ")" end
+        if owner.alive == false then who = who .. ", already gone?" end
+    end
+    return string.format("%s holds mem.lock in %s", who, tostring(dir))
+end
+
 function M:put(ns, key, value, ttl)
     if self.readonly and not self:reclaim() then
-        return false, "readonly memory (another lite holds mem.lock)"
+        -- 丢掉一次写就是丢一段历史：计个数，让 status/状态栏能报出来。
+        self.write_failures = (self.write_failures or 0) + 1
+        return false, "readonly memory (" .. M.lock_message(self.dir, self:owner()) .. ")"
     end
     local full = join(ns, key)
     local ok, s = pcall(cjson.encode, value)
@@ -184,7 +272,10 @@ function M:get(ns, key)
 end
 
 function M:del(ns, key)
-    if self.readonly and not self:reclaim() then return false end
+    if self.readonly and not self:reclaim() then
+        self.write_failures = (self.write_failures or 0) + 1
+        return false
+    end
     return cache.del(self.h, join(ns, key)) == 0
 end
 

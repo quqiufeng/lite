@@ -1624,6 +1624,49 @@ do
     if owner2 then owner2:close() end
     if slow then slow:close() end
     os.execute("rm -rf " .. shq(dir2))
+
+    -- 锁的持有者要能指名道姓：抢不到锁的一方拿到的必须是"pid N (comm)"，
+    -- 而不是一句 "another lite holds mem.lock"；诊断命令还要能探到锁空没空。
+    local dir3 = os.tmpname()
+    os.remove(dir3)
+    os.execute("mkdir -p " .. shq(dir3))
+    local ffi = require("ffi")
+    local self_pid = ffi.C.getpid()
+    local holder = Memory.new({ dir = dir3, max_mb = 32 })
+    check(holder ~= nil and holder.readonly == false, "lock owner: writable instance starts")
+    local own = holder:owner()
+    check(own ~= nil and own.pid == self_pid, "lock owner: pid written to mem.lock")
+    check(own.alive == true and own.comm ~= nil and #own.comm > 0,
+        "lock owner: comm resolved from /proc")
+
+    local st = holder:status()
+    check(st.writable == true and st.free == false and st.readonly == false,
+        "lock owner: own status is writable/self-held")
+
+    local other = Memory.new({ dir = dir3, max_mb = 32, lock_retry_ms = 60000 })
+    local ost = other:status()
+    check(ost.lock_busy == true and ost.readonly == true and ost.writable == false,
+        "lock owner: blocked instance reports readonly")
+    check(ost.free == false and ost.lock and ost.lock.pid == self_pid,
+        "lock owner: blocked instance names the holder pid")
+    local msg = Memory.lock_message(ost.dir, ost.lock)
+    check(msg:find("pid " .. self_pid, 1, true) ~= nil, "lock owner: message carries pid")
+    local _, perr = other:put("/agent/knowledge", "z", { c = 1 })
+    check(tostring(perr):find("pid " .. self_pid, 1, true) ~= nil,
+        "lock owner: write refusal names the holder")
+    check(other:status().write_failures >= 1, "lock owner: dropped writes counted")
+
+    -- 只读诊断实例（不抢锁）也要能看出锁空没空
+    local diag = Memory.new({ dir = dir3, max_mb = 32, readonly = true })
+    local dst = diag:status()
+    check(dst.free == false and dst.lock and dst.lock.pid == self_pid,
+        "lock owner: readonly probe sees busy lock")
+    holder:close()
+    local dst2 = diag:status()
+    check(dst2.free == true, "lock owner: readonly probe sees free lock after close")
+    diag:close()
+    other:close()
+    os.execute("rm -rf " .. shq(dir3))
 end
 
 -- native image resize
@@ -4841,6 +4884,17 @@ do
     check(Memdb.stats({ dir = dir }).entries == 4, "memdb stats counts entries")
 
     os.execute("rm -rf " .. shq(dir))
+end
+
+-- serve：reboot/shutdown 的收工判据（TUI 有 loop 收尾点，serve 只能自己判）
+do
+    local Serve = require("core.serve")
+    check(Serve.stop_reason(nil) == nil, "serve stop_reason: no settings = keep running")
+    check(Serve.stop_reason({}) == nil, "serve stop_reason: empty settings = keep running")
+    check(Serve.stop_reason({ reboot = true }) == "reboot", "serve stop_reason: reboot")
+    check(Serve.stop_reason({ exit = true }) == "exit", "serve stop_reason: shutdown")
+    check(Serve.stop_reason({ exit = true, reboot = true }) == "exit",
+        "serve stop_reason: shutdown wins over reboot")
 end
 
 -- entry

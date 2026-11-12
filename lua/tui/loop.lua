@@ -826,6 +826,9 @@ function M.run(ctx, agent, memory, opts)
             Status.render(screen, h, w, ctx, {
                 busy = busy,
                 mem = mem_count,
+                -- 记忆降级只读时状态栏必须显眼：否则整轮对话都不落盘，
+                -- 用户还以为在正常记。快照那种"故意只读"不算，别造假警报。
+                readonly = memory and memory.readonly and not memory.snapshot_only or false,
                 cache = ctx.cache_ratio and ctx:cache_ratio() or nil,
                 reuse = ctx.prefix_ratio and ctx:prefix_ratio() or nil,
                 ctxeng = agent and agent._compact_probe or nil,

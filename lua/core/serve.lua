@@ -15,6 +15,15 @@ local Text = require("core.text")
 
 local M = {}
 
+-- reboot/shutdown 工具只往 ctx.settings 里置标记，TUI 由 lua/tui/loop.lua 在空闲处收尾；
+-- serve 没有 UI 回收点，收工时靠这个判「为什么停」：nil=继续，"exit"/"reboot"=交回 main。
+function M.stop_reason(settings)
+    local s = settings or {}
+    if s.exit then return "exit" end
+    if s.reboot then return "reboot" end
+    return nil
+end
+
 local VERSION = "0.1.1"
 local REPLAY_MAX = 500
 
@@ -95,6 +104,18 @@ function M.run(opts)
         flush_sec = config.memory_flush,
     })
     if not memory then return nil, merr end
+    -- serve 是长命的写实例：抢不到锁就跑，等于整轮唤醒/对话不落盘，
+    -- 客户端还看得见流式回复，谁也发现不了记忆没写。这里直接拒绝启动。
+    if memory.lock_busy and not opts.allow_readonly then
+        local msg = Memory.lock_message(memory.dir, memory:owner())
+        memory:close()
+        return nil, "memory is locked by " .. msg
+            .. "; refusing to serve without write access (use --readonly to override)"
+    end
+    if memory.lock_busy then
+        io.stderr:write("lite serve: memory read-only by request ("
+            .. Memory.lock_message(memory.dir, memory:owner()) .. ")\n")
+    end
 
     local multi, mlerr = http.multi_new()
     if not multi then
@@ -248,6 +269,15 @@ function M.run(opts)
 
     local start_next
     local resume_agent
+    -- reboot/shutdown 工具只往 ctx.settings 里置标记，TUI 由 lua/tui/loop.lua 在
+    -- 空闲处收尾。serve 没有 UI 回收点，得自己判：一轮（含排队消息）收完就停下，
+    -- 交回 main 去换代进程 / 退出。`running` 提前声明，on_resume 才抓得到它。
+    local running = true
+    local stop_mode
+
+    local function stop_requested()
+        return M.stop_reason(ctx.settings)
+    end
 
     local function on_resume(ok, y)
         if not ok then
@@ -269,6 +299,18 @@ function M.run(opts)
             active_req = nil
             memory:sync()
             push(state_obj())
+            local stop = stop_requested()
+            if stop and #queue == 0 then
+                -- 收工：先把「为什么停」告诉客户端，再跳出 poll 循环（下面 loop 会看 running）。
+                stop_mode = stop
+                running = false
+                push({
+                    type = "info",
+                    text = stop == "exit" and "shutdown requested; exiting"
+                        or "reboot requested; restarting as a fresh process",
+                })
+                return
+            end
             start_next()
             return
         end
@@ -421,7 +463,6 @@ function M.run(opts)
     end
 
     local sigfd = Signal.sigfd()
-    local running = true
 
     local function loop()
         while running do
@@ -514,6 +555,11 @@ function M.run(opts)
 
     restore_history()
     load_inputs()
+    -- reboot 后那句「继续」（main 从 core.reboot 取回）：当普通用户消息排队，
+    -- attach 客户端在 replay 里能看到它，和 TUI 里自动发那句话等价。
+    if opts.resume_text and opts.resume_text ~= "" then
+        submit(opts.resume_text)
+    end
     start_next()
 
     local ok, err = pcall(loop)
@@ -527,6 +573,13 @@ function M.run(opts)
     http.multi_free(multi)
 
     if not ok then return nil, err end
+    -- 第三返回值 = 为什么要停：main 据此换代进程（reboot，exit 75 / execv）或直接退出。
+    if stop_mode then
+        return true, nil, {
+            mode = stop_mode,
+            prompt = ctx.settings and ctx.settings.reboot_prompt or nil,
+        }
+    end
     return true
 end
 

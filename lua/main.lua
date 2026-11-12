@@ -45,6 +45,7 @@ lite — DeepSeek 终端 coding agent
   --no-plugins                 禁用 helper/ 插件与 hook（默认启用）
   --reboot                     重启后自动继续（见用法里那条）
   --max-turns N                单次任务工具循环上限（默认 256）
+  --readonly                   明知不落盘也照跑（mem.lock 被占时不拒绝启动）
   --debug                      开启调试日志（默认 $TMPDIR/lite-debug.jsonl）
   --debug-log PATH             写 JSONL 调试日志（provider/HTTP）
 
@@ -55,6 +56,7 @@ lite — DeepSeek 终端 coding agent
   LITE_CWD                     默认当前目录
   LITE_MAX_TURNS               默认 256
   LITE_JSON=1                  等价于 --json
+  LITE_ALLOW_READONLY=1        等价于 --readonly
 
 状态: 无参数启动即交互入口（与 --tui 等价）；--once 用于脚本/CI。
 ]])
@@ -180,12 +182,41 @@ local function parse_flags(list)
         elseif a == "--debug-log" then
             flags.debug_log = list[i + 1]
             i = i + 2
+        elseif a == "--readonly" then
+            -- 显式认领"本次不落盘"：抢不到 mem.lock 时不再拒绝启动。
+            flags.readonly = true
+            i = i + 1
         else
             pos[#pos + 1] = a
             i = i + 1
         end
     end
     return flags, pos
+end
+
+-- 抢不到 mem.lock 的写实例：从「静默降级」改成「当场拒绝」。
+-- 旧行为是 stderr 打一行就照跑，于是整段对话 / remember / todo 全落进虚空，
+-- 直到下次启动才发现历史少了一截（实测踩过）。要么先把占锁的进程关掉，
+-- 要么显式 --readonly / LITE_ALLOW_READONLY=1 承认"这次不落盘"。
+local function allow_readonly(flags)
+    if flags and flags.readonly then return true end
+    local env = os.getenv("LITE_ALLOW_READONLY")
+    return env == "1" or env == "true" or env == "yes"
+end
+
+local function memory_busy_error(memory)
+    local st = memory:status()
+    local who = "another lite process"
+    local lk = st.lock
+    if lk and lk.pid then
+        who = string.format("pid %d", lk.pid)
+        if lk.comm and lk.comm ~= "" then who = who .. " (" .. lk.comm .. ")" end
+    end
+    return string.format(
+        "lite: memory is locked by %s in %s\n" ..
+        "  refusing to run without write access: turns/remember/todo would be silently dropped.\n" ..
+        "  close that instance, or pass --readonly (LITE_ALLOW_READONLY=1) to run anyway.\n",
+        who, tostring(st.dir))
 end
 
 -- 自重启的兜底路径：execv 原地换进程（进程还是同一个，只换镜像）。
@@ -257,7 +288,11 @@ elseif cmd == "serve" or cmd == "--serve" then
         os.exit(2)
     end
     local port = flags.port or tonumber(os.getenv("LITE_SERVE_PORT")) or 8765
-    local ok, err = require("core.serve").run({
+    -- `/reboot <prompt>` 或 reboot 工具带 prompt 留下的那句话：新进程带 --reboot
+    -- 起来时一次性取走，起来后作为第一条消息提交（serve 没有输入框，只能排队）。
+    local resume_text
+    if flags.reboot then resume_text = require("core.reboot").take(config.cwd) end
+    local ok, err, stop = require("core.serve").run({
         host = flags.host,
         port = port,
         config = config,
@@ -265,10 +300,26 @@ elseif cmd == "serve" or cmd == "--serve" then
         max_runs = flags.wake_max,
         task = flags.task,
         task_file = flags.task_file,
+        resume_text = resume_text,
+        allow_readonly = allow_readonly(flags),
     })
     if not ok then
         io.stderr:write("lite serve: " .. tostring(err) .. "\n")
         os.exit(1)
+    end
+    -- reboot 工具在 serve 里同样是「换一个全新进程」：先把提示词落盘（只有文件能
+    -- 跨过进程边界），再走和 TUI 同一条路——受监督时 exit 75 让 wrapper 拉起，
+    -- 裸跑时 execv 原地换镜像（新进程带 --reboot 取回那句话）。
+    if stop and stop.mode == "reboot" then
+        require("core.reboot").save(stop.prompt, config.cwd)
+        io.stdout:flush()
+        io.stderr:flush()
+        if os.getenv("LITE_SUPERVISED") == "1" then os.exit(75) end
+        local rok, rerr = exec_self()
+        if not rok then
+            io.stderr:write("lite serve: reboot failed: " .. tostring(rerr) .. "\n")
+            os.exit(1)
+        end
     end
     os.exit(0)
 elseif cmd == "attach" or cmd == "--attach" then
@@ -320,6 +371,9 @@ elseif cmd == "state" or cmd == "--state" or cmd == "sessions" or cmd == "--sess
         out.session = sid
         out.todos = todos
         out.memory = memory:stats()
+        -- 是不是真的能落盘：只看 mem.bin 有数据是不够的，还要知道有没有别的
+        -- 实例正占着 mem.lock（那意味着本进程的写全被丢掉）。
+        out.memory_lock = memory:status()
         out.wake = memory:get("/agent/working", "wake")
     end
 
@@ -336,6 +390,14 @@ elseif cmd == "state" or cmd == "--state" or cmd == "sessions" or cmd == "--sess
             local st = out.memory or {}
             print(string.format("memory count=%d used=%d max=%d",
                 st.count or 0, st.used or 0, st.max or 0))
+            local lk = out.memory_lock or {}
+            if lk.free == false then
+                print("memory lock  busy: " .. require("core.memory").lock_message(lk.dir, lk.lock))
+            elseif lk.free == true then
+                print("memory lock  free (no writable instance holds it)")
+            else
+                print("memory lock  unknown")
+            end
             for _, t in ipairs(todos) do
                 print(string.format("[%s] %s", tostring(t.status), tostring(t.content)))
             end
@@ -587,8 +649,17 @@ elseif cmd == "--tui" or cmd == "--gui" then
         io.stderr:write("lite: " .. tostring(merr) .. "\n")
         os.exit(2)
     end
+    -- 快照/验收用的只读实例要在状态栏上区分出来：它不是"降级丢数据"，
+    -- 标成 RO! 只会让每张快照都带假警报。
+    if snapshot_only then memory.snapshot_only = true end
     if memory.lock_busy and not snapshot_only then
-        io.stderr:write("lite: memory busy, read-only until lock frees (auto-retry): " .. tostring(config.memory_dir or config.cwd) .. "\n")
+        if allow_readonly(flags) then
+            io.stderr:write("lite: memory read-only by request (" .. Memory.lock_message(memory.dir, memory:owner()) .. ")\n")
+        else
+            io.stderr:write(memory_busy_error(memory))
+            memory:close()
+            os.exit(3)
+        end
     end
 
     local multi, mlerr = http.multi_new()
@@ -777,7 +848,13 @@ elseif cmd == "--once" then
         os.exit(2)
     end
     if memory.lock_busy then
-        io.stderr:write("lite: memory busy, read-only until lock frees (auto-retry): " .. tostring(config.memory_dir or config.cwd) .. "\n")
+        if allow_readonly(flags) then
+            io.stderr:write("lite: memory read-only by request (" .. Memory.lock_message(memory.dir, memory:owner()) .. ")\n")
+        else
+            io.stderr:write(memory_busy_error(memory))
+            memory:close()
+            os.exit(3)
+        end
     end
 
     local tools = Tools.new({
