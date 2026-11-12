@@ -109,16 +109,22 @@ return {
 
 ### 共享记忆库 `memdb/`（跨 agent）
 
-`mem.bin` 是本机私有脑，`memdb/` 是公共告示板：**每个 agent 一个 `<origin>.jsonl`，只 append，
-不加锁、不合并、不覆盖**。冗余是设计选择——同一条事实被三个 agent 各写一遍很正常，
-去重和判断可信度是读的人的事。
+`mem.bin` 是本机私有脑（按目录分、mmap + 独占写锁，第二个进程只能只读），
+`memdb/` 是公共的一份：**一个目录、一个文件 `mem.shared.jsonl`，所有 agent 都往里面 append**。
+不加锁、不合并、不覆盖——`O_APPEND` 单行写入原子，谁写的记在每行的 `o` 字段里。
+冗余是设计选择——同一条事实被三个 agent 各写一遍很正常，去重和判断可信度是读的人的事。
 
 ```bash
 export LITE_MEMDB_DIR=/srv/lite-memdb            # 指到共享盘（NFS/WebDAV 挂载点）就天然多机共享
-export LITE_AGENT_NAME=box-a                     # 可选，缺省 = <hostname>-<cwd 名>
+export LITE_MEMDB_FILE=/srv/lite-memdb/mem.shared.jsonl   # 可选，单独指定那个文件
+export LITE_AGENT_NAME=box-a                     # 可选，缺省 = <hostname>-<cwd 名>，只作署名
+export LITE_MEMDB_SPLIT=1                        # 仅在多机 NFS 上用：退回每 agent 一个文件
 ./tools/run.sh --memdb                           # 有多少条、谁写的
 ./tools/run.sh --memdb-search "ollama 端口"       # 全库搜（ASCII 词 + 中文 bigram）
 ```
+
+默认位置 `~/.local/share/lite/memdb/mem.shared.jsonl`（就在 `mem.bin` 旁边），
+`cat`/`grep`/`git diff` 都行，人工改也不会坏（坏行读取时跳过）。
 
 - `remember` 写完 `mem.bin` 后顺手 append 进共享库；`recall` 先给本地结果，
   再补最多 3 条 `shared@<origin>`（和本地重复的、自己刚写的都会先剔掉）。

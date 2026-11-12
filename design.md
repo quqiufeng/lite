@@ -74,10 +74,13 @@ prompt 可以有界，`mem.bin` 不能。
 - `mem.lock` 防多写实例覆盖；`--recall/--memory-export/state/sessions` 只读不加锁，运行中可诊断。
 - 搬运只走 JSONL（`core/memory_io.lua`）：`mem.bin` 的 mmap 布局含指针偏移，跨机器/跨版本不可读，
   所以导出按 key 排序吐行、导入逐行容错 + 同 key 覆盖，不做二进制拷贝。`ttl` 恒导 0（C 层无剩余寿命查询）。
-- **群体记忆 `core/memdb.lua`**：不做多写者的 mmap 协调，改成一个共享目录 + 每 agent 一个
-  `<origin>.jsonl`，只 append（`O_APPEND` 单行原子，无需锁）。`remember` 双写（mem.bin 私有 +
-  memdb 共享），`recall` 本地优先、共享补 3 条并标注 `shared@<origin>`。冗余不消除（读时按正文去重
-  一次、按查询词打分排序），矛盾也不仲裁——谁是权威由读的人自己判断。
+- **群体记忆 `core/memdb.lua`**：不做多写者的 mmap 协调（那要自建跨进程写锁 + 扩容重映射，
+  而记忆写入本就是追加语义），改成一个共享目录里的**单个 `mem.shared.jsonl`，所有 agent 都 append**
+  （`O_APPEND` 下 seek+write 不可分割，单行写入原子，无需锁；署名记在每行 `o` 字段，不靠文件名区分）。
+  `remember` 双写（mem.bin 私有 + memdb 共享），`recall` 本地优先、共享补 3 条并标注
+  `shared@<origin>`。冗余不消除（读时按正文去重一次、按查询词打分排序），矛盾也不仲裁——
+  谁是权威由读的人自己判断。唯一例外：多机 NFS 上跨客户端 `O_APPEND` 不保证原子，
+  设 `LITE_MEMDB_SPLIT=1` 退回每 agent 一个 `<origin>.jsonl`（单机写本地盘不需要）。
 - 头部损坏（magic/version 不符）不阻塞启动：改名 `mem.bin.corrupt-<ts>` 后以空库继续。
 - 会话结束把「同 tool+args 失败 ≥2 次且未恢复」写成 `fail/<ts>` 事实，下次自动召回。
 

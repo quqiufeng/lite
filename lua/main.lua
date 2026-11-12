@@ -416,10 +416,10 @@ elseif cmd == "--memdb" or cmd == "--memdb-search" then
     else
         local st = Memdb.stats()
         if json then
-            emit({ type = "memdb", dir = st.dir, entries = st.entries,
+            emit({ type = "memdb", dir = st.dir, file = st.file, entries = st.entries,
                    by_origin = st.by_origin })
         else
-            print("memdb: " .. st.dir)
+            print("memdb: " .. (st.file or st.dir))
             print(string.format("%d entries", st.entries))
             local names = {}
             for name in pairs(st.by_origin) do names[#names + 1] = name end

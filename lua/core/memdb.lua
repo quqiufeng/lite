@@ -1,15 +1,19 @@
--- 群体记忆：所有 agent 往同一个目录里追加，读取时自己挑。
+-- 群体记忆：一个目录、一个文件，所有 agent 都往同一个文件里 append。
 --
 -- 为什么不是"一个 mem.bin + 多写者"：
 --   mem.bin 是 mmap 二进制 + mem.lock 独占写锁，第二个进程只能降级只读（memory.lua）。
 --   要让 N 个 agent 同时写同一份 mmap，得自己做跨进程写锁和扩容重映射，
 --   那是给"每次写都要改同一块内存"付的代价，而记忆写入本来就是追加语义。
 --
--- 为什么是"每个 agent 一个 jsonl、只 append"：
---   1) O_APPEND 下单行 < PIPE_BUF 的 write 是原子的，不用锁、不用协调；
---   2) 一行坏了（写一半、进程被杀）只丢那一行，scan 跳过即可；
---   3) 放在同一个 NFS/WebDAV 目录里就是分布式——不需要谁来当 master；
---   4) 可 grep、可 git diff、可人工改。
+-- 为什么是"单文件 + 只 append"：
+--   1) O_APPEND 下 seek+write 不可分割，单行 < PIPE_BUF 的写入不会交织，不用锁；
+--   2) 每行自带 o（origin）字段，谁写的写在行里，不需要靠文件名区分；
+--   3) 一行坏了（写一半、进程被杀）只丢那一行，scan 跳过即可；
+--   4) 放在同一个 NFS/WebDAV 目录里就是跨机共享——不需要谁来当 master；
+--   5) 可 grep、可 git diff、可人工改。
+--
+-- NFS 例外：跨网络文件系统的 O_APPEND 不保证原子。真跑在多机 NFS 上时设
+-- LITE_MEMDB_SPLIT=1，退回"每 agent 一个 <origin>.jsonl"（单机写本地盘不需要）。
 --
 -- 冗余是设计选择，不是缺陷：同一条事实被三个 agent 各写一遍很正常，
 -- 人类的知识库本来也充满重复。去重、加权、判断可信度是**读的人**的事，
@@ -32,6 +36,21 @@ local function default_dir()
 end
 
 M.dir = default_dir
+
+-- 共享库就一个文件。所有 agent 都 append 它——这才叫共享。
+function M.file(opts)
+    opts = opts or {}
+    if opts.file and opts.file ~= "" then return opts.file end
+    local env = os.getenv("LITE_MEMDB_FILE")
+    if env and env ~= "" then return env end
+    return (opts.dir or M.dir()) .. "/mem.shared.jsonl"
+end
+
+-- NFS 上 O_APPEND 不原子，允许退回每 agent 一个文件（默认关）。
+local function split_mode()
+    local v = os.getenv("LITE_MEMDB_SPLIT")
+    return v == "1" or v == "true" or v == "yes"
+end
 
 -- 身份只用来分文件，不做权限也不参与合并：即使两个 agent 撞名，
 -- 也只是共用一个文件继续 append，仍然不会互相覆盖。
@@ -65,7 +84,8 @@ function M.append(rec, opts)
     local dir = opts.dir or M.dir()
     ensure_dir(dir)
     local origin = (opts.origin or M.origin()):gsub("[^%w%._%-]", "_")
-    local path = dir .. "/" .. origin .. ".jsonl"
+    -- 默认所有人写同一个文件；split 模式（NFS）才各写各的
+    local path = split_mode() and (dir .. "/" .. origin .. ".jsonl") or M.file(opts)
 
     -- ts 允许写在 rec 里，也允许写在 opts 里（导入历史条目时方便）
     local row = { k = key, o = origin, ts = tonumber(rec.ts) or tonumber(opts.ts) or os.time(), v = text }
@@ -86,10 +106,17 @@ end
 function M.scan(opts)
     opts = opts or {}
     local dir = opts.dir or M.dir()
-    local rows, files = {}, {}
+    local rows, files, seen_path = {}, {}, {}
+    -- 主文件排第一（绝大多数内容都在这），再捞目录里其余的 jsonl
+    -- （split 模式的 <origin>.jsonl、以及旧版本留下的按 agent 分文件，都能继续读）
+    local main = M.file(opts)
+    local function add(path)
+        if path and not seen_path[path] then seen_path[path] = true files[#files + 1] = path end
+    end
+    add(main)
     local p = io.popen(string.format("ls -1 '%s'/*.jsonl 2>/dev/null", (dir:gsub("'", "'\\''"))))
     if p then
-        for name in p:lines() do files[#files + 1] = name end
+        for name in p:lines() do add(name) end
         p:close()
     end
 
@@ -185,7 +212,8 @@ function M.stats(opts)
         local o = r.origin or "?"
         by_origin[o] = (by_origin[o] or 0) + 1
     end
-    return { dir = (opts and opts.dir) or M.dir(), entries = #rows, by_origin = by_origin }
+    return { dir = (opts and opts.dir) or M.dir(), file = M.file(opts),
+             entries = #rows, by_origin = by_origin }
 end
 
 return M
