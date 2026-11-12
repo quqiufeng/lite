@@ -622,6 +622,27 @@ do
     local blocked = t:execute("write", { path = "link/x", content = "bad" })
     check(blocked:find("error", 1, true) ~= nil, "tools symlink write blocked")
 
+    -- bwrap 装了但跑不起来（禁非特权 user namespace / 容器）时必须报 false：
+    -- 只看 `command -v` 会判「可用」却让每条命令在 bwrap 里炸（slave 实测踩到）。
+    local fakebin = os.tmpname()
+    os.remove(fakebin)
+    os.execute("mkdir -p " .. shq(fakebin))
+    local bf = io.open(fakebin .. "/bwrap", "w")
+    if bf then
+        bf:write("#!/bin/sh\nexit 1\n")
+        bf:close()
+        os.execute("chmod +x " .. shq(fakebin .. "/bwrap"))
+        local script = 'local S = require("core.sandbox") '
+            .. 'io.write(tostring(S.available()), " ", tostring(S.reason()))'
+        local h = io.popen("PATH=" .. fakebin .. ":$PATH "
+            .. shq(root .. "/tools/lite-lua") .. " -e " .. shq(script) .. " 2>/dev/null")
+        local line = h and h:read("*l") or ""
+        if h then h:close() end
+        check(line:match("^false ") ~= nil, "tools sandbox: unusable bwrap reports false")
+        check(line:find("namespace", 1, true) ~= nil, "tools sandbox: reason names the cause")
+    end
+    os.execute("rm -rf " .. shq(fakebin))
+
     if Sandbox.available() then
         local st = Tools.new({ cwd = dir, sandbox = true })
         local out = st:execute("bash", { command = "echo hi > in.txt; pwd" })

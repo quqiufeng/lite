@@ -2,12 +2,35 @@
 local M = {}
 
 local cached
+local cached_reason
 
+local function ok(rc) return rc == 0 or rc == true end
+
+-- bwrap 装了不等于能用：Ubuntu 23.10+/24.04、容器、以及禁了非特权 user namespace
+-- 的机器上，bwrap 二进制在、但一启动就 "Creating new namespace failed"。
+-- 只看 `command -v` 会让 --sandbox 变成「可用却在每条命令上炸」，测试也会误判。
+-- 所以真实探一次（结果缓存），失败时把原因留给 wrap() 报给用户。
 function M.available()
     if cached ~= nil then return cached end
-    local rc = os.execute("command -v bwrap >/dev/null 2>&1")
-    cached = (rc == 0 or rc == true)
+    if not ok(os.execute("command -v bwrap >/dev/null 2>&1")) then
+        cached, cached_reason = false, "bwrap is not installed (apt install bubblewrap)"
+        return cached
+    end
+    local probe = os.execute("bwrap --ro-bind / / --dev /dev --proc /proc -- true >/dev/null 2>&1")
+    cached = ok(probe)
+    if cached then
+        cached_reason = nil
+    else
+        cached_reason = "bwrap cannot create user namespaces on this host "
+            .. "(unprivileged_userns_clone=0 or container restriction)"
+    end
     return cached
+end
+
+-- 不可用时的原因（可用时为 nil）；给 user/model 一句能动手的话，别只说 false。
+function M.reason()
+    M.available()
+    return cached_reason
 end
 
 local function mode_on(v)
@@ -29,7 +52,7 @@ end
 function M.wrap(command, opts)
     opts = opts or {}
     if not M.available() then
-        return nil, "sandbox requested but bwrap is not installed"
+        return nil, "sandbox requested but unavailable: " .. tostring(M.reason())
     end
     local cwd = tostring(opts.cwd or ".")
     local parts = {
