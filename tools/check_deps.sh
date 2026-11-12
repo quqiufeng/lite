@@ -147,16 +147,27 @@ fi
 # 再判「源码树里能不能编」——安装版只关心前者。
 if [ -f "$ROOT/build/liblite_html.so" ]; then
     echo "[OK]   liblite_html $ROOT/build/liblite_html.so"
-    # 私有依赖必须在同一个目录里（$ORIGIN 自解析），缺了就是打包漏件
+    # 「能不能跑」只认加载器的答案：ldd 解不出来才算坏。源码树里这两个私有库通常不在
+    # build/ 兄弟位，而是靠 RUNPATH 的 /opt/litehtml/build-pic 兜底（$ORIGIN 只是给安装
+    # 版用的第一顺位）——以前这里只数兄弟文件，于是源码树永远报「缺件→加载失败」，
+    # 正好踩中 AGENTS.md 警告的那种误读：命令其实好使。
     missing_priv=()
     for so in liblitehtml.so.0 libgumbo.so.0; do
         [ -f "$ROOT/build/$so" ] || missing_priv+=("$so")
     done
-    if [ ${#missing_priv[@]} -eq 0 ]; then
-        echo "[OK]   lite_html 私有依赖随包 (liblitehtml.so.0, libgumbo.so.0)"
+    unresolved="$(ldd "$ROOT/build/liblite_html.so" 2>/dev/null | grep 'not found' || true)"
+    if [ -z "$unresolved" ]; then
+        if [ ${#missing_priv[@]} -eq 0 ]; then
+            echo "[OK]   lite_html 私有依赖随包 (liblitehtml.so.0, libgumbo.so.0)"
+        else
+            echo "[OK]   lite_html 私有依赖由 RUNPATH 解析：$(ldd "$ROOT/build/liblite_html.so" \
+                | grep -oE '/([^ ]*)(liblitehtml|libgumbo)\.so\.0' | tr '\n' ' ')"
+            echo "[INFO] build/ 里没有 ${missing_priv[*]} 兄弟副本 → 只能在本机跑，打包/安装要 ./tools/release.sh"
+        fi
     else
-        echo "[WARN] lite_html 缺私有依赖 ${missing_priv[*]} in $ROOT/build → html->png 加载失败"
-        echo "         重装可修：./tools/release.sh（package.sh 会从 /opt/litehtml 拷进来）"
+        echo "[WARN] liblite_html.so 加载器解不出依赖 → html->png 会失败："
+        echo "$unresolved" | sed 's/^/         /'
+        echo "         源码树可 ./tools/build.sh 重编，安装版 ./tools/release.sh"
     fi
 else
     echo "[INFO] build/liblite_html.so missing (html->png 不可用；./tools/build.sh 生成)"
@@ -188,6 +199,27 @@ for f in DroidSansFallbackFull.ttf DejaVuSansMono.ttf; do
         echo "[WARN] font missing helper/assets/$f → 中文/★ 渲染成方框"
     fi
 done
+
+# SVG→PNG（lua/trace/svgpng.lua，trace render 与 charts 出图共用这套后端）：
+# cairo + librsvg 靠 dlopen 系统库，缺了只在出图那一刻报错，所以这里直接真渲一张小图验到底
+# ——dlopen 成功不等于符号在（rsvg_handle_render_document 是 librsvg 2.46+ 才有的）。
+# 缺件不算 FAIL：.svg 输出照样能用，只是没有 PNG。
+SVGPNG_OUT=$("$ROOT/tools/lite-lua" -e '
+local ok, png = pcall(require, "trace.svgpng")
+if not ok then io.write("ERR=" .. tostring(png)); os.exit(0) end
+local c, r = png.backend()
+if not c then io.write("ERR=libcairo/librsvg 未加载"); os.exit(0) end
+local svg = [[<svg xmlns="http://www.w3.org/2000/svg" width="24" height="16"><rect width="24" height="16" fill="#333"/></svg>]]
+local path = "/tmp/.checkdeps-svgpng.png"
+local okr, info = png.render(svg, path)
+os.remove(path)
+if not okr then io.write("ERR=" .. tostring(info)); os.exit(0) end
+io.write(string.format("OK=%s + %s (%dx%d)", c, r, info.w, info.h))
+' 2>&1 | tail -1) || SVGPNG_OUT="ERR=probe crashed"
+case "$SVGPNG_OUT" in
+    OK=*) echo "[OK]   svg->png ${SVGPNG_OUT#OK=}" ;;
+    *)    echo "[WARN] svg->png ${SVGPNG_OUT#ERR=} → trace render / charts 只能出 .svg" ;;
+esac
 
 # codesearch（可选）：语义搜索需要 tokenizers-cpp 静态库、ONNX Runtime、Jina 模型。
 # 词法/符号/调用图/数据流只需要 ctags + jansson；缺 tokenizers 时 CMake 会跳过
