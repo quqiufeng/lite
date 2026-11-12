@@ -27,7 +27,7 @@ AI-native harness：记忆、工具、FFI、X11。
 
 ## 2 代码地图
 
-- `lua/main.lua`：入口；`lua/core/`：agent/tools/memory/prompt/session/compact（含 web）/reboot
+- `lua/main.lua`：入口；`lua/core/`：agent/tools/memory/prompt/session/compact（含 web）/reboot/serve_watch（去抖探活）
 - `lua/tui/`、`lua/ffi/`、`src/{cache,image,x11,codesearch}/`、`helper/`、`tools/`
 - `src/codesearch/`：从 `/opt/my_db` 全量迁移的代码索引/调用图/数据流/向量检索；
   `api.c` 是 JSON-in/JSON-out 公共入口，其余 `.c` 来自原 CLI（main 改名、日志走 stderr）。
@@ -267,7 +267,7 @@ HTTP 客户端走 `POST /prompt`），外部客户端要重启就自己 kill 再
 
 | 端点 | 说明 |
 |---|---|
-| `GET /health` | 探活，**不鉴权**，回 `{"ok":true,"live":true,"busy":…,"queued":…}`，不排队 |
+| `GET /health` | 探活，**不鉴权**，回 `{"ok":true,"live":true,"busy":…,"queued":…,"shell":…,"pid":…,"shell_sec":…}`，不排队 |
 | `POST /prompt` | `{"prompt":"..."}`（也收 `{"text":…}` 或裸文本体）下指令，跑完回 `{"ok":true,"text":"…"}` |
 
 **不做鉴权**：两端点都开放（本机自用，或 `--host 0.0.0.0` 给局域网里的应用调用）。
@@ -282,6 +282,23 @@ HTTP 客户端走 `POST /prompt`），外部客户端要重启就自己 kill 再
 curl -s localhost:8765/health                     # {"ok":true,"live":true,...}
 curl -s localhost:8765/prompt -d '{"prompt":"北京时间现在几点"}'
 ```
+
+**`/health` 的消费方式：单次采样不当判决**（`lua/core/serve_watch.lua`）。master 要判断
+「远端实例是不是闲下来了、能不能派活」，用 `lite serve --probe HOST:PORT`，它采样 N 次
+（默认 3 次、间隔 2s、单次超时 5s）后给结论，**连续 N 次「活着且空闲」才返回 0**：
+
+| 退出码 | decision | 含义 |
+|---|---|---|
+| 0 | `wake` | 连续 N 次 `live` 且 `busy`/`shell` 都为假，可以唤醒 |
+| 3 | `busy` | 采样里出现过 `busy` 或 `shell`（还在跑一轮 / 命令未收尸） |
+| 4 | `unreachable` | N 次全部答不上来（连不上、超时、坏 JSON 都归这类） |
+| 5 | `unstable` | 有空闲也有超时，凑不满连续 N 次——再采一轮，别当结论 |
+
+**为什么不去抖不行**：`active_proc:alive()` 是「尽快」而非「瞬时」，`kill -9` 后没收尸前
+`kill(pid,0)` 仍成功；serve 又是单协程，主循环一卡（同步 C 调用/前台工具）整个 `/health`
+答不上来。这两类噪声都只意味着「再采一次就清楚」，**不是死亡、也不是空闲**——把判决放在
+采样流上是为了吸收它们，不是为了提精度。`shell_sec` 只作展示，不参与判定（长命令跑一小时
+也是活着）。`--probe` 不启服务端、不需要 API key，`--json` 时回一条带 `trace[]` 的事件。
 
 **选路优先级（从省力到费劲，别跳级）**：
 

@@ -550,6 +550,46 @@ do
     check(cancelled:find("cancelled", 1, true) ~= nil, "proc cancel")
 end
 
+-- proc alive：只读探活（/health 用），不许吃掉 poll 需要的状态
+do
+    local Proc = require("core.proc")
+    local p = assert(Proc.new("sleep 5", { timeout = 30 }))
+    os.execute("sleep 0.05")
+    check(p:alive() == true, "proc alive: running shell")
+    check(p.done == false, "proc alive: must not mark done")
+    local out0 = p:output()
+    p:alive()
+    check(p:output() == out0, "proc alive: must not consume output")
+    local done, o = p:poll()
+    check(done == false, "proc alive: poll still sees live proc, got " .. tostring(done))
+    p:cancel()
+
+    -- 正常退出：status 文件落盘 → alive 立刻 false
+    local r = assert(Proc.new("true", { timeout = 30 }))
+    local exited
+    for _ = 1, 100 do
+        if not r:alive() then exited = true break end
+        os.execute("sleep 0.05")
+    end
+    check(exited == true, "proc alive: finished shell reported dead")
+    r:poll()
+
+    -- 被信号杀：不写 status，只能靠 pid 判断
+    local k = assert(Proc.new("sleep 30", { timeout = 60 }))
+    os.execute("sleep 0.05")
+    check(k:alive() == true, "proc alive: killed-case running")
+    os.execute("kill -9 " .. tostring(k.pid) .. " 2>/dev/null")
+    -- 被杀后有一小段僵尸窗口：kill(pid,0) 对僵尸仍返回成功，等 init 收尸。
+    -- 所以探活是「尽快」而不是「瞬时」，别把固定 sleep 当断言。
+    local gone
+    for _ = 1, 100 do
+        if not k:alive() then gone = true break end
+        os.execute("sleep 0.05")
+    end
+    check(gone == true, "proc alive: killed shell reported dead")
+    k:cancel()
+end
+
 -- tools sandbox / symlink escape
 do
     local dir = os.tmpname()
@@ -4950,6 +4990,56 @@ do
         "http 404: points at /prompt")
     check(nf:find('"ok":false', 1, true) ~= nil, "http error: ok=false")
 
+end
+
+-- serve 探活去抖：单次采样不当判决，凑满 N 次连续空闲才 wake
+do
+    local W = require("core.serve_watch")
+
+    -- 纯判定
+    local d, why = W.decide(3, 3, 0, 0)
+    check(d == "wake" and type(why) == "string", "probe decide: all idle = wake")
+    check(W.decide(3, 2, 1, 0) == "busy", "probe decide: one busy = busy")
+    check(W.decide(3, 0, 3, 0) == "busy", "probe decide: all busy = busy")
+    check(W.decide(3, 0, 0, 3) == "unreachable", "probe decide: no answer = unreachable")
+    check(W.decide(3, 2, 0, 1) == "unstable", "probe decide: idle+timeout = unstable")
+
+    -- 采样流：僵尸/卡住的那一次不该被单点判死
+    local w = W.new({ samples = 3, interval = 0 })
+    check(w:feed({ ok = true, shell = true }) == nil, "probe feed: busy sample no verdict")
+    check(w:feed({ ok = true }) == nil, "probe feed: idle sample no verdict")
+    check(w:feed({ ok = true }) == "busy", "probe feed: busy then idle = busy")
+    check(w:exit_code() == W.BUSY, "probe exit: busy = 3")
+
+    -- 一次超时打断空闲序列 → unstable（不唤醒，但也别当成还在干活）
+    local w1 = W.new({ samples = 3, interval = 0 })
+    w1:feed({ ok = false, err = "timeout" })
+    w1:feed({ ok = true })
+    check(w1:feed({ ok = true }) == "unstable", "probe feed: timeout then idle = unstable")
+    check(w1:exit_code() == W.UNSTABLE, "probe exit: unstable = 5")
+
+    local w2 = W.new({ samples = 3, interval = 0 })
+    w2:feed({ ok = true })
+    w2:feed({ ok = true })
+    check(w2:feed({ ok = true }) == "wake", "probe feed: 3 idle = wake")
+    check(w2:exit_code() == W.OK, "probe exit: wake = 0")
+    check(#w2.trace == 3 and w2.trace[3].ok == true, "probe trace: keeps samples")
+    -- 成功采样不带 err（`ok and nil or x` 惯用法会把它写成 x，踩过）
+    check(w2.trace[1].err == nil, "probe trace: idle sample has no err")
+
+    local w3 = W.new({ samples = 2, interval = 0 })
+    w3:feed({ ok = false, err = "curl rc=28: timeout" })
+    check(w3:feed({ ok = false, err = "timeout" }) == "unreachable", "probe feed: 2 down")
+    check(w3:exit_code() == W.UNREACHABLE, "probe exit: unreachable = 4")
+    check(w3.trace[1].err == "curl rc=28: timeout", "probe trace: keeps error")
+
+    -- samples=1 也该成立（单次采样 = 无去抖，直给结论）
+    local w4 = W.new({ samples = 1, interval = 0 })
+    check(w4:feed({ ok = true }) == "wake", "probe samples=1: idle = wake")
+
+    -- 端口号非法时 run 直接拒绝（host:port 解析在 main.lua，这里只验 port 必填）
+    local okrun, err = pcall(W.run, "127.0.0.1", nil, { samples = 1 })
+    check(okrun == false and tostring(err):find("port") ~= nil, "probe run: port required")
 end
 
 -- entry

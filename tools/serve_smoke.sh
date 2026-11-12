@@ -83,6 +83,18 @@ else
     echo "SKIP serve.http (curl missing)"
 fi
 
+# 探活去抖（master 侧那份规则）：活着的 serve 连续 3 次空闲 → 退出码 0；
+# 没人听的端口 → 4（连一次都没答上来）。--probe 不启服务端、不要 API key，
+# 走 lite 自己的 libcurl，所以不受上面 curl 分支影响。
+"$ROOT/tools/run.sh" serve --probe "127.0.0.1:$PORT" --samples 3 --interval 0.1 \
+    --probe-timeout 5 >/dev/null || fail "serve --probe on live server should be 0"
+set +e
+"$ROOT/tools/run.sh" serve --probe 127.0.0.1:1 --samples 2 --interval 0 \
+    --probe-timeout 1 >/dev/null 2>&1
+DEAD_RC=$?
+set -e
+[ "$DEAD_RC" = "4" ] || fail "serve --probe on dead port should exit 4, got $DEAD_RC"
+
 if command -v tmux >/dev/null 2>&1; then
     tmux new-session -d -s "$S" -x 120 -y 30 -c "$TMP" \
         "env LITE_CWD=$TMP $ROOT/tools/run.sh attach --port $PORT"

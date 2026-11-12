@@ -79,6 +79,21 @@ function M:_close()
     os.remove(self.status_file)
 end
 
+-- 只读探活：不动 self 状态、不删临时文件（poll 还要用），给 /health 用。
+-- status 文件落盘 = 命令已退出；进程被信号杀时不写 status，退回看 pid。
+-- 被杀后到 init 收尸之间是僵尸，kill(pid,0) 仍成功 → 这里「尽快」而非「瞬时」，
+-- 与 poll 的 dead_ticks>=2 是同一个原因。
+function M:alive()
+    if self.done then return false end
+    local sf = io.open(self.status_file, "rb")
+    if sf then
+        local code = tonumber((sf:read("*l") or ""):match("^%s*(%-?%d+)"))
+        sf:close()
+        if code then return false end
+    end
+    return ffi.C.kill(self.pid, 0) == 0
+end
+
 function M:poll()
     if self.done then return true, self:output(), "" end
     local delta = self:_read_new()

@@ -490,8 +490,18 @@ function M.run(opts)
         end
         -- /health 不鉴权：探活用，不回工作区信息，也不排队。
         if req.path == "/health" or req.path == "/healthz" then
+            -- shell = 当前这条 bash 后台进程还活着（含 setsid 出来的子孙）。
+            -- 探活只看「还在不在跑」，不看时间阈值：长命令跑一小时也是活着，
+            -- 主循环卡在同步 C 调用时这个请求根本答不上（对方超时即判卡）。
+            local shell, shell_sec, pid
+            if active_proc and active_proc:alive() then
+                shell = true
+                pid = active_proc.pid
+                shell_sec = os.time() - (active_proc.start or os.time())
+            end
             return http_close(fd, Http.json(200,
-                { ok = true, live = true, busy = busy, queued = #queue }))
+                { ok = true, live = true, busy = busy, queued = #queue,
+                  shell = shell, pid = pid, shell_sec = shell_sec }))
         end
         if req.path ~= "/prompt" then
             return http_close(fd, Http.not_found(req.path))

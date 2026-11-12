@@ -17,6 +17,9 @@ lite — DeepSeek 终端 coding agent
                                POST /prompt {"prompt":"..."}  直接下指令给 lite 执行
   lite serve --host 0.0.0.0    给局域网里的应用当大脑（不做鉴权，靠 host 控制暴露面）
   lite serve --port 8765 --wake 300 --task "检查 CI"   定时唤醒
+  lite serve --probe HOST:PORT [--samples 3] [--interval 2]
+                               去抖探活（master 用）：连续 N 次「活着且空闲」才返回 0，
+                               3=还在干活 4=连不上 5=采样不稳，不需要 API key
   lite attach --port 8765      连接服务端并显示 TUI
   lite attach --port 8765 --tmux  在新 tmux 窗口 attach
   lite --tui --snapshot out.txt   输出整屏快照（AI 验收）
@@ -121,6 +124,18 @@ local function parse_flags(list)
             i = i + 2
         elseif a == "--host" then
             flags.host = list[i + 1]
+            i = i + 2
+        elseif a == "--probe" then
+            flags.probe = list[i + 1]
+            i = i + 2
+        elseif a == "--samples" then
+            flags.samples = tonumber(list[i + 1])
+            i = i + 2
+        elseif a == "--interval" then
+            flags.interval = tonumber(list[i + 1])
+            i = i + 2
+        elseif a == "--probe-timeout" then
+            flags.probe_timeout = tonumber(list[i + 1])
             i = i + 2
         elseif a == "--http-timeout" then
             flags.http_timeout = tonumber(list[i + 1])
@@ -280,6 +295,32 @@ elseif cmd == "--help" or cmd == "-h" then
     os.exit(0)
 elseif cmd == "serve" or cmd == "--serve" then
     local flags = parse_flags(rest)
+    -- `--probe HOST:PORT`：master 侧的去抖探活，不启动服务端、不需要 API key，
+    -- 只采 N 次 /health 然后按退出码给结论（见 core/serve_watch.lua 的码表）。
+    if flags.probe then
+        local spec = tostring(flags.probe)
+        local phost, pport = spec:match("^(.-):(%d+)$")
+        if not phost then phost, pport = "127.0.0.1", spec:match("^(%d+)$") end
+        if not pport then
+            io.stderr:write("lite serve --probe: expected HOST:PORT or PORT\n")
+            os.exit(2)
+        end
+        local w = require("core.serve_watch").run(phost, pport, {
+            samples = flags.samples,
+            interval = flags.interval,
+            timeout = flags.probe_timeout,
+        })
+        if json then
+            emit({ type = "probe", host = phost, port = tonumber(pport),
+                   decision = w.decision, reason = w.reason,
+                   idle = w.idle, busy = w.busy, down = w.down,
+                   samples = w.samples, trace = w.trace })
+        else
+            print(string.format("%s %s:%s — %s (%d idle / %d busy / %d down of %d)",
+                w.decision, phost, pport, w.reason, w.idle, w.busy, w.down, w.samples))
+        end
+        os.exit(w:exit_code())
+    end
     local config = require("core.config").load()
     if flags.thinking then config.thinking = true end
     if flags.reasoning_effort then config.reasoning_effort = flags.reasoning_effort end

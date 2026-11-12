@@ -134,7 +134,7 @@ function M.post_stream(url, headers, payload, on_data)
 end
 
 -- 阻塞 GET（web 工具）；max_bytes 防大页面吃内存。
-function M.get(url, headers, max_bytes)
+function M.get(url, headers, max_bytes, timeout_sec)
     global_init()
     max_bytes = tonumber(max_bytes) or (1024 * 1024)
     local h = curl.curl_easy_init()
@@ -166,8 +166,11 @@ function M.get(url, headers, max_bytes)
     curl.curl_easy_setopt(h, CURLOPT_NOSIGNAL, ffi.cast("long", 1))
     curl.curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, ffi.cast("long", 1))
     curl.curl_easy_setopt(h, CURLOPT_ACCEPT_ENCODING, ffi.cast("const char *", ""))
-    curl.curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, ffi.cast("long", 20))
-    curl.curl_easy_setopt(h, CURLOPT_TIMEOUT, ffi.cast("long", 60))
+    -- timeout_sec 只给短命探测用（/health 探活）；默认 60s 不变，
+    -- connect 超时跟着整体收，否则「连不上」要白等 20s。
+    local tmo = math.max(1, tonumber(timeout_sec) or 60)
+    curl.curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, ffi.cast("long", math.min(20, tmo)))
+    curl.curl_easy_setopt(h, CURLOPT_TIMEOUT, ffi.cast("long", tmo))
 
     local rc = curl.curl_easy_perform(h)
     local code = ffi.new("long[1]")
