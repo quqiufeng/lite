@@ -1881,8 +1881,10 @@ function M:execute(name, args)
             return self:edit(args.path, args.old, args.new)
         elseif name == "remember" then
             if not self.memory then return "error: memory disabled" end
-            local ok = self.memory:remember_fact(args.key, args.content, args.tags)
-            if not ok then return "error: remember failed" end
+            local ok, rerr = self.memory:remember_fact(args.key, args.content, args.tags)
+            if not ok then
+                return "error: remember failed: " .. tostring(rerr or "unknown reason")
+            end
             return "remembered " .. tostring(args.key)
         elseif name == "recall" then
             if not self.memory then return "error: memory disabled" end

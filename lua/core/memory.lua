@@ -21,6 +21,8 @@ local O_CLOEXEC = 0x80000
 local LOCK_EX = 2
 local LOCK_NB = 4
 local LOCK_UN = 8
+-- 重抢节流：锁被占时别让每次 put 都 open+flock（默认 2 秒一次）。
+local RECLAIM_THROTTLE_MS = 2000
 
 local M = {}
 M.__index = M
@@ -85,12 +87,37 @@ function M.new(opts)
     return setmetatable({
         h = h,
         dir = base,
+        lock_path = base .. "/mem.lock",
         lock_fd = lock_fd,
         readonly = readonly,
         lock_busy = lock_busy,
+        lock_retry_ms = tonumber(opts.lock_retry_ms) or RECLAIM_THROTTLE_MS,
         flush_ms = (tonumber(opts.flush_sec) or 30) * 1000,
         last_sync = os.time() * 1000,
     }, M)
+end
+
+-- 抢锁失败只降级、不自愈是旧版的坑：另一个残留实例（或被 exec 继承 fd 的
+-- 长命子进程）一退出，本进程本该恢复写，却因为 readonly 是启动时定死的，
+-- 整轮会话 remember/todo 全废，只能重启。实测踩过：08:28 那次连续 3 次
+-- "error: remember failed"，重启才恢复。
+-- 这里在写路径上惰性重抢，带节流：锁还被占着时不至于每次 put 都 open+flock，
+-- 抢到就地把实例升级回可写，调用方无需知道降级发生过。
+function M:reclaim(now_ms)
+    if not self.lock_busy then return not self.readonly end
+    now_ms = now_ms or (os.time() * 1000)
+    if self.lock_retry_at and now_ms < self.lock_retry_at then return false end
+    self.lock_retry_at = now_ms + (self.lock_retry_ms or RECLAIM_THROTTLE_MS)
+    local fd = ffi.C.open(self.lock_path, bit.bor(O_CREAT, O_RDWR, O_CLOEXEC), 420)
+    if fd < 0 then return false end
+    if ffi.C.flock(fd, bit.bor(LOCK_EX, LOCK_NB)) ~= 0 then
+        net.close(fd)
+        return false
+    end
+    self.lock_fd, self.readonly, self.lock_busy = fd, false, false
+    self.lock_retry_at = nil
+    self.reclaimed = (self.reclaimed or 0) + 1
+    return true
 end
 
 function M:close()
@@ -109,7 +136,8 @@ end
 
 function M:sync()
     if not self.h then return nil end
-    if self.readonly then return nil end
+    -- tick 每 30 秒调一次，锁一空出来就能自动恢复落盘，不必等到有写操作。
+    if self.readonly and not self:reclaim() then return nil end
     self.last_sync = os.time() * 1000
     return cache.sync(self.h)
 end
@@ -139,7 +167,9 @@ function M:tick(now_ms)
 end
 
 function M:put(ns, key, value, ttl)
-    if self.readonly then return false, "readonly memory" end
+    if self.readonly and not self:reclaim() then
+        return false, "readonly memory (another lite holds mem.lock)"
+    end
     local full = join(ns, key)
     local ok, s = pcall(cjson.encode, value)
     if not ok then return false, s end
@@ -154,7 +184,7 @@ function M:get(ns, key)
 end
 
 function M:del(ns, key)
-    if self.readonly then return false end
+    if self.readonly and not self:reclaim() then return false end
     return cache.del(self.h, join(ns, key)) == 0
 end
 

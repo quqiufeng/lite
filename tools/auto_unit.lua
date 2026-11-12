@@ -1588,6 +1588,42 @@ do
     end
 
     os.execute("rm -rf " .. shq(dir))
+
+    -- 降级 readonly 后要能自愈：旧的另一个实例退出、锁空出来，
+    -- 下一次写操作应重抢成功，而不是像旧版那样锁死到重启。
+    local dir2 = os.tmpname()
+    os.remove(dir2)
+    os.execute("mkdir -p " .. shq(dir2))
+    local owner = Memory.new({ dir = dir2, max_mb = 32 })
+    local waiter = Memory.new({ dir = dir2, max_mb = 32, lock_retry_ms = 0 })
+    check(owner ~= nil and waiter ~= nil and waiter.lock_busy == true and waiter.readonly == true,
+        "reclaim: waiter degrades while lock held")
+    local rok, rerr = waiter:put("/agent/knowledge", "k", { c = 1 })
+    check(rok == false and tostring(rerr):find("readonly", 1, true) ~= nil,
+        "reclaim: write refused with reason while busy")
+    check(waiter:reclaim() == false, "reclaim: returns false while lock still held")
+    owner:close()   -- 释放锁，模拟残留实例退出
+    check(waiter:put("/agent/knowledge", "k", { c = 2 }) == true,
+        "reclaim: write succeeds after owner exits")
+    check(waiter.readonly == false and waiter.lock_busy == false and waiter.reclaimed == 1,
+        "reclaim: instance upgraded to writable")
+    local rv = waiter:get("/agent/knowledge", "k")
+    check(rv ~= nil and rv.c == 2, "reclaim: write after reclaim is readable")
+    check(waiter:del("/agent/knowledge", "k") == true, "reclaim: delete works after reclaim")
+    waiter:close()
+
+    -- 节流：锁一直被占时，连续写不该每次都去 open+flock
+    local owner2 = Memory.new({ dir = dir2, max_mb = 32 })
+    local slow = Memory.new({ dir = dir2, max_mb = 32, lock_retry_ms = 60000 })
+    check(slow ~= nil and slow.lock_busy == true, "reclaim: throttled instance degrades")
+    slow:put("/agent/knowledge", "t", { c = 1 })
+    local after_first = slow.lock_retry_at
+    slow:put("/agent/knowledge", "t", { c = 2 })
+    check(after_first ~= nil and slow.lock_retry_at == after_first,
+        "reclaim: retries throttled within window")
+    if owner2 then owner2:close() end
+    if slow then slow:close() end
+    os.execute("rm -rf " .. shq(dir2))
 end
 
 -- native image resize

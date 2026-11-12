@@ -450,7 +450,7 @@ elseif cmd == "--tui" or cmd == "--gui" then
         os.exit(2)
     end
     if memory.lock_busy and not snapshot_only then
-        io.stderr:write("lite: memory busy, read-only this run: " .. tostring(config.memory_dir or config.cwd) .. "\n")
+        io.stderr:write("lite: memory busy, read-only until lock frees (auto-retry): " .. tostring(config.memory_dir or config.cwd) .. "\n")
     end
 
     local multi, mlerr = http.multi_new()
@@ -639,7 +639,7 @@ elseif cmd == "--once" then
         os.exit(2)
     end
     if memory.lock_busy then
-        io.stderr:write("lite: memory busy, read-only this run: " .. tostring(config.memory_dir or config.cwd) .. "\n")
+        io.stderr:write("lite: memory busy, read-only until lock frees (auto-retry): " .. tostring(config.memory_dir or config.cwd) .. "\n")
     end
 
     local tools = Tools.new({
