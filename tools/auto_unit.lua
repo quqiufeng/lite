@@ -5121,6 +5121,13 @@ do
     local ok2, err2 = pcall(T.build_argv, { mode = "hotness", probe = "p" })
     check(ok2 == false and tostring(err2):find("mode=", 1, true) ~= nil, "trace build_argv unknown mode error")
 
+    -- perfmap 动作要在 schema 里（采自己时靠它把 JIT 帧叫成 lua文件:行 [trN]）
+    local has_pm = false
+    for _, v in ipairs(T.schema.parameters.properties.action.enum or {}) do
+        if v == "perfmap" then has_pm = true end
+    end
+    check(has_pm, "trace schema has perfmap action")
+
     -- summary：各模式一句话 + 顶层条目，不崩
     local S = require("trace.summary")
     check(S.render("count", { probes = { "p" }, count = 10, duration = 1, rate = 10 })
@@ -5139,6 +5146,49 @@ do
     check(S.render("folded", { events = 500, stacks = 7 }):find("500", 1, true) ~= nil,
         "trace summary folded")
     check(S.render("count", nil):find("没给出", 1, true) ~= nil, "trace summary bad json")
+end
+
+-- trace/jitmap：JIT trace → /tmp/perf-<pid>.map（Linux perf 认的地址表）
+-- engine 的 perf_map() 早就读它，缺的一直是**写**的一侧；这里成对验：
+-- 写出来的行必须能被 engine 的 `^(%x+)%s+(%x+)%s+(.+)$` 认下来，名字要带 [trN]。
+do
+    local jm = require("trace.jitmap")
+    local tmp = (os.getenv("TMPDIR") or "/tmp") .. "/lite-jitmap-test.map"
+    os.remove(tmp)
+    local st = jm.start({ path = tmp, quiet = true })
+    check(st and st.on == true, "jitmap start")
+    check(jm.enabled() == true, "jitmap enabled")
+
+    -- 造几条真 trace（不 mock：地址只有 JIT 给得出）
+    local function spin(n) local s = 0 for i = 1, n do s = s + math.sqrt(i) end return s end
+    for _ = 1, 3 do spin(20000) end
+    local wrote, info = jm.write()
+    check(wrote == true and info and info.traces >= 1, "jitmap write traces")
+
+    local f = io.open(tmp, "r")
+    check(f ~= nil, "jitmap map file exists")
+    local lines, bad, named = 0, 0, 0
+    if f then
+        for line in f:lines() do
+            lines = lines + 1
+            -- 与 engine.perf_map() 同一条正则，格式对不上就等于没写
+            local a, sz, nm = line:match("^(%x+) (%x+) (.+)$")
+            if not a or tonumber(sz, 16) == 0 then bad = bad + 1 end
+            if nm and nm:match("%[tr%d+%]$") then named = named + 1 end
+        end
+        f:close()
+    end
+    check(lines >= 1 and bad == 0, "jitmap lines parse like engine perf_map")
+    check(named >= 1, "jitmap names carry [trN]")
+
+    -- 注意：读文件/解析这段自己也会 JIT，on_trace 会再写一次（trace 变多），
+    -- 所以只能断言「盘上的行 ⊆ 当前已知的 trace」，不能要求两边相等。
+    local s = jm.status()
+    check(s.on == true and s.traces >= lines and s.writes >= 1, "jitmap status")
+    jm.stop(true)
+    local gone = io.open(tmp, "r")
+    if gone then gone:close() end
+    check(jm.enabled() == false and gone == nil, "jitmap stop removes map")
 end
 
 -- entry

@@ -276,6 +276,71 @@ local function do_status(root)
     return table.concat(L, "\n")
 end
 
+-- ── jitmap：本进程的 JIT trace → /tmp/perf-<pid>.map ────────────────────
+-- 见 lua/trace/jitmap.lua：JIT 机器码在 /proc/pid/maps 里是匿名页，只有 perf map
+-- 能让 perf/engine 把它叫成 `xxx.lua:123 [tr7]`。engine 的 perf_map() 读，这里写。
+local function jitmap_mod()
+    local ok, mod = pcall(require, "trace.jitmap")
+    if ok and mod then return mod end
+    return nil
+end
+
+local function self_pid()
+    local ok, ffi = pcall(require, "ffi")
+    if not ok then return nil end
+    local ok2, v = pcall(function() return ffi.C.getpid() end)
+    return ok2 and tonumber(v) or nil
+end
+
+-- 采自己（没给 pid 或 pid=本进程）就先把地址表落盘；采别人只看它自己有没有写过。
+-- 返回 perf map 路径（有表才算「能为 JIT 帧符号化」）
+local function ensure_perfmap(args)
+    local target = tonumber(args and args.pid)
+    local sp = self_pid()
+    if target and sp and target ~= sp then
+        local p = ("/tmp/perf-%d.map"):format(target)
+        local f = io.open(p, "r")
+        if f then f:close() return p end
+        return nil
+    end
+    local mod = jitmap_mod()
+    if not mod then return nil end
+    local st = mod.start({ quiet = true })
+    if not st then return nil end
+    mod.write()                       -- 采样开始前刷新一次（新 trace 随时会冒出来）
+    return mod.status().path
+end
+
+-- ── action=perfmap：显式开/关这张表（默认 run 采自己时会自动开）──────────
+local function do_perfmap(args)
+    local mod = jitmap_mod()
+    if not mod then error("trace: 找不到 lua/trace/jitmap.lua（LITE_ROOT="
+        .. tostring(os.getenv("LITE_ROOT")) .. "）", 0) end
+    if args.off then
+        local st = mod.stop(true)
+        return ("perfmap: 已关闭并删除 %s（本进程后续新建的 trace 不再入表）"):format(
+            tostring(st.path))
+    end
+    local st, err = mod.start({ quiet = true, path = args.path })
+    if not st then error("trace: perfmap 启动失败：" .. tostring(err), 0) end
+    local wrote = mod.write()
+    local s = mod.status()
+    local L = {}
+    local function add(fmt, ...) L[#L + 1] = fmt:format(...) end
+    add("perfmap: on（pid %s）", tostring(s.pid))
+    add("  path: %s%s", tostring(s.path), wrote and "" or "  ← 写失败，看上一条错误")
+    add("  traces: %d 条已入表，其中 %d 条带源码行（其余是 start() 之前就存在的 trace，只有 [trN]）",
+        s.traces, s.named)
+    add("  bytes: %d，累计写 %d 次", s.bytes, s.writes)
+    if #s.errors > 0 then add("  错误: %s", table.concat(s.errors, " | ")) end
+    add("  用法: trace run mode=oncpu probe=tracepoint:sched:sched_switch duration=3 flame=xxx.svg"
+        .. "（采本进程时自动带 --sym，JIT 帧显示成 file.lua:行 [trN]）")
+    if os.getenv("LITE_TRACE_PERFMAP") ~= "1" then
+        add("  想从进程启动第一刻就记（含加载期编译的 trace）：LITE_TRACE_PERFMAP=1 ./tools/run.sh")
+    end
+    return table.concat(L, "\n")
+end
+
 -- ── action=run ───────────────────────────────────────────────────────────
 local function do_run(args, env)
     local root = lite_root(env)
@@ -291,6 +356,11 @@ local function do_run(args, env)
     end
     local bin = lua_bin(root)
     if not bin then error("trace: 找不到 luajit（tools/lua.sh 缺失且 PATH 里没有）", 0) end
+
+    -- 采自己：先把 JIT ↔ 源码地址表写进 /tmp/perf-<pid>.map，再让 engine 开 --sym。
+    -- 否则 JIT 帧在 maps 里是匿名可执行页，火焰图上只有 0x7f.. 或 [anon+0x..]。
+    local pmap = ensure_perfmap(args)
+    if pmap and args.sym == nil then args.sym = true end
 
     local argv, mode, dur = M.build_argv(args)
     -- json_out 也要走 --json（engine 一次只出一种格式），落盘后由插件自己给摘要
@@ -423,16 +493,20 @@ local schema = {
     description = "动态追踪（Linux 内核，纯 LuaJIT）：perf_event_open + tracefs 探针采样，"
         .. "出火焰图/热力图/卡点排行。action=status 自检权限与内核五环；"
         .. "run 按 mode（count 数次数 / samples 看字段 / latency 配对时延 / folded 折叠栈 / "
-        .. "oncpu on-CPU 采样 / offcpu 阻塞时长）采一次；render 拿之前的 JSON 重出图。"
+        .. "oncpu on-CPU 采样 / offcpu 阻塞时长）采一次；render 拿之前的 JSON 重出图；"
+        .. "perfmap 开/关本进程的 JIT 地址表（/tmp/perf-<pid>.map，采自己时自动开，"
+        .. "JIT 帧才会叫 lua文件:行 [trN] 而不是 0x7f..）。"
         .. "需要 root 或 cap_perfmon（非 root 自动 sudo -n）。",
     parameters = {
         type = "object",
         properties = {
             action = {
                 type = "string",
-                enum = { "status", "run", "render" },
-                description = "status=环境自检（权限/tracefs/渲染依赖）；run=采样（默认）；render=从 json_in 重出图",
+                enum = { "status", "run", "render", "perfmap" },
+                description = "status=环境自检（权限/tracefs/渲染依赖）；run=采样（默认）；"
+                    .. "render=从 json_in 重出图；perfmap=开（默认）/关本进程 JIT 地址表",
             },
+            off = { type = "boolean", description = "perfmap：true=关掉并删除 /tmp/perf-<pid>.map" },
             mode = {
                 type = "string",
                 enum = { "count", "samples", "latency", "folded", "oncpu", "offcpu" },
@@ -486,7 +560,8 @@ function M.run(args, env)
     if action == "status" then return do_status(lite_root(env)) end
     if action == "run" then return do_run(args, env) end
     if action == "render" then return do_render(args, env) end
-    error("trace: 未知 action " .. action .. "（status/run/render）", 0)
+    if action == "perfmap" then return do_perfmap(args) end
+    error("trace: 未知 action " .. action .. "（status/run/render/perfmap）", 0)
 end
 
 return M

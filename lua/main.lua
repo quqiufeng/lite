@@ -81,6 +81,15 @@ for i = 1, #args do
     end
 end
 
+-- LITE_TRACE_PERFMAP=1：把本进程的 JIT trace 写成 /tmp/perf-<pid>.map 并持续刷新。
+-- 只有这张表能让 perf / lua/trace/engine.lua 把匿名可执行页（JIT 机器码）叫成
+-- `file.lua:行 [trN]`——否则火焰图上只有 0x7f.. 和 [unknown]。启动期就开，
+-- 连加载阶段编译出来的 trace 也带源码行。实现与开销见 lua/trace/jitmap.lua。
+if os.getenv("LITE_TRACE_PERFMAP") == "1" then
+    local ok, jm = pcall(require, "trace.jitmap")
+    if ok and jm then pcall(jm.start, { quiet = true }) end
+end
+
 local function emit(obj)
     local cjson = require("cjson")
     io.write(cjson.encode(obj), "\n")
