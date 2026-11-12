@@ -331,7 +331,12 @@ local function do_perfmap(args)
     add("  path: %s%s", tostring(s.path), wrote and "" or "  ← 写失败，看上一条错误")
     add("  traces: %d 条已入表，其中 %d 条带源码行（其余是 start() 之前就存在的 trace，只有 [trN]）",
         s.traces, s.named)
-    add("  bytes: %d，累计写 %d 次", s.bytes, s.writes)
+    add("  bytes: %d，累计写 %d 次（flush %d 次：flush 会让旧地址全部作废、整表重写）",
+        s.bytes, s.writes, s.flushes or 0)
+    if (s.reenters or 0) > 0 then
+        -- 重入不是错：写盘途中新 trace 落地会回头再调一次，串行化把它折成「写完补一轮」
+        add("  写盘重入 %d 次（已串行化补写，不会撕文件）", s.reenters)
+    end
     if #s.errors > 0 then add("  错误: %s", table.concat(s.errors, " | ")) end
     add("  用法: trace run mode=oncpu probe=tracepoint:sched:sched_switch duration=3 flame=xxx.svg"
         .. "（采本进程时自动带 --sym，JIT 帧显示成 file.lua:行 [trN]）")

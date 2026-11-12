@@ -18,6 +18,10 @@
 --   * start() 之后**新建**的 trace 才有源码行；之前已存在的 trace 只有 `[trN]` 兜底
 --     （要全带行号就在进程启动最早期 start，或 main.lua 里用 LITE_TRACE_PERFMAP=1）。
 --   * trace 被 flush 后 mcode 会被复用，所以 flush/start 事件都会整表重写。
+--   * **整表** flush（flushall）发 hook，**单条 root flush**（lj_trace_flush /
+--     lj_trace_flushproto → trace_flushroot，lj_trace.c:235）不发任何事件：那种情况
+--     盘上会短暂留着已死地址，直到下一次事件/调用 M.write()。engine 读图前先 write()
+--     就够用（helper/trace.lua:326 也是这么做的），别指望这份文件是实时的。
 --
 -- 开销：只有 trace 事件发生时重写（一次几 KB 写 + 一次 ≤ maxtrace 的扫描），
 -- 正常业务路径零成本；不 start 则连 jit.attach 都不挂。
@@ -37,6 +41,9 @@ local st = {
     path = nil,
     names = {},        -- trno -> "file.lua:123"（jit.attach start 事件填）
     writes = 0,
+    flushes = 0,       -- flush 次数：flush 后 mcode 全部作废、整表重写，
+                       -- 比对「盘上内容 vs live trace」时必须先看这个计数器有没有变
+    reenters = 0,      -- 写盘重入次数（>0 说明真发生过嵌套写，串行化生效的计数）
     errors = {},
     last_traces = 0,
     last_bytes = 0,
@@ -88,8 +95,13 @@ local function label(tr)
 end
 
 -- ── 写文件（整表重写 + 原子 rename）────────────────────────────────────
-function M.write()
-    if not st.on then return false, "jitmap 未启动" end
+-- 写盘**不可重入**：live_traces()/拼行这段 Lua 自己会造新 trace，start 事件又回头调
+-- write()，同一个临时文件被两个 fd 交错写就会留下「前一半新、后一半旧」的残行
+-- （末尾还被截断），perf 读到非 live 地址 = 静默错归因。所以外层串行化：
+-- 重入只置 pending，外层写完再补一轮；临时名字带序号，绝不复用同一个 tmp。
+local writing, pending, seq = false, false, 0
+
+local function write_once()
     local traces = live_traces()
     local lines, bytes = {}, 0
     for _, t in ipairs(traces) do
@@ -97,7 +109,8 @@ function M.write()
         lines[#lines + 1] = line
         bytes = bytes + #line
     end
-    local tmp = st.path .. ".tmp." .. tostring(getpid() or 0)
+    seq = seq + 1
+    local tmp = ("%s.tmp.%d.%d"):format(st.path, getpid() or 0, seq)
     local f, err = io.open(tmp, "wb")
     if not f then
         st.errors[#st.errors + 1] = ("open %s: %s"):format(tmp, tostring(err))
@@ -117,6 +130,31 @@ function M.write()
     return true, { traces = #traces, bytes = bytes }
 end
 
+-- 串行化入口：重入（写盘途中新建 trace 触发 start/flush 事件）只置 pending，
+-- 由外层写完后补一轮；补写最多 3 轮，避免「写盘自己造 trace」无限循环。
+function M.write()
+    if not st.on then return false, "jitmap 未启动" end
+    if writing then
+        pending = true
+        st.reenters = st.reenters + 1
+        return false, "reentrant"
+    end
+    writing = true
+    local ok, res, extra
+    for _ = 1, 3 do
+        pending = false
+        ok, res, extra = pcall(write_once)
+        if not ok or not pending then break end
+    end
+    pending = false
+    writing = false
+    if not ok then
+        st.errors[#st.errors + 1] = ("write: %s"):format(tostring(res))
+        return false, tostring(res)
+    end
+    return res, extra
+end
+
 -- ── 事件回调 ────────────────────────────────────────────────────────────
 local function on_trace(what, tr, func, pc)
     if not st.on then return end
@@ -129,6 +167,7 @@ local function on_trace(what, tr, func, pc)
         if tr then st.names[tr] = loc end
     elseif what == "flush" or what == "stop" or what == "abort" then
         -- flush 后 mcode 会被复用；stop/abort 不影响地址但顺手重写也无妨
+        if what == "flush" then st.flushes = st.flushes + 1 end
         if what ~= "stop" then M.write() end
         return
     end
@@ -178,7 +217,7 @@ function M.status()
     local s = {
         on = st.on, pid = st.pid or getpid(), path = st.path or default_path(getpid() or 0),
         traces = st.last_traces, bytes = st.last_bytes, writes = st.writes,
-        named = 0, errors = st.errors,
+        flushes = st.flushes, reenters = st.reenters, named = 0, errors = st.errors,
     }
     for _ in pairs(st.names) do s.named = s.named + 1 end
     return s
