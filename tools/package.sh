@@ -17,6 +17,35 @@ if [ -d "$ROOT/helper" ]; then
     find "$ROOT/helper" -mindepth 1 -maxdepth 1 ! -name '.gitkeep' \
         -exec cp -r {} "$DIST/helper/" \;
 fi
+
+# helper/*.so 是 native 工具编出来的，每次 build 都留一份 <name>-<ts>[-<n>].so，
+# 只有 <name>.json 清单里点名的那份是活的（_helper_so_abs 就按它找，见
+# lua/core/tools.lua）。上面是无脑 `cp -r`，历次构建的旧副本会一起进包 ——
+# 白涨体积，也让「装的到底是哪一版」没法一眼看出来。这里按清单剪一遍。
+prune_stale_helper_so() {
+    local dir="$1" f base stem name dropped=0 kept=0
+    [ -d "$dir" ] || return 0
+    for f in "$dir"/*.so; do
+        [ -e "$f" ] || continue
+        base="$(basename "$f")"
+        stem="${base%.so}"
+        case "$stem" in
+            *-[0-9]*) ;;                    # 只认带时间戳的历史副本
+            *) continue ;;                  # 裸 <name>.so 是清单缺失时的兜底候选，留着
+        esac
+        name="${stem%%-[0-9]*}"
+        if [ -f "$dir/$name.json" ] && grep -qF "\"$base\"" "$dir/$name.json"; then
+            kept=$((kept + 1))
+        else
+            rm -f "$f"
+            dropped=$((dropped + 1))
+        fi
+    done
+    if [ "$dropped" -gt 0 ]; then
+        echo "package: helper/ 剪掉 $dropped 个清单未点名的旧 .so（保留 $kept 个）"
+    fi
+}
+prune_stale_helper_so "$DIST/helper"
 cp "$ROOT/AGENTS.md" "$ROOT/design.md" "$DIST/"
 if [ -f "$ROOT/build/liblite_cache.so" ]; then
     cp "$ROOT/build/liblite_cache.so" "$DIST/build/"
