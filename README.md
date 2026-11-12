@@ -123,7 +123,9 @@ export LITE_MEMDB_SPLIT=1                        # 仅在多机 NFS 上用：退
 ./tools/run.sh --memdb-search "ollama 端口"       # 全库搜（ASCII 词 + 中文 bigram）
 ```
 
-默认位置 `~/.local/share/lite/memdb/mem.shared.jsonl`（就在 `mem.bin` 旁边），
+默认位置 `~/.local/share/lite-memdb/mem.shared.jsonl`（**安装目录之外**：
+早先放在 `share/lite/memdb`，而 `tools/install.sh` 升级时 `rm -rf` 安装目录，
+每次 release 都会把共享库清空——老路径的数据会一次性自动搬过来），
 `cat`/`grep`/`git diff` 都行，人工改也不会坏（坏行读取时跳过）。
 
 - `remember` 写完 `mem.bin` 后顺手 append 进共享库；`recall` 先给本地结果，

@@ -25,14 +25,38 @@ local M = {}
 -- 所有 key 都从这走，读的时候一眼能认出"这不是本机亲眼所见"
 M.NS = "/shared/"
 
+-- 老版本默认放在 <prefix>/share/lite/memdb，也就是**安装目录内部**。
+-- tools/install.sh 升级时 rm -rf "$APP"，于是每次 release 都把共享库清空一次
+-- （本机实测：09:08 写入的 7 条，09:09 装完就没了）。数据目录必须在安装目录之外。
+local LEGACY_DIR = "/.local/share/lite/memdb"
+
+-- 老路径有东西、新路径还没有时，搬一次；失败不影响使用（只是读不到旧条目）。
+-- 注意优先整目录 rename，只有目标已存在才退化成逐文件搬 —— 直接 `mv from to`
+-- 在 to 已存在时会搬成 to/memdb/，多套一层目录（踩过）。
+local function migrate(from, to)
+    local f = io.open(from .. "/mem.shared.jsonl", "r")
+    if not f then return end
+    f:close()
+    local to_f = io.open(to .. "/mem.shared.jsonl", "r")
+    if to_f then to_f:close() return end   -- 新路径已有数据，不覆盖
+
+    local parent = to:match("^(.*)/[^/]+$")
+    if parent then os.execute(string.format("mkdir -p %q", parent)) end
+    if os.rename(from, to) then return end -- 目录整体搬走
+    os.execute(string.format("mkdir -p %q && mv -f %q/*.jsonl %q/ 2>/dev/null; rmdir %q 2>/dev/null",
+        to, from, to, from))
+end
+
 local function default_dir()
     local env = os.getenv("LITE_MEMDB_DIR")
     if env and env ~= "" then return env end
     local mem = os.getenv("LITE_MEMORY_DIR")
     if mem and mem ~= "" then return mem .. "/../memdb" end
     local home = os.getenv("HOME") or "."
-    -- 放在 memory_dir 旁边：mem.bin 是私有脑，memdb/ 是公共告示板
-    return home .. "/.local/share/lite/memdb"
+    -- 与安装目录（share/lite）平级，升级 rm -rf 不会碰到它
+    local dir = home .. "/.local/share/lite-memdb"
+    migrate(home .. LEGACY_DIR, dir)
+    return dir
 end
 
 M.dir = default_dir
