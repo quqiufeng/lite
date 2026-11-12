@@ -4871,6 +4871,13 @@ do
     check(W.command("#监工模式") == "on", "watchdog command on")
     check(W.command("  #监工模式  ") == "on", "watchdog command on trimmed")
     check(W.command("#终止监工") == "off", "watchdog command off")
+    -- 三个同义词都得认，用户嘴上说「退出监工」不算新命令
+    check(W.command("#退出监工") == "off", "watchdog command off (退出)")
+    check(W.command("#关闭监工") == "off", "watchdog command off (关闭)")
+    check(W.command("  #退出监工\t") == "off", "watchdog command off trimmed")
+    for _, w in ipairs(W.OFF_WORDS) do
+        check(W.command(w) == nil, "watchdog off word alone is not a command (" .. w .. ")")
+    end
     check(W.command("#监工") == nil, "watchdog command partial ignored")
     check(W.command("帮我看看 #监工模式 怎么写的") == nil, "watchdog command mid-text ignored")
     check(W.command(nil) == nil and W.command(123) == nil, "watchdog command non-string")
@@ -5181,14 +5188,295 @@ do
     check(lines >= 1 and bad == 0, "jitmap lines parse like engine perf_map")
     check(named >= 1, "jitmap names carry [trN]")
 
-    -- 注意：读文件/解析这段自己也会 JIT，on_trace 会再写一次（trace 变多），
-    -- 所以只能断言「盘上的行 ⊆ 当前已知的 trace」，不能要求两边相等。
+    -- 读文件/解析这段自己也会 JIT：on_trace 会再写一次（trace 变多），所以两边**不可能**相等。
+    -- 反过来 `s.traces >= lines` 也不成立 —— 只要这段代码把 trace 缓存挤到 flush，
+    -- 所有 mcode 立刻作废、flush 处理器整表重写成 0 行，status.traces 就掉到 lines 以下
+    -- （就是这条断言偶发红的原因）。只断言能用得上的不变量：status 结构 + 存活计数。
     local s = jm.status()
-    check(s.on == true and s.traces >= lines and s.writes >= 1, "jitmap status")
+    check(s.on == true and s.writes >= 1 and s.traces >= 1, "jitmap status")
+
+    -- 盘上内容必须是「某次扫描视角下的真地址」：不能是拼写残行、不能重复、不能是垃圾。
+    --
+    -- 为什么不是「⊆ 当前 live」：LuaJIT 的**单条 root flush**（lj_trace_flush /
+    -- lj_trace_flushproto → trace_flushroot，third_party/luajit/src/lj_trace.c:235）
+    -- 根本不发 "flush" 事件，只有整表 flushall 才发。所以判 live 的瞬间可能有 trace
+    -- 刚被静默回收，盘上那条地址在「写之前」那次扫描里还是活的 —— 拿单次快照做相等
+    -- 比较，就是这条断言过去偶发红的根因（maxtrace 压满时更容易复现）。
+    -- 真能担保的不变量：盘上每个地址必须出现在「写之前」或「写之后」的某次活 trace 扫描里
+    -- （撕裂/交错写留下的半截地址两者都不在），且不许出现重复行（两个 fd 交错写的指纹）。
+    local function scan_live()
+      local set, n = {}, 0
+      for _, t in ipairs(jm.live_traces()) do set[("%x"):format(t.addr)] = true; n = n + 1 end
+      return set, n
+    end
+    local before = scan_live()
+    jm.write()
+    local disk, dup = {}, 0
+    local seen = {}
+    local f2 = io.open(tmp, "r")
+    if f2 then
+        for line in f2:lines() do
+            local a = line:match("^(%x+)")
+            disk[#disk + 1] = a
+            if a and seen[a] then dup = dup + 1 end
+            seen[a] = true
+        end
+        f2:close()
+    end
+    local after = scan_live()
+    local stale, dead = 0, {}
+    for _, a in ipairs(disk) do
+        if a and not before[a] and not after[a] then stale = stale + 1; dead[#dead + 1] = a end
+    end
+    check(dup == 0, "jitmap no duplicate map lines" .. (dup > 0 and (" ← " .. dup) or ""))
+    check(stale == 0, "jitmap disk lines are real live addrs"
+        .. (stale > 0 and (" ← %d/%d 条两次扫描都不在（%s）")
+            :format(stale, #disk, table.concat(dead, ",", 1, math.min(#dead, 4))) or ""))
+
+    -- flush 回归：mcode 被复用后旧地址还留在 map 里，perf 会把采样算到别的函数头上
+    -- （静默错归因，比丢失更糟）。flush 处理器必须整表重写，所以 flush 之后盘上
+    -- 每个地址都仍必须是活 trace —— 不能拿「地址变了」当断言：flush 释放的槽会被新
+    -- trace 原地复用，同一地址重新变活是**正确**的。
+    local fl = jm.status().flushes
+    pcall(function() require("jit").flush() end)
+    local s3 = jm.status()
+    check(s3.flushes == fl + 1, "jitmap counts flush")
+    local fresh = {}
+    local f3 = io.open(tmp, "r")
+    if f3 then
+        for line in f3:lines() do fresh[#fresh + 1] = line:match("^(%x+)") end
+        f3:close()
+    end
+    local afterLive = {}
+    local nlive = 0
+    for _, t in ipairs(jm.live_traces()) do
+        afterLive[("%x"):format(t.addr)] = true
+        nlive = nlive + 1
+    end
+    local stale2 = 0
+    for _, a in ipairs(fresh) do
+        if not afterLive[a] then stale2 = stale2 + 1 end
+    end
+    check(stale2 == 0 and #fresh <= nlive, "jitmap flush rewrites map without stale addrs")
+
+    -- 写盘重入回归：live_traces()/拼行这段 Lua 自己会造 trace，start 事件又回头调
+    -- write()，两个 fd 交错写同一个临时文件就留下「前半新后半旧」的残行 —— 表现为
+    -- perf 把样本算到已死地址（静默错归因），file:line 也随机缺。这里压一段：
+    -- 每轮造 trace + write()，盘上必须始终是完整行（末尾换行、三字段可解析）、
+    -- 地址不重复，且不留 .tmp. 垃圾。（不断言「⊆ 当前 live」：单条 root flush 不发 hook）
+    local torn, dup3, rounds, wrote3 = 0, 0, 300, 0
+    for _ = 1, rounds do
+        for _ = 1, 2 do spin(2000) end
+        local wok = jm.write()
+        if wok then wrote3 = wrote3 + 1 end
+        local body
+        local fz = io.open(tmp, "rb")
+        if fz then body = fz:read("*a"); fz:close() end
+        if body and #body > 0 then
+            if body:sub(-1) ~= "\n" then torn = torn + 1 end
+            local seen3 = {}
+            for line in body:gmatch("[^\n]+") do
+                local a, sz, nm = line:match("^(%x+) (%x+) (.+)$")
+                if not a or tonumber(sz, 16) == 0 or nm == "" then
+                    torn = torn + 1
+                else
+                    if seen3[a] then dup3 = dup3 + 1 end
+                    seen3[a] = true
+                end
+            end
+        end
+    end
+    check(wrote3 > 0 and torn == 0,
+        "jitmap map file never torn under reentrant writes" .. (torn > 0 and (" ← " .. torn .. " bad lines") or ""))
+    check(dup3 == 0, "jitmap stress never duplicates addrs" .. (dup3 > 0 and (" ← " .. dup3) or ""))
+    local strays = 0
+    local ls = io.popen("ls -1 " .. (os.getenv("TMPDIR") or "/tmp") .. " 2>/dev/null")
+    if ls then
+        for name in ls:lines() do
+            if name:find("lite%-jitmap%-test%.map%.tmp%.") then strays = strays + 1 end
+        end
+        ls:close()
+    end
+    check(strays == 0, "jitmap leaves no tmp files behind" .. (strays > 0 and (" ← " .. strays) or ""))
+
     jm.stop(true)
     local gone = io.open(tmp, "r")
     if gone then gone:close() end
     check(jm.enabled() == false and gone == nil, "jitmap stop removes map")
+end
+
+-- charts：54 张卡全部出 demo SVG。手绘笔触最容易出的错是 NaN/Inf 悄悄进了 path 的 d
+-- 属性——SVG 仍然合法，浏览器/rsvg 却把整张画成空白或一条线，肉眼很难定位。这里做成
+-- 机械检查：每张卡都要出得成 <svg>…</svg>，且数字里不许出现 nan/inf 记号。
+do
+    local C = require("charts")
+    local cards = C.list()
+    check(#cards >= 54, "charts registry lists all cards (" .. #cards .. ")")
+    local bad, num = {}, {}
+    local fams = { parts = true, bars = true, lines = true, dist = true, flow = true, hier = true }
+    for _, c in ipairs(cards) do
+        check(fams[c.family] == true and type(c.label) == "string" and #c.label > 0,
+            "charts card " .. tostring(c.id) .. " has family+label")
+        local okc, svg = pcall(C.svg, c.id)
+        if not okc or type(svg) ~= "string"
+            or not svg:find("^%s*<svg") or not svg:find("</svg>%s*$") then
+            bad[#bad + 1] = c.id .. ":" .. tostring(okc and "not-svg" or svg)
+        elseif svg:find("[%s,%(]%-?nan[%s,%)]") or svg:find("[%s,%(]%-?inf[%s,%)]") then
+            num[#num + 1] = c.id
+        end
+    end
+    check(#bad == 0, "charts every card renders SVG" .. (#bad > 0 and (" ← " .. table.concat(bad, ", ")) or ""))
+    check(#num == 0, "charts no nan/inf in path data" .. (#num > 0 and (" ← " .. table.concat(num, ", ")) or ""))
+
+    -- 退化输入：demo 数据清空 / 只剩一条。除零最容易在这里冒 nan，而 demo 全量数据永远
+    -- 盖住它——所以按卡跑一遍，仍然不许 nan/inf，也不许抛错。
+    local deg = {}
+    for _, c in ipairs(cards) do
+        local demo = (C.get(c.id) or {}).demo or {}
+        if type(demo.data) == "table" and #demo.data > 1 then
+            local probes = {
+                { "empty", { data = {} } },
+                { "one", { data = { demo.data[1] } } },
+            }
+            for _, p in ipairs(probes) do
+                local okd, svg = pcall(C.svg, c.id, p[2])
+                if not okd then
+                    deg[#deg + 1] = c.id .. "/" .. p[1] .. ":err " .. tostring(svg)
+                elseif type(svg) ~= "string" or not svg:find("^%s*<svg") then
+                    deg[#deg + 1] = c.id .. "/" .. p[1] .. ":not-svg"
+                elseif svg:find("[%s,%(]%-?nan[%s,%)]") or svg:find("[%s,%(]%-?inf[%s,%)]") then
+                    deg[#deg + 1] = c.id .. "/" .. p[1] .. ":nan"
+                end
+            end
+        end
+    end
+    check(#deg == 0, "charts degenerate data stays finite" .. (#deg > 0 and (" ← " .. table.concat(deg, ", ")) or ""))
+
+    -- 轴上的数字：0 别写成 0.00，5 别写成 5.0（原点、时间线起点、表盘下端都用它）
+    local K0 = require("charts.kit")
+    local fbad = {}
+    for v, want in pairs({ [0] = "0", [0.5] = "0.5", [1] = "1", [2.5] = "2.5", [5] = "5",
+        [40] = "40", [1000] = "1k", [1200] = "1.2k", [0.07] = "0.07", [-40] = "-40" }) do
+        local got = K0.vfmt(v)
+        if got ~= want then fbad[#fbad + 1] = v .. "→" .. got .. "(want " .. want .. ")" end
+    end
+    check(#fbad == 0, "charts vfmt has no trailing zeros"
+        .. (#fbad > 0 and (" ← " .. table.concat(fbad, ", ")) or ""))
+
+    -- 比例尺尾巴：K.top 给的是「上界」，一旦小于最大值，点/柱就被画到轴外（scatter 的
+    -- (8,10) 档曾把 9 次画到标题上）。机械守住 top(v) >= v 这条不变量，跨 4 个数量级。
+    local K = require("charts.kit")
+    local lowt = {}
+    for _, v in ipairs({ .07, .13, 1, 1.21, 1.22, 2.01, 2.6, 4.01, 5.01, 6.01, 8.01, 9, 9.99,
+        10.01, 12.01, 80.01, 99, 999.5, 1234, 9999 }) do
+        if K.top(v) < v then lowt[#lowt + 1] = v .. ">" .. K.top(v) end
+    end
+    check(#lowt == 0, "charts scale top never undershoots max"
+        .. (#lowt > 0 and (" ← " .. table.concat(lowt, ", ")) or ""))
+
+    -- 图形别出画：文字有包围盒检查，形状却没人管——点/柱越界正是从这漏出去的。
+    -- 只查 path 的 d、circle 的圆心、rect 的四角，留 6px 给刻意的装饰留白。
+    local Pen0 = require("charts.pen")
+    local outb = {}
+    for _, c in ipairs(cards) do
+        local oks, svg = pcall(C.svg, c.id)
+        if oks then
+            local bad2 = nil
+            local function hit(x, y) return x < -6 or x > Pen0.W + 6 or y < -6 or y > Pen0.H + 6 end
+            for d in svg:gmatch('<path[^>]-d="([^"]*)"') do
+                local nums = {}
+                for n in d:gmatch("-?%d+%.?%d*") do nums[#nums + 1] = tonumber(n) end
+                for i = 1, #nums - 1, 2 do
+                    if hit(nums[i], nums[i + 1]) then
+                        bad2 = string.format("%.0f,%.0f", nums[i], nums[i + 1]); break
+                    end
+                end
+                if bad2 then break end
+            end
+            if not bad2 then
+                for tag in svg:gmatch("<circle[^>]*>") do
+                    local cx, cy = tonumber(tag:match('cx="([-%d%.]+)"')), tonumber(tag:match('cy="([-%d%.]+)"'))
+                    if cx and cy and hit(cx, cy) then bad2 = string.format("dot %.0f,%.0f", cx, cy); break end
+                end
+            end
+            if bad2 then outb[#outb + 1] = c.id .. ":" .. bad2 end
+        end
+    end
+    check(#outb == 0, "charts shapes stay inside canvas"
+        .. (#outb > 0 and (" ← " .. table.concat(outb, ", ")) or ""))
+
+    -- 文字别出画、别互相压字：<text> 的包围盒按 font-size 粗估（CJK 一字一 em，西文半 em 略宽），
+    -- 只查同一行相邻 2px 以上的重叠。图例位置、轴外标签挤在一起都靠这条守着。
+    local Pen = require("charts.pen")
+    local W, H = Pen.W, Pen.H
+    local bad = {}
+    for _, c in ipairs(cards) do
+        local oks, svg = pcall(C.svg, c.id)
+        if oks then
+            local tx = {}
+            for el in svg:gmatch("<text[^>]*>[^<]*</text>") do
+                local x = tonumber(el:match(' x="([%d%.%-]+)"'))
+                local y = tonumber(el:match(' y="([%d%.%-]+)"'))
+                local size = tonumber(el:match('font%-size="([%d%.%-]+)"')) or 12
+                local track = tonumber(el:match('letter%-spacing="([%d%.%-]+)"')) or 0
+                local anchor = el:match('text%-anchor="([%a]+)"') or "start"
+                local txt = el:match(">([^<]*)</text>") or ""
+                if x and y and #txt > 0 and not el:find('transform="rotate') then
+                    local w = Pen.textw(txt, size)
+                    local n = 0
+                    for _ in txt:gmatch("[%z\1-\127\194-\244][\128-\191]*") do n = n + 1 end
+                    w = w + track * math.max(0, n - 1)
+                    local x0 = anchor == "middle" and (x - w / 2) or anchor == "end" and (x - w) or x
+                    tx[#tx + 1] = { x0 = x0, x1 = x0 + w, y0 = y - size * .78, y1 = y + size * .24, t = txt }
+                end
+            end
+            for i, a in ipairs(tx) do
+                if a.x1 > W - 2 or a.x0 < 2 or a.y1 > H - 2 or a.y0 < 2 then
+                    bad[#bad + 1] = c.id .. ":bleed " .. a.t
+                end
+                for j = i + 1, #tx do
+                    local t = tx[j]
+                    local ox = math.min(a.x1, t.x1) - math.max(a.x0, t.x0)
+                    local oy = math.min(a.y1, t.y1) - math.max(a.y0, t.y0)
+                    if ox > 2 and oy > 2 then bad[#bad + 1] = c.id .. ":overlap " .. a.t .. "|" .. t.t end
+                end
+            end
+        end
+    end
+    check(#bad == 0, "charts text stays inside and never overlaps"
+        .. (#bad > 0 and (" ← " .. table.concat(bad, ", ")) or ""))
+
+    -- 插件层（helper/charts.lua）的动作编排：list/spec/错 id/错 action 都要给出可读结果，
+    -- 别让 list 在某个 family 上漏卡、也别让错 id 静默返回空串。
+    local P = dofile(root .. "/helper/charts.lua")
+    check(type(P.run) == "function" and type(P.schema) == "table", "charts plugin exposes run+schema")
+    local txt = P.run({ action = "list" })
+    check(type(txt) == "string" and txt:find("共 %d+ 张") ~= nil, "charts list prints count")
+    local json = P.run({ action = "list", json = true })
+    local okj, arr = pcall(require("cjson").decode, json)
+    check(okj and type(arr) == "table", "charts list json decodes")
+    local n_json = 0
+    for _ in pairs(arr or {}) do n_json = n_json + 1 end
+    check(n_json == #cards, "charts list json covers every card (" .. n_json .. "/" .. #cards .. ")")
+    local fl = P.run({ action = "list", family = "flow" })
+    check(fl:find("流向") ~= nil, "charts list filters by family")
+    check(select(1, pcall(P.run, { action = "spec", id = "pie" })) == true, "charts spec pie")
+    local oku, erru = pcall(P.run, { action = "spec", id = "nosuch" })
+    check(oku == false and tostring(erru):find("没有这张卡") ~= nil, "charts unknown id errors clearly")
+    local oka, erra = pcall(P.run, { action = "bogus" })
+    check(oka == false and tostring(erra):find("未知 action") ~= nil, "charts unknown action errors clearly")
+
+    -- render 的目标目录不存在时，cairo 只会回一句 "error while writing to output stream"，
+    -- 完全看不出是缺目录（54 张全「失败」的元凶）。ensure_dir 在出图前先建目录，
+    -- 这里只验目录被建出来——cairo 缺席的机器上 render 会失败，但建目录发生在更早。
+    local base = (os.getenv("TMPDIR") or "/tmp") .. "/lite-charts-dirtest"
+    os.execute("rm -rf " .. base)
+    local deep = base .. "/a/b/pie.png"
+    pcall(C.render, "pie", nil, deep)
+    local okd = io.open(base .. "/a/b", "r")
+    check(okd ~= nil, "charts render creates missing output dirs")
+    if okd then okd:close() end
+    os.execute("rm -rf " .. base)
 end
 
 -- entry

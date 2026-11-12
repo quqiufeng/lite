@@ -12,11 +12,17 @@ M.TEXT = os.getenv("LITE_WATCHDOG_TEXT") or "继续"
 
 -- 命令识别：整行就是 #监工模式 / #终止监工（前后允许空白）。
 -- 返回 "on" / "off" / nil。
+M.OFF_WORDS = { "终止", "关闭", "退出" }
+
 function M.command(s)
     if type(s) ~= "string" then return nil end
     s = s:gsub("^%s+", ""):gsub("%s+$", "")
     if s == "#监工模式" or s == "#watchdog" then return "on" end
-    if s == "#终止监工" or s == "#关闭监工" or s == "#watchdog off" then return "off" end
+    -- 「终止 / 关闭 / 退出监工」等价：都是把定时器停掉。
+    if s == "#watchdog off" then return "off" end
+    for _, w in ipairs(M.OFF_WORDS) do
+        if s == "#" .. w .. "监工" then return "off" end
+    end
     return nil
 end
 

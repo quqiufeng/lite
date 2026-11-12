@@ -156,7 +156,7 @@ workspace `.env`（优先级 cwd/上级 → `~/.config/lite/.env` → `~/.env` �
 **TUI 斜杠外的两个 `#` 开关**（`submit()` 里先拦，不进模型）：
 
 - `#语音模式` / `#退出`：语音转文字，见 `core/voice.lua:command`；
-- `#监工模式` / `#终止监工`：每 `LITE_WATCHDOG_SEC`（默认 180s）自动发一句
+- `#监工模式` / `#终止监工`（`#关闭监工`、`#退出监工` 同义，见 `watchdog.OFF_WORDS`）：每 `LITE_WATCHDOG_SEC`（默认 180s）自动发一句
   `LITE_WATCHDOG_TEXT`（默认「继续」），状态栏显 `watch:Ns`。只在**空闲 + 队列空 +
   输入框空**时发，忙时 deadline 滑窗后推（收工后再等满一个周期），不抢用户的半句话。
   开关状态落 mem：`/agent/session/<sid>/watchdog`（`TTL.long`，与 todos 同一条旁路键，
@@ -199,8 +199,10 @@ JSON**——把那次调用拆小（长文档用 `write` 的 `append=true` 分�
 
 注意发现机制：插件只扫 `<cwd>/helper` → `$LITE_ROOT/helper`（`lua/core/tools.lua:_helper_roots`），
 **`tools/` 里的 `.lua` 不会被当插件加载**（那是 build/test/run/release 这类仓库脚本）。
-现有 adb/wechat/music/search/fetch/tokens/uimap/usb/cgrep/lens/md2png/pdftext/trending/trace/web2png
-住 `helper/`，因为发现只认那里；重活（codesearch、trace）的实现在 `lua/` + `src/`，插件只做编排。
+现有 adb/wechat/music/search/fetch/tokens/uimap/usb/cgrep/lens/md2png/pdftext/trending/trace/web2png/charts
+住 `helper/`，因为发现只认那里；重活（codesearch、trace、charts）的实现在 `lua/` + `src/`，插件只做编排。
+`charts` 是 SVG 图表卡（`lua/charts/`：`pen` 手绘抖动笔 / `kit` 取数与结巴防重叠 /
+`types/*` 54 种图），出图给 `read` 看，不截图。
 
 **改过 C/C++ 就必须重编，然后 `/reboot` 才算测得上**（硬规矩，适用于 `tools/` 与 `helper/`
 两条通道）。`reboot` 只重启进程、**不编译**；Lua 侧 `ffi.load` 的 `build/liblite_*.so` 是进程内

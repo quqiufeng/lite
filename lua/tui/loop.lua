@@ -508,14 +508,14 @@ function M.run(ctx, agent, memory, opts)
             if draw then draw() end
             return
         end
-        -- 监工模式开关：#监工模式 / #终止监工
+        -- 监工模式开关：#监工模式 / #终止监工（#关闭监工、#退出监工同义）
         local wcmd = Watchdog.command(text)
         if wcmd then
             composer:clear()
             if wcmd == "on" then
                 watchdog:start()
                 transcript:add("system", string.format(
-                    "监工模式已开启：每 %d 秒自动替你发一句「%s」（仅在空闲且输入框为空时发）。输入 #终止监工 关闭",
+                    "监工模式已开启：每 %d 秒自动替你发一句「%s」（仅在空闲且输入框为空时发）。输入 #终止监工（或 #退出监工 / #关闭监工）关闭",
                     watchdog.sec, Watchdog.TEXT))
             else
                 watchdog:stop()
