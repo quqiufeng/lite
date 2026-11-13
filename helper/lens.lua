@@ -9,19 +9,37 @@
 -- 下面每条都是「工具的真实行为边界」，不是理想设计；括号里是当初踩出来的证据，
 -- 别当成可以随手改掉的注释。改行为前先重跑一次证据里的命令（入口都在
 -- helper/lens.lua:run_inner / do_locate / do_peek / do_grep）。
+-- 证据分两轮，语气不同别混：
+--   2026-11-13 内核（/opt/code_caches/linux_7212_cache，C/大规模/重名）→ [8]-[20]
+--   2026-11-14 三个 agent 仓库（/opt/pi-mono、/opt/reasonix、/opt/opencode，
+--     TS/Go/多包）→ [1][2][21]-[24]。同一条 query 在三者上的命中质量差 3 倍以上，
+--     所以「选哪个动词」比「怎么读输出」更早决定成败。
 --
 -- [0] 先判该不该用 lens。它只索引 cwd 之外的项目（AGENTS.md §7）：改 lite 自己用
 --     read/cgrep/edit，别为 lite 建索引。索引是一次性成本、查询才是毫秒级；只查一次
 --     的小问题直接 action=grep 更省，别为它跑几十分钟 build。
 --
--- [1] 起手式 = 只给一个参数，让 run_inner 推断 action：
---       query=<符号名|英文短语>  → locate（默认起手式：签名 + callers/callees + 源码窗口）
---       pattern=<正则>           → grep（作用域 cgrep）
---       path=<file|file:line>    → peek（定点读窗口）
---       都不给                   → status（看产物）
---     显式 action= 只是覆盖推断，不再是必需项；推断不合意就补一个 action。
---     locate 一次往返 ≈ 原来 grep + read 两次，所以先 locate，peek 补别的窗口，
---     grep 只用来兜底复核。
+-- [1] 【起手式】先判仓库形状，再按问题类型选动词 —— 默认用 locate 是错的。
+--     形状决定 locate 可不可信（2026-11-14 三个 agent 仓库实测，15 条 locate）：
+--       · 单包、名字唯一（reasonix：一个 internal/ 树）：每条都到点，闭眼用。
+--       · 多包 + 同名目录 + 服务化碎片（opencode：35 个 packages、12 个名字带 plugin
+--         的目录(含 test/stories 噪声)、5702 个 ts 里 920 个含 Effect.gen）→ 3/3 全错：「plugin 钩子」全落 GUI
+--         桥接（createPluginBridge / pluginEnabled），「compaction」全落配置校验
+--         （normalizeCompaction）。语义被词表重叠压平，不是排序 bug。
+--     判形状只花一次 bash，别拿 locate 试错：
+--       ls packages; find . -name '*.ts' -not -path '*/node_modules/*' | wc -l
+--     多包仓：locate 必须带 path_prefix（[5]），否则直接跳到下面的 peek / grep。
+--     动词表（按「读完能不能直接下结论」排，别跳级）：
+--       peek  ← 「架构长什么样 / 状态在哪维护」。实测 peek llm.ts:85 lines=60 一发
+--               拿下整个 advanceToStep 的收件箱分派（inbox type 分流的返回路径）——
+--               全程唯一「读完即结论」的动作；locate 只给候选，还得再 read 一遍。
+--       symbol← 「符号定义在哪」，不加载 ONNX 模型，最省（[3]）。
+--       grep  ← 「这个词在哪出现过 / 复核猜疑」，配 path= 是 3ms 零噪声（[7]）。
+--       context / dataflow ← 「谁调我」，结构化那半，见 [8]-[13]。
+--       locate← 只留给「知道概念、不知道名字」，且把 [1] 判断的形状一起喂给它。
+--     推断捷径仍在（语法糖，不是选路依据）：query→locate、pattern→grep、
+--     path=file[:line]→peek、都不给→status；显式 action= 覆盖推断。
+--     连续 locate 三次没中 = 该换 grep，别再换 query 重投。
 --
 -- [2] locate 的输出怎么读（默认 max_results=3、lines=40、before=2、max_chars=8000）：
 --       · 表头 `search "x" -> N result(s), M with source [static]` 里的 M 是**真读到盘**
@@ -35,6 +53,14 @@
 --       · 窗口**读盘优先**：盘上首行与索引 chunk 首行不一致时标 stale。索引是建索引
 --         那一刻的快照，文件改过后行号会错开，看着正常但引用出去就是错的，以盘上为准。
 --       · `no hit` 会打印 grep / symbol / build 三条下一步，照抄一条改 action 即可。
+--       · confidence 是「该不该信」的过滤器，不是判决书 —— 每条仍要 peek 复核。
+--         实测常年落在 low/mid（15 条 0.37-0.63，一次 high 都没出过）。自然语言 query
+--         的「词元命中比」现在只数实词（the/how/does 不算 term），lex 会比旧版高，
+--         但高出来的只是词面巧合那段，语义分（0.6 权重）没动 —— 该 peek 还是 peek。
+--         别因为 note 写着 low 就重投 query，那时该做的是换 action（[1]）。
+--       · 每个命中带的 `why` 行（`vector: cosine-sim 0.663 | keyword: 1/5 terms`）
+--         约占总输出三成，对「读什么」零帮助：真要分数/证据用 json=true，别在
+--         默认输出上纠结；字符预算紧张时靠它省下来给源码窗口。
 --
 -- [3] locate 的 type 与自动退回：默认 type=search（语义）。一条真命中都没有（或缺向量）
 --     时它**自动**退回 symbol，note 写 `retried as symbol`；显式给了 type= 就不退
@@ -160,6 +186,35 @@
 --      100-139; next: peek ...)` / `budget reached: lower max_results/lines or raise
 --      max_chars`。别把窗口末尾当函数末尾，也别把「截断」当「没找到」；
 --      要看得全就一次调大 max_chars / lines，而不是原样重试同一调用。
+--
+-- ═══════════ 2026-11-14 增补：多包 / TS / 文档密集仓库的额外边界 ═══════════════
+--
+-- [21] 【文档会给出不存在的符号】比排错序更坑，因为它看着像答案。
+--     物证：opencode 的 `packages/core/src/tool/AGENTS.md:8` 是 grep
+--     "registry|Tool\.define" 的头号命中，里面写的 `ToolEditor.add` 在
+--     packages/core/src 下 `grep -rn ToolEditor --include=*.ts` **零命中** [verified]。
+--     成因：22 个 README*.md（th/ko/bn/zht/da… 同一段话翻了十几遍）+ 18 个 AGENTS.md，
+--     让 tool/plugin/session/permission 这些词的词频彻底失真，规范文字混进代码语料。
+--     纪律：**从 .md 读到的符号，先 grep 一次代码确认真身再用**；反过来，
+--     grep 命中落在 .md 里就不算代码证据，别拿它支撑结论。
+--
+-- [22] 同名不同层是常态，不是异常。opencode：`loop.ts` 两份（packages/ui/src/motion/
+--     loop.ts 是动画循环，packages/ai/src/loop.ts 是 provider 流循环），真正的 agent
+--     循环却叫 session/runner/llm.ts（advanceToStep）；compaction 三份
+--     （config/normalize.ts 校验 / session/compaction.ts 实现 / session/transfer.ts 脱敏）。
+--     locate 会把它们一起端上来 —— 看到同名命中，先看路径前缀属于哪个 package 再读内容。
+--     「这个仓没有唯一符号」本身就是仓库结构的证据，别为了消歧反复换 query。
+--
+-- [23] 非内核仓的 excludes 配方（省掉的全是噪声源）：
+--       node_modules,dist,build,coverage,.next,out,specs,stories,docs,__fixtures__
+--       以及 tests/testdata 这类只有数据的目录。
+--     path_prefix 与 lang 仍是仅有的两个降噪旋钮（[5]）；多包仓优先 path_prefix
+--     （opencode 上 path_prefix=packages/core/src/session/runner 立刻把三份同名收成一份）。
+--
+-- [24] 【lens 答不了「这个仓为什么难查」】包清单、目录深度、同名目录聚集、文档/代码比
+--     —— 全是一次 bash 的事（ls packages、find|wc、grep -c 比较），lens 没有
+--     map/overview 档，也别用 locate 硬凑，凑出来的是「检索质量问题」这种错答案。
+--     这个误判会污染后面所有结论，所以 [1] 把「判形状」提到了起手式的位置。
 -- ═══════════════════════════════════════════════════════════════════════════════
 
 local CS = require("ffi.codesearch")
@@ -993,7 +1048,12 @@ end
 --   read 文件再数行号                            ⇒ peek 给 file:line 直接读窗口
 -- 读源码的硬上限：单行 200 字符（SNIP_LINE_MAX，见 one_line 上方）、总输出 8000 字符，
 -- 超了明确说怎么调。
-local GREP_MAX_FILES_DEFAULT = 3000
+-- 3000 是照内核「子树一次也别全树」的直觉拍的，在多包 JS/TS 仓直接变成「全树不能用」：
+-- opencode prune 掉 node_modules 后仍有 11233 个真源文件，locate 恰在这里最不可信，
+-- 两个动词一起失效。实测 cgrep 扫 11233 个文件 914 ms（含正则），并没有慢到要拦；
+-- 「噪音」靠 max_hits + 表头热力图控，不靠拒绝。所以上限按「实测还能等」定，内核树
+-- （~80k）仍会被拦下并提示先 locate 收窄。
+local GREP_MAX_FILES_DEFAULT = 20000
 
 local function shell_quote(s)
     return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
@@ -1038,8 +1098,15 @@ end
 -- fork/exec + 一次 find 遍历；合成一条 shell：非目录就回 -1，是目录最多数到 cap+1
 -- 个文件就停（find | head 靠 SIGPIPE 提前退出）。
 local function probe_dir(dir, cap)
+    -- 必须和 cgrep.c 的 SKIP 名单对齐：护栏数的是「cgrep 会不会扫」的文件，不是
+    -- 「磁盘上有多少」。opencode 全树 11264 个文件里 node_modules/dist/build 占大头，
+    -- 不 prune 就直接 >3000 被拒——而 locate 恰恰在 JS/TS 多包仓最不可信，两个动词
+    -- 同时不可用只剩 peek 硬啃。prune 后同一棵树落到千级，escape hatch 才真的开着。
     local cmd = string.format(
-        "test -d %s || { echo -1; exit 0; }; find %s -maxdepth 8 -type f 2>/dev/null | head -n %d | wc -l",
+        "test -d %s || { echo -1; exit 0; }; find %s \\( -name .git -o -name node_modules "
+        .. "-o -name build -o -name dist -o -name .cache -o -name __pycache__ -o -name .venv "
+        .. "-o -name target -o -name .idea -o -name .vscode \\) -prune -o -type f -print "
+        .. "2>/dev/null | head -n %d | wc -l",
         shell_quote(dir), shell_quote(dir), cap + 1)
     local f = io.popen(cmd)
     if not f then return -1 end
