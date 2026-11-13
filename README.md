@@ -248,6 +248,12 @@ P0 基础设施 · P1 无 UI agent · P1.5 上下文记忆 · P2 TUI · P3 serve
 
 设计取舍见 [design.md](design.md)；开发/测试规范与插件细节见 [AGENTS.md](AGENTS.md)。
 
+**用 lite 这套体系开别的项目**（同样必须遵守，不是 lite 私有）：
+`./tools/newproject.sh <目录> --name <名字>` 生成可跑骨架（LuaJIT FFI + Lua 编排 + C 内核 +
+唯一 .so 解析点 + `see.lua` 定位截图 + `test.sh` 三层验收），规范全文
+[templates/PROJECT_STANDARD.md](templates/PROJECT_STANDARD.md)；
+`./tools/newproject.sh --refresh-ffi` 把最新 `lua/ffi/{x11,xdo}.lua` 自包含对刷进模板。
+
 ## 参考
 
 - Pi <https://github.com/badlogic/pi-mono> · Reasonix <https://github.com/esengine/reasonix>

@@ -1,0 +1,47 @@
+# AGENTS.md — @NAME@
+
+体系规范见 `PROJECT_STANDARD.md`（从 lite 的 `templates/PROJECT_STANDARD.md` 拷来，勿改其条目）。
+本文件只写**每次动手都必须遵守**的东西；原理进 README / 代码头注释。本文件 ≤16000 字节。
+
+## 0 我是谁
+
+LuaJIT + FFI + C 内核 + 系统 .so。能力 = `bash` + 编译器 + FFI；
+子进程是例外不是默认（见规范 §2.1）。
+
+## 1 代码地图
+
+- `lua/app.lua`：入口（参数解析 / 输出 / 退出码）
+- `lua/ffi/lib.lua`：`.so` **唯一**解析点；新库只加这里，别在插件里写第二份候选表
+- `lua/ffi/x11.lua` + `xdo.lua`：自包含对（可整对拷走），窗口控制/截图
+- `src/native.c`：C 内核；`lite_helper` JSON ABI + 库型 ABI 两种，见规范 §3
+- `helper/`：插件（`return { run = ... }`）；cwd 优先，其次 `$ROOT/helper`
+- `tools/`：人写脚本（build/test/run/see/lua），**不会**被当插件加载
+
+## 2 命令
+
+```bash
+./tools/build.sh                # 编 .so；改完 C 必须重启宿主进程（FFI 不热更）
+./tools/test.sh                 # 依赖 + 单元 + 活体 + CLI 契约，全绿才算验过
+./tools/run.sh --json ping
+./tools/run.sh --json add --a 1 --b 2
+./tools/lua.sh -e 'print(_VERSION)'   # 唯一解释器入口（LuaJIT）
+./tools/see.lua --list                # 先定位窗口，再截图
+./tools/see.lua --class myapp --width 1280
+```
+
+## 3 铁律
+
+MUST：改代码后 `./tools/test.sh` 通过；C ABI 变更同步 `lua/ffi/*` cdef 与文档；
+引用写 `file:symbol`，结论标 `[static]` / `[verified]`；失败错误回带原参数 + `required` + 退出码。
+MUST NOT：`xdotool/wmctrl/import`；全屏截图验收；`exit()`/`abort()` 进 C；stdout 打日志；
+仓库里出现密钥字面量（只从 `os.getenv` 读）；拿 `grep` 日志措辞当测试断言。
+
+## 4 看见 UI 的四步
+
+`see.lua --list` → 按 class/pid 唯一定位 → `capture` → `read`/`ocr`。
+命中不唯一时补条件，**绝不静默选一个**。点击类操作前后各截一张做 diff 自证。
+
+## 5 记忆
+
+长跑任务把结论写 `remember`（跨会话仍成立 + 重踩成本 > 记录成本），
+不记行号。旧结论过期就重验，别照抄。

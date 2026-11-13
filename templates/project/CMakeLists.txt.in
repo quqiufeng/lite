@@ -1,0 +1,21 @@
+cmake_minimum_required(VERSION 3.16)
+project(@NAME@ C)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+add_library(@NAME@_core SHARED src/native.c)
+target_compile_options(@NAME@_core PRIVATE -O2 -Wall -Wextra -fvisibility=hidden)
+target_link_libraries(@NAME@_core PRIVATE m)
+set_target_properties(@NAME@_core PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+    OUTPUT_NAME @NAME@_core
+    C_VISIBILITY_PRESET hidden)
+
+# 可选：liblite_image.so（PNG/JPEG/WebP 解码 + 缩放，给 see.lua 省 token 用）。
+# 有就链，没有不影响主构建；缺件时 see.lua 打印原图 + 提示。
+find_library(LITE_IMAGE NAMES lite_image PATHS ${CMAKE_CURRENT_SOURCE_DIR}/../lite/build NO_DEFAULT_PATH)
+if(LITE_IMAGE)
+    message(STATUS "@NAME@: 链接 ${LITE_IMAGE}")
+endif()
