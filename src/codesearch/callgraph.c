@@ -919,6 +919,204 @@ static void json_escape_str(const char* src, char* dst, int max_len) {
     dst[j] = '\0';
 }
 
+// ---------------------------------------------------------------------------
+// 去注释 / 去字符串字面量（2026-11-13）
+//
+// Phase 3 是在函数体原文上扫标识符的（本质是 C 词法的粗版），注释里提到的
+// `foo(` 一样算一次调用：内核里 `enqueue_task_fair` 挂了 3 个"调用者"，实际全是
+// 注释里的一句"同 enqueue_task_fair"；`*_init()` 这种注释举例同理。
+// 这里在扫之前把注释和字符串字面量原地替换成空格：
+//   - 长度不变、换行保留 → 后面「数 \n 得调用行号」的逻辑不用改；
+//   - 实参提取（extract_call_args）也从同一份内容里读，字面量变空格反而更干净
+//     （字符串里的词不再被当成实参标识符）。
+//
+// dataflow.c 有自己的 strip_comments_line（整行 memmove，跨行靠 in_block），
+// 语义不同、不能互相替换：那边按行流式处理，这边必须等长替换才不改行号。
+// 语言规则按 chunks_meta.jsonl 的 language 字段选，未知语言按 C 家族处理。
+typedef struct {
+    int slash_line;   // // 行注释
+    int hash_word;    // # 行注释（前一个字符是空白/行首：shell/ruby/python 的规则）
+    int hash_line;    // # 行首 = 预处理器指令（C/C++/ObjC），整行不是代码
+    int dash_line;    // -- 行注释（Lua）
+    int block;        // /* */
+    int nest_block;   // 块注释可嵌套（Rust）
+    int lua_long;     // [[ ]] 长串/长注释（Lua）
+    int dquote;       // "…"
+    int squote;       // '…'
+    int backtick;     // `…`（Go 原始串 / JS 模板串，可跨行）
+    int triple;       // ''' ''' / """ """（Python）
+    int rust_char;    // ' 只在 'x' / '\n' 这种真字符字面量时才当引号，避开生命周期 'a
+} cs_lex_rules_t;
+
+static int lang_is(const char* lang, const char* name) {
+    size_t n = strlen(name);
+    return lang && strncmp(lang, name, n) == 0;
+}
+
+static void lex_rules(const char* lang, cs_lex_rules_t* r) {
+    // 未知语言按 C 家族（最常见的误判代价最小）
+    r->slash_line = 1; r->block = 1; r->dquote = 1; r->squote = 1;
+    r->hash_word = 1; r->hash_line = 1;
+
+    if (lang_is(lang, "python")) {
+        r->slash_line = 0; r->block = 0; r->hash_line = 0; r->triple = 1;
+    } else if (lang_is(lang, "lua")) {
+        r->slash_line = 0; r->block = 0; r->hash_word = 0; r->hash_line = 0;
+        r->dash_line = 1; r->lua_long = 1;
+    } else if (lang_is(lang, "rust")) {
+        // #[attr] 也常以 # 开头，别当预处理器整行砍掉；靠 dquote/squote 就够
+        r->hash_word = 0; r->hash_line = 0; r->nest_block = 1;
+        r->rust_char = 1; r->squote = 0;
+    } else if (lang_is(lang, "go")) {
+        r->hash_word = 0; r->hash_line = 0; r->backtick = 1;
+    } else if (lang_is(lang, "javascript") || lang_is(lang, "typescript")) {
+        r->hash_word = 0; r->hash_line = 0; r->backtick = 1;
+    } else if (lang_is(lang, "java") || lang_is(lang, "kotlin") || lang_is(lang, "csharp")) {
+        r->hash_word = 0; r->hash_line = 0;
+    } else if (lang_is(lang, "ruby")) {
+        r->slash_line = 0; r->block = 0; r->hash_line = 0;
+    } else if (lang_is(lang, "php")) {
+        r->hash_line = 0;
+    }
+}
+
+// 从 s[i] 起把到行尾（不含 '\n'）的字节换成空格
+static void blank_to_eol(char* s, size_t i) {
+    for (; s[i] && s[i] != '\n'; i++) s[i] = ' ';
+}
+
+// 从 s[i] 起找 end 标记，找到则整段（含标记）换空格；返回终止后的下标。
+// 越界（没找到）→ 到串尾。跨行 OK，'\n' 原样保留。
+static size_t blank_until(char* s, size_t i, const char* end) {
+    size_t n = strlen(end);
+    size_t j = i;
+    while (s[j]) {
+        if (strncmp(s + j, end, n) == 0) {
+            size_t k = j;
+            j += n;
+            for (; k < j; k++) if (s[k] != '\n' && s[k] != '\r') s[k] = ' ';
+            return j;
+        }
+        char c = s[j];
+        if (c != '\n' && c != '\r') s[j] = ' ';
+        j++;
+    }
+    return j;
+}
+
+static int is_ident_byte(unsigned char c) { return isalnum(c) || c == '_'; }
+
+static void strip_comments(char* s, const char* lang) {
+    cs_lex_rules_t r;
+    lex_rules(lang, &r);
+
+    size_t i = 0;
+    int line_start = 1;   // 当前处在「行首空白」里（预处理器判定用）
+    while (s[i]) {
+        unsigned char c = (unsigned char)s[i];
+
+        if (c == '\n') { line_start = 1; i++; continue; }
+        if (c == ' ' || c == '\t' || c == '\r') { i++; continue; }
+
+        int at_bol = line_start;
+        line_start = 0;
+
+        // ---- 行注释 ----
+        if (r.slash_line && c == '/' && s[i + 1] == '/') { blank_to_eol(s, i); continue; }
+        if (r.dash_line && c == '-' && s[i + 1] == '-') {
+            if (r.lua_long && s[i + 2] == '[') { i = blank_until(s, i, "]]"); continue; }
+            blank_to_eol(s, i);
+            continue;
+        }
+        if ((r.hash_word || r.hash_line) && c == '#') {
+            int bol_ok = at_bol;
+            int word_ok = (i == 0) || s[i - 1] == ' ' || s[i - 1] == '\t' || s[i - 1] == '\n';
+            if ((r.hash_line && bol_ok) || (r.hash_word && word_ok)) { blank_to_eol(s, i); continue; }
+        }
+
+        // ---- 块注释 ----
+        if (r.block && c == '/' && s[i + 1] == '*') {
+            size_t j = i + 2;
+            int depth = 1;
+            while (s[j] && depth) {
+                if (r.nest_block && s[j] == '/' && s[j + 1] == '*') { depth++; j += 2; continue; }
+                if (s[j] == '*' && s[j + 1] == '/') { depth--; j += 2; if (!depth) break; continue; }
+                if (s[j] != '\n' && s[j] != '\r') s[j] = ' ';
+                j++;
+            }
+            for (size_t k = i; k < (j < i + 2 ? i + 2 : j); k++)
+                if (s[k] != '\n' && s[k] != '\r') s[k] = ' ';
+            i = j;
+            continue;
+        }
+
+        // ---- Lua 长串 / 长注释尾部 ----
+        if (r.lua_long && c == '[' && s[i + 1] == '[') { i = blank_until(s, i, "]]"); continue; }
+
+        // ---- 字符串字面量 ----
+        if (r.triple && c == '\'' && s[i + 1] == '\'' && s[i + 2] == '\'') {
+            i = blank_until(s, i, "'''"); continue;
+        }
+        if (r.triple && c == '"' && s[i + 1] == '"' && s[i + 2] == '"') {
+            i = blank_until(s, i, "\"\"\""); continue;
+        }
+        if (r.backtick && c == '`') {
+            size_t j = i + 1;
+            while (s[j] && s[j] != '`') {
+                if (s[j] == '\\' && s[j + 1]) {
+                    s[j] = ' ';
+                    if (s[j + 1] != '\n') s[j + 1] = ' ';
+                    j += 2;
+                    continue;
+                }
+                if (s[j] != '\n' && s[j] != '\r') s[j] = ' ';
+                j++;
+            }
+            if (s[j] == '`') { s[j] = ' '; j++; }
+            s[i] = ' ';
+            i = j;
+            continue;
+        }
+        if (r.rust_char && c == '\'') {
+            // 'a / 'static 是生命周期，不是字面量；只有 'x' 或 '\esc' 才算
+            int is_char = 0;
+            if (s[i + 1] == '\\') {
+                for (size_t j = i + 2; j < i + 8 && s[j]; j++) {
+                    if (s[j] == '\'') { is_char = 1; break; }
+                    if (s[j] == '\n') break;
+                }
+            } else if (s[i + 1] && s[i + 1] != '\'' && s[i + 2] == '\'') {
+                is_char = 1;
+            }
+            if (!is_char) { i++; continue; }
+        }
+        if ((r.dquote && c == '"') || (r.squote && c == '\'') ||
+            (r.rust_char && c == '\'')) {
+            unsigned char q = c;
+            size_t j = i + 1;
+            int closed = 0;
+            while (s[j]) {
+                if (s[j] == '\\' && s[j + 1]) { s[j] = ' '; if (s[j + 1] != '\n') s[j + 1] = ' '; j += 2; continue; }
+                if ((unsigned char)s[j] == q) { closed = 1; break; }
+                if (s[j] == '\n') break;   // 没闭合就到行尾：别把整份函数体吃掉
+                s[j] = ' ';
+                j++;
+            }
+            s[i] = ' ';
+            if (closed) { s[j] = ' '; j++; }
+            i = j;
+            continue;
+        }
+
+        // 普通标识符整段跳过（顺带省掉逐字节判断，也不会把 0x1'000 之类切碎）
+        if (is_ident_byte(c)) {
+            while (is_ident_byte((unsigned char)s[i])) i++;
+            continue;
+        }
+        i++;
+    }
+}
+
 // 全局状态清零（2026-11-13）：这些 static 表是当年按「CLI 一次性跑」写的，
 // 但 lite 是长驻进程，同一个 .so 会被 lens 反复调用：cleanup 只 free 不置空，
 // 第二次进来 g_node_hash 里还是已释放的节点指针、g_func_count 还留着上一轮的计数
@@ -1038,7 +1236,15 @@ int lite_cs_callgraph_main(int argc, char** argv) {
         char* kind_p = strstr(line, "\"kind\":\"");
         char* line_p = strstr(line, "\"line_start\":");
         char* content_p = strstr(line, "\"content\":\"");
+        char* lang_p = strstr(line, "\"language\":\"");
         if (!name_p || !kind_p) continue;
+
+        char lang[32] = {0};
+        if (lang_p) {
+            lang_p += 12;
+            int k = 0;
+            while (*lang_p && *lang_p != '"' && k < 31) lang[k++] = *lang_p++;
+        }
 
         name_p += 8;
         kind_p += 8;
@@ -1110,6 +1316,8 @@ int lite_cs_callgraph_main(int argc, char** argv) {
                     }
                 }
                 content[j] = '\0';
+                // 扫标识符之前先把注释/字符串抹成空格：注释里的 `foo(` 不是调用（等长替换，行号不变）
+                strip_comments(content, lang);
 
                 func_body_t* b = malloc(sizeof(func_body_t));
                 strncpy(b->name, name, MAX_NAME_LEN - 1);

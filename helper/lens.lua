@@ -62,17 +62,23 @@
 --       · 输出先给热点（哪个文件最热、散在几处）再给正文；正文按 file:line 去重，
 --         per_file 默认 10、max_hits 默认 120，不够就显式调大。
 --
--- [8] 【最重要】call_graph 的边是「函数体文本扫到的标识符」，注释也算，不是语法解析。
---     所以任何 caller 结论都要 grep 兜底复核。
---     证据 A：enqueue_task_fair 报 callers=remove_entity_load_avg / clear_delayed /
---       tg_unthrottle_up —— 这三个函数体里只是在注释中提到了「enqueue_task_fair()」
---       （fair.c:5917 / 6439 / 6986）；反过来在 enqueue_task_fair 体内 grep 这三个
---       名字是 0 命中，真 caller 只有 fair.c:7004 和表项赋值 fair.c:15671。
---     证据 B：tcp_v4_rcv 报 callers=rds_cong_queue_updates / inet_child_forget，
---       分别只来自 net/rds/cong.c:235 与 net/ipv4/inet_connection_sock.c:1384 的注释
---       「held by tcp_v4_rcv()」；整个 net/ 里 tcp_v4_rcv() 带括号只出现在注释中。
+-- [8] 【最重要】call_graph 的边是「函数体文本扫到的标识符」，不是语法解析；
+--     注释/字符串里的提及曾经也算边。**2026-11-13 起 callgraph 扫之前先把注释和
+--     字符串字面量抹成空格**（src/codesearch/callgraph.c:strip_comments），
+--     所以 < 2026-11-13 的旧索引里那些「注释伪边」才是假的，重建后应当消失：
+--       旧证据 A：enqueue_task_fair 报 callers=remove_entity_load_avg / clear_delayed /
+--         tg_unthrottle_up，前两条来自 fair.c:5917 / 6439 的 `* enqueue_task_fair()…`
+--         注释。重建后只剩 tg_unthrottle_up（fair.c:7004 真调用）。
+--       旧证据 B：tcp_v4_rcv 报 callers=rds_cong_queue_updates / inet_child_forget，
+--         分别只来自 net/rds/cong.c:235 与 inet_connection_sock.c:1384 的注释
+--         「held by tcp_v4_rcv()」。
+--     仍然要 grep 兜底的场合（这次没治的）：
+--       · 裸名撞名（[9]）—— 同名函数被当成同一个；
+--       · 预处理宏展开体（#define foo(x) bar(x) 里的 bar() 仍算 foo 的边 ——
+--         行首 # 整行被抹掉，但续行 `\` 后的宏体不是行首，会留下）；
+--       · 函数指针注册（[10]）—— 压根不在文本里出现调用形式。
 --     复核手法：被报成 caller 却看不出调用关系时，去对方函数体里 grep 这个名字，
---     命中落在 /* */ 或 // 行内 → 伪边，直接丢弃。
+--     命中落在 /* */ 或 // 行内 → 旧索引的伪边，重建后才可信。
 --
 -- [9] call_graph.json 顶层 key 是裸函数名（无文件前缀），同名函数直接串边。
 --     内核里 init / read / xmit 之类满地重名，这类边一律不可信。

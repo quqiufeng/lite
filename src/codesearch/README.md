@@ -643,6 +643,36 @@ callgraph 从 509–613s 降到 **5s**：`get_func_node` 原来是线性扫全�
 （O(edges×functions)），现在改成开放寻址哈希表；参数解析也从“每个 callee 重扫
 整个 body”改成从当前调用点直接解析。
 
+#### 注释/字符串里的 `foo(` 不算调用（2026-11-13）
+
+旧的 Phase 3 直接在函数体原文上扫标识符，注释里提到的 `foo(` 也算一条边：
+`enqueue_task_fair` 因此挂了 3 个"调用者"，其中两条来自 `kernel/sched/fair.c`
+的 `* enqueue_task_fair() which will have added…` 这类注释（行号 5917、6439 都是
+`*` 开头的注释行）。伪边还有两个下游代价：`resolve_def` 给它们标上
+`local/global` 让 `context`/`dataflow` 当真边跟；`dataflow` 又拿
+`call_graph.json` 的 `arguments` 对齐跨过程 hop，于是 `dataflow.json` 里多出
+一堆从未发生的调用。
+
+修法：`strip_comments()`（`src/codesearch/callgraph.c`）在扫之前把注释和字符串
+字面量**原地等长**替换成空格——长度和 `\n` 都不动，所以"数换行得调用行号"、
+`extract_call_args` 的切片下标全都不用改。规则按 `chunks_meta.jsonl` 的
+`language` 字段选（C 家族 `//` `/* */` 行首 `#` 预处理器；Python `#`/三引号；
+Lua `--`/`[[ ]]`；Rust 可嵌套块注释 + `'a` 生命周期不当引号；Go/JS 反引号串），
+未知语言按 C 家族。`dataflow.c` 那份 `strip_comments_line`（整行 memmove）不动，
+两者语义不同、不能互换。
+
+内核 7.2.12 全量重建实测（同一份 `chunks_meta.jsonl`，只换 callgraph 的 .so）：
+
+| 指标 | 旧 | 新 | 变化 |
+|---|---|---|---|
+| 边 | 1,073,924 | 1,049,525 | −24,399（−2.3%） |
+| 被调节点 | 146,300 | 145,351 | −949 |
+| `call_graph.json` | 214,510,439 B | 210,646,940 B | −1.8% |
+| `dataflow.json` | 833,934,776 B | 683,098,619 B | −18% |
+
+`dataflow.json` 掉得比 callgraph 多得多，正说明伪边被数据流当成了跳转切口。
+`enqueue_task_fair` 的 callers 从 3 条降到 1 条（真调用 `tg_unthrottle_up`）。
+
 HNSW 构建期间每 1 万条打印一次：
 
 ```text
