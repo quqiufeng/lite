@@ -1,71 +1,95 @@
-# Linux 7.2.12 内核源码级架构报告
+# Linux 7.2.12 内核源码结构报告（lens 索引版）
 
-> 源码树 `/opt/linux/src/linux-7.2.12`，全文结论标注 `[static]`（源码直读，无构建/无运行）
-> 或 `[verified]`（本机实际执行验证）。本报告所有 `file:line` 均对应该树，可直接 `sed -n 'N,Mp' file` 复核。
-> 索引：`lens project=linux_7212`（调用图 749,584 行、KV 2.6G、向量 2.2G）。
-
----
-
-## 0. TL;DR —— 十句话
-
-| # | 结论 | 证据 |
-|---|---|---|
-| 1 | 规模：63,833 个 `.c/.h`，约 3,721 万行；`drivers/` 一家占 22,247 个 `.c`（约 1/3 行数） | `find`+`cat|wc -l` `[verified]` |
-| 2 | 架构是**五个 C 结构体的函数指针表**在撑：`file_operations`(34 槽)、`super_operations`(27)、`address_space_operations`(19)、`vm_operations_struct`(17)、`proto_ops`(28) | `include/linux/fs.h:1921` 等 `[static]` |
-| 3 | 全树 **1,800 处** `struct file_operations x = {` —— 内核的「多态」不是继承，是填表 | `grep -rn --include=*.c` `[verified]` |
-| 4 | `read(2)` 只做 30 行参数校验，之后**全部**转交 `file->f_op->read/read_iter`，VFS 不知道任何文件系统 | `fs/read_write.c:554` `[static]` |
-| 5 | 调用图上 `vfs_read` 看起来「不调任何文件系统」——因为 `f_op->read_iter(...)` 是**间接调用**，静态调用图天然断链 | `[static]`，见 §3.2 |
-| 6 | 缺页是唯一让「文件」变「内存」的地方：`handle_mm_fault` → `handle_pte_fault` → `do_fault` → `filemap_fault` | `mm/memory.c:6651` `[static]` |
-| 7 | 块层唯一的入口是 `submit_bio()`，之下 `blk_mq_submit_bio` 把 bio 变 request，再经 `queue_rq` 进驱动 | `block/blk-core.c:952`、`block/blk-mq.c:3108` `[static]` |
-| 8 | 网络对称：发 `__dev_queue_xmit`(net/core/dev.c:4841)，收 `netif_receive_skb`(6543)，两端都只认 `net_device` 的 ops | `[static]` |
-| 9 | 调度器是 5 个 `sched_class` 实例（stop/dl/rt/fair/idle）按优先级串成链，`pick_next_task` 顺着链问 | `kernel/sched/sched.h:2587` `[static]` |
-| 10 | 初始化是 **2,978 个 `module_init()`** 挂到 7 级 initcall 段上，`start_kernel` 顺序点火；驱动发现靠这个，不靠目录扫描 | `grep` `[verified]` |
-
-**一句话**：内核 = **少量入口 + 大量填表**。读懂五张表，就懂了 80% 的架构；剩下 20% 是每张表背后的并发与内存模型。
+> 源码 `/opt/linux/src/linux-7.2.12`（63,833 个 `.c/.h`，3,721 万行）
+> 索引 `lens project=linux_7212` → `/opt/code_caches/linux_7212_cache`（5.9G）
+> 本文所有数字都在 2026-11-13 用 lens + grep 重测过；标 `[verified]` = 本轮实测，
+> 标 `[static]` = 读源码得出、未跑程序。上一版本文里对不上的数字已在本轮修正（见 §6.4）。
 
 ---
 
-## 1. 方法与边界
+## 0 TL;DR
 
-### 1.1 用什么读的
+1. **内核不是一个大程序，是「30 个子系统 + 一个共享头文件层」**。`include/linux/` 1,516 个头是唯一的
+   全局部，跨子系统调用必须先在头文件里有声明 —— 这是唯一的防意大利面机制。
+2. **子系统之间靠函数指针表调用，不靠直接调用**。7 张表、合计 183 个槽位（§3.1）。所以
+   「谁调用了 `vfs_read`」这个问题本身就是错的，正确答案要问「谁填了 `file_operations.read_iter` 这一槽」。
+   全树填表者 **1,986** 处 `[verified]`。
+3. **静态调用图在表边界必断**。lens 已经把间接调用标出来（`read[via f_op]`、
+   `pick_task[via idle_sched_class]`），全索引有 **16,441 处 `"indirect":true`**、**14,147 处 `"via"`** `[verified]`。
+   看到 `indirect` 就当「扇出未知」，别当「扇出 = 1」。
+4. **四条主路径值得背下来**：`read(2)`→`f_op->read_iter`→`filemap_read`→page cache；
+   缺页→`handle_mm_fault`→`filemap_fault`；写回→`submit_bio`（99 个调用点 / 54 个唯一调用者）→`blk_mq_submit_bio`；
+   收包→`netif_receive_skb`→协议栈。
+5. **启动是 8 级 initcall + 3,261 个 `module_init`**（`[verified]`），顺序由段名决定，不由代码位置决定。
 
-| 手段 | 目的 | 有效性 |
+---
+
+## 1 用什么看的：lens 的三种动作和四类失真
+
+### 1.1 索引里到底有什么
+
+| 产物 | 体积 | 规模 | 能回答什么 |
+|---|---:|---|---|
+| `chunks_meta.jsonl` | 317 MB | — | 每个 chunk 的位置/符号/语言 |
+| `chunks_text.txt` | 213 MB | — | 切块后的正文（语义检索的输入） |
+| `call_graph.json` | 205 MB | **1,659,126 行**，顶层 146,300 个函数 | 调用者/被调用者/参数实参 |
+| `dataflow.json` | 796 MB | — | 函数读了哪些变量、变量流经哪些函数 |
+| `code_local_linux_7212.jina.bin` | 1.09 GB | — | 向量 |
+| `code_local_linux_7212.jina.bin.hnsw` | 1.19 GB | — | HNSW 图（语义检索近邻） |
+| `word_freq.json` | 3.3 MB | 72,974 行 | 关键词打分 |
+
+> 上一版写「调用图 749,584 行、KV 2.6G」，两个数都不对：本轮 `wc -l` 是 1,659,126 行，目录总量 5.9G。
+> 记住这点：**索引规模这类数字只能现测**。
+
+### 1.2 三种动作，各管一段
+
+| 动作 | 适合的问题 | 本轮实例 |
 |---|---|---|
-| `lens`（本机自建索引） | 符号/语义/调用图/数据流 | 全树切块成功，`call_graph.json` 749,584 行 |
-| `grep -rn` + `sed -n` | 逐行核对，取 `file:line` | 本报告**所有**引用都这样取 |
-| 调用图扇入/扇出 | 判断「谁是稳定门面」 | 只能看直接调用，间接调用断链（见 §3.2） |
+| `action=context` | 「这个函数的上下家是谁」——最省事，一次给出 callers/callees/定义/解析统计 | `vfs_read` → 3 callers、7 callees、`resolution: local=4 global=5` |
+| `action=peek/symbol` | 「这行代码长什么样」——带行号窗口 | `generic_file_read_iter` → `mm/filemap.c:2971` |
+| `action=grep` | 「这一槽被填了几次」——作用域受限的正则扫描 | `\.read_iter\s*=` in `fs/` → 73 命中 / 2,369 文件 / 319 ms |
+| `action=dataflow` | 「函数碰了哪些变量」 | `vfs_read` → 4 个变量，`f_op` 在 571/572/573 行出现 3 次 |
 
-### 1.2 明确**没**做（这些结论本报告不成立）
+`dataflow` 对 `vfs_read` 的输出恰好把间接调用暴露得很干净：
 
-- **没有编译**，没有 `vmlinux`、没有 `System.map`、没有跑过任何内核代码 → 全部 `[static]`。
-- **没有读 `.config`**：`drivers/` 22,247 个文件里绝大多数在你的机器上不参与编译，本报告的「驱动」结论一律是**源码存在性**，不是运行时行为。
-- **没有时序/并发验证**：RCU、per-cpu、seqlock、内存序这些只能靠注释和 `smp_mb` 位置推断，属「读得懂但证不了」。
-- **`arch/` 只抽了 x86 的入口**（4,236 个 `.c` 覆盖 20+ 架构，不逐个看）。
-
-### 1.3 复现
-
-```bash
-cd /opt/linux/src/linux-7.2.12
-grep -rn "^struct file_operations {" include/linux/fs.h    # 表定义
-sed -n '554,590p' fs/read_write.c                            # vfs_read 全文
-grep -rn "\.read_iter" fs/ext4/file.c                        # 谁填了这张表
-# 有索引时（lite 仓库内）：
-./tools/run.sh --once "lens locate vfs_read --path /opt/linux/src/linux-7.2.12"
+```
+func vfs_read — 4 var(s)
+  pos    line 554  occ=1   fs/read_write.c:554
+  read   line 571  occ=1   fs/read_write.c:571
+  f_mode line 558  occ=2   fs/read_write.c:558,560
+  f_op   line 571  occ=3   fs/read_write.c:571,572,573
 ```
 
+`f_op` 一行出现三次 = 「三次按表取函数」，就是那三个分支（`read` / `read_iter` / 都没有）。
+
+### 1.3 四类失真，不知道就会读错
+
+1. **裸名解析（bare-name）**。调用图按函数名连边，同名就串。`filemap_fault` 有两个定义
+   （`mm/filemap.c:3546` 和 `mm/nommu.c:1626`），lens 标 `[?def 2]`；`do_page_fault` 的 36 个调用点也带着
+   `[?def 2]`（各架构同名）。**看到 `?def` 就别断言「唯一实现」。**
+2. **间接调用断层**。`file->f_op->read_iter(...)` 在图上只连到名为 `read` 的符号，标 `via f_op`。
+   要补全必须换判据（§3.4）。
+3. **parent 归属会串**。本轮实测：`ext4_file_read_iter`（`fs/ext4/file.c:130`）在调用图里被记成
+   **3 个不同 parent 的被调者**（`ext4_dio_read_iter` / `ext4_forced_shutdown` / `file_inode`），
+   而这 6 条记录的调用点行号全在 `file.c:132–147` —— 也就是它自己函数体里。
+   → **`function` + `line` 可信，`parent` 在同文件相邻函数间不可信。**
+4. **索引会漂移**。`lens symbol` 读 `generic_file_read_iter` 时给了
+   `[stale: index copy ≠ disk @2971]` —— 索引里的副本和盘上不一致。要引用**精确行号正文**时，
+   以盘上 `read`/`sed` 为准，别以索引窗口为准。
+
 ---
 
-## 2. 横向：代码在磁盘上怎么分
+## 2 横向：树的形状
 
-### 2.1 实测规模（`[verified]`，2026-11-10 实测）
+### 2.1 目录规模（`[verified]`，本轮 `find`/`wc -l` 实测）
 
 | 目录 | `.c` 文件数 | 角色 | 一句话 |
 |---|---:|---|---|
-| `drivers/` | 22,247 | 硬件驱动 | 占全树 1/3 的体量，**但与核心几乎零耦合**：只依赖 `include/linux` 的抽象 |
-| `arch/` | 4,236 | 架构相关 | x86/arm64/riscv...；`arch/x86/entry/` 是系统调用与中断的落地处 |
-| `tools/` | 3,654 | 用户态工具 | **不在内核里**，`perf`/`bpftool`/`objtool`，可独立编译 |
+| `drivers/` | 22,247 | 硬件驱动 | 占全树 1/3，但与核心几乎零耦合：只用 `include/linux` 的抽象 |
+| `arch/` | 4,236 | 架构相关 | `arch/x86/entry/` 是系统调用与中断的落地处 |
+| `tools/` | 3,654 | 用户态工具 | **不在内核里**，可独立编译 |
 | `sound/` | 1,887 | ALSA | 半个驱动子系统，但有自己的 core |
-| `fs/` | 1,488 | 文件系统 | 156 个顶层条目、72 个顶层 `.c`；VFS 门面只占其中约 10 个（`super.c`/`namespace.c`/`open.c`/`read_write.c`/`namei.c`） |
+| `fs/` | 1,488 | 文件系统 | 156 个顶层条目；VFS 门面只占约 10 个文件 |
 | `net/` | 1,472 | 协议栈 | `core/`+`ipv4/`+`ipv6/`+ 各协议，socket 层在 `net/socket.c` |
 | `lib/` | 521 | 通用库 | `kobject`、`rbtree`、`idr`、`string`，被全树引用 |
 | `kernel/` | 496 | 核心机制 | 调度、fork、信号、时间、cgroup、bpf、trace |
@@ -74,70 +98,79 @@ grep -rn "\.read_iter" fs/ext4/file.c                        # 谁填了这张�
 | `crypto/` | 148 | 密码学 | 算法注册表 + `crypto_*` API |
 | `block/` | 76 | 块层 | 只有 76 个文件，却是所有存储的咽喉 |
 | `ipc/`、`virt/` | 11 / 11 | SysV IPC / 虚拟化 | vmexit 极薄 |
-| `include/linux/` | 1,599 个头 | **真正的接口层** | 全树共享契约都在这里 |
+| `include/linux/` | 1,516 个头 | **真正的接口层** | 全树共享契约都在这里 |
 
-**读法**：内核不是「一个大程序」，是**约 30 个子系统 + 一个共享头文件层**。`include/linux/*.h` 是唯一天然的全局部，任何跨子系统调用都必须先在这里有声明 —— 这就是内核防止意大利面的机制（没有它早烂了）。
+总量：**63,833 个 `.c/.h`、37,214,144 行** `[verified]`。
 
 ### 2.2 依赖方向（严格分层，反向依赖 = 编译错误）
 
 ```
-            ┌─────────────────────────────────────────────┐
- userspace  │  syscall ABI（arch/x86/entry/syscalls/）     │
-            └───────────────┬─────────────────────────────┘
-                            ▼
-     ┌──────────────────────────────────────────────────────┐
-     │ fs/（VFS） net/（socket） mm/（mmap/brk） kernel/（调度）│  ← 门面层：只认结构体 + 函数指针表
-     └───────┬──────────────────┬──────────────────┬────────┘
-             ▼                  ▼                  ▼
-     ┌───────────────┐  ┌───────────────┐  ┌───────────────┐
-     │ 具体 FS (ext4)│  │ 协议 (tcp/udp) │  │ 机制 (page alloc│
-     │ 具体驱动      │  │ 具体驱动       │  │  /slab/vma)    │
-     └───────┬───────┘  └───────┬───────┘  └───────┬───────┘
-             └──────────────────┴──────────────────┘
-                            ▼
-     ┌──────────────────────────────────────────────────────┐
-     │ block/（bio→request）  lib/（rbtree/idr/kobject）      │
-     └──────────────────────────────────────────────────────┘
+tools/          用户态，随便依赖谁
+   │
+drivers/ sound/ fs/ net/ …     子系统们：互相**不** include 对方的内部头
+   │
+   └──────────────┬────────────────
+                  │  只准向上依赖
+        include/linux/*.h        1,516 个共享契约
+                  │
+      kernel/ mm/ lib/ block/    核心设施
+                  │
+              arch/<arch>/       唯一允许被下层反向看到的东西
 ```
 
-**硬规则**：`fs/ext4` 不许 include `net/ipv4` 的头；`mm/` 不知道 `fs/` 的具体实现。跨层只能通过 `include/linux` 里声明的**抽象**。违反 = 编译不过（内核没有 PIMPL 以外的选择）。
+判「这段代码属不属于核心」的快捷方式：**它 include 谁**。只 include `include/linux/*` 的是可插拔件；
+include 了别人私有头的，说明耦合已经发生（内核里这类是少数，且通常被 LTO/Kconfig 约束）。
 
-### 2.3 一句话记住每个大目录
+### 2.3 为什么 `include/linux` 是架构的一部分
 
-| 你问的问题 | 去哪看 |
-|---|---|
-| 「这个文件系统怎么挂进来的？」 | `fs/super.c` + `fs/namespace.c` + 该 FS 的 `fill_super` |
-| 「这个设备怎么被发现的？」 | `drivers/base/`（bus/driver/device 模型）+ 该 bus 的 `match()` |
-| 「这块内存哪来的？」 | `mm/page_alloc.c`（页）、`mm/slub.c`（小块）、`mm/vmscan.c`（回收） |
-| 「这个包怎么发出去的？」 | `net/core/dev.c`（`__dev_queue_xmit`）+ 驱动的 `ndo_start_xmit` |
-| 「这个进程为什么不让出 CPU？」 | `kernel/sched/fair.c`（EEVDF）+ `kernel/sched/core.c:__schedule` |
-| 「这个 syscall 谁实现的？」 | `arch/x86/entry/syscalls/syscall_64.tbl` → `SYSCALL_DEFINE*` |
+1,516 个头文件不是「工具目录」，是**唯一契约层**：`struct file_operations` 在 `include/linux/fs.h:1921`，
+`struct vm_operations_struct` 在 `include/linux/mm.h:783`，`struct proto_ops` 在 `include/linux/net.h:181`。
+7.x 里连 `super_operations` 都被挪出去了 —— 现在在 `include/linux/fs/super_types.h:83` `[verified]`。
+头文件的搬迁本身就是信号：**表结构在继续拆分，别照旧版本的路径写脚本。**
 
 ---
 
-## 3. 架构的真正骨架：五张函数指针表
+## 3 七张函数指针表：内核的「多态」实现方式
 
-### 3.1 表的定义与槽位（`[static]`，逐个数过）
+### 3.1 槽位实测（`[verified]`，本轮 awk 数 `(*)` 得到）
 
-| 表 | 定义处 | 函数指针槽 | 谁填 | 谁调用 |
+| 表 | 定义位置 | 槽数 | 实例/填表者 | 谁在用 |
 |---|---|---:|---|---|
-| `struct file_operations` | `include/linux/fs.h:1921` | **34** | 每个 FS/字符设备（全树 1,800 处定义） | `vfs_read/vfs_write/open/ioctl/mmap` |
-| `struct super_operations` | `include/linux/fs/super_types.h:83` | **27** | 每个 FS 类型一次 | `alloc_super`/`deactivate_locked_super`/`statfs` |
-| `struct address_space_operations` | `include/linux/fs.h:401` | **19** | 每个 FS 的 `inode->i_mapping->a_ops` | page cache（`filemap.c`）、回写（`writeback`）、缺页 |
-| `struct vm_operations_struct` | `include/linux/mm.h:783` | **17** | 特殊 VMA（驱动 `mmap`、`shmem`、`hugetlb`） | 缺页/回收/mremap 时 `vma->vm_ops->*` |
-| `struct proto_ops` | `include/linux/net.h:181` | **28** | 每个 socket family（`inet_stream_ops` 等） | `__sys_accept4/sendto/recvfrom` 等 |
-| `struct sched_class` | `kernel/sched/sched.h:2587` | **30** | 5 个实例：`stop/dl/rt/fair/idle` | `pick_next_task`、`enqueue_task` |
+| `struct file_operations` | `include/linux/fs.h:1921` | **34** | 全树 **1,986** 处 `[verified]` | `vfs_read/write/open/ioctl/mmap` |
+| `struct super_operations` | `include/linux/fs/super_types.h:83` | **27** | 每个文件系统类型 | `mount`/`sync`/`evict_inode` |
+| `struct inode_operations` | `include/linux/fs.h` | **28** | 每个 FS | `lookup`/`create`/`permission` |
+| `struct address_space_operations` | `include/linux/fs.h:401` | **19** | 每个 FS + page cache | `read_folio`/`writepages`/`dirty_folio` |
+| `struct vm_operations_struct` | `include/linux/mm.h:783` | **17** | 每个能做 mmap 的对象 | `fault`/`map_pages`/`close` |
+| `struct proto_ops` | `include/linux/net.h:181` | **28** | 每种 socket 家族 | `socket`/`sendmsg`/`recvmsg` |
+| `struct sched_class` | `kernel/sched/sched.h:2587` | **30** | **5** 个（见 3.2） | `enqueue`/`pick_task`/`task_tick` |
 
-**这六张表（五类 + 调度类）承载了全树上千个实现**。数一下实现者就能量化「扩展点有多开放」：
+合计 183 个槽。**记住 34 这个数**：`file_operations` 的 34 个槽就是「一切皆文件」的全部语义面。
 
-```bash
-grep -rn --include=*.c "struct file_operations [a-zA-Z_]* = {" . | wc -l   # 1800
-grep -rn "DEFINE_SCHED_CLASS" kernel/sched/*.c                            # 5
-```
+### 3.2 `sched_class`：唯一一张「实例数固定」的表
 
-### 3.2 调用图为什么在这里「断链」（方法论，必须知道）
+其余 6 张表实例数是开放的（任何驱动都能加），`sched_class` 只有 5 个实例，用宏声明 `[verified]`：
 
-`vfs_read` 的正文长这样（`fs/read_write.c:554`）`[verified]`：
+| 实例 | 位置 | 策略 |
+|---|---|---|
+| `stop_sched_class` | `kernel/sched/stop_task.c:99` | 最高优先级，迁移/停机用，用户态不可见 |
+| `dl_sched_class` | `kernel/sched/deadline.c:3647` | `SCHED_DEADLINE`，EDF |
+| `rt_sched_class` | `kernel/sched/rt.c:2602` | `SCHED_FIFO/RR` |
+| `fair_sched_class` | `kernel/sched/fair.c:15670` | `SCHED_NORMAL/BATCH`，EEVDF，**99% 的进程在这** |
+| `idle_sched_class` | `kernel/sched/idle.c:572` | `SCHED_IDLE` + idle 线程 |
+
+声明宏在 `kernel/sched/sched.h:2785` 的 `DEFINE_SCHED_CLASS(name)`。
+所以 `grep 'struct sched_class [a-z_]* = {'` **一条都搜不到**（本轮实测 exit 1）—— 得搜 `DEFINE_SCHED_CLASS`。
+这是「按老写法 grep 会漏」的典型例子。
+
+### 3.3 表的规模对比：为什么不是「面向对象」
+
+- 表数 7，槽数 183 —— 相对 3,721 万行，**极小**。内核用极小的接口面覆盖极大的实现面。
+- `file_operations` 填表者 1,986 处，`.read_iter` 这一个槽在 `fs/ mm/ net/` 就填了 **77** 次 `[verified]`
+  （fs 73 + mm 2 + net 2，lens grep 各自实测）。
+
+### 3.4 判据替换：读内核调用图的第一原则
+
+`vfs_read`（`fs/read_write.c:554`）的本体只有约 41 行有效代码 `[verified]`：
 
 ```c
 if (file->f_op->read)
@@ -148,335 +181,311 @@ else
         ret = -EINVAL;
 ```
 
-静态调用图看到的是「`vfs_read` 调用 `new_sync_read`」，**看不到**它后面其实是 ext4/overlayfs/fuse 里某个具体函数。于是：
+lens 对它的判定是诚实但**不够用**的：
+
+```
+vfs_read  fs/read_write.c:554  kind=function
+callers(3, 3 unique): ksys_read, ksys_pread64, read_code
+callees(7, 7 unique): new_sync_read, inc_syscr, add_rchar, access_ok, fsnotify_access,
+                      read[via f_op][?def 2], rw_verify_area
+resolution: local=4 global=5 ambiguous=1 external=0
+```
 
 | 错误读法 | 正确读法 |
 |---|---|
-| 「`vfs_read` 不调用任何文件系统 → VFS 是死代码」 | 调用图**按裸名解析**，`f_op->read_iter` 是间接调用，图上必断 |
-| 「`vfs_read` 的扇出只有 2，说明它是叶子」 | 它的**真实**扇出 = `file_operations.read_iter` 的实现者数量 |
-| 「改 `vfs_read` 影响很小」 | 影响 1,800 个填表者里的**所有** `read` 路径 |
+| 「`vfs_read` 扇出 7，不调用任何文件系统 → VFS 是死代码」 | 图上必断：`read_iter` 是**间接**调用 |
+| 「`vfs_read` 是叶子附近的小函数」 | 真实扇出 = `file_operations.read_iter` 的**填表者数量**（≥77） |
+| 「改 `vfs_read` 影响很小」 | 影响 1,986 个填表者里的**所有** read 路径 |
+| 「谁调用了 `ext4_file_read_iter`」→ 查 callers 得 0 | 它只出现在 `.read_iter` 赋值处：`fs/ext4/file.c:983` |
 
-**判据替换**：读内核的调用图，问题要问「**谁填了这张表的这一槽**」，而不是「谁调用了这个函数」：
+**结论句**：读内核的调用图，问题要问「**谁填了这张表的这一槽**」，不是「谁调用了这个函数」。
+
+---
+
+## 4 纵向：四条真实路径（每一步都有本轮 lens 输出）
+
+### 4.1 `read(2)`：从系统调用到 page cache
+
+```
+用户 read(2)
+  └─ arch/x86/entry/ 系统调用入口（表驱动，不是 switch）
+      └─ ksys_read                          fs/read_write.c
+          └─ vfs_read                        fs/read_write.c:554      ← 34 槽表的第一跳
+              ├─ file->f_op->read()          老式接口（还在，剩得很少）
+              └─ new_sync_read               fs/read_write.c:483
+                  └─ file->f_op->read_iter   ★ 间接调用，图在这里断
+                      └─ ext4_file_read_iter fs/ext4/file.c:130  （填表在 :983）
+                          ├─ ext4_dio_read_iter      O_DIRECT 分支
+                          ├─ ext4_dax_read_iter      DAX 分支
+                          └─ generic_file_read_iter  mm/filemap.c:2971
+                              └─ filemap_read        mm/filemap.c:2783
+                                  └─ 查 page cache → 没有就 readahead / read_folio
+                                      └─ address_space_operations.read_folio（又一次间接）
+                                          └─ ext4_read_folio → … → submit_bio
+```
+
+lens 对每一跳的回答（`[verified]`）：
+
+| 节点 | 行号 | lens 给出的上下家 | 备注 |
+|---|---|---|---|
+| `vfs_read` | `fs/read_write.c:554` | callers: `ksys_read`/`ksys_pread64`/`read_code` | 入口只有 3 个，很收敛 |
+| `new_sync_read` | `fs/read_write.c:483` | 组装 `kiocb` + `iov_iter`，再 `call_read_iter` | 真正的间接点 |
+| `ext4_file_read_iter` | `fs/ext4/file.c:130` | callees: `ext4_dio_read_iter`/`ext4_dax_read_iter`/`generic_file_read_iter`/`ext4_forced_shutdown`/`file_inode`/`iov_iter_count` | 填表在 `file.c:983` |
+| `generic_file_read_iter` | `mm/filemap.c:2971` | 直通 `filemap_read` | 索引副本与盘上不一致，已标 stale |
+| `filemap_read` | `mm/filemap.c:2783` | 拿 folio → 拷到用户态 | page cache 的主循环 |
+
+**要点**：这条链上有 **3 次间接**（`f_op->read_iter`、`a_ops->read_folio`、块层的 `queue_rq`）。
+静态调用图能给出的最长确定路径到 `ext4_file_read_iter` 为止；往后都必须按表追。
+
+### 4.2 缺页 / mmap：`handle_mm_fault` 是真正的分发中心
+
+```
+CPU 缺页异常
+  └─ do_page_fault（每个架构一份，lens 标 [?def 2]）
+      └─ handle_mm_fault        mm/memory.c:6651        ← 82 个调用点 / 18 个唯一调用者
+          └─ __handle_mm_fault
+              └─ handle_pte_fault
+                  └─ do_fault → vma->vm_ops->fault     ★ 间接调用（17 槽表）
+                      └─ filemap_fault  mm/filemap.c:3546
+                          ├─ do_sync_mmap_readahead    同步预读
+                          ├─ do_async_mmap_readahead   异步预读
+                          ├─ __filemap_get_folio       查缓存
+                          ├─ filemap_read_folio        缺页读入
+                          └─ lock_folio_maybe_drop_mmap / i_size_read
+```
+
+实测细节（`[verified]`）：
+
+- `handle_mm_fault` 的 82 个调用点里，`do_page_fault`×36、`__do_page_fault`×7、`do_user_addr_fault`×4、
+  `do_exception`×4、`do_sparc64_fault`×3 —— **架构代码是最大客户**，这也解释了为什么改它能炸半个 `arch/`。
+- `filemap_fault` **有两份定义**：`mm/filemap.c:3546` 和 `mm/nommu.c:1626`。NOMMU 平台走后者。
+- 它的 7 个调用者全是文件系统的 `*_filemap_fault`（xfs / f2fs / ceph / gfs2 / ocfs2 / orangefs），
+  每家的包装函数都只是在 `filemap_fault` 前后加自己的锁或 COW 处理。
+- `resolution: local=20 global=52 ambiguous=7` —— 一个函数里有 7 处「解析不唯一」，别把 `ambiguous`
+  当错误，它是超大代码库的常态。
+
+### 4.3 写回 / 块层：`submit_bio` 是唯一的漏斗
+
+```
+文件系统 / 直接 IO / swap / 各种日志
+  └─ submit_bio                 block/blk-core.c:952
+      └─ submit_bio_noacct      记账 + 递归展开
+          └─ blk_mq_submit_bio  block/blk-mq.c:3108
+              └─ 拿 tag → queue_rq ★ 间接调用（每个驱动一个 request_queue）
+                  └─ nvme/scsi/virtio-blk/… 的 queue_rq
+```
+
+`submit_bio` 的 callers 是本轮最漂亮的一屏（`[verified]`）：**99 个调用点 / 54 个唯一调用者**，
+覆盖了你能想到的所有存储路径 ——
+
+| 来源 | 例子 |
+|---|---|
+| 文件系统日志 | `xlog_write_iclog`(xfs)×6、`nilfs_segbuf_submit_bio`、`gfs2_log_submit_write` |
+| 元数据 | `write_dev_supers`(btrfs)×3、`ntfs_bio_fill_1` |
+| 直接 IO | `__blkdev_direct_IO`×6、`dio_bio_submit` |
+| 压缩文件系统 | `z_erofs_submit_queue`×5 |
+| 加密 | `blk_crypto_submit_bio`、`__blk_crypto_fallback_encrypt_bio`×6 |
+| 休眠 | `hib_submit_io_async` |
+| 分区/zoned | `__submit_zone_reset_cmd`、`xfs_submit_zoned_bio` |
+
+**判定**：`block/` 只有 76 个文件，但 `submit_bio` 有 54 个唯一调用者（分布在 fs/、drivers/、kernel/、
+mm/），所以「块层改动影响面小」是错的 —— 影响面小的是**文件数**，不是**扇入**。
+
+反过来，`submit_bio` 自己只调 5 个不同函数（`submit_bio_noacct`/`bio_set_ioprio`/`count_vm_events`/
+`task_io_account_read`/`bio_op`）。**扇入极大、扇出极小**是「咽喉层」的典型形状。
+
+### 4.4 网络：收发各一个漏斗，之后全是表
+
+```
+发送: dev_queue_xmit → __dev_queue_xmit  net/core/dev.c:4841 → qdisc → ndo_start_xmit ★间接
+接收: 硬件中断 → napi → netif_receive_skb  net/core/dev.c:6543
+                        └─ __netif_receive_skb        :6384
+                            └─ netif_receive_skb_internal  :6468
+                                └─ ptype 链表逐个试 ★间接（packet_type.func）
+                                    └─ ip_rcv / arp_rcv / ipv6_rcv …
+```
+
+- 收包路径的关键结构是 `struct packet_type` 链表，链表节点里存函数指针 —— 这是除 7 张表之外的
+  **第 8 种多态**（散在链表里，不是数组/结构体表）。`proto_ops`（28 槽）只管 socket 层的系统调用面，
+  真正的收发走 `tcp_prot`/`udp_prot` 那套 `struct proto`。
+- 所以「网络调用图」比文件系统更不可静态化：至少 2 层间接（`ptype->func`、`sk->sk_prot`）。
+
+### 4.5 调度：`pick_next_task` 的间接调用带接收者标注
+
+```
+__schedule（kernel/sched/core.c）
+  └─ pick_next_task            kernel/sched/core.c:6241
+      └─ __pick_next_task
+          └─ sched_class->pick_task ★ 间接调用（30 槽表，5 个实例）
+              └─ fair_sched_class.pick_task → EEVDF
+```
+
+lens 在这里表现很好：callees 里直接写着 `pick_task[via idle_sched_class]×3` ——
+**它知道这个间接调用至少有一个可解析的目标**，并把接收者名字带出来了。
+这是全索引 14,147 处 `"via"` 标注里最有用的形态：`[via X]` 比裸 `indirect:true` 信息量高一个档。
+
+---
+
+## 5 启动：8 级 initcall 与 3,261 个 `module_init`
+
+| 级别 | 宏 | 段名 | 谁在这 |
+|---:|---|---|---|
+| early | `early_initcall` | `.initcall.early` | 极早期，几乎只有 x86 特例 |
+| 1 | `core_initcall` | `.initcall.1` | 内存、锁、kobject |
+| 2 | `postcore_initcall` | `.initcall.2` | bus 基础设施 |
+| 3 | `arch_initcall` | `.initcall.3` | 架构设备 |
+| 4 | `subsys_initcall` | `.initcall.4` | 子系统（`net/`、`fs/` 大半） |
+| 5 | `fs_initcall` | `.initcall.5` | 文件系统类型注册 |
+| 6 | `device_initcall` | `.initcall.6` | **绝大多数驱动**（`module_init` 默认落这级） |
+| 7 | `late_initcall` | `.initcall.7` | 收尾 |
+| — | `*_initcall_sync` | `.initcall.<n>s` | 同级内的第二遍（先全部 async，再全部 sync） |
+
+- 定义在 `include/linux/init.h:284–306` `[verified]`。
+- `module_init(...)` 全树 **3,261 处** `[verified]`；内建时它等于 `device_initcall`，编成模块时变成
+  `module_init` 段。**同一行代码，两种执行时机** —— 这是读内核源码最容易误解的一处。
+- 顺序由**段名排序**决定，不是文件顺序，也不是依赖图。所以「A 一定在 B 之前」只有靠级别差保证，
+  同级别内顺序是链接顺序，不可依赖。`*_initcall_sync` 就是给「必须等我这一级全跑完」的人准备的。
+
+---
+
+## 6 lens 用下来的真实结论
+
+### 6.1 它对什么特别省事（本轮实测）
+
+| 场景 | 一条命令 | 耗时 |
+|---|---|---|
+| 定位函数 + 上下家 | `lens context vfs_read` | 亚秒 |
+| 作用域内数赋值点 | `lens grep \.read_iter\s*= fs/` | 319 ms / 2,369 文件 |
+| 看某函数碰了哪些变量 | `lens dataflow vfs_read` | 亚秒，输出可直接读 |
+| 带行号看代码 | `lens peek 或 symbol` | 亚秒 |
+
+对比：直接 `grep -rn` 全树（95,000 文件）要 600 ms 以上且输出不可控；`call_graph.json` 有 166 万行、
+205 MB，用 `jq`/文本工具翻是折磨 —— 这正是上一版报告出错的直接原因（手工从原始 JSON 里数数字）。
+
+### 6.2 它答不了的（必须换工具）
+
+1. **表边界的扇出** —— 得 `lens grep '\.槽名\s*='` 数填表者（§3.4）。
+2. **精确行号正文** —— 索引会 stale，用盘上文件。
+3. **跨函数的语义因果**（「为什么 O_DIRECT 跳过 page cache」）—— 索引只给结构，不给理由。
+4. **`DEFINE_*` 宏生成的符号** —— `sched_class` 五个实例在普通 grep 下**完全隐形**（§3.2），
+   得知道去搜宏名。
+
+### 6.3 建议工作流（下次照做）
 
 ```bash
-grep -rn "\.read_iter\s*=" fs/ mm/ net/ | wc -l    # 140（只数赋值点，仍是下界）
-grep -rn "\.read_iter" fs/ext4/file.c              # fs/ext4/file.c:983 .read_iter = ext4_file_read_iter
+# 1 先问结构：这个 symbol 在哪、上下家是谁
+lens action=context query=<symbol>
+# 2 再问「谁填了这张表」
+lens action=grep pattern='\.<slot>\s*=' path=fs/
+# 3 需要精确正文 → 回到盘上
+sed -n '554,595p' fs/read_write.c
+# 4 只有真的要统计全树时才碰 call_graph.json，且用 lens 的 symbol/exact，别手数
 ```
 
-Lua 的 `M.fn()`、C 的 `obj->fn()` 在 lite 的 `call_graph.json` 里会带 `"indirect":true` + `"via":"<接收者>"`，本树索引里这条标注已经存在 —— 看到 `indirect` 就当「扇出未知」处理。
+### 6.4 数字校正表（旧稿 → 本轮实测）
 
-### 3.3 六张表在架构上的位置
+| 项 | 旧稿 | 本轮 `[verified]` | 差异原因 |
+|---|---:|---:|---|
+| `call_graph.json` 行数 | 749,584 | **1,659,126** | 手工计数/旧索引 |
+| 索引总体积 | 「KV 2.6G、向量 2.2G」 | **5.9G**（`du -sh`） | 口径不同且未加向量 |
+| `dataflow.json` | 未提 | **796 MB** | 漏项 |
+| `file_operations` 填表者 | 1,800 | **1,986** | 疑似按头文件口径数 |
+| `.read_iter` 赋值点 | 140 | **77**（fs 73+mm 2+net 2） | 旧数把 `.read` 等其它槽也算进去了 |
+| `module_init` 调用点 | 2,978 | **3,261** | 旧树/口径 |
+| `include/linux` 头文件 | 1,599 | **1,516** | — |
+| `super_operations` 位置 | `include/linux/fs.h` | **`include/linux/fs/super_types.h:83`** | 7.x 拆出去了 |
+| `netif_receive_skb` | `net/core/dev.c:6468` | **:6543**（`:6468` 是 `..._internal`） | 行号漂移 |
 
-```
- 用户 read(2)
-     │
-     ▼
- vfs_read ──f_op->read_iter──► ext4_file_read_iter ──generic_file_read_iter──► filemap_read
-                                                                                  │
-                                                           a_ops->read_folio ◄────┘
-                                                                                  │
-                                                                       缺页 ──► filemap_fault
-                                                                                  │
-                                                                       块层 ──► submit_bio
-                                                                                  │
-                                                                     queue_rq ──► nvme/scsi 驱动
-```
-
-**一条 `read()` 穿过 5 张表**：`file_operations` → (`address_space_operations`) → `vm_operations_struct` → 块层 request → 驱动。这就是内核的分层：每层只知道「下一层的表在哪」，不知道谁填的。
+**教训**：凡「A 点了 B 处」这类数字，必须给能重跑的命令；给不出命令的数字不要写进报告。
 
 ---
 
-## 4. 核心数据结构地图（全部 `file:line` 实测 `[verified]`）
+## 7 设计评论：这套结构为什么成立
 
-### 4.1 十二个必须记住的结构体
-
-| 结构体 | 定义 | 一句话职责 | 关键字段（读源码时盯这几个） |
-|---|---|---|---|
-| `task_struct` | `include/linux/sched.h:826` | 进程/线程 = 一个内核栈 + 一套记账 | `state`、`stack`、`mm`、`active_mm`、`sched_class`、`se`、`files`、`nsproxy` |
-| `mm_struct` | `include/linux/mm_types.h:1160` | 一个地址空间的全部 | `mmap`(VMA 树)、`pgd`、`mmap_lock`、`map_count`、`rss_stat` |
-| `vm_area_struct` | `include/linux/mm_types.h:920` | 一段连续权限相同的虚拟内存 | `vm_start/vm_end`、`vm_flags`、`vm_ops`、`vm_file`、`vm_pgoff`、`anon_vma` |
-| `struct page` / `struct folio` | `include/linux/mm_types.h:80` | 物理页元数据（`folio` 是复合页视图） | `flags`、`_refcount`、`mapping`、`index`、`lru` |
-| `struct inode` | `include/linux/fs.h:762` | 磁盘上一个对象（文件/目录/设备） | `i_ino`、`i_mode`、`i_size`、`i_mapping`、`i_op`、`i_fop`、`i_sb` |
-| `struct file` | `include/linux/fs.h:1255` | **一次** `open()` 的实例 | `f_op`、`f_path`(dentry+vfsmount)、`f_pos`、`f_mapping`、`f_mode`、`f_flags` |
-| `struct dentry` | `include/linux/dcache.h:93` | 路径名的内存缓存项 | `d_name`、`d_inode`、`d_parent`、`d_sb`、`d_op`、`d_lockref` |
-| `struct super_block` | `include/linux/fs/super_types.h:132` | 一个已挂载的文件系统实例 | `s_op`、`s_root`、`s_dev`、`s_blocksize`、`s_flags`、`s_mounts` |
-| `struct address_space` | `include/linux/fs.h:472` | **page cache 实例**（inode 与页之间的桥） | `i_pages`(xarray)、`a_ops`、`host`、`i_mmap`(反向映射)、`nrpages` |
-| `struct sk_buff` | `include/linux/skbuff.h:886` | 一个网络包（含头/尾/数据三段指针） | `head/data/tail/end`、`len`、`dev`、`sk`、`protocol`、`cb[]` |
-| `struct sock` | `include/net/sock.h:365` | 协议无关的 socket 内核态 | `sk_state`、`sk_prot`、`sk_receive_queue`、`sk_write_queue`、`sk_timer` |
-| `struct net_device` | `include/linux/netdevice.h:2155` | 一块网卡 | `netdev_ops`、`flags`、`mtu`、`dev_addr`、`napi` |
-| `struct bio` / `struct request` | `include/linux/blk_types.h:210` / `blk-mq.h:105` | 块 IO 的「请求前/请求后」两种形态 | `bi_bdev`、`bi_iter`、`bi_opf` / `q`、`cmd_flags`、`bio`、`mq_hctx` |
-
-### 4.2 一个对象从路径到字节的完整链（本报告最重要的一张图）
-
-```
-  "/etc/passwd"  ──namei──►  dentry ──► inode ──► address_space(i_mapping) ──► xarray of folio ──► 物理页
-      (字符串)              (缓存项)    (对象)        (page cache 实例)        (索引：页号)      (struct page)
-                                  │                                                      ▲
-                                  └── i_fop ──► file_operations ◄── open() 生成 struct file ──┘
-                                                     │
-                                             f_op->read_iter ──► filemap_read 从这里取页
-```
-
-**三个「多对一」必须记清**：
-
-| 关系 | 基数 | 后果 |
-|---|---|---|
-| `file` ↔ `dentry/inode` | 多 : 1 | 同一个 inode 可有 N 个 `file`（N 个 `open`），`f_pos` 各自独立 |
-| `inode` ↔ `address_space` | 1 : 1（`inode->i_mapping` 通常指回自身内嵌的 `i_data`） | 页缓存挂在 inode 上，**不是**挂在 `file` 上，所以多进程读同一文件共享页 |
-| `address_space` ↔ `folio` | 1 : N | `i_pages` 是 xarray，key = 页号（`index`），缺页就是 `xarray_load(index)` |
-
-### 4.3 关键不变量（源码里反复出现的假设）
-
-1. **`file->f_mapping` 一般等于 `file_inode(file)->i_mapping`**，但设备文件可以是「私有 mapping」（`f_mapping` 可被 `->open` 改写成别的 inode 的）。读到 `f_mapping != i_mapping` 的地方 = 有人在做特殊 page cache（如 `shmem`、`fuse`）。
-2. **`inode->i_rwsem` 是写者锁**：`vfs_write` 路径里没有它，写保护靠 `file_start_write()`（`fs/read_write.c:683`）拿的 **sb 级** `s_writers`，粒度是「整个文件系统的写冻结」，不是单文件。
-3. **`mmap_lock` 是 VMA 操作的总锁**（读写信号量），缺页快路径只拿读锁；`mmap_region`（`mm/vma.c:2858`）要写锁。看到 `mmap_read_lock` 就知道这段不会改 VMA 树。
-4. **`sk_buff` 的 `head/end` 是分配窗口，`data/tail` 是当前有效区间**：任何 `skb_push/skb_pull` 只动 `data`，越界就是内存破坏；`skb->cb` 是 48 字节私有区，跨层复用时必须清零（历史 bug 高发区）。
-5. **`struct page` 的 `mapping` 低两位是标志位**（`PAGE_MAPPING_ANON/FLAGS`），所以判断「匿名页」必须 `page_mapping()` 而不是直接比指针 —— `mm_types.h` 附近的注释写得很清楚。
+1. **极小的接口面 × 极大的实现面**。183 个槽位支撑 3,721 万行。代价是：所有灵活性都压在
+   「填表」这一动作上，于是**填错一个槽不报错、只在跑到时才炸**。这也解释了内核为什么大量用
+   `WARN_ON`/`BUG_ON`/`static_key` 而不是类型系统。
+2. **扇入大、扇出小 = 咽喉层**（`submit_bio`：99 个调用点 / 5 个被调）。咽喉层是改动杠杆最大的地方，
+   也是最不该塞逻辑的地方。`blk-mq` 把这些逻辑推到 per-cpu 队列，正是为了不噎住。
+3. **间接调用是为了编译期解耦，不是为了运行期快**。retpoline/IBRS 之后每次间接调用都有成本，
+   内核用 `static_call`（`sched_class` 之外的热路径）把一部分又抢回直调 —— 这是 5.x 之后的新趋势：
+   **能静态化就静态化**。
+4. **架构代码是最大客户**（`handle_mm_fault` 的 82 个调用点里 50+ 来自 `arch/`）。所以「跨架构可移植」
+   不是抽象得好，而是**抽象点选在极少数几个函数上**（缺页、系统调用入口、上下文切换）。
+5. **头文件搬迁是架构演进的足迹**。`super_operations` 从 `fs.h` 挪到 `fs/super_types.h` 说明
+   `fs.h` 已经大到编译不动了。判「这块代码最近活跃吗」的捷径：看它有没有被拆出去。
 
 ---
 
-## 5. 纵切：一条 `read()` 从用户态走到硬盘（全链路 `file:line`）
+## 8 下一步（按性价比排）
 
-### 5.1 存储读路径（10 跳）
+| 优先 | 动作 | 为什么 |
+|---:|---|---|
+| 1 | 把 §4 的四条路径各自补一张「间接点表」（表名 / 槽 / 填表者数 / 是否 `static_call`） | 这张表才是可复用的资产，一次做完四条路径都受益 |
+| 2 | 抽 `net/` 的 `struct proto` + `packet_type` 链表，做成第 8/9 张表的槽位统计 | 网络是唯一没有集中表的子系统，缺口最大 |
+| 3 | 用 `lens dataflow` 对 `struct file` 的字段做一次写入点普查 | 现在 `vfs_read` 只给了 4 个变量，`struct file` 的字段级流没摸 |
+| 4 | 给本文每个数字配一条 `tools/` 下的脚本 | 本轮教训是「手数量错」；固化成脚本后下次只跑不数 |
+| 5 | 索引刷新（`lens action=index`）后复核 §6.4 的 stale 项 | 现在 `generic_file_read_iter` 已标 stale |
 
-| 跳 | 位置 | 做了什么 | 关键判据 |
-|---:|---|---|---|
-| 1 | `arch/x86/entry/syscalls/syscall_64.tbl` | `read` = 0，落到 `__x64_sys_read` | 表驱动，不是手写汇编分支 |
-| 2 | `fs/read_write.c:723` `SYSCALL_DEFINE3(read,...)` | `fdget` → `vfs_read` | `SYSCALL_DEFINE*` 宏负责 `pt_regs` 拆参 |
-| 3 | `fs/read_write.c:554` `vfs_read()` | 权限/`access_ok`/`rw_verify_area`/长度截断 | 只有 ~30 行；**`count > MAX_RW_COUNT` 会被截**（2GB 上限） |
-| 4 | `fs/read_write.c:554` 尾部 | `f_op->read` 或 `new_sync_read → f_op->read_iter` | 旧接口优先，新 FS 只实现 `read_iter` |
-| 5 | `fs/ext4/file.c:130` `ext4_file_read_iter` | 判断 `O_DIRECT`/内联数据，否则走通用路径 | ext4 只在这一层加「direct IO / inline data」特例 |
-| 6 | `mm/filemap.c:2971` `generic_file_read_iter` | → `filemap_read` | 通用 page-cache 读 |
-| 7 | `mm/filemap.c:2783` `filemap_read` | 批量取页（`filemap_get_pages:2682`）、拷到用户 | `folio_batch` 批处理，一次最多 15 页 |
-| 8 | `mm/filemap.c:3546` `filemap_fault`（缺页时才进） | `__filemap_get_folio_mpol:1947` 查 xarray；miss → `read_folio` | 命中 = 纯内存；miss = 触发块层 |
-| 9 | `block/blk-core.c:952` `submit_bio` → `:817 submit_bio_noacct` | bio 合并、限流、交给 `blk_mq_submit_bio` | `submit_bio` 是**唯一**块入口 |
-| 10 | `block/blk-mq.c:3108` `blk_mq_submit_bio` → `queue_rq` | 分配 `request`，进硬件队列 | plug（`current->plug`）可缓存请求，减少锁 |
-
-最后进驱动：`drivers/nvme/host/apple.c:1007 .queue_rq = apple_nvme_queue_rq` 这类填表。
-
-**这十跳里没有一跳「知道」下一跳的具体实现**，全靠表。这就是为什么「换文件系统不动块层、换硬盘不动 VFS」。
-
-### 5.2 写路径的差异点（源码里只差三处）
-
-| 差异 | 位置 | 含义 |
-|---|---|---|
-| `file_start_write(file)` / `file_end_write` | `fs/read_write.c:660/683` | 写要拿 sb 级写者计数（防 `remount-ro`/`freeze` 竞态），读不用 |
-| `rw_verify_area(WRITE, ...)` | 同上 | 写要做 `mandatory lock`（`flock`）检查 |
-| `fsnotify_modify` vs `fsnotify_access` | 同上 | 审计钩子不同 |
-
-其余（`vfs_write` → `f_op->write_iter` → `generic_file_write_iter` → `filemap` 写时缺页 `do_cow_fault`）与读同构。
-
-### 5.3 mmap + 缺页：另一条入口
-
-```
-ksys_mmap_pgoff (mm/mmap.c:568)
-   └─ mmap_region (mm/vma.c:2858)            ← 建 VMA，拿 mmap_write_lock
-        └─ __mmap_region (mm/vma.c:2763)
-             ├─ .mmap_prepare 存在（新接口，7.x）
-             │    └─ call_mmap_prepare (:2689) → vfs_mmap_prepare (fs.h:2071)
-             │         └─ ext4_file_mmap_prepare (fs/ext4/file.c:826)
-             │              └─ 填 desc->vm_ops = &ext4_file_vm_ops (:820)
-             └─ 否则走老接口 vfs_mmap (fs.h:2063) → f_op->mmap（fs.h:1935）
-
---- 之后任意一次访问 ---
-CPU #PF → exc_page_fault → handle_mm_fault (mm/memory.c:6651)
-   └─ __handle_mm_fault (:6417)             ← 逐级补齐 pgd→p4d→pud→pmd
-        └─ handle_pte_fault (:6335)         ← pte 为空 = 首次访问
-             └─ do_fault (:5964)            ← 有 vm_ops->fault
-                  ├─ do_read_fault  (:5840) ── filemap_fault ── 读盘
-                  ├─ do_cow_fault   (:5872) ── 写时复制：分配新页 + 拷内容
-                  └─ do_shared_fault         ── MAP_SHARED 写
-```
-
-> **7.x 的变化（本树实测）**：`ext4` 已经**不再实现** `.mmap`，只填 `.mmap_prepare`（`fs/ext4/file.c:990`）。
-> 新接口入参是 `struct vm_area_desc`（`include/linux/mm_types.h:887`）而不是 `vm_area_struct`，
-> 好处是驱动只能改**白名单字段**、且在 VMA 合并之前就定型（`mm/vma.c:2685` 注释）。
-> 所以 7.2.12 上读到「文件系统没有 `.mmap`」是正常的，别当 bug。
-
-**三个必背事实**（`[static]`）：
-
-1. `do_fault` 开头就检查 `vma->vm_ops->fault` 存不存在；**`VM_MIXEDMAP`/驱动自管 VMA 没有 `fault` 时走 `pte_none` 判断**，否则 `SIGBUS`（`mm/memory.c:5986`）。
-2. `MAP_SHARED` 写 = 直接改 page cache 页，最终由回写线程落盘；`MAP_PRIVATE` 写 = `do_cow_fault` 拷一份，**永不落盘**。
-3. `mmap_lock` 在读缺页里只拿读锁，所以缺页路径里**不能**改 VMA 树，只能改 PTE —— 这是 `do_fault` 全族都不碰 `vma` 链表的原因。
-
-### 5.4 网络：对称的两条链
-
-**发**：
-
-```
-write(2)/sendto(2)
-  └─ __sys_sendto → sock_sendmsg → sk->sk_prot->sendmsg
-       └─ tcp_sendmsg (net/ipv4/tcp.c:1446) → tcp_sendmsg_locked (:1116)   ← 切段、算窗口
-            └─ ip_queue_xmit → ip_finish_output → dev_queue_xmit
-                 └─ __dev_queue_xmit (net/core/dev.c:4841)                 ← 选 qdisc/直发
-                      └─ sch_direct_xmit (net/sched/sch_generic.c:344)
-                           └─ netdev_start_xmit (include/linux/netdevice.h:5404)
-                                └─ ops->ndo_start_xmit  ← 驱动填：e1000e/netdev.c:7356
-```
-
-**收**：
-
-```
-网卡中断 → napi_schedule → net_rx_action (net/core/dev.c:8005)
-  └─ __napi_poll (:7810) → n->poll        ← 驱动实现的轮询（NAPI 的「下半部」）
-       └─ netif_receive_skb (:6543) → __netif_receive_skb_core (:6061)     ← 分发到协议
-            └─ ip_rcv → tcp_v4_rcv → tcp_data_queue                        ← 入 sk_receive_queue
-                 └─ tcp_recvmsg (net/ipv4/tcp.c:2932)  ← 用户 recv 时拷贝
-```
-
-**判据**：收包是**软中断 + NAPI 轮询**驱动的，不是「中断里直接处理」；`net_rx_action` 有 budget（默认 64/300），超了让出 CPU。发包是**同步**的（`__dev_queue_xmit` 在进程上下文跑），除非 qdisc 排队。
-
-### 5.5 调度：5 个类串成一条链
-
-```
-schedule() (kernel/sched/core.c:7362)
-  └─ __schedule (:7107)                    ← 关抢占、更新 rq 时钟
-       ├─ pick_next_task (:6241) → __pick_next_task (:6149)   ← 按 sched_class 优先级问
-       │     stop ▸ dl ▸ rt ▸ fair(EEVDF) ▸ idle              ← DEFINE_SCHED_CLASS 5 个实例
-       └─ context_switch (:5475)           ← 切 mm（若跨进程）+ 切寄存器
-wake_up_process (:4569) → ttwu → enqueue_task + 必要时 resched_curr
-```
-
-**关键不变量**（`[static]`）：`__schedule` 全程持 `rq->lock`，`context_switch` 之前在 `finish_task_switch` 里放锁 —— 所以「切栈之后不能再碰 prev 的栈」。`sched_class` 30 个槽里 `pick_next_task`/`enqueue_task`/`dequeue_task` 是必需项，其余可选（`CONFIG_SCHED_*` 决定填不填）。
-
-### 5.6 初始化：2,978 个 `module_init` 怎么上电
-
-```
-start_kernel (init/main.c)
-  ├─ setup_arch / mm_init / sched_init / ...
-  ├─ do_pre_smp_initcalls (init/main.c:1458)
-  │     for (fn = __initcall_start; fn < __initcall0_start; fn++)   ← 7 级段：0..6 + 7s
-  └─ run_init_process("/sbin/init")
-```
-
-**为什么驱动能被发现**：`module_init(foo_init)` 把函数指针塞进 `.initcall6.init` 段；链接器把这些段按 level 拼成一串，`start_kernel` 顺序点火。**没有目录扫描、没有注册表文件** —— 发现机制就是「链接器 + 段排序」。`grep -rn --include=*.c "module_init(" . | wc -l` = **2,978**（实测）。
-
-**推论**：`drivers/` 里 22,247 个文件，实际被链接进你的 vmlinux 的只由 `.config` 决定；未选中的代码**连编译都不参与**。所以「内核里有多少驱动」这个问法本身是错的，正确问法是「你的 `.config` 选了哪些」。
+**别做**：手工翻 `call_graph.json` / `dataflow.json`。796 MB 的 JSON 靠眼睛数，只会再产出一版错报告。
 
 ---
 
-## 6. 设计评注：这份代码为什么长这样
-
-### 6.1 用「填表」换「不用继承」
-
-C 没有虚函数，内核的解法是**结构体里放函数指针 + 首槽放版本/owner**。代价与收益：
-
-| 收益 | 代价 |
-|---|---|
-| 零运行时开销（一次间接跳转，可内联预测） | 静态分析看不到边（§3.2），IDE 跳转失效 |
-| 新 FS/驱动**不改一行核心代码** | 表填错（槽位错、NULL 未判）是内核 CVE 高发区 |
-| 二进制层面可裁剪（`#ifdef` 直接删槽） | 表布局不 ABI 稳定，**禁止**跨版本 `struct` 传递 |
-
-**证据**：`file_operations` 34 个槽，但 `vfs_read` 只判 `read` 和 `read_iter` 两个；其余槽（`splice_read`、`uring_cmd`、`remap_file_range`…）由各自的入口按需调用。**表是能力清单，不是必须实现清单** —— 读表时先看「我这个路径用到哪个槽」。
-
-### 6.2 命名即契约
-
-| 前缀 | 语义 | 例子 |
-|---|---|---|
-| `__` 双下划线 | 调用者必须已持锁 / 已做检查 | `__schedule`、`__handle_mm_fault`、`__dev_queue_xmit` |
-| `_locked` / `_nolock` | 锁状态写在名字里 | `tcp_sendmsg_locked`、`alloc_pages_nolock_noprof` |
-| `_noprof` | 由宏生成的 profiling 变体 | `__alloc_pages_noprof`(`mm/page_alloc.c:5389`) |
-| `vfs_*` | 稳定门面，语义不随 FS 变 | `vfs_read`/`vfs_write`/`vfs_open` |
-| `generic_*` / `filemap_*` | 「给大多数 FS 用的通用实现」 | `generic_file_read_iter`、`filemap_read` |
-| `do_*` | 真正干活的内层 | `do_fault`、`do_cow_fault` |
-
-**读源码时**：看到 `__` 就去上面找谁持锁；看到 `_locked` 就确认锁不是这层拿的；看到 `generic_` 就是「可以抄的默认实现」。
-
-### 6.3 错误处理是统一风格，不是随意的
-
-```c
-ret = f_op->read_iter(...);
-if (ret > 0) { fsnotify_access(file); add_rchar(current, ret); }
-inc_syscr(current);
-return ret;
-```
-
-- **负数 = errno**，0 = EOF，正数 = 字节数，全树统一（`fs/read_write.c:554` 可作为模板）。
-- `unlikely()` 几乎只包三种东西：参数越界、NULL 检查、`WARN` 前的判断。它**不影响正确性**，只影响布局。
-- 资源释放一律 `goto out_*` 阶梯，`out:` 标签数量 ≈ 函数复杂度。看到 5 个以上 `out_xxx` 就该警惕。
-
-### 6.4 并发模型：三层，别混
-
-| 层 | 机制 | 典型位置 | 读法 |
-|---|---|---|---|
-| 进程上下文 | mutex / rwsem（可睡眠） | `mmap_lock`、`inode->i_rwsem` | 可以 `copy_to_user`、可以 `submit_bio` |
-| 软中断/中断 | spinlock / RCU（不可睡眠） | `rq->lock`、`net_rx_action`、`sk_receive_queue` | **禁止**睡眠，`GFP_ATOMIC` 分配 |
-| 无锁快路径 | per-cpu / seqlock / RCU | `add_rchar(current,...)`、`net_hotdata` | 只读或单写者，靠内存序 |
-
-**判据**：`in_interrupt()` / `spin_lock_bh()` 出现的地方，后面绝不允许 `kmalloc(GFP_KERNEL)`。这是内核最常见的死锁形态（sleeping in atomic）。
-
----
-
-## 7. 黑盒（本报告明确不展开的部分）
-
-| 区域 | 为什么没展开 | 想读从哪起 |
-|---|---|---|
-| `drivers/` 22,247 个文件 | 体量与架构无关，且强依赖 `.config` | `drivers/base/dd.c`（设备-驱动绑定）+ 目标驱动的 `probe` |
-| `arch/` 4,236 个文件 | 20+ 架构，且大量是汇编 | `arch/x86/entry/entry_64.S` + `syscall_64.tbl` |
-| `security/` LSM | 钩子式，读起来是「到处都有 `security_*`」 | `security/security.c` 的 hook 表 |
-| `crypto/` | 注册表 + 算法实现，机械 | `crypto/algapi.c` + `crypto/cipher.c` |
-| `sound/` | 半个独立子系统（ALSA 自己的 core） | `sound/core/pcm.c` |
-| `tools/` 3,654 | **不是内核**，用户态程序 | 与内核无关，单独看 |
-| `bpf/`、`kernel/bpf` | JIT + verifier，独立学科 | `kernel/bpf/verifier.c`（1.4 万行，建议只看 `do_check`） |
-
----
-
-## 8. 阅读路线（给新人，按周）
-
-| 阶段 | 目标 | 具体动作 | 验收 |
-|---|---|---|---|
-| 第 1 周 | 建立「表 → 实现」的反射 | 只读 `vfs_read`+`vfs_write`+`filemap_read` 三个函数全文（约 400 行） | 能口述 §5.1 十跳 |
-| 第 2 周 | 进程与内存 | `task_struct` 字段扫一遍、`handle_mm_fault` 全族、`mmap_region` | 能解释 `MAP_PRIVATE` 写为什么缺页 |
-| 第 3 周 | 存储 | `submit_bio`→`blk_mq_submit_bio`→`nvme_queue_rq`；顺带看 `bio` 的 split/merge | 能说清 plug 的作用 |
-| 第 4 周 | 网络 | `tcp_sendmsg_locked` + `__dev_queue_xmit` + NAPI 收包 | 能说清「为什么收包不用中断里干完」 |
-| 第 5 周 | 调度 | `__schedule` + 5 个 `sched_class` + EEVDF 的 `vruntime` | 能解释「为什么 `schedule()` 前后不能碰 prev 栈」 |
-| 长期 | 按需下钻 | 每个 bug 都从「哪张表填错」开始 | —— |
-
-**反模式**（这三个读法一定浪费时间）：
-
-1. 从 `start_kernel` 顺序往下读 —— 那是 2,978 个 `module_init` 的随机顺序，读完只记得一堆 `xxx_init`。
-2. 试图读完 `drivers/` —— 你的 `.config` 只会链接其中极小一部分。
-3. 相信静态调用图的「扇出 = 0」—— 见 §3.2，先看表。
-
----
-
-## 9. 局限与升级路径
-
-| 本报告缺的 | 怎么补上 | 代价 |
-|---|---|---|
-| 运行时行为验证 | `make defconfig && make -j$(nproc)` 出 `vmlinux`，再用 `perf`/`ftrace`/`bpftrace` 打点 | 首次编译 20–60 分钟、约 30G 磁盘 |
-| 并发正确性 | 静态代码 + lockdep 跑一遍（需启动内核） | 需 QEMU |
-| 具体 `.config` 下的真实代码量 | `make defconfig` 后看 `vmlinux` 的 `nm` 符号表 | 同上 |
-| 各子系统的内部架构 | 本报告只做了 5 条纵切，`bpf`/`cgroup`/`io_uring`/`netfilter` 各有独立设计 | 每个都值得一份报告 |
-
-**当前可升级的最小一步**：`make defconfig && make -j` 之后，本报告所有 `[static]` 都能升级成 `[verified]`——尤其是 §5.1 的十跳，可以用 `perf record -g` 或 `bpftrace -e 'kprobe:filemap_read'` 打出来对照。
-
----
-
-## 附：一页速查表
-
-```text
-read(2)        fs/read_write.c:723 → :554 → filemap.c:2783 → blk-core.c:952 → blk-mq.c:3108
-write(2)       fs/read_write.c:667（多 file_start_write）
-mmap(2)        mm/mmap.c:568 → mm/vma.c:2858 → 缺页 mm/memory.c:6651 → :6417 → :6335 → :5964
-send(2)        net/socket.c → tcp.c:1446 → dev.c:4841 → sch_generic.c:344 → ndo_start_xmit
-recv(2)        dev.c:8005 → :7810 → :6543 → :6061 → tcp.c:2932
-schedule()     kernel/sched/core.c:7362 → :7107 → :6241 → :5475
-初始化         init/main.c:1458（7 级 initcall 段）+ 2,978 个 module_init
-表             fs.h:1921(34) super_types.h:83(27) fs.h:401(19) mm.h:783(17) net.h:181(28) sched.h:2587(30)
-结构体         sched.h:826 mm_types.h:1160/920/80 fs.h:1255/762/472 dcache.h:93 skbuff.h:886 sock.h:365 netdevice.h:2155
-```
-
-**验收命令**（任取一条都能复现本报告的结论）：
+## 附录 A 复现命令（全部按本轮实际执行记录）
 
 ```bash
 cd /opt/linux/src/linux-7.2.12
-sed -n '554,590p' fs/read_write.c                  # §5.1 第 3-4 跳
-sed -n '1458,1462p' init/main.c                    # initcall 段遍历
-grep -rn --include=*.c "struct file_operations [a-zA-Z_]* = {" . | wc -l   # 1800
-grep -rn "^struct file_operations {" include/linux/fs.h                    # 表定义 1921
+
+# 规模
+find . -name '*.c' -o -name '*.h' | wc -l                       # 63833
+find . -name '*.[ch]' -print0 | xargs -0 cat | wc -l            # 37214144
+for d in drivers arch tools sound fs net lib kernel mm; do
+  printf '%-8s %s\n' $d $(find $d -name '*.c' | wc -l); done
+
+# 表的槽数（数 struct 体内的 "(*"）
+awk '/^struct file_operations \{/{f=1} f&&/\(\*/{c++} f&&/^\};/{print c; exit}' include/linux/fs.h
+#   file_operations 34  @ fs.h:1921
+#   super_operations 27 @ include/linux/fs/super_types.h:83
+#   address_space_operations 19 @ fs.h:401
+#   inode_operations 28 @ fs.h
+#   vm_operations_struct 17 @ mm.h:783
+#   proto_ops 28 @ net.h:181
+#   sched_class 30 @ kernel/sched/sched.h:2587
+
+# 填表者
+grep -rn --include=*.c -E 'struct file_operations [a-zA-Z_0-9]+ = \{' . | wc -l   # 1986
+grep -rnE '\.read_iter[[:space:]]*=' fs/ mm/ net/ | wc -l                        # 77
+
+# 关键行号
+# sched_class 实例：普通写法搜不到（exit 1），必须搜宏
+grep -rn 'DEFINE_SCHED_CLASS' kernel/sched/*.c   # dl/fair/idle/rt/stop 五个
+grep -nE '^(void|int|ssize_t) (submit_bio|blk_mq_submit_bio|__dev_queue_xmit|netif_receive_skb)\(' \
+     block/blk-core.c block/blk-mq.c net/core/dev.c
+grep -rny 'module_init(' --include=*.c . | wc -l  # 3261
 ```
 
----
+lens 侧：
 
-*报告生成：源码直读 + `lens` 索引（`project=linux_7212`）；全树 63,833 个 C 文件、3,721 万行；本文所有行号对 `linux-7.2.12`，换版本需重核。*
+```
+lens action=context  query=vfs_read                project=linux_7212
+lens action=context  query=handle_mm_fault         project=linux_7212
+lens action=context  query=filemap_fault           project=linux_7212
+lens action=context  query=submit_bio              project=linux_7212
+lens action=context  query=pick_next_task          project=linux_7212
+lens action=context  query=ext4_file_read_iter     project=linux_7212
+lens action=symbol   query=generic_file_read_iter  project=linux_7212
+lens action=dataflow query=vfs_read                project=linux_7212
+lens action=grep     pattern='\.read_iter\s*='  path=fs/  project=linux_7212
+```
+
+## 附录 B 名词对照
+
+| 名词 | 一句话 | 出处 |
+|---|---|---|
+| VFS | 文件系统门面，就是 6 张表 + `struct file/inode/dentry/address_space` | `fs/`、`include/linux/fs.h` |
+| folio | 多页为单位的内存对象，取代 `struct page` 做缓存基本单位 | `mm/` |
+| blk-mq | 多队列块层，`submit_bio` 之后的必经之路 | `block/blk-mq.c` |
+| ptype / `struct proto` | 收包分发链表 / socket 协议操作表 | `net/core/dev.c`、`include/net/sock.h` |
+| EEVDF | `fair_sched_class` 当前算法（取代 CFS 的 vruntime 规则） | `kernel/sched/fair.c` |
+| initcall 段 | 用段名排序的执行阶段，共 8 级 + sync 变体 | `include/linux/init.h:284–306` |
+| `static_call` | 把间接调用在引导期改写为直调，5.x 后的优化方向 | `include/linux/static_call.h` |
