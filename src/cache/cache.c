@@ -717,7 +717,16 @@ int cache_set(cache_t* cache, const char* key, const char* value, uint64_t ttl_m
     cache->memory_used += aligned_size;
     
     // 更新索引
-    cache_hash_insert(cache, offset, key, key_len);
+    // hash 插入失败（pool 分配不到 bucket 节点）时 entry 已经写进 pool：
+    // 留着它就是「数据在、查不到」，所以回滚成墓碑并归还统计。
+    if (cache_hash_insert(cache, offset, key, key_len) < 0) {
+        header->flags |= CACHE_ENTRY_DELETED;
+        cache->entry_count--;
+        cache->memory_used -= aligned_size;
+        cache->deleted_count++;
+        metric_timer_stop(&timer);
+        return CACHE_ERR_NOMEM;
+    }
     cache_sorted_insert(cache, offset);
     cache_ns_add(cache, key, offset);
     cache_tag_index_add(cache, offset, value, value_len);
@@ -855,7 +864,15 @@ int cache_batch_set(cache_t* cache, const cache_batch_item_t* items, size_t coun
     for (size_t i = 0; i < count; i++) {
         const char* key = items[i].key;
         size_t key_len = strlen(key);
-        cache_hash_insert(cache, offsets[i], key, key_len);
+        // 同 cache_set：hash 插入失败就把这条回滚成墓碑，否则数据在、查不到
+        if (cache_hash_insert(cache, offsets[i], key, key_len) < 0) {
+            cache_entry_header_t* h = (cache_entry_header_t*)CACHE_PTR(cache, offsets[i]);
+            h->flags |= CACHE_ENTRY_DELETED;
+            cache->entry_count--;
+            cache->deleted_count++;
+            cache->memory_used -= cache_entry_total_size(h);
+            continue;
+        }
         cache_ns_add(cache, key, offsets[i]);
         cache_tag_index_add(cache, offsets[i], items[i].value, strlen(items[i].value));
     }

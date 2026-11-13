@@ -109,6 +109,11 @@ int cache_hash_insert(cache_t* cache, size_t entry_offset, const char* key, size
         if (cache_hash_init(cache) < 0) return -1;
     }
     
+    // 先算 hash 再做扩容：hash_resize 会 pool_alloc → mremap 搬移整个映射，
+    // 而 key 可能就指在 pool 里（rebuild_hash_index_inplace 就是这么传的），
+    // 搬移后再读 key 等于读野指针 —— 会把条目挂到错误的桶，key 静默查不到。
+    uint64_t h = hash_fnv1a(key, key_len);
+
     // 检查负载因子
     if (cache->hash.size > 0 && cache->hash.size >= cache->hash.bucket_count * 3 / 4) {
         if (hash_resize(cache) < 0) {
@@ -116,7 +121,6 @@ int cache_hash_insert(cache_t* cache, size_t entry_offset, const char* key, size
         }
     }
     
-    uint64_t h = hash_fnv1a(key, key_len);
     size_t idx = h % cache->hash.bucket_count;
     size_t buckets_offset = cache->hash.buckets_offset;
 

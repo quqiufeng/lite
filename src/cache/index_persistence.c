@@ -313,7 +313,7 @@ int cache_index_save(cache_t* cache) {
         entry->data_offset = data_ptr - (char*)base;
         entry->data_size = hash_size;
         entry->entry_count = cache->hash.bucket_count;
-        entry->reserved = 0;
+        entry->reserved = (uint32_t)sizeof(cache_hash_bucket_t);  // 布局指纹，见 CACHE_INDEX_VERSION
         entry->reserved2 = 0;
         
         size_t written = write_hash_index(cache, data_ptr);
@@ -501,6 +501,39 @@ static int loaded_hash_heads_ok(cache_t* cache, const cache_hash_bucket_t* bucke
     return heads <= saved_size;
 }
 
+// fast_read 路径的抽样链校验：抽 2048 个桶，逐跳验「key 的 hash 确实落到这个桶」。
+//
+// 只验桶头是否落在 pool 内是不够的：桶结构/布局换过代时（例如旧版 32 字节
+// 桶结构落盘、现在读 16 字节），桶数与字节数依然自洽，桶头也都在 pool 里，
+// 但每条链都挂错了桶 —— 表现为「一半 key 查不到，sorted 却齐全」。抽样
+// 只碰 2048 条链（最坏 2048*64 次随机读），毫秒级，能拦住这类系统性错位。
+static int loaded_hash_sample_ok(cache_t* cache, const cache_hash_bucket_t* buckets,
+                                 size_t bucket_count) {
+    if (bucket_count == 0) return 1;
+    size_t samples = bucket_count < 2048 ? bucket_count : 2048;
+    size_t step = bucket_count / samples;
+    if (step == 0) step = 1;
+    size_t used = cache->pool.used;
+    for (size_t i = 0; i < bucket_count; i += step) {
+        size_t off = buckets[i].entry_offset;
+        size_t guard = 0;
+        while (off) {
+            if (off < CACHE_HEADER_SIZE || off + sizeof(cache_hash_bucket_t) > used) return 0;
+            if (++guard > 64) break;  // 长链只验前 64 跳，异常环交给全量校验
+            cache_hash_bucket_t* node = (cache_hash_bucket_t*)CACHE_PTR(cache, off);
+            size_t eoff = node->entry_offset;
+            if (eoff < CACHE_HEADER_SIZE || eoff + CACHE_ENTRY_HEADER_ALIGNED > used) return 0;
+            cache_entry_header_t* h = (cache_entry_header_t*)CACHE_PTR(cache, eoff);
+            if (h->key_len == 0 || h->key_len > CACHE_MAX_KEY_LEN ||
+                h->value_len > CACHE_MAX_VALUE_LEN) return 0;
+            const char* key = (const char*)CACHE_PTR(cache, eoff + sizeof(cache_entry_header_t));
+            if (cache_hash_fnv1a(key, h->key_len) % bucket_count != i) return 0;
+            off = node->next_offset;
+        }
+    }
+    return 1;
+}
+
 // 内存里（非落盘）的 hash 索引是否仍然可用：写盘前自检用
 static int cache_hash_readable(cache_t* cache) {
     if (cache->hash.bucket_count == 0) return 1;
@@ -658,13 +691,22 @@ int cache_index_load(cache_t* cache) {
                     size_t hash_size = *(size_t*)((char*)data + 8);
                     size_t buckets_data_size = bucket_count * sizeof(cache_hash_bucket_t);
 
-                    // 落盘内容必须先自洽：容量合法、字节数不超过本条索引的数据区，
-                    // 桶头偏移都落在 pool 内。快路径只验桶头（O(bucket_count) 顺序扫描），
-                    // 慢路径再全量验链（loaded_hash_valid）。
+                    // 落盘内容必须先自洽：桶结构布局指纹、容量、字节数不超过本条索引的
+                    // 数据区，桶头偏移都落在 pool 内。快路径在桶头扫描之外再抽样验链
+                    // （loaded_hash_sample_ok），慢路径全量验链（loaded_hash_valid）。
+                    if (entry->reserved != (uint32_t)sizeof(cache_hash_bucket_t)) {
+                        CACHE_LOG("[CACHE] hash index layout fingerprint %u != %zu, discarding\n",
+                                  entry->reserved, sizeof(cache_hash_bucket_t));
+                        munmap(base, file_size);
+                        discard_loaded_index(cache);
+                        return -1;
+                    }
                     if (bucket_count == 0 || buckets_data_size / sizeof(cache_hash_bucket_t) != bucket_count ||
                         buckets_data_size > entry->data_size - 16 ||
                         !loaded_hash_heads_ok(cache, (const cache_hash_bucket_t*)((char*)data + 16),
                                              bucket_count, hash_size) ||
+                        !loaded_hash_sample_ok(cache, (const cache_hash_bucket_t*)((char*)data + 16),
+                                              bucket_count) ||
                         (!fast_read &&
                          !loaded_hash_valid(cache, (const cache_hash_bucket_t*)((char*)data + 16),
                                             bucket_count, hash_size))) {

@@ -10,7 +10,10 @@ extern "C" {
 
 // Index file magic
 #define CACHE_INDEX_MAGIC     0x5849594D  // "MYIX" little-endian
-#define CACHE_INDEX_VERSION   1
+// v2: hash 条目的 reserved 存 sizeof(cache_hash_bucket_t) 作为布局指纹。
+// 旧实现曾用 32 字节的桶结构落盘（现在 16 字节），桶数/字节数仍然自洽，
+// 只有逐个验 key 的 hash 才能发现——曾经整份索引一半 key 静默不可达。
+#define CACHE_INDEX_VERSION   2
 
 // Index types
 #define INDEX_TYPE_HASH       1
