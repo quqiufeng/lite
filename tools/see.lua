@@ -138,10 +138,25 @@ else
     shot = path
 end
 
--- 缩放：2560 宽原图 token 太贵，默认缩到 1280
+-- 缩放：2560 宽原图 token 太贵，默认缩到 1280。
+-- 只缩不放：小窗口（760 宽）放大到 1280 既糊又费 token，原样读更清楚。
 local width = tonumber(opt.width) or 1280
 local t = Tools.new({ cwd = cwd })
 local resized = shot
+local function png_width(p)
+    local f = io.open(p, "rb")
+    if not f then return nil end
+    local hdr = f:read(24)
+    f:close()
+    if not hdr or #hdr < 24 or hdr:sub(2, 4) ~= "PNG" then return nil end
+    local b1, b2, b3, b4 = hdr:byte(17, 20)
+    return ((b1 * 256 + b2) * 256 + b3) * 256 + b4
+end
+local orig_w = png_width(shot)
+if width > 0 and orig_w and orig_w <= width then
+    io.stderr:write(string.format("resize skipped: 原图 %dpx <= %dpx，不放大\n", orig_w, width))
+    width = 0
+end
 if width > 0 then
     local base = shot:match("([^/]+)%.png$") or "screen"
     local out = out_dir() .. "/" .. base .. "-" .. width .. ".png"
