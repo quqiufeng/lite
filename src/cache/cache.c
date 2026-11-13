@@ -751,6 +751,14 @@ int cache_set(cache_t* cache, const char* key, const char* value, uint64_t ttl_m
 
 // 批量设置（性能优化：先批量写入 pool，最后统一排序数组 qsort）
 // 如果内存不足，会尝试 LRU 淘汰或回退到逐条 cache_set
+//
+// 语义与 cache_set 对齐（**别只调 cache_hash_insert**）：key 已存在时先把旧 entry
+// 标墓碑并从 hash/sorted/ns/tag/vector/hot 各索引里摘掉，再挂新条目；批内同 key
+// 重复也一样按出现顺序后写覆盖先写。漏了这段用户看不见错但库会烂：旧副本既没
+// DELETED 也没减 entry_count，cache_compact 认它活着回收不到，KV 文件按导入轮次
+// 线性翻倍（复现：同 key 3 轮 batch_set，count 2→4→6、reopen pool_used 1216→5568）。
+// 另注意 cache_compact 的返回值是「记账里还留着的死条目数」而非回收字节，墓碑在
+// 标记时就扣了 entry_count，所以正常压缩完照样可能回 0，不代表没压。
 int cache_batch_set(cache_t* cache, const cache_batch_item_t* items, size_t count) {
     if (!cache || !items || count == 0) return CACHE_ERR_INVAL;
     
