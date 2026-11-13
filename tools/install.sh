@@ -31,9 +31,22 @@ else
     "$ROOT/tools/package.sh"
 fi
 
+# $APP 既是安装目录，也是数据目录（sessions/ 会话镜像、codesearch/ 索引、老版本
+# memdb/）。直接 rm -rf 会连用户数据一起删：跑一次 release 就丢全部 codesearch
+# 索引和会话备份（2026-11-13 实测，dfproj 索引 + sessions/*.jsonl 一次 rm 全没）。
+# 所以先把数据目录挪到临时区，装完再挪回来；KEEP 只列**数据**，装进去的东西照旧全删。
+KEEP="sessions codesearch memdb"
+STASH="$(mktemp -d)"
+for d in $KEEP; do
+    [ -e "$APP/$d" ] && mv "$APP/$d" "$STASH/$d"
+done
 rm -rf "$APP"
 mkdir -p "$APP" "$BIN"
 cp -rL "$DIST/." "$APP/"
+for d in $KEEP; do
+    [ -e "$STASH/$d" ] && mv "$STASH/$d" "$APP/$d"
+done
+rmdir "$STASH"
 # 源码树安装时默认把 lua/ 做成软链：改 Lua 后重启即生效，不再出现
 # “源码改了但 /usr/local 还是旧副本”。dist 独立部署仍保持实体拷贝。
 if [ "${LITE_INSTALL_LINK_LUA:-0}" = "1" ] && [ "$ROOT" != "$APP" ] && [ -d "$ROOT/lua" ]; then
