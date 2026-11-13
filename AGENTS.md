@@ -1,535 +1,216 @@
 # AGENTS.md — lite
 
-AI-native harness：记忆、工具、FFI、X11。
+**lite = 会改自己的 agent 外壳**：`lua/` 提供循环/工具/记忆/TUI/serve，机器提供 shell/编译器/`.so`/X11。
+本文件只写「每次都要遵守的规则和入口」；设计原理见 `design.md`，专题见各自 README。
+**本文件必须 ≤16000 字节**——超了会被 `prompt.project_context` 截断（`DEFAULT_PROJECT_CHARS`），新增内容先想
+「能不能挪进 README/代码头注释」。
 
-## 0 我是谁
-
-| 层 | 内容 |
+| 层 | 你怎么用 |
 |---|---|
-| 模型 | DeepSeek（多模态，可读图） |
-| harness | `lua/`：循环、工具、记忆、TUI/serve、compact |
-| 机器 | `bash` 直达 shell、编译器、系统 `.so`、X11、GPU |
+| 模型 | DeepSeek，多模态（图可读） |
+| harness | `lua/core`（循环/工具/记忆/prompt/session/compact）、`lua/tui`（自绘屏）、`lua/ffi` |
+| 机器 | `bash` 直达 shell、`web` 取 live 数据、编译器、系统 `.so`、X11/GPU |
 
-**能力 = `bash`/`web` + 编译器 + FFI + `native`**；内置工具只是快捷键。
-- `web`：内置 libcurl GET，只取 live data，不翻仓库。
-同目录只允许一个写实例（`mem.lock`）；上下文有界，旧内容靠 `recall`。
+**能力 = `bash`/`web` + 编译器 + FFI + `native`**，内置工具只是常用快捷键，不是上限。
+上下文有界（旧内容靠 `recall`）；同目录只允许一个写实例（`mem.lock`）。
+原则：**缺能力先造，别降级**；**代码是唯一真相**，注解落后顺手修。
 
 ## 1 看见自己
 
-先定位窗口再截图，不要直接截全屏（可能截到遮挡窗口）。
+先定位窗口再截图，别直接截全屏（会截到遮挡窗口）。
 
 ```bash
-./tools/lite-lua tools/see.lua --list
-./tools/lite-lua tools/see.lua --class wechat --width 1280
+./tools/lite-lua tools/see.lua --list                        # 列可截窗口
+./tools/lite-lua tools/see.lua --class wechat --width 1280   # 出图片路径，再 read
+./tools/run.sh --tui --snapshot out.txt                      # 文本快照验收 TUI
+./tools/run.sh state --json                                  # 进程/锁/用量
 ```
 
-输出图片路径后 `read`；`--tui --snapshot FILE` 是文本快照；`state/sessions --json` 查状态。
+**自造 GUI 的验收环**：编译 → 起进程 → `see.lua --pid $PID`（重名别靠 `--name`）→ `read` 图 →
+`Xdo:click(win,x,y,btn)`（`lua/ffi/xdo.lua`，窗口内坐标；xdotool 仍禁）→ 再截再断言。
+断言优先截图 diff；OCR 认不了窄数字，要认就零填充 `%02d`。`--width` 只缩不放。
 
 ## 2 代码地图
 
-- `lua/main.lua`：入口；`lua/core/`：agent/tools/memory/prompt/session/compact（含 web）/reboot/serve_watch（去抖探活）
-- `lua/tui/`、`lua/ffi/`、`src/{cache,image,x11,codesearch}/`、`helper/`、`tools/`
-- `src/codesearch/`：从 `/opt/my_db` 全量迁移的代码索引/调用图/数据流/向量检索；
-  `api.c` 是 JSON-in/JSON-out 公共入口，其余 `.c` 来自原 CLI（main 改名、日志走 stderr）。
-  `lua/ffi/codesearch.lua` 包 FFI，工具入口 `helper/lens.lua` 做 action 编排；
-  `locate`（语义/符号查询 + 内联源码窗口，默认起手式）/`peek`（file:line 读窗口）/
-  `grep`（作用域 cgrep，>3000 文件的目录直接拒扫）是「搜→读」组合三连，
-  写法纪律见 `src/codesearch/code_search_best_practices.md`。`action` 可省：
-  给了 `pattern`→`grep`、`query`→`locate`、只给 `path`→`peek`、都没有→`status`。
-  `action=dataflow`（`lite_cs_dataflow_query`）走 import 写的 `dataflow/funcs/<func>`
-  与 `dataflow/vars/<var>` 两条键，`cache_get` 直取，不读几百 MB 的 `dataflow.json`
-  / `_func_index`；旧 KV 没这两类键，要重跑一次 `import`。
-  调用边带间接标注：调用点是 `obj->fn()` / `obj.fn()`（Lua 的 `M.fn()` 同理）时
-  `call_graph.json` 里多 `"indirect":true` + `"via":"<接收者>"`，import 透传到
-  `callers/`、`callees/` 的 site，query 显示成 `name[via obj]`。边**仍然**按裸名解析
-  （没有类型信息），标注只表示「这条边可能混了同名直接调用」，旧 KV 无此字段 = 直接调用。
-  **lite 仓库自身不做索引**（`~/.local/share/lite/codesearch/` 下不保留 `lite` 那一份）：
-  自己改自己就 `read`/`cgrep`/`edit`，语义检索丢给 `cgrep` + 代码地图，别为查自己跑
-  `lens build`（几十分钟换不到有用信息，还占几百 M）。`lens` 只服务于**外部**项目。
-- `lua/ffi/libfind.lua`：`liblite_*.so` 的**唯一**解析顺序，
-  `$LITE_ROOT/build/` → `$LITE_ROOT/lib/` → 模块所在树 → `./build|lib` → 裸名；
-  cache/codesearch/image 都走它（只有 `x11.lua` 因自包含约束内联同样的顺序）。
-  命中后若另一份候选长度不同就往 stderr 打一行警告——「只 `build.sh` 没 `release.sh`」
-  的新旧混编由此暴露，别再各自维护候选表。
-- `lua/ffi/x11.lua` + `xdo.lua`：**自包含单文件**（只用 LuaJIT `ffi` + 系统 libX11/libxdo，不引用 lite 代码、不注册工具），可整对拷给别的项目；`x11.lua` 靠 `require("ffi.xdo")` 找同伴，换布局要同步改这一行
-- `lua/tui/mouse.lua` + `clipboard.lua`：拖选/剪贴板；选区在 `screen.lua`
-- `lua/trace/`：动态追踪（纯 LuaJIT，零 perf/bcc）：`engine.lua` 走 perf_event_open + tracefs
-  探针（count/samples/latency/folded/oncpu/offcpu），`render.lua` 出 flame/heat/rank SVG，
-  `svgpng.lua` 用 cairo+librsvg 转 PNG，`summary.lua` 出人读摘要；工具入口是
-  `helper/trace.lua`（action=run/render/status，非 root 自动 `sudo -n`，要密码就报错不弹 tty）。
-  纪律与权限自查见 `lua/trace/README.md`，先 `action=status` 再 `count` 验探针，别拿 count 当采样。
+| 位置 | 内容 |
+|---|---|
+| `lua/main.lua`、`lua/core/` | 入口；agent 循环、工具派发、记忆、prompt、session、compact、web、serve |
+| `lua/tui/`、`lua/gui/`、`lua/charts/`、`lua/trace/` | 终端界面、SDL2 GUI、SVG 图表卡、纯 LuaJIT 动态追踪 |
+| `lua/ffi/` | C 库绑定；`libfind.lua` 是 `liblite_*.so` 唯一解析点（见下） |
+| `src/` | `cache` `codesearch` `html` `image` `storage` `utils` `x11`：重活实现 |
+| `helper/` | 模型自造插件（`.lua` + `native` 编的 `.so`），发现只认这里 |
+| `tools/` | 人的脚本：build/test/run/release/package/cluster/see/lua.sh…（**不当插件加载**） |
+| `templates/` | 体系出口：规范 + 可跑骨架；`tools/newproject.sh` 起项目 |
+| `helper/lib/` | 插件共享模块（`adb/music/usb/uimap/deepseek/webdav/md4c/htmlmd`），不是插件 |
+
+`lua/ffi/x11.lua`+`xdo.lua` 是**自包含单文件**（只用 FFI + 系统 libX11/libxdo），可整对拷走。
 
 ## 3 记忆
 
-每个目录一份 `mem.bin` + `mem.idx`；删掉=清空该目录记忆。但 `mem.bin` 是二进制，
-坏了/被截断会被 `cache_open` 改名成 `mem.bin.corrupt-<ts>` 后重建空库，所以另有一份
-**JSONL 镜像**（`~/.local/share/lite/sessions/<id>.jsonl`，逐行追加的纯文本）：
-`Session.from_memory` 只在 KV 一条会话都没有时才拿它兜底（`lua/core/session.lua` 第 3 步），
-按 `<cwd>` 段精确匹配本目录的最近一条，消息回写进 KV（下一条 `append` 接着原 seq 写）。
-KV 里只要还有任意会话就不读 JSONL，正常路径仍然「记忆跟着目录走」。
-**真要清空**：`rm mem.bin mem.idx` + 删掉 `sessions/<id>.jsonl`，否则下次启动还会从那唯一
-一条备份里捞回来（打印 `recovered from JSONL backup`）。JSONL 受 `RAW_KEEP` 裁剪，
-只有 user 原文 + 最近 200 条，是备份不是完整历史。
+记忆跟着目录走：每目录一份 `mem.bin`+`mem.idx`。键：`/agent/knowledge/*`（长期事实）、
+`/agent/session/<id>/*`（消息/摘要/todo）、`/agent/working/*`（运行态，不注入 prompt）。JSONL 镜像
+（`~/.local/share/lite/sessions/<id>.jsonl`）只在 KV 无会话时兜底。**真要清空**：
+`rm mem.bin mem.idx` + 删对应 `.jsonl`，否则下次启动会从备份捞回来。
 
-- `/agent/knowledge/*`：长期事实；`/agent/session/<id>/*`：消息/摘要/工作态/todo
-- `/agent/working/*`：wake 等运行态，不注入 prompt
+- **自动注入**：每个用户轮首次请求注入一次，作为末尾 system 的 `<retrieved_memory>`（≤8 条/2400 字），
+  查询是最近 user 文本前 600 字；工具循环的后续请求不再注入（保前缀缓存）。
+- **召回是字面匹配、无向量**：白名单 `knowledge/`(1.0) > `working/`(0.9) > user 原文(0.8) > `turn/` 摘要(0.6)。
+  换个说法可能一条不中，且它失败了你不知道。
+- **主动 `recall`**：hard_window 丢了且需要那段；用户说「上次/之前」而窗口里没有；动手前核对旧结论。显式 recall
+  额外捞 `msg/` 里的 assistant/tool 原文（截 1200 字、≤3 条），被丢掉的长 tool 结果靠它找回。
+- **`remember` 判据**：跨会话仍成立 + 重踩成本 > 记录成本。存「`excludes` 不持久化」这类坑，不存行号。
+- **单写者**：抢不到 `mem.lock` 时 `--tui/--once/serve` 报「被 pid N (comm) 占着」并以**退出码 3** 拒绝启动；
+  明知不落盘就 `--readonly`/`LITE_ALLOW_READONLY=1`（状态栏 `mem:N RO!`），只读实例不持 fd。
+- 截断：tool 结果 `LITE_TOOL_RESULT_CHARS`（8192），非 user 原文留 `LITE_SESSION_RAW_KEEP`（200）条。
 
-最近 `LITE_SESSION_RAW_KEEP`（默认 200）条非 user 原文 + user 永久；tool 结果入库截到
-`LITE_TOOL_RESULT_CHARS`（默认 8192），旧内容靠 turn 摘要/`recall`。写实例持 `mem.lock`。
-抢不到锁**不再静默降级**：`--tui` / `--once` / `serve` 直接报「被 pid N (comm) 占着」并以退出码 3
-拒绝启动（旧版只打一行 stderr 就照跑，整轮对话不落盘，下次启动才发现历史缺一段）。
-明知不落盘也照跑就 `--readonly` 或 `LITE_ALLOW_READONLY=1`，状态栏会显示 `mem:N RO!`；
-`lite state` 多一行 `memory lock`（free / busy + 占锁进程），JSON 里是 `memory_lock`。
-只读实例（快照/导出/state）不持 fd，`probe_lock` 才能探出锁到底空没空。
-
-**取**（下面这些在代码里，别靠猜）：
-
-- 自动注入：每个用户轮**首次请求**注入一次（`lua/core/agent.lua:568`），工具循环的后续
-  请求不注入（模型已看过，重复注入破坏前缀缓存）。查询 = 最新 user 文本；不足 80 字接上
-  一条 user 的前 200 字，总截 600（`prompt.recall_query`）。上限 8 条 / 2400 字，作为
-  **末尾**一条 `system` 的 `<retrieved_memory>` 块。
-- 白名单 + 权重（`memory.lua:recall`）：只收 `/agent/knowledge/`(1.0)、会话 `working/`
-  (0.9)、`msg/` 里的 user 原文(0.8)、`turn/` 摘要(0.6)；`/agent/working` 永不注入。
-  `hits>0` 才留，按 IDF + 长度惩罚 + 30 天半衰打分，最多 2 条 turn / 4 条 user。
-  显式 `recall`（`transcript=true`）额外收 `msg/` 里的 assistant/tool 原文（kind `trunc`，
-  权重 0.35，单条截 1200 字、3 条封顶）——`hard_window` 丢掉的 tool 结果因此还能捞回来；
-  自动注入路径不传 `transcript`，每轮 prompt 里仍然只有 user 原话。
-- 主动 `recall`：看到 `hard_window` 的丢弃提示且需要那段；用户提"上次/之前"而窗口里
-  没有；动手前核对旧结论。**字面匹配、无向量**，换个说法可能一条不中，且召回失败模型
-  自己看不见（`stats()` 不进 prompt）。
-- `remember` 判据：跨会话仍成立 + 重踩成本 > 记录成本。存"`excludes` 不持久化"这类坑，
-  不存"某文件在第几行"。
-
-system prompt 必须**字节稳定**（时钟/轮次/预算都追加在消息末尾的同一个尾部块，走
-`prompt.runtime_block` / `prompt.budget_block`），否则前缀缓存全丢。工具**名字**也不在
-system 里（helper 增删插件会把它整段打散）：名字由 `runtime_block` 在每个用户轮的第一次
-请求播报（`tools=inject and schemas()`），schema 一律以 API `tools` 字段为准。
-前缀 reset 按原因分账（`context:note_cache_reset`）：`fold`/`hard_window`/`window`，
-计数落 `/agent/session/<id>/usage`，`lite state` 的 `usage … resets fold=… hard_window=…
-window=…` 一行就能看出命中率抖动是谁干的。没拿到真 usage 的请求（provider 的
-`estimated` 兜底）只计 requests/prompt/completion，不进 cache 两栏、单记 `usage_unknown`，
-否则网关不返 usage 时命中率会被凭空压成 0%。会话结束 `session_end` 把"反复失败未恢复"
-（同 tool+args 失败 ≥2 次）写成 `fail/<ts>` 事实。
+**system prompt 必须字节稳定**：时钟/轮次/预算都在消息末尾的 `runtime_block`，工具**名字**也在那里
+（helper 增删会打散清单），schema 以 API `tools` 为准。前缀 reset 按 `fold`/`hard_window`/`window` 记账
+（落 `/agent/session/<id>/usage`）。会话结束把「同 tool+args 失败 ≥2 次」写成 `fail/<ts>`。
 
 ## 4 铁律
 
-MUST：改代码后 `./tools/test.sh` 通过；依赖变更同步 `tools/check_deps.sh` 和本文件；
-C ABI/FFI 同步 `lua/ffi/*` 与文档；UI 用 `tmux capture-pane` 或 `--tui --snapshot` 验收；
-引用写 `file:symbol`，结论标 `[static]` / `[verified]`；commit 用
-`feat/fix/style/docs/chore(scope): ...`，只在用户明确要求时 commit/push。
+MUST：改代码后 `./tools/test.sh` 通过；依赖变更同步 `tools/check_deps.sh` 与本文件；C ABI/FFI 同步
+`lua/ffi/*`；UI 用 `tmux capture-pane` 或 `--tui --snapshot` 验收；引用写 `file:symbol`，结论标
+`[static]`/`[verified]`；commit 用 `feat/fix/style/docs/chore(scope): …`，**只在用户明确要求时** commit/push。
 
-MUST NOT：不用 `python`/`sed -i` 改仓库文件（用 `edit`/`write`）；不用
-Chrome/WebView/CEF/Electron；不起 `xdotool/wmctrl/import`；不用 `systemd --user`；
-不用 `pkill -f`；不把 API Key 或 `$ROOT/lib` 写进仓库/`LD_LIBRARY_PATH`。
+MUST NOT：`python`/`sed -i` 改仓库文件（用 `edit`/`write`）；Chrome/WebView/CEF/Electron；起
+`xdotool/wmctrl/import`；`systemd --user`；`pkill -f`；把 API Key 或 `$ROOT/lib` 写进仓库或 `LD_LIBRARY_PATH`。
 
-**密钥规范**：密钥只活在环境变量里。人写 `~/.config/lite/.env`、通用的 `~/.env` 或
-workspace `.env`（优先级 cwd/上级 → `~/.config/lite/.env` → `~/.env` → `$LITE_ROOT`，
-`$LITE_ENV_FILE` 一给就独占），`tools/lua.sh` / `run.sh` 启动时注入进程环境，脚本和插件一律 `os.getenv` 读；
-`sudo` 下 HOME 变 `/root` 且 env_reset 清环境，靠 `SUDO_USER` 补读
-`$LITE_HOME_ROOT`（默认 `/home`）`/<user>/.config/lite/.env` 与 `/<user>/.env`；
-仓库文件里不出现字面量 key、不 `print` key、不把 key 拼进命令行参数（`ps` 可见）。
-`tools/auto_unit.lua` 里有一条机械检查扫 `helper/` + `lua/` 的 `sk-` 字面量，
-占位符（`sk-test`、`sk-...`）放过。
+**密钥只活在环境变量里**：读 `os.getenv`，缺 key 时报变量名和该写进 `~/.config/lite/.env`。`run.sh`/`lua.sh`
+启动时按 cwd 向上 → `~/.config/lite/.env` → `~/.env` → `$LITE_ROOT` 注入（`$LITE_ENV_FILE` 独占），
+`sudo` 下靠 `SUDO_USER` 补读原用户 `.env`。不 print key、不拼进命令行（`ps` 可见）、仓库里无 `sk-` 字面量。
 
 ## 5 命令
 
 ```bash
-./tools/build.sh
-./tools/test.sh
-./tools/run.sh                 # TUI；另见 --once/--recall/state/sessions/serve/attach
-./tools/run.sh --once --json "prompt"
-./tools/run.sh --memory-export kb.jsonl [--all] [--prefix P]   # 记忆 → JSONL（- 或省略=stdout）
-./tools/run.sh --memory-import kb.jsonl [--dry-run]            # JSONL → 当前目录 mem.bin
-./tools/run.sh --memdb                                         # 共享记忆库：文件/条数/每个 agent 写了多少
-./tools/run.sh --memdb-search "关键词"                          # 搜共享库（别人的记忆也在里面）
-./tools/run.sh plugins [--json]   # helper/ 插件清单 + 加载错误（只读快照）
-./tools/run.sh --tui --snapshot out.txt
-./tools/run.sh --gui           # 自绘 GUI（SDL2+SDL2_ttf，见 lua/gui/，可选依赖）
-./tools/release.sh             # build + package + install；源码安装软链 lua/
-
-./tools/cluster.sh [--dry-run] [--jobs N] [--out DIR] tasks.tsv  # 并行派活（ssh + --once --json）
+./tools/build.sh        # 编 C（src/**）
+./tools/test.sh         # 全量回归
+./tools/release.sh      # build + package + install（跑安装版必须它，见 §6）
+./tools/run.sh          # TUI：--once/--tui/--readonly/--gui/state/sessions/serve/attach
+./tools/run.sh --once --json "prompt"                          # 单轮（脚本/集群用）
+./tools/run.sh --memory-export|import kb.jsonl [--all] [--prefix P]  # 记忆 ⇄ JSONL（省略路径=stdout）
+./tools/run.sh --memdb[-search "词"]                                # 共享记忆库统计 / 检索
+./tools/run.sh plugins [--json]                                # 插件清单 + 加载错误
+./tools/cluster.sh [--dry-run] [--jobs N] tasks.tsv            # 并行派活
 ```
 
-**`tools/cluster.sh`：集群 = 槽 = 目录**。因为 `mem.lock` 只允许同目录一个写实例，
-并发度 = 机器数 × 每台目录数，不是进程数。`tasks.tsv` 一行一槽：
-`<box>\t<dir>\t<prompt>[\t<task>]`，`box` 为 ssh 目标，`local`/`-` 表示本机跑（本机多槽并行也用它）。
-`prompt` 走 base64 过 ssh（避开引号），`~/x` 留给远端 `$HOME` 展开；每个任务落
-`out/<task>.{jsonl,rc,sec,err}`，退出码 0=全 ok、1=有任务失败（rc≠0 或 JSONL 里没有
-`done ok:true`）、2=用法错误。汇总表从 JSONL 里取最后一条 `assistant` + `tool_start` 计数，
-所以「谁交付了什么」直接看表，不用翻文件。任务身份只到 `task` 名这一层，
-真正的任务编号写进 prompt 或 task 名里。
+- **`cluster.sh`：集群 = 槽 = 目录**（`mem.lock` 定并发上限）。`tasks.tsv` 一行一槽
+  `<box>\t<dir>\t<prompt>[\t<task>]`，`local`/`-` 跑本机，prompt 走 base64 过 ssh；产物落
+  `out/<task>.{jsonl,rc,sec,err}`；退出码 0 全 ok、1 有任务失败、2 用法错误。
+- **TUI 两个 `#` 开关**（`submit()` 先拦，不进模型）：`#语音模式`；`#监工模式`/`#终止监工` 每
+  `LITE_WATCHDOG_SEC`（180s）在**空闲+队列空+输入框空**时补发 `LITE_WATCHDOG_TEXT`（默认「继续」），
+  状态落 `/agent/session/<sid>/watchdog`，reboot 自动接上。
+- **HTML→PNG 三件套**走 `build/liblite_html.so`，与 `liblitehtml.so.0`/`libgumbo.so.0` 同目录靠 `$ORIGIN`：
+  源码树要 `/opt/litehtml` 才能**编**，安装版不必也能**跑**；缺库别误读成「liblite_html 没编译」。
+- 工具输出 ≤32KB；`read` 文本限 workspace，图片可读 `$TMPDIR:/tmp:/var/tmp`，多文件用 `paths` 批量读；
+  `bash` 可异步长跑，TUI `Ctrl+C` 取消。回归测试先 commit 出 FAIL 再修。
+- 工具失败要**可自修**：报错带原参数 + 缺的 `required` 键 + 退出码语义（`tools.exit_note`：124 超时/
+  126 不可执行/127 未找到）；同一调用连续失败第 2 次起追加 `[this exact call has now failed N times]`。
+  `finish_reason: length` = 撞 `LITE_MAX_OUTPUT_TOKENS`，**参数被截断不是写错 JSON**：拆小（长文档用 `write`
+  的 `append=true`），别原样重试。
 
-**TUI 斜杠外的两个 `#` 开关**（`submit()` 里先拦，不进模型）：
+## 6 扩展：两条通道
 
-- `#语音模式` / `#退出`：语音转文字，见 `core/voice.lua:command`；
-- `#监工模式` / `#终止监工`（`#关闭监工`、`#退出监工` 同义，见 `watchdog.OFF_WORDS`）：每 `LITE_WATCHDOG_SEC`（默认 180s）自动发一句
-  `LITE_WATCHDOG_TEXT`（默认「继续」），状态栏显 `watch:Ns`。只在**空闲 + 队列空 +
-  输入框空**时发，忙时 deadline 滑窗后推（收工后再等满一个周期），不抢用户的半句话。
-  开关状态落 mem：`/agent/session/<sid>/watchdog`（`TTL.long`，与 todos 同一条旁路键，
-  **不放 `working/`**那里在召回白名单里）→ `reboot` / 切回该会话时自动接上，恢复后重起
-  一个完整周期；新会话无快照即关闭态。逻辑与单测见 `lua/tui/watchdog.lua`
-  （`state`/`restore`）、`lua/tui/loop.lua:watchdog_save`、`tools/auto_unit.lua:tui watchdog`。
-
-**HTML→PNG 三件套随包**：`md2png`/`web2png`/`trending` 都走 `build/liblite_html.so`，
-它 NEEDED `liblitehtml.so.0` + `libgumbo.so.0`，三者摆**同一目录**靠 `$ORIGIN` 自解析
-（`CMakeLists.txt` 的 lite_html 段已把 gumbo 升成直接 NEEDED）。`tools/package.sh` 会
-`ldd` 出解析路径落在 `$LITEHTML_PREFIX`（默认 `/opt/litehtml`）下的库一起打进 dist 与
-安装目录，**系统库（cairo/fontconfig/X11/freetype）一律用目标机自己那份**——fontconfig
-依赖 `/etc/fonts` 和系统字体目录，随包只会更难排查。所以：源码树要 `/opt/litehtml` 才能
-**编**，安装版不需要它也能**跑**；`./tools/check_deps.sh` 分「能不能跑」（看
-`build/` 三件套全不全）与「能不能编」两行报。缺件时的报错由 `helper/md2png.lua` 给出
-（源码树 `build.sh` / 安装版 `release.sh`），别把 `libgumbo.so.0: cannot open shared object`
-误读成「liblite_html 没编译」。
-
-`src/html/prepass.{h,cpp}` 是进 litehtml **之前**的 CSS 改写层（litehtml 无元素钩子，
-`opacity`/`box-shadow`/`transform:translate` 它全不认）：把这三样烧进 HTML（opacity→
-预混 rgba 前景、translate→给元素加 margin、shadow→记进 `shadow_spec` 由
-`render.cpp:paint_shadow` 按 erfc 模糊剖面画环）。改 `paint_shadow` 的坑：采样区间要往
-「平移量 + 3σ」内延伸、挖洞只挖元素自身盒子，否则 offset 阴影与卡片之间留一条背景色亮缝；
-`tools/auto_unit.lua` 的 `html prepass` 段逐像素验这三项。
-仍不支持：`grid`（上游无布局）、`transform: rotate/scale/matrix`、`background-image`。
-
-工具输出 ≤ 32KB；`read` 文本/目录限 workspace，图片可读 `$TMPDIR:/tmp:/var/tmp`；
-`bash` 可异步长跑，TUI 里 `Ctrl+C` 取消。回归测试先在修复前 commit 确认 FAIL。
-
-工具失败要**可自修**：报错带原参数 + `required` 键 + 退出码语义（`tools.exit_note`：
-124 超时 / 126 不可执行 / 127 未找到），同一调用连续失败第 2 次起追加
-`[this exact call has now failed N times]`，成功时清账。工具参数 JSON 非法时先看报错里的
-`finish_reason`：`length` = 输出撞了 `LITE_MAX_OUTPUT_TOKENS`，参数被截断，**不是模型写错
-JSON**——把那次调用拆小（长文档用 `write` 的 `append=true` 分段落盘），别原样重试。
-多文件只读用 `read` 的 `paths` 数组批量读（N 个文件 1 次往返），图片一次一张。
-
-## 6 原生扩展
-
-**两条通道，别混**：`tools/` 是**人设计实现的专业插件**——提前写、要过 `tools/test.sh`、
-进版本控制、接口稳定、必须有文档；`helper/` 是**大模型自己发挥的**——会话里临时起意就写，
-允许粗糙、允许下次删掉，按名即调、不承诺稳定，只受 `sk-` 字面量机械检查约束。
-判据：这东西「下个会话/下个用户也该有」→ 升级进 `tools/` 并补测试与文档；只有当前任务
-有价值 → 留在 `helper/` 用完即弃。
-
-**`tools/` 同样能进化**，不是人写死的封地：会话里发现某个已存在的 `tools/` 脚本/插件不够用，
-就改它、重编、测过、写进文档——只是纪律更严（`tools/test.sh` 必须过、接口要稳、要更新
-`AGENTS.md` 对应表格）。差别只在**代价与责任**，不在能不能改。
-
-注意发现机制：插件只扫 `<cwd>/helper` → `$LITE_ROOT/helper`（`lua/core/tools.lua:_helper_roots`），
-**`tools/` 里的 `.lua` 不会被当插件加载**（那是 build/test/run/release 这类仓库脚本）。
-现有 adb/wechat/music/search/fetch/tokens/uimap/usb/cgrep/lens/md2png/pdftext/trending/trace/web2png/charts
-住 `helper/`，因为发现只认那里；重活（codesearch、trace、charts）的实现在 `lua/` + `src/`，插件只做编排。
-`charts` 是 SVG 图表卡（`lua/charts/`：`pen` 手绘抖动笔 / `kit` 取数与结巴防重叠 /
-`types/*` 54 种图），出图给 `read` 看，不截图。
-
-**改过 C/C++ 就必须重编，然后 `/reboot` 才算测得上**（硬规矩，适用于 `tools/` 与 `helper/`
-两条通道）。`reboot` 只重启进程、**不编译**；Lua 侧 `ffi.load` 的 `build/liblite_*.so` 是进程内
-一次性句柄，同路径换不掉，中间态永远是旧代码。所以顺序是：
-
-| 步 | 动作 |
-|---|---|
-| 1 | 仓库 C/C++（`src/**`、`include/**`）→ `./tools/build.sh`（或 `cmake --build build --target <t> -j`） |
-| 1b | **跑的是安装版就走 `./tools/release.sh`**（= build + package + install）。`lua/` 是软链回仓库、改了立刻生效，`build/liblite_*.so` 却是 `install` 时的实体拷贝：只 `build.sh` 的话仓库 `.so` 变新、`/usr/local/share/lite/build` 还是旧的，reboot 起来仍是旧 C 代码。对不上就 `ls -l build/liblite_*.so /usr/local/share/lite/build/` 比大小/mtime |
-| 2 | `helper/<x>.c` → `native build name=x`（每次出新 `<name>-<ts>.so` + 清单，免重启即生效） |
-| 3 | 先用**进程外** `./tools/lite-lua -e ...` / `native action=run` 验行为，别在主进程里猜 |
-| 4 | `/reboot` —— 让新 `.so` 与插件 schema 进清单，主进程换成新代码 |
-| 5 | 重启后跑真实用例 + `./tools/test.sh`；ABI 变了没改 `lua/ffi/*.lua` 的 cdef 会在这里炸 |
-
-**别跳步**：只改 C 不重编就 reboot（看到的是旧行为）、用 `native build` 冒充 `./tools/build.sh`
-（产物不同，`build/liblite_*.so` 还是旧的）、或者改完 C 直接 `shutdown` 收工（下个会话才踩）。
-
-**C/ABI 的硬验证放远程实例**（见 `design.md:D10`）：本机进程内 `ffi.load` 过的同路径 `.so`
-换不掉，验失败还会污染主工作区与主会话记忆。所以「编译 → 验 → 重启」这套搬到另一台机器上的
-实例里做：slave 上 `./tools/build.sh && ./tools/test.sh` 过了才 commit，master `git pull` 后
-重编、`reboot` 生效。本机只做小改与文本级验证，不为了试错在主工作区反复编译半成品。
-
-**缺能力先造，别降级**（自我进化流程）。碰到「这个命令没装 / 这个库没有 / 内置工具缺这个
-动作」时，不许手工硬凑、更不许直接回「做不到」——按下表走一遍。整条链**会话内**可用，
-不需要重启：
-
-| 步 | 动作 | 怎么落 |
+| 通道 | 谁写 | 纪律 |
 |---|---|---|
-| 1 判 | 内置工具能覆盖？系统已有 `.so` 能 `ffi.load`？`helper/` 里已经有？（`lite plugins` / `ldconfig -p \| grep`） | 三者都不行才造 |
-| 2 估 | 只跑一次的用 `lua` 内联；会反复用的才落 `helper/` | 代价/收益判定见 `design.md:D6` |
-| 3 写 | C/C++ 导出 `char *lite_helper(const char *input)` + `lite_helper_free`，输入输出 UTF-8/JSON | `native action=build name=x lang=c libs=["pthread"]` |
-| 4 验 | `native action=run` 喂真实输入，**先看返回串**再信它；空结果 / 非法输入 / 超限三种边界都跑 | 报错就改源码重 build |
-| 5 接 | `native action=wrap` 生成 `helper/<name>.lua` + schema，或手写 `{schema=...,run=...}` | 立刻按名可调 |
-| 6 记 | 用法与坑写进文件头注释 + `remember`；反复踩的补进本节 | 别让下个会话重踩 |
+| `helper/` | 模型自己，会话里临时起意 | 粗糙可接受，下次可删；按名即调，不承诺稳定 |
+| `tools/` + `src/` | 人要长期用的 | 必须过 `tools/test.sh`、接口稳定、有文档 |
 
-三条真踩过的工程约束：
+判据：「下个会话/下个用户也该有」→ 升级进 `tools/`+`src/`；只有当前任务有价值 → 留 `helper/` 用完即弃。
+`tools/` 不是封地：不够用就改它、重编、测过、补文档，只是代价更高。
 
-- **JSON 键名不能和数组同名**：`{"hits":[...],"hits":3}` → cjson 取后者，数组被覆盖成数字。
-  计数器改叫 `count`。
-- **错误必须可自修**：缺参数时回 `required: pattern (string)`（原参数 + 缺哪个键），
-  别让调用方猜；退出码语义走 `tools.exit_note`。
-- **每次 build 出新 `.so`**：`helper/<name>-<epoch>.so`，下次调用自动用最新的；
-  旧版本留着无害，定位靠 `helper/<name>.lua`。
+**选路（从省力到费劲，别跳级）**
 
-**「清单冻结」≠ 能力封顶**：只有 API `tools` 的自动发现被冻结（保前缀缓存），
-`native run` / `lua`（`ffi.load` 最新 `.so`、`loadfile` 插件）都是会话内动态出口，
-新工具**按名调用立刻可用**，重启后才出现在模型可见清单里。所以发现能力缺口的正确
-反应是「写一个」，不是「等重启」或「做不到」。范例：`rg` 没装 → `helper/cgrep.c`
-（pthread + regex，59 个 lua 文件 1ms）→ `helper/cgrep.lua` 包一层 → 当场调用。
+1. **系统已有 `.so`** → `ffi.cdef` + `ffi.load`，一个 `helper/<x>.lua` 完事（零编译零子进程）。无头文件就
+   `nm -D --defined-only lib<x>.so.N` 抄符号手写 cdef（范例 `helper/pdftext.lua`）；符号错只在调用时炸
+   `undefined symbol`，别猜符号表里没有的东西。
+2. **库没有 / 热路径 / 复杂 ABI** → 自己写 C：`native build`（`helper/`）或 `src/<feature>/`（进仓库，封装到
+   `lua/ffi/<feature>.lua`，在 `lua/core/tools.lua` 暴露）。
+3. **只跑一次** → `lua` 内联（进程外 30s 超时，崩了不带崩 agent），不落盘。
 
-**要清单里看见，就走 `/reboot`** —— 自动重启，自我进化的收尾动作。`reboot` 工具或 TUI
-`/reboot` 只置标记，本轮（含排队消息）收完才动：退出码 75 → `tools/lite-lua` 监督循环
-拉起全新进程（裸跑退化成 `execv`）。会话/记忆/todo 都在盘上，**历史不丢**；新进程带
-`--reboot` 起来**自动发「重启成功，继续工作。」**，模型接着上一轮往下干，插件清单与
-`.so` 全部重扫 —— 刚写的 `helper/<x>.lua` 下一轮就带 schema 出现在 API `tools` 里。
+**改过 C/C++ 就必须重编再 `/reboot`**（reboot 只重启进程、不编译；进程内 `ffi.load` 的同路径换不掉）：
 
-**重启可以带话**：`/reboot <提示词>`（或 `reboot` 工具的 `prompt` 参数）给的那句，优先
-于默认的「重启成功，继续工作。」，重启后自动发出去。跨进程靠一次性文件
-`<XDG_DATA_HOME|~/.local/share>/lite/reboot.prompt`（`lua/core/reboot.lua`）：子进程改不了
-父进程环境，argv 会被 `ps` 看见，所以只有文件这条路；写 = `main.lua` 退出 75 之前，
-读 = 新进程带 `--reboot` 起来时 `take()`（读完即删，带 cwd 作用域，陈旧提示词不污染下一次）。
-于是自造工具的完整闭环是：`native build` / `write` → 按名调用验一遍 → `reboot` → 清单可见。
-**改的是仓库 C/C++ 就先 `./tools/build.sh` 再 reboot**（reboot 不编译，见本节开头那张表）。
-**前缀缓存不丢**：provider 的 cache 是服务端按 prompt 内容前缀命中的，新进程重建出的
-system prompt 字节相同（时钟/轮次/预算都在本轮尾部的 `runtime_block`）、历史从 JSONL/mem.bin
-原样回放 → 同一串 token，命中率照旧。真代价有三条：多一轮「继续工作」的请求；内存里全文的
-tool 结果在盘上是截断版（`LITE_TOOL_RESULT_CHARS`，默认 8192，`session.lua:store_copy`），
-重启看到的是截断版、且第一个截断点之后的前缀跟重启前不同（那一段才真 miss）；进程内的临时态
-（异步 bash 长跑、连接复用、TUI 回滚）清零，serve/attach 的客户端得重连。本地启动本身
-（插件扫描 + mmap + JSONL 回放）是毫秒级。连续重启**不设次数上限**（旧的
-`LITE_REBOOT_MAX` 已去掉：自我演进常常连着重启几次，一刀切会打断长任务），
-`LITE_REBOOT_CHAIN` 也不再注入子进程环境。
-`shutdown` 才是真停（不自动接续）；serve/attach 不跑斜杠命令（attach 走 JSONL 请求，
-HTTP 客户端走 `POST /prompt`），外部客户端要重启就自己 kill 再拉。
+1. 仓库 C/C++ → `./tools/build.sh`；**跑安装版就 `./tools/release.sh`**（`lua/` 是软链、`build/liblite_*.so` 是
+   install 时的实体拷贝，只 build 会「新源码配旧二进制」，对不上就比两处 `.so` 大小）。
+2. `helper/<x>.c` → `native action=build name=x`（每次出新 `<name>-<ts>.so`，免重启生效）。
+3. 先进程外验：`./tools/lite-lua -e …` 或 `native action=run`，喂真实输入 + 空/非法/超限三边界。
+4. `/reboot` 让新 `.so` 与 schema 进清单，再跑真实用例 + `./tools/test.sh`（ABI 改了忘改 cdef 在这炸）。
 
-**serve 的 HTTP 前端（`lua/core/serve_http.lua`）只开两个端点**：同一个端口同时服务两种
-协议，靠首包嗅探分流——`{` 开头是 JSONL（attach），`GET/POST …` 开头是 HTTP，互不影响（`accept_conn`
-里 peek 最多等 50ms，没字节按 JSONL 处理）。HTTP 请求**复用 serve 的同一条队列**：它就是
-一条用户消息，轮到自己时跑一轮，跑完（`on_resume` 协程 dead）再把答案回写那条连接，
-所以 HTTP 客户端和 TUI/attach 共享同一个 agent 与记忆，谁先来谁先答。
+别跳步：只改 C 不重编就 reboot、拿 `native build` 冒充 `./tools/build.sh`、改完 C 直接 `shutdown`。用法与坑写进
+文件头注释 + `remember`，反复踩的升级进本节。
+
+**native ABI**：`char *lite_helper(const char *input)` + 可选 `lite_helper_free`，UTF-8/JSON。`build`/`run`/`wrap`，
+`scope=local|global` 决定写 `<cwd>/helper` 还是 `$LITE_ROOT/helper`。踩过的约束：JSON 里**键名不能与数组同名**
+（`{"hits":[…],"hits":3}` 会被覆盖，计数器叫 `count`）；缺参数回 `required: pattern (string)`。
+
+**只有工具清单冻结，派发全是动态的**：schema 启动扫一次并 memo（保前缀缓存），执行侧每次调用都读盘
+（`loadfile` 重读、`.so` 按 `<name>.json` 重新 `ffi.load`）。所以：改已存在插件的 `run`、`native build` 出新
+`.so`、新建 `helper/x.lua` 都**立刻按名可调**（只是清单里没描述）；想让新工具进 API `tools` 清单才要
+`/reboot`；删插件立刻不可调用，清单残留的 schema 报 `helper not found`。
+
+**`/reboot`**：退出码 75 → 监督循环拉起新进程（裸跑退化成 `execv`），会话/记忆/todo 都在盘上，新进程自动发
+「重启成功，继续工作。」；`/reboot <提示词>` 的提示词优先，不设次数上限。`shutdown` 才是真停；serve/attach
+不跑斜杠命令（要重启自己 kill 再拉）。
+
+**hook 插件**：只返回 `hooks`（`before_tool`/`after_tool`/`on_user_turn`/`on_compact`/`on_session_end`）
+不返回 `run` 的不进工具列表；`before_tool` 返回字符串即拦截（优先于审批），钩子错误 fail-open。插件与 agent
+同进程同权限，跑不受信任的仓库用 `--no-plugins`/`LITE_PLUGINS=0`。
+
+## 7 现有插件
+
+细节看文件头注释；共享逻辑放 `helper/lib/`（`app_<class>_map.lua` 勿手改）。
+
+只列**作用 + 在哪**；参数和坑看各文件头注释（`helper/<name>.lua` 开头几行），用到再读。
+
+| 插件 | 作用 | 实现在哪 |
+|---|---|---|
+| `adb` | Android：screenshot/tap/swipe/text/open/shell/push | `helper/adb.lua` + `helper/lib/adb.lua` |
+| `wechat` | 搜联系人/群 → 进会话 → 发消息/文件 | `helper/wechat.lua` |
+| `uimap` | 视觉定位按钮：discover/learn/click/save | `helper/uimap.lua`，映射落 `helper/lib/app_<class>_map.lua` |
+| `usb` | 麦/音箱/摄像头：record/play/photo/video/volume | `helper/usb.lua` |
+| `music` | 常驻 VLC 播放器（本地/URL/WebDAV） | `helper/music.lua` + `helper/lib/webdav.lua` |
+| `search`/`fetch` | DeepSeek 搜索 / URL→Markdown | `helper/{search,fetch}.lua` + `helper/lib/deepseek.lua` |
+| `tokens` | 每日 token 账本（源 `/agent/usage`） | `helper/tokens.lua` |
+| `cgrep` | 正则/字面串扫目录 → `path:line: text` | `helper/cgrep.c` + `helper/cgrep.lua` |
+| `lens` | 代码库检索：`locate`/`peek`/`grep`/`dataflow` | `helper/lens.lua` → `lua/ffi/codesearch.lua` → `src/codesearch/` |
+| `pdftext` | PDF 抽文本 | `helper/pdftext.lua`（纯 FFI） |
+| `md2png`/`web2png`/`trending` | MD / 网页 / Trending → 长图 PNG | `helper/{md2png,web2png,trending}.lua` + `helper/lib/{md4c,htmlmd}.lua` + `src/html/` |
+| `charts` | 手绘风 SVG 图表卡（54 种）→ PNG | `helper/charts.lua` → `lua/charts/` |
+| `trace` | perf 探针采样 → 火焰图/热力/排行 | `helper/trace.lua` → `lua/trace/` |
+
+`lens` **只索引 cwd 之外的项目**（lite 自身不建索引），细节见 `src/codesearch/README.md`
+与 `code_search_best_practices.md`。
+
+## 8 serve
+
+`./tools/run.sh serve --host 0.0.0.0 --port 8765`：同一端口靠首包嗅探分流 JSONL(attach)/HTTP，HTTP 复用同一条
+队列和同一个 agent（谁先来谁先答）；**不鉴权**，暴露面由 `--host` 控制（默认 `127.0.0.1`）。
 
 | 端点 | 说明 |
 |---|---|
-| `GET /health` | 探活，**不鉴权**，回 `{"ok":true,"live":true,"busy":…,"queued":…,"shell":…,"pid":…,"shell_sec":…}`，不排队 |
-| `POST /prompt` | `{"prompt":"..."}`（也收 `{"text":…}` 或裸文本体）下指令，跑完回 `{"ok":true,"text":"…"}` |
+| `GET /health` | 探活 `{ok,live,busy,queued,shell,pid,shell_sec}`，不排队 |
+| `POST /prompt` | `{"prompt":"…"}`（也收裸文本），回 `{"ok":true,"text":…}`；超时 `LITE_SERVE_HTTP_TIMEOUT`（900s）回 504 |
 
-**不做鉴权**：两端点都开放（本机自用，或 `--host 0.0.0.0` 给局域网里的应用调用）。
-暴露面由 `--host` 控制——默认 `127.0.0.1`，要给别人用才显式绑 `0.0.0.0`。
-超时 `LITE_SERVE_HTTP_TIMEOUT`（默认 900s）到点回 504，
-那一轮仍会跑完（结果进记忆，只是没人收）。没有 SSE、没有 OpenAI/Anthropic 兼容层、不摊平
-`messages[]`——要上下文就把话说全，历史靠 lite 自己的记忆。**响应恒为 `Connection: close`**：
-没有 keep-alive 状态机，客户端每请求一条连接。
+判「远端闲置没」用 `lite serve --probe HOST:PORT`（采样 3 次、间隔 2s，连续 N 次空闲才判闲）：**单次采样不当
+判决**（`active_proc:alive()` 是「尽快」不是瞬时）。退出码 0=`wake`、3=`busy`、4=`unreachable`、5=`unstable`（再采）。
 
-```bash
-./tools/run.sh serve --host 0.0.0.0 --port 8765
-curl -s localhost:8765/health                     # {"ok":true,"live":true,...}
-curl -s localhost:8765/prompt -d '{"prompt":"北京时间现在几点"}'
-```
+## 9 进化
 
-**`/health` 的消费方式：单次采样不当判决**（`lua/core/serve_watch.lua`）。master 要判断
-「远端实例是不是闲下来了、能不能派活」，用 `lite serve --probe HOST:PORT`，它采样 N 次
-（默认 3 次、间隔 2s、单次超时 5s）后给结论，**连续 N 次「活着且空闲」才返回 0**：
+**进化任务由人下达**：lite 没有内在目标，是「接到任务就能把能力补齐的执行器」，要求「缺能力不降级」，
+不是「自己找活干」。环 = 感知（内置工具够吗/系统 `.so` 有吗/`helper/` 已有吗：`lite plugins`、`ldconfig -p`、
+`nm -D`）→ 造（§6 选路）→ 验（真实输入 + 空/非法/超限，进程外）→ 留（一次性 `helper/`，长期 `tools/`+测试+本文件）。
 
-| 退出码 | decision | 含义 |
-|---|---|---|
-| 0 | `wake` | 连续 N 次 `live` 且 `busy`/`shell` 都为假，可以唤醒 |
-| 3 | `busy` | 采样里出现过 `busy` 或 `shell`（还在跑一轮 / 命令未收尸） |
-| 4 | `unreachable` | N 次全部答不上来（连不上、超时、坏 JSON 都归这类） |
-| 5 | `unstable` | 有空闲也有超时，凑不满连续 N 次——再采一轮，别当结论 |
+**靠摩擦小，不靠聪明**：造（秒级）、试（进程外）、退（`git checkout`+重编+reboot）、留（升级进 `tools/`）都便宜，
+所以不必事前判准——`tools/test.sh` 只测契约。`helper/*.so` 多版本共存无害（按 `<name>.json` 取）。
 
-**为什么不去抖不行**：`active_proc:alive()` 是「尽快」而非「瞬时」，`kill -9` 后没收尸前
-`kill(pid,0)` 仍成功；serve 又是单协程，主循环一卡（同步 C 调用/前台工具）整个 `/health`
-答不上来。这两类噪声都只意味着「再采一次就清楚」，**不是死亡、也不是空闲**——把判决放在
-采样流上是为了吸收它们，不是为了提精度。`shell_sec` 只作展示，不参与判定（长命令跑一小时
-也是活着）。`--probe` 不启服务端、不需要 API key，`--json` 时回一条带 `trace[]` 的事件。
+**知识来源与冲突**：代码 > gitlog > 本文件 > `mem.bin`。冲突时**代码赢**，顺手修注解。跨实例知识放 gitlog
+（`git pull` 即合并）；`mem.bin` 不进 git，它是缓存不是真相。commit subject 做目录、body 记「为什么」和
+「反着改会踩什么」；踩过一次写 body，两次升级进本文件。
 
-**选路优先级（从省力到费劲，别跳级）**：
+**多实例收敛**：一致 = 源码一致 + 重编 + `reboot`。单写者：slave（远程实例）验过才 commit，master 只
+`git pull`+重编+reboot。C/ABI 硬验证放远程实例（`design.md:D10`），本机只做小改与文本级验证。
 
-1. **系统已有 `.so`** → 直接 `ffi.cdef` + `ffi.load`，**一个 `helper/<x>.lua` 就完事**（零编译、
-   零子进程、零 `.so` 产物）。没装开发头也照做：`nm -D --defined-only lib<x>.so.N` 抄导出符号手写
-   cdef 即可（`helper/pdftext.lua` 就是这么吃 `libpoppler-glib.so.8` 的）。**先找库再动手**：
-   `ls /usr/lib/x86_64-linux-gnu/lib*.so.*`、`pacman/dpkg -S` 看已装了什么。
-2. **库没有、或热路径/复杂 ABI** → 才自己写 C：`native build`（`helper/`，模型自造）或
-   `src/<feature>/`（进仓库的正式模块），封装放 `lua/ffi/<feature>.lua`，工具在
-   `lua/core/tools.lua` 暴露。
+## 10 参考
 
-手写 cdef 的代价是丢掉编译期检查：符号错只会在调用时炸 `undefined symbol`，靠试错收敛
-（pdftext 连踩 `poppler_page_new` → `poppler_page_free`/`poppler_document_free`，最终统一
-`g_object_unref`）。所以第 1 步的前提是**符号表里确实有它**，别猜。
-
-- C ABI：`int lite_<feature>_...` + `const char *lite_<feature>_error(void)`。
-- `.so` 用 `$ORIGIN` RPATH；打包只复制非 libc 依赖到 `dist/lib/`。
-- 大库/模型不随包：见 `README.md` 的 `ort_link.sh`、`cuda_provider.sh`、`LITE_DIST_WITH_*`。
-- `lite_codesearch` 的 tokenizers 静态库随仓库自带：
-  `third_party/codesearch/lib/tokenizers-cpp/`（`-DLITE_CS_TOKENIZERS_DIR=...` 覆盖）；
-  源码也在 `third_party/codesearch/tokenizers-cpp/`，用 `tools/build-tokenizers.sh` 离线重建 `.a`。
-  缺失时 CMake 跳过该 target，索引/查询功能不可用但其余构建正常。
-  ONNX Runtime 运行期 `dlopen`（`LITE_ORT_LIB`），模型用 `LITE_CS_MODEL_DIR`；
-  GPU 只走 CUDA + FP16，不使用 TensorRT，也不预加载 `libnvinfer*`。
-- 热重载：Lua 清 `package.loaded[...]` 后 require；TUI `/reload` 只重载 `core.tools` /
-  `core.prompt` / `ffi.*`，**不重扫插件快照**。进程内 `ffi.load` 过的同路径 `.so` 换不掉，
-  但 `native build` 每次出新文件名（`<name>-<ts>.so` + `<name>.json` 清单），下一次
-  helper 调用按清单重新 `ffi.load` → **不用重启**。
-
-`native` 自造工具：`build` / `run` / `wrap`；ABI 为
-`char *lite_helper(const char *input)` + 可选 `lite_helper_free`（UTF-8/JSON）。
-插件发现 `<workspace>/helper` → `$LITE_ROOT/helper`；`scope=local|global` 控制写入侧。
-wrapper 返回 `{ run=function(args,env) ... end }`；重新 build 生成新 `.so`，免重启。
-
-**只有清单冻结，派发全是动态的**（`design.md:D5`）：`helper/*.lua` 里返回
-`{ schema={...}, run=function(args,env) end }` 即可同时声明工具名和实现
-（`.tool.json` 写法仍可用、优先）。**冻结的只是 API `tools` 字段**：schema 在会话启动
-扫一次并 memo（`_helper_cache`），之后 `schemas()` 用快照 —— 保前缀缓存，新建/删除
-`.lua` 不会自己冒进清单。**执行侧每次调用都读盘**：`_run_helper_tool` →
-`_helper_find`（`file_size` 现查磁盘）→ `loadfile`（每次重读）→ `.so` 按
-`<name>.json` 清单重新 `ffi.load`。所以：
-
-| 动作 | 生效时机 |
-|---|---|
-| 改已存在插件的 `run` | 立刻，下次调用 |
-| 新建 `helper/x.lua` / `native wrap` | 立刻，**按名调用即可**（模型看不见描述，由 `native` 输出/你点名） |
-| `native build` 出新 `.so` | 立刻，下次调用换新句柄 |
-| 想让新工具**出现在 API 清单** | `/reboot`（会话接续、历史不丢）或新会话 |
-| 删插件 | 立刻不可调用；清单里残留的 schema 会报 `helper not found` |
-
-所以「不热插拔」只指工具清单，不是能力。要试新代码而不想动进程，走 `lua` 工具（进程外
-`tools/lua.sh -e`，`args` 走 `LITE_LUA_ARGS` JSON，默认 30s 超时，审批同 `bash`）。
-入口分两个：`tools/lua.sh`
-给插件/脚本（`LITE_CWD`、workspace `?.lua`/`?.so` + `helper/lib/?.lua`、预加载
-`liblite_*.so` 与 workspace `build|lib|helper/*.so`、自动读 `.env`：cwd 向上 12 级 →
-`~/.config/lite/.env` → 仓库 `.env`，已设变量优先；`LITE_ENV_FILE=路径` 只读该文件、
-`/dev/null` 全关；预加载失败写 stderr，`LITE_PRELOAD_WARN=0` 静音），
-`tools/lite-lua` 给仓库内部脚本（干净，不继承 workspace 状态）。
-
-**hook 插件**：只返回 `hooks`（`before_tool` / `after_tool` / `on_user_turn` /
-`on_compact` / `on_session_end`）不返回 `run` 的插件**不进工具列表**，只当钩子用：
-`before_tool` 返回字符串即拦截（优先于审批），`on_user_turn` 返回值可改写用户文本。
-hook 错误一律 fail-open（记 `_hook_errors`，不炸 agent）。`has_hooks()` 为空时零开销。
-插件与 agent 同进程同权限，跑不受信任的仓库用 `--no-plugins` / `LITE_PLUGINS=0` 全关。
-
-**查插件用 `lite plugins`**：只读启动快照、不触发加载，列每项的
-`name/path/scope/tool/hooks` 与错误（`--json` 给脚本）；启动时只打印错误
-（`plugin <name> failed: ...`），清单不打扰。别靠翻 `helper/` 猜加载了啥。
-
-**现有插件做什么**（`helper/*.lua`，实现细节看文件头注释；共享逻辑在 `helper/lib/`）：
-
-| 插件 | 作用 | 关键用法/坑 |
-|---|---|---|
-| `adb` | Android 设备：screenshot/tap/swipe/text/open/shell/push | 坐标是**设备像素**，先截图再换算；中文走 AdbKeyboard |
-| `wechat` | 微信：搜索联系人/群 → 进会话 → 发消息/文件 | libxdo 直驱 + 每步 OCR 验收；坐标是 2560x1440 屏幕像素 |
-| `uimap` | 视觉定位按钮：discover/learn/click/save | 结果落 `helper/lib/app_<class>_map.lua`，每 app 一文件 |
-| `usb` | 本机麦/音箱/摄像头：record/play/photo/video/volume | 设备可用名字子串；缺 arecord/ffmpeg 只对应 action 报错 |
-| `music` | 后台常驻 VLC 放歌：play/pause/next/volume/seek/playlist | 源可为本地路径、关键词（WebDAV 搜）、`dav://host:port/路径`（流播不下载）。控制走 MPRIS（本机无 `playerctl`/`socat`），WebDAV 逻辑在 `helper/lib/webdav.lua` |
-| `search` | DeepSeek Search：关键词→rerank 结果+摘要 | 需要 `DEEPSEEK_API_KEY` |
-| `fetch` | DeepSeek Fetch：URL→Markdown 正文 | 同上；替代原始 HTTP 抓页面 |
-| `tokens` | 每日 token 账本查询 | 数据源 `/agent/usage`，跨会话同一本账 |
-| `cgrep` | 代码搜索：正则/字面串扫目录，输出 `path:line: text` | 本体是 `helper/cgrep.c`（pthread + POSIX regex）编出的 `.so`，Lua 层只做 JSON→文本；本机没 `rg`/`ugrep`，搜代码就靠它。`ext`/`fixed`/`per_file`/`threads` 可省，输出自身封顶 8000 字 |
-| `lens` | 代码库级检索：陌生项目找入口/子系统、跨文件符号与调用关系、数据流、语义找实现 | 需要先建索引；适合 `cgrep` 做不到的跨文件/语义问题。用法、索引、依赖、性能与内核实践见 `src/codesearch/README.md` |
-| `pdftext` | 抽 PDF 文本（`path/first/last/max_chars`） | 纯 Lua FFI 直连 `libpoppler-glib.so.8`，零编译零子进程；本机无 poppler 头文件，cdef 手写（导出符号 `poppler_document_get_page`/`poppler_page_get_text`），释放用 `g_object_unref`（`poppler_page_free`/`poppler_document_free` 已不在 134 里）；缺库报装 `libpoppler-glib8` |
-| `md2png` | Markdown 文件 → HTML → 长图 PNG（`path/out/width/height/scale/gfm`） | 全 FFI 无子进程无 Chrome：`libmd4c.so.0` 解析（**无 md4c.h，cdef 手写**，`abi_version` 必须 = 0、结构体字段顺序不能错否则崩在回调里）→ `build/liblite_html.so` 出图 → `src/html/render.cpp` 的字体。同名 `.html` 一起落盘便于调试；`height` 默认 **0 = 自动测高**（`render.cpp` 先布局取 `doc->height()` 再定高），给正数才是固定视口、超出裁掉 |
-| `trending` | GitHub Trending → Kami 排版 → 长图 PNG（`lang/since/limit/width/height/scale/out`） | `curl` 抓页面（`io.popen`）+ 文件内 `parse()` 的 `gmatch` 逐字段抽（**无 dom 库**，页面结构一变就返回空表）；出图复用 `liblite_html.so`。坑：HTML 必须一次成型（追加 `<style>` 会让内容溢出被裁）；`.page{width:auto}` 铺满、`width` 别低于 780（19px 仓库名会折行）；`os.date` 里 `"%%m"` 是字面量；`height` 默认 0 = 自动测高，加 `limit` 不用手动调高 |
-| `web2png` | URL → 正文 → 资料卡片长图 PNG（`url/out/width/scale/title/max_chars`） | 三段链路：`helper/lib/deepseek.lua` 的 `/v1/tools/fetch` 取干净 Markdown（无 `DEEPSEEK_API_KEY` 则降级 `core.http` 抓 HTML 去标签）→ `helper/lib/md4c.lua` 转 HTML 片段 → `liblite_html.so` 出图（`h=0` 自动测高）。样式全内联，cairo toy font 只认单族名，**禁止写字体栈** |
-
-**什么时候用 lens**：陌生代码库要找子系统入口/实现、查某符号的 callers/callees
-与数据流、或按自然语言找相似实现时用它；单文件/精确文本搜索先用 `cgrep`。
-**只在 cwd 之外的外部项目上建索引**——lite 自己的源码不建（见 §2）。
-
-索引创建、参数、加速、依赖、Linux/参考项目实践统一看 `src/codesearch/README.md`
-（§0 快速开始，§4/§5 详细流程）。
-
-`music` 的 `dav://` 语义：`dav://host:port/路径` 列目录**直接流播**（默认整库随机，
-`limit=N` 限首数，`index=N` 选第几首）；**只写 `dav://` 不带路径会 PROPFIND 失败**，
-因为 host 拆不出来——要整库就带上 `WEBDAV_MUSIC` 的路径（`~/.env` 里有）。
-
-**`helper/lib/` 是共享模块，不是插件**（扫描只平铺看 `helper/*.lua`，子目录一律跳过）：
-`adb.lua`（传输层）、`music.lua`（VLC/MPRIS 控制）、`usb.lua`（ALSA/V4L2）、`uimap.lua`
-（视觉定位）、`deepseek.lua`（search/fetch 共用的鉴权+重试）、`webdav.lua`（PROPFIND +
-libcurl `CURLOPT_USERPWD`，凭据不进 argv/m3u）、`app_<class>_map.lua`（`uimap learn` 生成的
-坐标表，**勿手改**）。要给插件加共用能力就放这里，别复制两遍。
-
-**调一次插件工具的完整链路**（`lua/core/tools.lua`）：
-
-1. 发现 —— `_scan_helper_schemas`（`:1173`）遍历 `_helper_roots()`：`<cwd>/helper`
-   （local）→ `$LITE_ROOT/helper`（global），每个根一次 `ls -1` **平铺**，只认
-   `*.tool.json` 与 `*.lua`；`helper/lib/` 之类子目录不会被当插件（search/fetch 就靠这个共享共用库）。
-2. 快照 —— `helper_lua_load`（`:1148`，`loadfile`+`pcall`）→ `helper_lua_schema`
-   （`:1156`）：`run`+`schema` = 工具，只有 `hooks` = 纯钩子；`BUILTIN_TOOLS` 不可覆盖；
-   同名 `.tool.json` 优先。结果 memo 进 `_helper_cache`（`:1277`）。
-3. 上桌 —— `M:schemas`（`:276`）把快照拼进 API `tools` 字段；system prompt 里只列名字，
-   保证字节稳定。
-4. 派发 —— 模型 tool_call → agent 循环 → `M:call`：内建 if-else 链先走，都不中才落
-   `_run_helper_tool`（`:1465`）。
-5. 执行 —— `loadfile` **每次调用都重读文件** → 校验 `table.run` → `_helper_env(p)`
-   （`:1444`，`{cwd, helper_dir, scope, ffi, load(so), call(native)}`）→
-   `pcall(mod.run, args, env)`。
-6. 回流 —— `nil`→`(helper returned nil)`；抛错→`error: helper <name>: ...`；
-   否则 `truncate`(≤32KB) → `error_hint`（同调用失败计数）→ 回消息。
-
-**插件要密钥怎么办**：只读环境变量，不读文件、不内置。插件在 agent 进程里跑，
-`run.sh` 启动时已把 `.env`（`~/.config/lite/.env` / workspace `.env`）灌进环境，
-所以 `helper/*.lua` 里 `os.getenv("DEEPSEEK_API_KEY")` 直接可用；缺 key 时
-`error` 里写清变量名和"写进 `~/.config/lite/.env`"，别打印别的前缀/后缀片段。
-独立脚本走 `tools/lua.sh`，同样自动带 `.env`。共用逻辑（key 读取、错误表、
-重试）放 `helper/lib/<vendor>.lua`（见 `helper/lib/deepseek.lua`）。
-
-所以「不热插拔」只针对第 2 步的**工具清单**：改插件实现立刻生效（第 5 步重读），
-新建/删除 `.lua` 才需要重启；钩子走 `has_hooks`（`:1366`）旁路，与工具派发无关。
-
-## 7 持续自主进化（原理与流程）
-
-**前提**：进化任务由人下达。lite 没有内在目标，也不需要——它不是要变成有意图的主体，
-是**接到任务就能把能力补齐的执行器**。所以「自己发现缺口」不是要求，「缺能力不降级」才是。
-
-### 7.1 闭环四环
-
-| 环 | 动作 | 入口 | 保底 |
-|---|---|---|---|
-| 感知 | 内置工具够吗 / 系统 `.so` 有吗 / `helper/` 已有吗 | `ldconfig -p`、`nm -D --defined-only`、`lite plugins` | 三者都不行才造 |
-| 造 | 现成库 → `ffi.load`；要 C → `native build`；进仓库 → `src/` | §6 选路优先级 | `lua` 内联跑一次 |
-| 验 | 真实输入 + 空/非法/超限三边界 | `native run`、进程外 `./tools/lite-lua -e` | 硬验证推远程实例（`design.md:D10`） |
-| 留 | 一次性 → `helper/`；下个会话也该有 → `tools/` + 测试 + 本文档 | `native wrap` / 手写 `{schema,run}` | `reboot` 让清单可见 |
-
-### 7.2 原理：靠摩擦小，不靠聪明
-
-代价全压到秒级，「缺什么造什么」才是日常动作而不是大工程：
-
-| 环节 | 代价 |
-|---|---|
-| 造 | `native build` 秒级；`helper/*.so` 随仓库走（`!helper/*.so`），clone 下来直接能调 |
-| 试 | 进程外 `lua`（30s 超时），崩了不带崩 agent |
-| 退 | `git checkout` + 重编 + `/reboot`（`build/` 未跟踪，只回源码跑的是旧 `.so`） |
-| 留 | `helper/` 验完升级进 `tools/`，补测试与文档 |
-
-**没有事前判准是选择，不是缺失**：质量好坏由模型判断、由人下任务定义，harness 只负责
-让验证和回退都便宜。试错成本低时不需要精确的 fitness function——所以 `tools/test.sh`
-（68 行）只测契约（能调通、结构对）、不测性能基线，属于正常。
-
-`helper/` 里多版本 `.so` 入库无害：`_helper_so_abs`（`lua/core/tools.lua:1134`）按
-`<name>.json` 清单的 `so` 字段取，**不按时间戳排序**，每次 `native build` 重写清单即自愈。
-本地都会重编，可以不清理。
-
-### 7.3 知识从哪来，冲突听谁的
-
-| 源 | 内容 | 腐坏方式 |
-|---|---|---|
-| **代码** | 唯一真相 | 不错，但会变；注解总落后于它 |
-| **gitlog** | 跨实例、跨会话的推导与坑 | 只增不清 |
-| `AGENTS.md` | 反复踩到才升级的规则 | 落后于代码 |
-| `mem.bin` | 本机、本实例的局部经验 | 陈旧；`recall` 字面匹配，召回失败模型自己看不见 |
-
-- **冲突时代码赢**，然后顺手修注解（§4 要求引用写 `file:symbol` 就是这个桥）。
-- **跨实例知识放 gitlog**：`git pull` 一次即合并、带时间与作者、不可变（改它要改历史）。
-  `mem.bin` **不进 git 是对的**——它是缓存不是真相，各实例局部经验本就该不同。
-- commit 纪律：**subject 做目录，body 记「为什么」和「反着改会踩什么」**，结论标
-  `[static]`/`[verified]`。踩过一次 → 写 body；踩过两次 → 升级进本文档。
-- 现场探查（`nm`/`man`/`ldconfig`/`web`）是获取途径但不写盘：一次性结论别塞 `mem.bin`。
-
-### 7.4 多实例怎么收敛
-
-各实例**最后代码一致**就够；一致 = 源码一致 + 重编 + `reboot`。`build/` 未跟踪，安装版
-`lua/` 是软链而 `build/liblite_*.so` 是 install 时的实体拷贝，只 `build.sh` 会得到
-「新源码配旧二进制」（见 §6 那张表）。
-
-- **单写者**：slave 验过才 commit，master 只 `git pull` + 重编 + `reboot`，不各写一份历史
-  （`design.md:D10`）；两边各自 commit 再合 = 第三份谁都没验过的代码。
-- **长任务开远程实例（分身）**：进程内临时态（异步
-  bash、连接复用）清零、同目录 `mem.lock` 单写实例这些麻烦自然消失，主工作区与主记忆
-  一个字节不动。`serve` 走 `net.listen(host, port)`（`lua/core/serve.lua:138`）是 TCP
-  而非 unix socket，所以主实例能连上去看 slave 在干什么。
-
-## 8 参考实现（新功能先查）
-
-参考：Pi `/opt/pi-mono`、Reasonix `/opt/reasonix`、opencode `/opt/opencode`；缓存
-`/opt/code_caches/<name>_cache`。逐项目查，不 cross-search，只借鉴思路。
-原 my_db 的 code search 已迁入 `src/codesearch/`，不再依赖 `/opt/my_db`。
-符号：Go `pkg::Func`、C++ `Class::method`、TS 导出名。
+Pi `/opt/pi-mono`、Reasonix `/opt/reasonix`、opencode `/opt/opencode`；缓存 `/opt/code_caches/<name>_cache`。
+逐项目查不 cross-search，只借思路。符号写法：Go `pkg::Func`、C++ `Class::method`、TS 导出名。
