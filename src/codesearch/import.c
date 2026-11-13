@@ -925,8 +925,12 @@ static void import_dataflow(const char* analysis_dir, const char* namespace) {
                     json_integer_value(json_object_get(fe, "count")) + 1));
                 json_t* lines = json_object_get(fe, "lines");
                 json_t* ln = json_object_get(o, "line");
-                if (lines && json_is_integer(ln) && json_array_size(lines) < 8)
-                    json_array_append(lines, ln);
+                if (lines && json_is_integer(ln) && json_array_size(lines) < 8) {
+                    // 同一行多条 occurrence（定义+赋值/多次访问）只留一个行号，count 仍逐条累加
+                    size_t lsz = json_array_size(lines);
+                    json_t* last = lsz ? json_array_get(lines, lsz - 1) : NULL;
+                    if (!(last && json_equal(last, ln))) json_array_append(lines, ln);
+                }
             }
         }
     }

@@ -1596,6 +1596,50 @@ static void save_dataflow(const char* output_file) {
 // 主函数
 // ============================================
 
+// 进程内复用：lite 是长驻进程，同一个 .so 里 dataflow 会被反复处理（lens build 每轮一次）。
+// 旧版这些 static 表既没有收尾也没有入口清零，第二次进来变量表还留着上一轮的记录 →
+// occurrences 成倍重复、dataflow.json 一轮比一轮大（现场：72 行 → 78 行，`a` 的赋值出现两条）。
+// 统一 free + 置 NULL，analyze/show 入口各调一次；CLI 单次进程里多这一步也无害。
+static void dataflow_globals_reset(void) {
+    for (int i = 0; i < g_var_count; i++) {
+        free(g_vars[i].occurs);
+        free(g_vars[i].fields);
+        free(g_vars[i].hops);
+    }
+    free(g_vars); g_vars = NULL;
+    g_var_count = 0;
+    g_var_capacity = 0;
+
+    free(g_var_hash); g_var_hash = NULL;
+    g_var_hash_size = 0;
+    g_var_hash_used = 0;
+
+    if (g_param_hash) {
+        for (size_t i = 0; i < PARAM_HASH_SIZE; i++) {
+            func_param_t* p = g_param_hash[i];
+            while (p) { func_param_t* nx = p->next; free(p); p = nx; }
+        }
+        free(g_param_hash); g_param_hash = NULL;
+    }
+
+    if (g_caller_hash) {
+        for (size_t i = 0; i < CALLER_HASH_SIZE; i++) {
+            edge_node_t* n = g_caller_hash[i];
+            while (n) { edge_node_t* nx = n->next; free(n); n = nx; }
+        }
+        free(g_caller_hash); g_caller_hash = NULL;
+    }
+
+    free(g_call_graph.edges); g_call_graph.edges = NULL;
+    g_call_graph.edge_count = 0;
+    g_call_graph.capacity = 0;
+
+    memset(g_langs, 0, sizeof(g_langs));
+    g_lang_count = 0;
+    g_funcs_total = 0;
+    g_hop_total = 0;
+}
+
 int lite_cs_dataflow_main(int argc, char** argv) {
     if (argc < 2) {
         printf("Variable Data Flow Analyzer (Enhanced)\n");
@@ -1624,6 +1668,7 @@ int lite_cs_dataflow_main(int argc, char** argv) {
         snprintf(out_file, sizeof(out_file), "%s/dataflow.json", cache_dir);
         
         printf("Analyzing data flow from %s...\n", meta_file);
+        dataflow_globals_reset();
         if (analyze_meta(meta_file) != 0) return 1;
         
         load_call_graph(cache_dir);
@@ -1645,6 +1690,7 @@ int lite_cs_dataflow_main(int argc, char** argv) {
         snprintf(meta_file, sizeof(meta_file), "%s/chunks_meta.jsonl", cache_dir);
         
         printf("Loading data flow from %s...\n", meta_file);
+        dataflow_globals_reset();
         if (analyze_meta(meta_file) != 0) return 1;
         
         load_call_graph(cache_dir);

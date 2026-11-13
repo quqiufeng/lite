@@ -878,6 +878,73 @@ static void json_escape_str(const char* src, char* dst, int max_len) {
     dst[j] = '\0';
 }
 
+// 全局状态清零（2026-11-13）：这些 static 表是当年按「CLI 一次性跑」写的，
+// 但 lite 是长驻进程，同一个 .so 会被 lens 反复调用：cleanup 只 free 不置空，
+// 第二次进来 g_node_hash 里还是已释放的节点指针、g_func_count 还留着上一轮的计数
+// → 写入已释放内存 / 越界读名字表 = 段错误（现场：第二次 `lens action=build`）。
+// 所有清理都收敛到这里，main 开头也先调一次（早退路径不留下半初始化状态）。
+static void cs_callgraph_globals_reset(void) {
+    if (g_func_names) {
+        for (int i = 0; i < g_func_count; i++) free(g_func_names[i]);
+        free(g_func_names);
+        g_func_names = NULL;
+    }
+    g_func_count = 0;
+    memset(g_name_hash, -1, sizeof(g_name_hash));
+
+    free(g_bares);
+    g_bares = NULL;
+    g_bare_count = 0;
+    memset(g_bare_hash, -1, sizeof(g_bare_hash));
+
+    while (g_func_nodes) {
+        func_node_t* fn = g_func_nodes;
+        g_func_nodes = fn->next;
+        call_edge_t* e = fn->calls;
+        while (e) {
+            call_edge_t* next = e->next;
+            free(e);
+            e = next;
+        }
+        free(fn);
+    }
+    free(g_node_hash);          // 只是哈希桶数组，节点已随 g_func_nodes 释放
+    g_node_hash = NULL;
+    memset(g_scope_count, 0, sizeof(g_scope_count));
+
+    if (g_def_hash) {
+        for (int i = 0; i < DEF_HASH_SIZE; i++) {
+            def_list_t* d = g_def_hash[i];
+            while (d) {
+                def_list_t* next = d->next;
+                free(d->name);
+                free(d);
+                d = next;
+            }
+        }
+        free(g_def_hash);
+        g_def_hash = NULL;
+    }
+    if (g_file_hash) {          // 文件池必须在 def 表之后释放（def_rec.file 指向它）
+        for (int i = 0; i < DEF_HASH_SIZE; i++) {
+            file_node_t* n = g_file_hash[i];
+            while (n) {
+                file_node_t* next = n->next;
+                free(n->path);
+                free(n);
+                n = next;
+            }
+        }
+        free(g_file_hash);
+        g_file_hash = NULL;
+    }
+
+    free(g_plugin_edges);
+    g_plugin_edges = NULL;
+    g_plugin_edge_count = 0;
+    g_plugin_edge_capacity = 0;
+}
+
 int lite_cs_callgraph_main(int argc, char** argv) {
     if (argc < 2) {
         printf("Call Graph Builder (Enhanced with TypeScript plugin support)\n");
@@ -890,6 +957,8 @@ int lite_cs_callgraph_main(int argc, char** argv) {
     snprintf(meta_file, sizeof(meta_file), "%s/chunks_meta.jsonl", cache_dir);
     snprintf(out_file, sizeof(out_file), "%s/call_graph.json", cache_dir);
     snprintf(plugin_file, sizeof(plugin_file), "%s/plugin_output.jsonl", cache_dir);
+
+    cs_callgraph_globals_reset();   // 同进程第 2 次调用：先把上一轮的表清干净
 
     g_func_names = malloc(MAX_FUNC * sizeof(char*));
     if (!g_func_names) return 1;
@@ -956,16 +1025,47 @@ int lite_cs_callgraph_main(int argc, char** argv) {
 
             char* content = malloc(line_len);
             if (content) {
+                // 反解 JSON 转义：以前 `\n` 只吃掉反斜杠就写入字面 'n'，
+                // 于是 body 里一个换行都不剩 → 数换行得到的调用行号永远等于 line_start，
+                // 同一函数里对同一被调者的多个调用点也被去重成一条边（行号看着像「全在函数首行」）。
                 const char* p = content_p;
                 int j = 0;
                 while (*p) {
-                    if (*p == '\\' && *(p+1)) {
-                        content[j++] = *(++p);
-                        p++;
-                    } else if (*p == '"') {
-                        break;
-                    } else {
-                        content[j++] = *p++;
+                    if (*p == '"') break;
+                    if (*p != '\\' || !*(p + 1)) { content[j++] = *p++; continue; }
+                    char c = *(p + 1);
+                    p += 2;
+                    switch (c) {
+                        case 'n': content[j++] = '\n'; break;
+                        case 't': content[j++] = '\t'; break;
+                        case 'r': content[j++] = '\r'; break;
+                        case 'b': content[j++] = '\b'; break;
+                        case 'f': content[j++] = '\f'; break;
+                        case 'u': {
+                            // \uXXXX → UTF-8（BMP；代理对/U+0000 退化成 '?'，够用且不越界）
+                            unsigned int cp = 0;
+                            int digits = 0;
+                            while (digits < 4 && isxdigit((unsigned char)*p)) {
+                                char h = *p++;
+                                cp = cp * 16 + (unsigned int)(isdigit((unsigned char)h)
+                                         ? h - '0' : (tolower((unsigned char)h) - 'a' + 10));
+                                digits++;
+                            }
+                            if (digits < 4 || cp == 0 || (cp >= 0xD800 && cp <= 0xDFFF)) {
+                                content[j++] = '?';
+                            } else if (cp < 0x80) {
+                                content[j++] = (char)cp;
+                            } else if (cp < 0x800) {
+                                content[j++] = (char)(0xC0 | (cp >> 6));
+                                content[j++] = (char)(0x80 | (cp & 0x3F));
+                            } else {
+                                content[j++] = (char)(0xE0 | (cp >> 12));
+                                content[j++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                                content[j++] = (char)(0x80 | (cp & 0x3F));
+                            }
+                            break;
+                        }
+                        default: content[j++] = c; break;  // \" \\ \/ …
                     }
                 }
                 content[j] = '\0';
@@ -1058,18 +1158,30 @@ int lite_cs_callgraph_main(int argc, char** argv) {
                         char callee[MAX_NAME_LEN];
                         resolve_callee(b->name, tok, callee, sizeof(callee));
                         if (strcmp(b->name, callee) != 0 && is_func_known(callee)) {
-                            unsigned int sh = hash_str(callee) % 256;
+                            // 边上的行号必须是「调用点」而不是函数首行：b->content 起于
+                            // line_start，数到 token 开始的换行数即可。以前统一记 line_start，
+                            // 导致 add_call_edge 的去重键 (caller,file,line) 把同一被调者的多个
+                            // 调用点合并成一条（dataflow 的 hop 也跟着丢）。
+                            int call_line = b->line_start;
+                            for (const char* nl = b->content; nl < start; nl++) {
+                                if (*nl == '\n') call_line++;
+                            }
+                            // 去重键从 (callee) 改成 (callee, call_line)：同一函数体里对同一被调者
+                            // 的不同调用点是不同的边，旧键会把第二个调用点整个吃掉。
+                            unsigned int key = hash_str(callee) ^ (unsigned int)call_line * 2654435761u;
+                            if (key == 0) key = 1u;  // 0 是 seen[] 的空槽标记
+                            unsigned int sh = key % 256;
                             int dup = 0, probes = 0;
                             while (seen[sh] && probes < 256) {
-                                if (seen[sh] == hash_str(callee)) { dup = 1; break; }
+                                if (seen[sh] == key) { dup = 1; break; }
                                 sh = (sh + 1) % 256;
                                 probes++;
                             }
                             if (!dup) {
-                                seen[sh] = hash_str(callee);
+                                seen[sh] = key;
                                 char args[1024];
                                 extract_call_args(q + 1, args, sizeof(args));
-                                add_call_edge(callee, b->name, b->file, b->line_start, args, via);
+                                add_call_edge(callee, b->name, b->file, call_line, args, via);
                             }
                         }
                     }
@@ -1157,10 +1269,8 @@ int lite_cs_callgraph_main(int argc, char** argv) {
            g_scope_count[SCOPE_LOCAL], g_scope_count[SCOPE_GLOBAL],
            g_scope_count[SCOPE_AMBIGUOUS], g_scope_count[SCOPE_EXTERNAL]);
 
-    // Cleanup
-    for (int i = 0; i < g_func_count; i++) free(g_func_names[i]);
-    free(g_func_names);
-
+    // Cleanup：全部走 cs_callgraph_globals_reset()（free 且置 NULL）。
+    // 以前这里只 free 不置空，第二次调用会踩已释放的 g_node_hash / 名字表 → 段错误。
     while (bodies) {
         func_body_t* next = bodies->next;
         free(bodies->content);
@@ -1168,18 +1278,7 @@ int lite_cs_callgraph_main(int argc, char** argv) {
         bodies = next;
     }
 
-    while (g_func_nodes) {
-        func_node_t* fn = g_func_nodes;
-        g_func_nodes = fn->next;
-        call_edge_t* e = fn->calls;
-        while (e) {
-            call_edge_t* next = e->next;
-            free(e);
-            e = next;
-        }
-        free(fn);
-    }
-
+    cs_callgraph_globals_reset();
     free(line);
     return 0;
 }

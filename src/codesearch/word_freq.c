@@ -159,15 +159,11 @@ int lite_cs_word_freq_main(int argc, char** argv) {
     
     printf("Saved word frequencies to %s\n", out_file);
     
-    // Cleanup
-    for (int i = 0; i < HASH_SIZE; i++) {
-        word_freq_t* entry = hash_table[i];
-        while (entry) {
-            word_freq_t* next = entry->next;
-            free(entry);
-            entry = next;
-        }
-    }
+    // Cleanup：必须走 word_freq_reset()（它会把槽位置 NULL）。
+    // 以前这里手写 free 却不置空，lite 是长驻进程、同一 .so 会被调很多次：
+    // 第二次进来时开头的 word_freq_reset() 遍历的是已释放的链表 → double free
+    // → 段错误（真实现场：`lens action=build` 第二次跑，挂在 word_freq 阶段）。
+    word_freq_reset();
     free(line);
     
     return 0;

@@ -1026,7 +1026,12 @@ static json_t* do_dataflow(const char* query, const char* repo, int max_results)
                     json_t* lines = json_object_get(agg, "lines");
                     if (lines && json_array_size(lines) < 8) {
                         json_t* l = json_object_get(o, "line");
-                        if (l) json_array_append(lines, l);
+                        // 同一行常有 definition+assignment 两条 occurrence：count 要算两次，
+                        // 行号清单只留一份，否则输出成 "lines 16,16,17,18"。
+                        size_t lsz = json_array_size(lines);
+                        json_t* last = lsz ? json_array_get(lines, lsz - 1) : NULL;
+                        if (l && !(last && json_equal(last, l)))
+                            json_array_append(lines, l);
                     }
                 }
             }
