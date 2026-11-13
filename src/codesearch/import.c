@@ -488,6 +488,44 @@ static void import_symbols(const char* analysis_dir, const char* namespace) {
     log_info(msg);
 }
 
+// call_graph.json 的 `arguments` 在不同产出方有两种形态：字符串，或
+// 调用点实参的数组（新版 callgraph.c 写数组）。只认 json_string_value 会让
+// 数组形态静默变成空串 —— 调用点全丢参数，看着像「没解析出来」。
+// 这里两种都接：数组按 ", " 拼成一个字符串，超长截断。
+static const char* call_args_text(json_t* call, char* buf, size_t cap) {
+    json_t* a = json_object_get(call, "arguments");
+    if (!a || cap == 0) return "";
+    const char* s = json_string_value(a);
+    if (s) {
+        snprintf(buf, cap, "%s", s);
+        return buf;
+    }
+    if (!json_is_array(a)) return "";
+    size_t n = json_array_size(a), used = 0;
+    buf[0] = '\0';
+    for (size_t i = 0; i < n; i++) {
+        json_t* it = json_array_get(a, i);
+        const char* t = json_string_value(it);
+        char numbuf[32];
+        if (!t) {
+            // 非字符串元素（数字/布尔）按 JSON 文本近似，别静默丢参数
+            if (json_is_integer(it)) {
+                snprintf(numbuf, sizeof(numbuf), "%lld", (long long)json_integer_value(it));
+                t = numbuf;
+            } else {
+                continue;
+            }
+        }
+        int w = snprintf(buf + used, cap - used, "%s%s", used ? ", " : "", t);
+        if (w < 0 || (size_t)w >= cap - used) {  // 截断：保证 '\0'
+            buf[cap - 1] = '\0';
+            return buf;
+        }
+        used += (size_t)w;
+    }
+    return buf;
+}
+
 // Import call_graph.json
 static void import_callgraph(const char* analysis_dir, const char* namespace) {
     char path[512];
@@ -527,10 +565,11 @@ static void import_callgraph(const char* analysis_dir, const char* namespace) {
         size_t idx;
         json_t* call;
         json_array_foreach(calls, idx, call) {
+            char args_buf[512];
             const char* caller = json_string_value(json_object_get(call, "function"));
             const char* file = json_string_value(json_object_get(call, "file"));
             json_int_t line = json_integer_value(json_object_get(call, "line"));
-            const char* args = json_string_value(json_object_get(call, "arguments"));
+            const char* args = call_args_text(call, args_buf, sizeof(args_buf));
             // 间接/成员调用标注（callgraph.c 写、query 侧展示）：obj->fn() 这类边
             // 只能按裸名解析，可能与同名直接调用混淆，标出来供调用方打折。
             json_t* indirect_j = json_object_get(call, "indirect");
@@ -1078,8 +1117,51 @@ static void register_vectors(const char* analysis_dir, const char* namespace) {
     }
 }
 
+// 从 chunks_meta.jsonl 的 file 字段反推源码根（公共目录前缀）。
+// 以前 _meta/info 的 source_dir 直接写 analysis_dir（缓存目录），
+// 读的人会当成源码根，实际源码在 /opt/linux/src/... 这种地方。
+static void derive_source_root(const char* analysis_dir, char* out, size_t cap) {
+    out[0] = '\0';
+    char path[768];
+    snprintf(path, sizeof(path), "%s/chunks_meta.jsonl", analysis_dir);
+    FILE* fp = fopen(path, "r");
+    if (!fp) return;
+    char* line = malloc(65536);
+    if (!line) { fclose(fp); return; }
+    int seen = 0;
+    size_t plen = 0;
+    while (seen < 500 && fgets(line, 65536, fp)) {
+        json_error_t err;
+        json_t* obj = json_loads(line, 0, &err);
+        if (!obj) continue;
+        const char* file = json_string_value(json_object_get(obj, "file"));
+        if (file && *file) {
+            size_t flen = strlen(file);
+            if (seen == 0) {
+                const char* slash = strrchr(file, '/');
+                plen = slash ? (size_t)(slash - file) : 0;
+                if (plen >= cap) plen = cap - 1;
+                memcpy(out, file, plen);
+                out[plen] = '\0';
+            } else {
+                while (plen > 0 && (flen < plen || strncmp(out, file, plen) != 0)) {
+                    while (plen > 0 && out[plen - 1] != '/') plen--;
+                    if (plen > 0) plen--;
+                    out[plen] = '\0';
+                }
+            }
+            seen++;
+        }
+        json_decref(obj);
+    }
+    free(line);
+    fclose(fp);
+    if (plen <= 1) out[0] = '\0';  // 只剩 "/" 或空 = 没有公共根
+}
+
 // Store metadata
-static void store_metadata(const char* namespace, const char* source_dir) {
+static void store_metadata(const char* namespace, const char* source_dir,
+                           const char* analysis_dir) {
     char key[512];
     snprintf(key, sizeof(key), "%s/_meta/info", namespace);
     
@@ -1091,6 +1173,8 @@ static void store_metadata(const char* namespace, const char* source_dir) {
     json_t* val = json_object();
     json_object_set_new(val, "type", json_string("code_repo"));
     json_object_set_new(val, "source_dir", json_string(source_dir));
+    // 缓存目录单列：source_dir 只表示源码根，别混用
+    json_object_set_new(val, "analysis_dir", json_string(analysis_dir ? analysis_dir : ""));
     json_object_set_new(val, "imported_at", json_string(time_str));
     json_object_set_new(val, "total_keys", json_integer(g_total_keys));
     
@@ -1176,7 +1260,10 @@ int lite_cs_import_main(int argc, char** argv) {
     }
     if (!skip_chunks || !skip_callgraph) {
         register_vectors(analysis_dir, namespace);
-        store_metadata(namespace, analysis_dir);
+        // source_dir 报源码根（从 chunk 路径反推），推导失败才退回 analysis_dir
+        char root[768];
+        derive_source_root(analysis_dir, root, sizeof(root));
+        store_metadata(namespace, root[0] ? root : analysis_dir, analysis_dir);
     }
     
     flush_batch();

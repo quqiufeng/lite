@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <errno.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -30,6 +31,39 @@ static void set_error(const char* msg) {
 
 void lite_cs_free(char* p) {
     free(p);
+}
+
+// namespace 归一化：去空白、补前导 '/'、限定字符集。
+// KV 键的前缀就是 ns 原文，`code/x` 与 `/code/x` 是两套互不可见的键空间：
+// import 少一个斜杠，查询侧仍是 /code/x，读到的就是上一次构建的旧键 ——
+// 表现为「重建了但内容还是旧的」，且不报错。库这一层统一收口，
+// 调用方（FFI / CLI / lens）不必各自记得。
+// 返回 malloc 的规范串；非法输入返回 NULL。
+static char* ns_normalize(const char* raw) {
+    if (!raw) return NULL;
+    size_t n = strlen(raw);
+    char* out = malloc(n + 2);
+    if (!out) return NULL;
+    size_t k = 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)raw[i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') continue;
+        if (!(isalnum(c) || c == '/' || c == '.' || c == '_' || c == '-' || c == ':')) {
+            free(out);
+            return NULL;
+        }
+        out[k++] = (char)c;
+    }
+    size_t s = 0;
+    while (s < k && out[s] == '/') s++;  // 多余的前导斜杠收成一个
+    if (s == k) { free(out); return NULL; }  // 空 ns
+    char* norm = malloc(k - s + 2);
+    if (!norm) { free(out); return NULL; }
+    norm[0] = '/';
+    memcpy(norm + 1, out + s, k - s);
+    norm[k - s + 1] = '\0';
+    free(out);
+    return norm;
 }
 
 static char* json_ok(int rc) {
@@ -246,17 +280,21 @@ char* lite_cs_import(const char* analysis_dir, const char* ns,
     if (!kv_dir || !*kv_dir) return json_fail("kv_dir required");
     if (mkdir_p(kv_dir) != 0) return json_fail("cannot create kv directory");
 
+    char* norm = ns_normalize(ns);
+    if (!norm) return json_fail("bad ns (required: ns like \"/code/<repo>\" / [A-Za-z0-9._-/:])");
+
     char* argv[10];
     int argc = 0;
     argv[argc++] = (char*)"cache_import";
     argv[argc++] = (char*)analysis_dir;
-    argv[argc++] = (char*)ns;
+    argv[argc++] = norm;
     argv[argc++] = (char*)"--cache-dir";
     argv[argc++] = (char*)kv_dir;
     if (only_dataflow) argv[argc++] = (char*)"--only-dataflow";
     argv[argc] = NULL;
 
     int rc = lite_cs_import_main(argc, argv);
+    free(norm);
     return json_ok(rc);
 }
 
@@ -275,9 +313,15 @@ char* lite_cs_query(const char* query, const char* repo, const char* type,
 
     char* argv[32];
     int argc = 0;
+    // repo 就是 namespace，与 import 同一条归一化：少个斜杠会切到另一套键空间
+    char* nrepo = NULL;
+    if (repo && *repo) {
+        nrepo = ns_normalize(repo);
+        if (!nrepo) return json_fail("bad ns (required: ns like \"/code/<repo>\" / [A-Za-z0-9._-/:])");
+    }
     argv[argc++] = (char*)"cache_query";
     argv[argc++] = (char*)query;
-    if (repo && *repo) { argv[argc++] = (char*)"--repo"; argv[argc++] = (char*)repo; }
+    if (nrepo) { argv[argc++] = (char*)"--repo"; argv[argc++] = nrepo; }
     if (type && *type) { argv[argc++] = (char*)"--type"; argv[argc++] = (char*)type; }
     argv[argc++] = (char*)"--cache-dir"; argv[argc++] = (char*)kv_dir;
     if (analysis_dir && *analysis_dir) {
@@ -303,6 +347,7 @@ char* lite_cs_query(const char* query, const char* repo, const char* type,
 
     int rc = 0;
     char* out = run_capture(lite_cs_query_main, argc, argv, &rc);
+    free(nrepo);
     if (!out) {
         if (rc == 0) return strdup("{\"ok\":true}");
         set_error("query failed");
@@ -323,9 +368,11 @@ char* lite_cs_dataflow_query(const char* query, const char* kv_dir, const char* 
     snprintf(mbuf, sizeof(mbuf), "%d", max_results);
     char* argv[16];
     int argc = 0;
+    char* nns = ns_normalize(ns);
+    if (!nns) return json_fail("bad ns (required: ns like \"/code/<repo>\" / [A-Za-z0-9._-/:])");
     argv[argc++] = (char*)"cache_query";
     argv[argc++] = (char*)query;
-    argv[argc++] = (char*)"--repo"; argv[argc++] = (char*)ns;
+    argv[argc++] = (char*)"--repo"; argv[argc++] = nns;
     argv[argc++] = (char*)"--type"; argv[argc++] = (char*)"dataflow";
     argv[argc++] = (char*)"--cache-dir"; argv[argc++] = (char*)kv_dir;
     argv[argc++] = (char*)"--max-results"; argv[argc++] = mbuf;
@@ -333,6 +380,7 @@ char* lite_cs_dataflow_query(const char* query, const char* kv_dir, const char* 
 
     int rc = 0;
     char* out = run_capture(lite_cs_query_main, argc, argv, &rc);
+    free(nns);
     if (!out) {
         if (rc == 0) return strdup("{\"ok\":true,\"results\":[]}");
         set_error("dataflow query failed");

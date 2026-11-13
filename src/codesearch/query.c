@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <ctype.h>
 #include <time.h>
 #include <getopt.h>
@@ -27,6 +28,11 @@
 #include "vector_engine.h"
 
 static cache_t* g_cache = NULL;
+// symbol 走的 `/symbols/<name>` 键里，一个名字可能挂着多种语言的同名实现
+// （内核里 C 的 `xchg` 和 Rust 的 `xchg` 共存）。裸名查询不做语言收窄时，
+// 命中列表会被别的语言占满。--lang 是「这条查询关心哪种语言」的唯一表达，
+// 这里把符号/调用点两条路径都按它收窄（未指定 = 不过滤）。
+static const char* g_lang_filter = NULL;
 static vector_engine_t* g_ve = NULL;
 // 进程内复用：同一项目连续 query（TUI/agent）不再反复加载 2GB KV 和数 GB HNSW。
 // 反复 create/destroy ORT session 还会偶发段错误；保持 engine 常驻更稳。
@@ -245,6 +251,71 @@ static void add_line_alias(json_t* obj) {
         json_object_set_new(obj, "line_start", json_integer(json_integer_value(ln)));
 }
 
+// --lang 的扩展名映射（indexer.c 的 detect_language 是 static，这里只做过滤用）。
+// 别名都认：c++/js/ts/py 各归一到 detect_language 的写法。
+static const char* sym_file_lang(const char* file) {
+    const char* ext = file ? strrchr(file, '.') : NULL;
+    if (!ext) return NULL;
+    if (!strcmp(ext, ".c") || !strcmp(ext, ".h")) return "c";
+    if (!strcmp(ext, ".cpp") || !strcmp(ext, ".cc") || !strcmp(ext, ".cxx") ||
+        !strcmp(ext, ".hpp") || !strcmp(ext, ".hh")) return "cpp";
+    if (!strcmp(ext, ".py")) return "python";
+    if (!strcmp(ext, ".lua")) return "lua";
+    if (!strcmp(ext, ".js") || !strcmp(ext, ".jsx")) return "javascript";
+    if (!strcmp(ext, ".ts") || !strcmp(ext, ".tsx")) return "typescript";
+    if (!strcmp(ext, ".go")) return "go";
+    if (!strcmp(ext, ".rs")) return "rust";
+    if (!strcmp(ext, ".java")) return "java";
+    if (!strcmp(ext, ".kt") || !strcmp(ext, ".kts")) return "kotlin";
+    if (!strcmp(ext, ".rb")) return "ruby";
+    if (!strcmp(ext, ".php")) return "php";
+    if (!strcmp(ext, ".m")) return "objc";
+    if (!strcmp(ext, ".mm")) return "objcpp";
+    if (!strcmp(ext, ".cs")) return "csharp";
+    return NULL;
+}
+
+// 该文件是否属于 --lang 指定的语言：没设过滤就放行；认不出扩展名也放行
+// （宁可多给一条，也别因为路径不认识就把真命中藏掉）。
+static int sym_lang_ok(const char* file) {
+    if (!g_lang_filter || !*g_lang_filter) return 1;
+    const char* want = g_lang_filter;
+    if (!strcasecmp(want, "c++")) want = "cpp";
+    else if (!strcasecmp(want, "cxx")) want = "cpp";
+    else if (!strcasecmp(want, "js")) want = "javascript";
+    else if (!strcasecmp(want, "ts")) want = "typescript";
+    else if (!strcasecmp(want, "py")) want = "python";
+    else if (!strcasecmp(want, "rs")) want = "rust";
+    else if (!strcasecmp(want, "golang")) want = "go";
+    const char* have = sym_file_lang(file);
+    if (!have) return 1;
+    return !strcasecmp(want, have);
+}
+
+// 条目行号：chunk 用 line_start，符号记录用 line（add_line_alias 之外还要认老键）
+static long entry_line(json_t* o) {
+    json_t* v = json_object_get(o, "line_start");
+    if (!json_is_integer(v)) v = json_object_get(o, "line");
+    return json_is_integer(v) ? (long)json_integer_value(v) : -1;
+}
+
+// arr 里是否已有同 (file, line) 的条目。chunk 键是 <repo>/chunks/<file>/<name>，
+// 同一文件里同名符号（内核 rust atomic.rs 有两处 pub fn xchg）撞同一个键、只剩
+// 最后写入那份；不去重就返回两条一模一样的命中。路径忽略前导 '/'。
+static int has_entry(json_t* arr, const char* file, long line) {
+    const char* a = file;
+    while (*a == '/') a++;
+    size_t i;
+    json_t* it;
+    json_array_foreach(arr, i, it) {
+        const char* f = json_string_value(json_object_get(it, "file"));
+        if (!f) continue;
+        while (*f == '/') f++;
+        if (!strcmp(f, a) && entry_line(it) == line) return 1;
+    }
+    return 0;
+}
+
 // 展开一个 /symbols/<name> 键：优先取 chunk 全文，缺 chunk 退回符号条目
 static void symbol_entries_into(json_t* arr, const char* repo, const char* name) {
     char key[1024];
@@ -267,12 +338,25 @@ static void symbol_entries_into(json_t* arr, const char* repo, const char* name)
         
         // Skip leading '/' to match trim_slash() in cache_import.c
         while (*file == '/') file++;
+
+        // 同名符号在别的语言里也常有（内核里 C 的 xchg / Rust 的 xchg）：
+        // --lang 给了就按文件语言收窄，否则裸名查询会被别的语言占满。
+        if (!sym_lang_ok(file)) continue;
         
+        long ln = entry_line(sym);
+        if (has_entry(arr, file, ln)) continue;
+
         char ckey[1024];
         snprintf(ckey, sizeof(ckey), "%s/chunks/%s/%s", repo, file, name);
         const char* cvalue = cache_get(g_cache, ckey);
         if (cvalue) {
             json_t* chunk = json_loads(cvalue, 0, &error);
+            // 行号对不上 = 这个 chunk 是同文件另一处同名符号的，内容/行号都错，
+            // 丢掉退回符号元数据（宁可少一段源码，也不能给错位置）。
+            if (chunk && entry_line(chunk) != ln) {
+                json_decref(chunk);
+                chunk = NULL;
+            }
             if (chunk) {
                 add_line_alias(chunk);
                 json_object_set_new(chunk, "_source", json_string("symbol"));
@@ -1413,6 +1497,7 @@ int lite_cs_query_main(int argc, char** argv) {
             opts.kind_filter = argv[++i];
         } else if (strcmp(argv[i], "--lang") == 0 && i + 1 < argc) {
             opts.lang_filter = argv[++i];
+            g_lang_filter = opts.lang_filter;
         } else if (strcmp(argv[i], "--file") == 0 && i + 1 < argc) {
             opts.file_filter = argv[++i];
         } else if (strcmp(argv[i], "--path-prefix") == 0 && i + 1 < argc) {

@@ -171,8 +171,12 @@ local function marker_ns(dir)
     local s = f:read("*l")
     f:close()
     s = s and s:gsub("%s+$", "")
-    if s and s:match("^/[%w%._%-/]+$") then return s end
-    return nil
+    if not s or s == "" then return nil end
+    -- 文件里的值可能是手写的 `code/x`（少前导斜杠）：KV 前缀是 ns 原文，
+    -- 原样用会落到另一套键空间，所有查询稳定 0 命中且不报错 —— 这里就地归一化。
+    s = (s:gsub("%s+", "")):gsub("^/+", "")
+    if s == "" or not s:match("^[%w%._%-/:]+$") then return nil end
+    return "/" .. s
 end
 
 local function ns_from_dir(dir)

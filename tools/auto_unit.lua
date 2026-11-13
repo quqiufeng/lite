@@ -4812,6 +4812,36 @@ int only_ab(int v) {
             sym.results[1].content:find("helper_add", 1, true) ~= nil,
             "codesearch symbol returns chunk content")
 
+        -- 同文件同名符号撞 chunk 键：symbols/<name> 有两条不同行，chunks/<file>/<name>
+        -- 只有一份（内核 rust atomic.rs 两处 pub fn xchg）。必须返回两条不同行号的命中，
+        -- 且行号对不上的 chunk 不能拿来充数 —— 否则同一行会返回两遍、位置还是错的。
+        do
+            local dupkv = base .. "/kv_dup"
+            local CH = require("ffi.cache")
+            local h = CH.open(dupkv, 8 * 1024 * 1024)
+            check(h ~= nil, "codesearch dup kv opens")
+            if h then
+                local dns = "/code/unit_dup"
+                CH.set(h, dns .. "/symbols/dupfn",
+                    '[' .. '{"name":"dupfn","kind":"function","file":"/p/x.rs","line":10},'
+                    .. '{"name":"dupfn","kind":"function","file":"/p/x.rs","line":40}' .. ']')
+                CH.set(h, dns .. "/chunks/p/x.rs/dupfn",
+                    '{"name":"dupfn","file":"/p/x.rs","kind":"function",'
+                    .. '"line_start":40,"line_end":44,"content":"fn dupfn(){}"}')
+                CH.close(h)
+                local dq = CS.query({ query = "dupfn", repo = dns, type = "symbol", kv_dir = dupkv })
+                local dres = (dq and dq.results) or {}
+                local seen, duped = {}, false
+                for _, e in ipairs(dres) do
+                    local ln = e.line or e.line_start
+                    if seen[ln] then duped = true end
+                    seen[ln] = true
+                end
+                check(#dres == 2 and not duped,
+                    "codesearch symbol same-file dup keeps distinct lines")
+            end
+        end
+
         -- exact 落文件：<ns>/chunks/sub/b.c 与「文件 + 写错符号」两种写法都必须只命中
         -- sub/b.c 自己的 chunk（不能因整段子串匹配把同目录 sub/ab.c 也带出来）。
         local function exact_names(q)

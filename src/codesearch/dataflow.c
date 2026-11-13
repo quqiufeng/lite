@@ -81,6 +81,7 @@ typedef struct {
     occurrence_t* occurs;   // 动态，上限 MAX_OCCURS
     int occur_count;
     int occur_capacity;
+    int occur_truncated;    // 1 = 撞 MAX_OCCURS 被截断，输出里要标出来
     field_record_t* fields; // 动态，上限 MAX_FIELDS
     int field_count;
     int field_capacity;
@@ -215,6 +216,7 @@ static var_record_t* find_or_create_var(const char* name) {
     var->name[sizeof(var->name) - 1] = '\0';
     var->type[0] = '\0';
     var->occurs = NULL; var->occur_count = 0; var->occur_capacity = 0;
+    var->occur_truncated = 0;
     var->fields = NULL; var->field_count = 0; var->field_capacity = 0;
     var->hops = NULL; var->hop_count = 0; var->hop_capacity = 0;
 
@@ -288,7 +290,10 @@ static void add_field_occurrence(field_record_t* field, occurrence_t* occ) {
 static void add_occurrence(var_record_t* var, const char* file, const char* func, 
                            int line, int col, const char* context, int is_def,
                            const char* field_name) {
-    if (!var || var->occur_count >= MAX_OCCURS) return;
+    if (!var || var->occur_count >= MAX_OCCURS) {
+        if (var) var->occur_truncated = 1;
+        return;
+    }
     if (var->occur_count >= var->occur_capacity) {
         int newcap = var->occur_capacity ? var->occur_capacity * 2 : 8;
         if (newcap > MAX_OCCURS) newcap = MAX_OCCURS;
@@ -1550,6 +1555,12 @@ static void save_dataflow(const char* output_file) {
             fprintf(fp, "\n    },\n");
         }
         
+        // 撞 MAX_OCCURS 时条目是被截断的：不标出来，调用方会以为「这个变量
+        // 全生命周期就这么多引用」（i/ret 这类高频变量最容易被误读）。
+        if (var->occur_truncated) {
+            fprintf(fp, "    \"occurrences_truncated\": true,\n");
+            fprintf(fp, "    \"occurrences_limit\": %d,\n", MAX_OCCURS);
+        }
         fprintf(fp, "    \"occurrences\": [\n");
         for (int i = 0; i < var->occur_count; i++) {
             if (i > 0) fprintf(fp, ",\n");
