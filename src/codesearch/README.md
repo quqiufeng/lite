@@ -187,6 +187,12 @@ namespace 默认是 `/code/<project>`。
 每次 import 默认以 8 GiB 逻辑内存上限 `cache_open`（`LITE_CS_KV_MAX_GB` 可调），
 批量写入后 `cache_sync` 落盘。
 
+**大仓库别写整块 `_func_index`**：函数数超过 `LITE_CS_FUNC_INDEX_MAX`（默认 20000）时
+import 跳过 `dataflow/_func_index` 这一整块，只写逐函数键 `dataflow/funcs/<func>`（查询侧本来就走它），
+并在 `dataflow/_func_index_meta` 里记 `skipped` 与函数总数。旧逻辑是「先 `json_dumps` 全量、
+再看长度决定是否分片」——内核 19 万个函数那次，为了知道它太大先拼出几 GB 字符串，
+在 8 GiB RSS + swap 抖动下卡在 `json_dumps` 里 29 分钟、盘上一行没动。
+
 ### 1.1 本机已经建好的索引（2026-11-10 快照，已清掉源码丢失的 5 份）
 
 **lite 自身不建索引**：`~/.local/share/lite/codesearch/` 下**不留** `lite` 那一份
@@ -409,6 +415,7 @@ TensorRT 之前实测在该工作负载下比 CUDA 慢且版本耦合严重，�
 | `LITE_CS_HNSW_M` | `16` | HNSW `M` |
 | `LITE_CS_DISABLE_VECTOR` | 关 | helper `build` 时跳过向量化 |
 | `LITE_CS_KV_MAX_GB` | `8` | import 时 KV 逻辑内存上限（大仓库可调） |
+| `LITE_CS_FUNC_INDEX_MAX` | `20000` | 函数数超过它就不写 `dataflow/_func_index` 整块（只留 `dataflow/funcs/<func>`） |
 | `LITE_ORT_LIB` | ORT 1.20.1 路径 | 指定 ONNX Runtime `.so.1` |
 | `LITE_CS_PRELOAD_DIRS` | 空 | 额外预加载目录，冒号分隔（高级调试） |
 

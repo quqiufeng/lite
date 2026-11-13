@@ -825,16 +825,55 @@ static void import_dataflow(const char* analysis_dir, const char* namespace) {
     // "Value too large, skipping"，谁也不知道到底丢了什么）。查询侧已经改成
     // cache_get `dataflow/funcs/<func>`，这份大块索引只剩调试价值，所以
     // 超限就明确说一句跳过，不再假装失败。
+    //
+    // 函数数量先设闸：先 json_dumps 再看长度，等于为了知道「太大」而先把
+    // 几 GB 的字符串拼出来——内核 191850 个函数那次在 18GB RSS + swap 抖动下
+    // 卡在 json_dumps 里 29 分钟没动一行盘（gdb: json_dump_callback）。
+    // 落盘与否由函数条数决定，超大就只写 dataflow/_func_index_meta 记一笔。
     char fkey[512];
     snprintf(fkey, sizeof(fkey), "%s/dataflow/_func_index", namespace);
-    char* fstr = json_dumps(func_index, JSON_COMPACT);
-    if (fstr) {
-        if (strlen(fstr) < MAX_VALUE_LEN) {
-            safe_set_json(fkey, fstr);
-        } else {
-            store_sharded_func_index(namespace, func_index, strlen(fstr));
+    size_t func_count = json_object_size(func_index);
+    size_t func_index_max = 20000;
+    const char* fimax_env = getenv("LITE_CS_FUNC_INDEX_MAX");
+    if (fimax_env && *fimax_env) {
+        long v = atol(fimax_env);
+        if (v > 0) func_index_max = (size_t)v;
+    }
+    if (func_count <= func_index_max) {
+        char* fstr = json_dumps(func_index, JSON_COMPACT);
+        if (fstr) {
+            if (strlen(fstr) < MAX_VALUE_LEN) {
+                safe_set_json(fkey, fstr);
+            } else {
+                store_sharded_func_index(namespace, func_index, strlen(fstr));
+            }
+            free(fstr);
         }
-        free(fstr);
+    } else {
+        json_t* meta = json_object();
+        if (meta) {
+            json_object_set_new(meta, "shards", json_integer(0));
+            json_object_set_new(meta, "functions", json_integer((json_int_t)func_count));
+            json_object_set_new(meta, "indexed_functions", json_integer(0));
+            json_object_set_new(meta, "key_prefix", json_string("dataflow/funcs/"));
+            json_object_set_new(meta, "skipped", json_true());
+            json_object_set_new(meta, "note", json_string(
+                "function count above LITE_CS_FUNC_INDEX_MAX (default 20000): whole "
+                "_func_index block skipped; query dataflow/funcs/<func> instead"));
+            char* mstr = json_dumps(meta, JSON_COMPACT);
+            if (mstr) {
+                char mkey[512];
+                snprintf(mkey, sizeof(mkey), "%s/dataflow/_func_index_meta", namespace);
+                safe_set_json(mkey, mstr);
+                free(mstr);
+            }
+            json_decref(meta);
+        }
+        char msg[192];
+        snprintf(msg, sizeof(msg),
+                 "Phase 3: _func_index skipped (%zu funcs > LITE_CS_FUNC_INDEX_MAX=%zu), "
+                 "per-function dataflow/funcs/ keys only", func_count, func_index_max);
+        log_info(msg);
     }
 
     // 每函数一条 `dataflow/funcs/<func>`：查某个函数碰了哪些变量时直接
