@@ -128,6 +128,14 @@ int cache_sorted_remove(cache_t* cache, const char* key, size_t key_len) {
     cache_sorted_array_t* sorted = &cache->sorted;
     if (sorted->count == 0) return -1;
     
+    // 大库上的隐患：跳表从未被建过（cache_skiplist_build 只有 cache_sorted_rebuild 调用，
+    // 而 rebuild 此前没有任何调用者），于是每次删除都掉进下面的 fallback：一次全量 qsort。
+    // 3.4M 条 key 的库单次 qsort ≈ 4s，批量删（import 清理旧调用边）就退化成 N×4s 的小时级任务。
+    // 超过阈值就先付一次「排序 + 建跳表」的代价，之后每次删除走 O(log n)。
+    if (!sorted->skiplist && sorted->count >= CACHE_SKIPLIST_THRESHOLD) {
+        cache_sorted_rebuild(cache);
+    }
+
     // 优化：如果跳表已启用且规模足够，直接用跳表定位，避免全表排序
     if (sorted->skiplist && sorted->count >= CACHE_SKIPLIST_THRESHOLD) {
         cache_skiplist_node_t* node = cache_skiplist_find(sorted->skiplist, key, key_len);

@@ -214,8 +214,10 @@ void cache_skiplist_build(cache_t* cache, cache_skiplist_t* sl) {
     sl->max_level = 1;
     sl->size = 0;
     
-    // 确保 sorted array 已排序
-    cache_sorted_rebuild(cache);
+    // 确保 sorted array 已排序。
+    // 以前这里调 cache_sorted_rebuild，而 rebuild 又会回调 build，跳表一旦非空就无限递归；
+    // 建表只需要「排好序」，所以只做 ensure_sorted。
+    cache_sorted_ensure_sorted(cache);
     
     // 批量插入
     for (size_t i = 0; i < cache->sorted.count; i++) {
