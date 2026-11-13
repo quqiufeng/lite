@@ -950,6 +950,20 @@ static json_t* do_dataflow(const char* query, const char* repo, int max_results)
             json_object_set_new(entry, "occurrence_count", json_integer((json_int_t)occ_n));
             json_t* vtype = json_object_get(data, "type");
             if (vtype) json_object_set_new(entry, "type", json_incref(vtype));
+            // 跨过程跳：analyzer 落盘的实参位 → 形参边，直接带着走（最多 12 条）
+            json_t* vhops = json_object_get(data, "hops");
+            if (vhops && json_is_array(vhops) && json_array_size(vhops) > 0) {
+                json_t* hs = json_array();
+                size_t hi;
+                json_t* h;
+                json_array_foreach(vhops, hi, h) {
+                    if (json_array_size(hs) >= 12) break;
+                    json_array_append(hs, h);
+                }
+                json_object_set_new(entry, "hops", hs);
+                json_object_set_new(entry, "hop_count",
+                                    json_integer((json_int_t)json_array_size(vhops)));
+            }
             json_t* vfields = json_object_get(data, "fields");
             if (vfields && json_is_object(vfields) && json_object_size(vfields) > 0) {
                 // 字段清单按访问次数降序给前 24 个，方便顺着结构体往下钻
@@ -1072,6 +1086,25 @@ static json_t* do_dataflow(const char* query, const char* repo, int max_results)
             json_decref(cands);
         }
         cache_results_free(found);
+    }
+
+    // 4) 还是空：dataflow 只做 C 词法，把「覆盖范围」说清楚，别让人误以为拼错了
+    //    （内核之外的 python/go/ts 仓库命中 0 条是设计使然，不是索引坏了）。
+    if (json_array_size(results) == 0) {
+        char mkey[512];
+        snprintf(mkey, sizeof(mkey), "%s/dataflow/_meta", repo);
+        const char* mvalue = cache_get(g_cache, mkey);
+        if (mvalue) {
+            json_t* meta = json_loads(mvalue, 0, &error);
+            if (meta) {
+                json_t* entry = json_object();
+                json_object_set_new(entry, "kind", json_string("note"));
+                json_object_set_new(entry, "query", json_string(query));
+                json_object_set_new(entry, "note", json_incref(meta));
+                json_array_append_new(results, entry);
+                json_decref(meta);
+            }
+        }
     }
     return results;
 }

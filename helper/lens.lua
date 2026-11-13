@@ -467,6 +467,26 @@ local function fmt_dataflow(d)
         elseif entry.kind == "variable" then
             out[#out + 1] = string.format("var %s — %s occurrence(s) across %d func(s)",
                 entry.var or "?", tostring(entry.occurrence_count or 0), #(entry.funcs or {}))
+            -- 跨过程跳：变量在 caller 里作为第 pos 个实参传给 callee 的哪个形参。
+            -- 以前这条边只在查询侧用 strstr(args, var) 猜，既不落盘也不给形参名。
+            local hops = entry.hops or {}
+            if #hops > 0 then
+                local show = math.min(#hops, 8)
+                for i = 1, show do
+                    local h = hops[i]
+                    out[#out + 1] = string.format(
+                        "  → %s:%s %s() calls %s(%s) [arg %s, %s]",
+                        h.file or "?", tostring(h.line or "?"), h.caller or "?",
+                        h.callee or "?",
+                        (h.param and h.param ~= "") and h.param
+                            or ("arg" .. tostring(h.pos or "?")),
+                        tostring(h.pos or "?"), h.scope or "external")
+                end
+                local more = tonumber(entry.hop_count or #hops) - show
+                if more > 0 then
+                    out[#out + 1] = string.format("  ... and %d more cross-proc hop(s)", more)
+                end
+            end
             for _, f in ipairs(entry.funcs or {}) do
                 local lines = {}
                 for i, l in ipairs(f.lines or {}) do
@@ -479,6 +499,21 @@ local function fmt_dataflow(d)
         elseif entry.kind == "candidates" then
             out[#out + 1] = string.format('"%s" not found; similar functions: %s',
                 entry.query or "?", table.concat(entry.functions or {}, ", "))
+        elseif entry.kind == "note" then
+            -- dataflow 只做 C 族词法：空结果时把覆盖范围讲清楚（而不是让人去猜拼写）
+            local n = entry.note or {}
+            local langs = {}
+            for k, v in pairs(n.langs or {}) do
+                langs[#langs + 1] = string.format("%s=%s", k, tostring(v))
+            end
+            table.sort(langs)
+            out[#out + 1] = string.format(
+                'no dataflow hit for "%s" — analyzer covered %s function(s) ' ..
+                '(c-family %s, other %s; %s); langs: %s',
+                entry.query or "?", tostring(n.functions or "?"),
+                tostring(n.c_family_functions or 0), tostring(n.other_language_functions or 0),
+                tostring(n.lexer or "?"), table.concat(langs, ", "))
+            if n.note then out[#out + 1] = "  note: " .. tostring(n.note) end
         end
     end
     local s = table.concat(out, "\n")

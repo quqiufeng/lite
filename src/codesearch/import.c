@@ -643,6 +643,78 @@ static void import_callgraph(const char* analysis_dir, const char* namespace) {
 }
 
 // Import dataflow.json
+// _func_index 超过单值上限时的分片落盘：旧版只打一行 "skipped"，等于整块索引
+// 静默消失（谁也不知道丢了什么）。这里按 4096 个函数一片写 _func_index/<NNNN>，
+// 再写一条 _func_index_meta 记片数与函数总数，超限也照样可查。
+static void store_sharded_func_index(const char* namespace, json_t* func_index,
+                                     size_t total_bytes) {
+    size_t total_funcs = json_object_size(func_index);
+    json_t* shard = json_object();
+    if (!shard) return;
+    int in_shard = 0;
+    int shards = 0;
+    long long indexed = 0;
+    const char* sk;
+    json_t* sv;
+    json_object_foreach(func_index, sk, sv) {
+        json_object_set(shard, sk, sv);
+        in_shard++;
+        if (in_shard < 4096) continue;
+        char* s = json_dumps(shard, JSON_COMPACT);
+        if (s && strlen(s) < MAX_VALUE_LEN) {
+            char skey[640];
+            snprintf(skey, sizeof(skey), "%s/dataflow/_func_index/%04d",
+                     namespace, shards + 1);
+            safe_set_json(skey, s);
+            shards++;
+            indexed += in_shard;
+            json_object_clear(shard);
+            in_shard = 0;
+        }
+        free(s);
+    }
+    if (in_shard > 0) {
+        char* s = json_dumps(shard, JSON_COMPACT);
+        if (s && strlen(s) < MAX_VALUE_LEN) {
+            char skey[640];
+            snprintf(skey, sizeof(skey), "%s/dataflow/_func_index/%04d",
+                     namespace, shards + 1);
+            safe_set_json(skey, s);
+            shards++;
+            indexed += in_shard;
+        }
+        free(s);
+    }
+    json_decref(shard);
+
+    json_t* meta = json_object();
+    if (meta) {
+        json_object_set_new(meta, "shards", json_integer(shards));
+        json_object_set_new(meta, "functions", json_integer((json_int_t)total_funcs));
+        json_object_set_new(meta, "indexed_functions", json_integer((json_int_t)indexed));
+        json_object_set_new(meta, "key_prefix", json_string("dataflow/_func_index/"));
+        json_object_set_new(meta, "note", json_string(
+            "whole _func_index exceeded the 1MB single-value limit; read the shards, "
+            "or prefer dataflow/funcs/<func> for exact lookups"));
+        char* mstr = json_dumps(meta, JSON_COMPACT);
+        if (mstr) {
+            char mkey[512];
+            snprintf(mkey, sizeof(mkey), "%s/dataflow/_func_index_meta", namespace);
+            safe_set_json(mkey, mstr);
+            free(mstr);
+        }
+        json_decref(meta);
+    }
+
+    char msg[192];
+    snprintf(msg, sizeof(msg),
+             "Phase 3: _func_index %.1f MB > limit, sharded into %d value(s) "
+             "(%lld/%lld funcs indexed; see dataflow/_func_index_meta)",
+             (double)total_bytes / (1024.0 * 1024.0), shards,
+             indexed, (long long)total_funcs);
+    log_info(msg);
+}
+
 static void import_dataflow(const char* analysis_dir, const char* namespace) {
     char path[512];
     snprintf(path, sizeof(path), "%s/dataflow.json", analysis_dir);
@@ -694,6 +766,15 @@ static void import_dataflow(const char* analysis_dir, const char* namespace) {
             }
             json_object_set_new(val, "fields", fs);
             json_object_set_new(val, "field_count", json_integer(json_object_size(vfields)));
+        }
+        // 跨过程跳（实参位置 → callee 形参）：analyzer 里算好落盘，查询侧直接读，
+        // 不再用 strstr(args, var) 猜（猜会把 bufsize 算成 buf、把嵌套调用的内层
+        // 实参算成外层实参）。单变量最多 48 条，KV 里全量存，查询时再截。
+        json_t* vhops = json_object_get(var_data, "hops");
+        if (vhops && json_is_array(vhops) && json_array_size(vhops) > 0) {
+            json_object_set_new(val, "hops", json_incref(vhops));
+            json_object_set_new(val, "hop_count", json_integer(
+                (json_int_t)json_array_size(vhops)));
         }
         
         char* str = json_dumps(val, JSON_COMPACT);
@@ -751,11 +832,7 @@ static void import_dataflow(const char* analysis_dir, const char* namespace) {
         if (strlen(fstr) < MAX_VALUE_LEN) {
             safe_set_json(fkey, fstr);
         } else {
-            char msg[128];
-            snprintf(msg, sizeof(msg),
-                     "Phase 3: _func_index %.1f MB > limit, skipped (use dataflow/funcs/<func>)",
-                     (double)strlen(fstr) / (1024.0 * 1024.0));
-            log_info(msg);
+            store_sharded_func_index(namespace, func_index, strlen(fstr));
         }
         free(fstr);
     }
@@ -888,6 +965,26 @@ static void import_dataflow(const char* analysis_dir, const char* namespace) {
         snprintf(fmsg, sizeof(fmsg), "Phase 3: indexed %d struct fields for dataflow",
                  stored_fields);
         log_info(fmsg);
+    }
+
+    // ---- 覆盖范围 dataflow/_meta --------------------------------------------
+    // dataflow 只做 C 词法：python/go/ts 的索引命中 0 条时，必须能说清是
+    // 「语言不在覆盖范围」还是「名字拼错」，否则调用方只会去重跑 import。
+    {
+        char mpath[512];
+        snprintf(mpath, sizeof(mpath), "%s/dataflow_meta.json", analysis_dir);
+        json_error_t merr;
+        json_t* meta = json_load_file(mpath, 0, &merr);
+        if (meta) {
+            char* mstr = json_dumps(meta, JSON_COMPACT);
+            if (mstr) {
+                char mkey[512];
+                snprintf(mkey, sizeof(mkey), "%s/dataflow/_meta", namespace);
+                safe_set_json(mkey, mstr);
+                free(mstr);
+            }
+            json_decref(meta);
+        }
     }
 
     json_decref(root);

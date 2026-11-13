@@ -10,6 +10,7 @@
 #define MAX_OCCURS 2000  /* 200→2000: 高频变量（i/ret 等）不再过早截断；occurs 动态分配 */
 #define MAX_FIELDS 50
 #define MAX_FUNCS 5000
+#define MAX_PARAMS 12   /* 形参表长度上限 = 实参位置上限（跨过程 hop 按位置对齐） */
 
 // 前向声明（is_c_type / is_type_word / is_type_qualifier 定义在后面）
 static int is_c_type(const char* word);
@@ -92,6 +93,35 @@ static var_record_t* g_vars = NULL;
 static int g_var_count = 0;
 static int g_var_capacity = 0;
 
+// 语言分布：dataflow 只做 C 词法（声明驱动），python/go/ts 的函数体也能走一遍但
+// 语义差得远。0 条命中时必须能说清是「这门语言不在覆盖范围」还是「名字拼错了」，
+// 所以 analyzing 时把语言计数落到 dataflow_meta.json，import 存进 KV。
+#define MAX_LANGS 16
+typedef struct {
+    char name[24];
+    int funcs;
+} lang_count_t;
+static lang_count_t g_langs[MAX_LANGS];
+static int g_lang_count = 0;
+static int g_funcs_total = 0;
+static int g_hop_total = 0;
+
+static int lang_is_c_family(const char* l) {
+    return l && (strcmp(l, "c") == 0 || strcmp(l, "cpp") == 0 ||
+                 strcmp(l, "objc") == 0 || strcmp(l, "objcpp") == 0);
+}
+
+static void count_lang(const char* lang) {
+    if (!lang || !*lang) lang = "unknown";
+    for (int i = 0; i < g_lang_count; i++) {
+        if (strcmp(g_langs[i].name, lang) == 0) { g_langs[i].funcs++; return; }
+    }
+    if (g_lang_count >= MAX_LANGS) return;
+    strncpy(g_langs[g_lang_count].name, lang, sizeof(g_langs[0].name) - 1);
+    g_langs[g_lang_count].funcs = 1;
+    g_lang_count++;
+}
+
 // 变量名哈希索引（开放寻址）：name → g_vars 下标+1，0 表示空。
 // 修复 find_or_create_var 旧版线性扫描（变量一多即 O(n²)）。
 #define VAR_HASH_INIT 65536
@@ -116,6 +146,10 @@ typedef struct {
     char call_site_file[512];
     int call_site_line;
     char args[1024];  // 参数字符串，如 "c, pool, log"
+    // 按顶层逗号切开的实参表达式（arg_list[k] 就是第 k 个实参）。只留一份字符串
+    // 时位置无法还原，hop 也就只能写 "传给了 callee" 而说不出「传给第几个形参」。
+    char arg_list[MAX_PARAMS][128];
+    int arg_count;
     int scope;        // 0=external 1=local 2=global 3=ambiguous（call_graph.json）
     char def[512];
     int defs;
@@ -288,7 +322,6 @@ static void add_occurrence(var_record_t* var, const char* file, const char* func
 // 这里从 chunks_meta 的 signature 解析形参（name + type），实参按顶层逗号切成
 // 位置索引 → 形参名，跨过程边才带得上 param/pos。
 // ============================================
-#define MAX_PARAMS 12
 #define PARAM_HASH_SIZE 65536
 
 typedef struct {
@@ -417,7 +450,10 @@ static void add_func_params(const char* func, const char* sig) {
         if (!boundary) {
             if (*p == '(') { depth++; continue; }
             if (*p == ')') { depth--; continue; }
+            // 普通字符必须 continue：旧版缺这一句，于是每轮都往下走
+            // `start = p + 1`，len 恒为 0，形参表永远是空的。
             if (*p == ',' && depth == 0) boundary = 1;
+            else continue;
         }
         int len = (int)(p - start);
         if (len > 0 && fp->count < MAX_PARAMS) {
@@ -428,7 +464,6 @@ static void add_func_params(const char* func, const char* sig) {
         if (p == close) break;
     }
 }
-// PARAM_PARSE_HERE
 static const char* extract_field_access(const char* line, const char* var_name) {
     static char field_name[128];
     field_name[0] = '\0';
@@ -634,8 +669,18 @@ static void analyze_line_impl(const char* line, ctx_info_t* ctx) {
             char* prev = tokens[i - 1];
             if (strcmp(prev, "+") != 0 && strcmp(prev, "-") != 0 &&
                 strcmp(prev, "*") != 0 && strcmp(prev, "&") != 0) {
+                // `obj->field = 1` / `s.field = 1`：field 是成员名，不是局部变量
+                int is_member = (i >= 2 && (strcmp(tokens[i - 2], "->") == 0 ||
+                                            strcmp(tokens[i - 2], ".") == 0));
                 var_record_t* var = find_var(prev);
-                if (!var) var = implicit_param_var(prev, ctx->func);
+                if (!var && !is_member) var = implicit_param_var(prev, ctx->func);
+                // 声明没被认出来的局部变量（跨行声明、宏展开、非 C 语言的
+                // `x = 1`）以前整条赋值都丢掉，于是查询那儿「变量查不到」。
+                // 这里兜底建一个无类型变量：只要求是个合法标识符、不是成员名。
+                if (!var && !is_member && is_identifier(prev) &&
+                    !is_c_type(prev) && !is_c_keyword(prev) && !is_type_word(prev)) {
+                    var = find_or_create_var(prev);
+                }
                 if (var) {
                     const char* field = extract_field_access(line, prev);
                     add_occurrence(var, ctx->file, ctx->func, ctx->abs_line, 0, line, 2, field);
@@ -785,6 +830,7 @@ static int analyze_meta(const char* meta_file) {
         char* sig_p = strstr(line, "\"signature\":\"");
         char* line_p = strstr(line, "\"line_start\":");
         char* content_p = strstr(line, "\"content\":\"");
+        char* lang_p = strstr(line, "\"language\":\"");
         
         if (!name_p || !file_p || !kind_p || !content_p) continue;
         
@@ -831,7 +877,10 @@ static int analyze_meta(const char* meta_file) {
         if (sig_p) {
             char sig[512];
             int si = 0;
-            const char* sp = sig_p + 12;
+            // sig_p 指向 strstr 的 `"signature":"`（13 字节，末尾那个引号是值的开引号）。
+            // 旧版只 +12，sp 停在开引号上，上面循环立刻因 *sp=='"' 结束 → sig 恒空，
+            // 于是 func_params 永远是空表，跨过程 hop 的 param 全为空。
+            const char* sp = sig_p + 13;
             while (*sp && *sp != '"' && si < (int)sizeof(sig) - 1) {
                 if (*sp == '\\' && sp[1]) { sp++; if (*sp != 'n' && *sp != 't') sig[si++] = *sp; }
                 else sig[si++] = *sp;
@@ -841,8 +890,21 @@ static int analyze_meta(const char* meta_file) {
             add_func_params(name, sig);
         }
 
+        // 语言计数：只统计真正会被分析的函数体（上面 kind 过滤已经过了）
+        {
+            char lang[24] = {0};
+            int li = 0;
+            if (lang_p) {
+                const char* lp = lang_p + 12;
+                while (*lp && *lp != '"' && li < (int)sizeof(lang) - 1) lang[li++] = *lp++;
+            }
+            lang[li] = '\0';
+            count_lang(lang);
+        }
+
         process_function_content(content, &ctx);
         func_count++;
+        g_funcs_total = func_count;
     }
     
     fclose(fp);
@@ -854,6 +916,36 @@ static int analyze_meta(const char* meta_file) {
 // ============================================
 // 调用图加载
 // ============================================
+
+// call_graph.json 的 arguments 是对齐切口后重新拼成的一整串（"c, pool, log"），
+// 位置信息只剩「顶层逗号的第几段」。跨过程 hop 要写「传给第几个形参」，所以
+// 加载时按顶层逗号再切回 arg_list[]（括号/方括号内的逗号不算，嵌套调用保持完整）。
+static void split_edge_args(call_edge_t* edge) {
+    edge->arg_count = 0;
+    const char* p = edge->args;
+    while (*p && edge->arg_count < MAX_PARAMS) {
+        while (*p == ' ' || *p == '\t') p++;
+        const char* start = p;
+        int depth = 0;
+        while (*p) {
+            if (*p == '(' || *p == '[' || *p == '{') depth++;
+            else if ((*p == ')' || *p == ']' || *p == '}') && depth > 0) depth--;
+            else if (*p == ',' && depth == 0) break;
+            p++;
+        }
+        int len = (int)(p - start);
+        while (len > 0 && (start[len - 1] == ' ' || start[len - 1] == '\t')) len--;
+        if (len > 0) {
+            int cap = (int)sizeof(edge->arg_list[0]) - 1;
+            int n = len < cap ? len : cap;
+            memcpy(edge->arg_list[edge->arg_count], start, (size_t)n);
+            edge->arg_list[edge->arg_count][n] = '\0';
+            edge->arg_count++;
+        }
+        if (*p == ',') { p++; continue; }
+        break;
+    }
+}
 
 static int load_call_graph(const char* cache_dir) {
     char path[512];
@@ -889,12 +981,15 @@ static int load_call_graph(const char* cache_dir) {
         json_array_foreach(calls, idx, call) {
             if (!json_is_object(call)) continue;
             
-            json_t* callee_j = json_object_get(call, "function");
+            // call_graph.json 是反向图：key 是 callee，entry 的 "function" 是 caller。
+            // 旧版直接 key→caller、"function"→callee，整张图装反，于是「谁调谁」
+            // 和跨过程流全是反的（helper_add 的实参被算成传给调用者的实参）。
+            json_t* caller_j = json_object_get(call, "function");
             json_t* file_j = json_object_get(call, "file");
             json_t* line_j = json_object_get(call, "line");
             json_t* args_j = json_object_get(call, "arguments");
             
-            if (!callee_j || !json_is_string(callee_j)) continue;
+            if (!caller_j || !json_is_string(caller_j)) continue;
             
             if (g_call_graph.edge_count >= g_call_graph.capacity) {
                 g_call_graph.capacity *= 2;
@@ -903,8 +998,9 @@ static int load_call_graph(const char* cache_dir) {
             }
             
             call_edge_t* edge = &g_call_graph.edges[g_call_graph.edge_count++];
-            strncpy(edge->caller, func_name, sizeof(edge->caller) - 1);
-            strncpy(edge->callee, json_string_value(callee_j), sizeof(edge->callee) - 1);
+            memset(edge, 0, sizeof(*edge));
+            strncpy(edge->caller, json_string_value(caller_j), sizeof(edge->caller) - 1);
+            strncpy(edge->callee, func_name, sizeof(edge->callee) - 1);
             
             if (file_j && json_is_string(file_j)) {
                 strncpy(edge->call_site_file, json_string_value(file_j), 
@@ -935,6 +1031,7 @@ static int load_call_graph(const char* cache_dir) {
             }
             
             edge->args[0] = '\0';
+            edge->arg_count = 0;
             if (args_j && json_is_array(args_j)) {
                 size_t arg_idx;
                 json_t* arg;
@@ -955,12 +1052,193 @@ static int load_call_graph(const char* cache_dir) {
                 }
                 edge->args[pos] = '\0';
             }
+            split_edge_args(edge);
         }
     }
     
     json_decref(root);
     printf("Loaded call graph: %d edges\n", g_call_graph.edge_count);
     return 0;
+}
+
+// ============================================
+// 跨过程跳（hop）：变量在 caller 里作为第 k 个实参传给 callee
+//
+// 旧版跨函数流只在查询侧用 strstr(args, var_name) 猜，dataflow.json 里既没有
+// 位置也没有形参名，于是「x 传给 helper_add 的哪个形参、那里是不是形参上被改写」
+// 全靠人肉翻代码。这里把边显式落盘，查询/打印都直接读。
+// caller → edges 建哈希，避免对每个 occurrence 线性扫全部调用边。
+// ============================================
+#define CALLER_HASH_SIZE 65536
+typedef struct edge_node {
+    int idx;
+    struct edge_node* next;
+} edge_node_t;
+
+static edge_node_t** g_caller_hash = NULL;
+
+static unsigned int caller_hash(const char* s) {
+    unsigned int h = 5381;
+    while (*s) h = ((h << 5) + h) + (unsigned char)*s++;
+    return h % CALLER_HASH_SIZE;
+}
+
+static void build_caller_index(void) {
+    if (g_caller_hash || g_call_graph.edge_count <= 0) return;
+    g_caller_hash = calloc(CALLER_HASH_SIZE, sizeof(edge_node_t*));
+    if (!g_caller_hash) return;
+    for (int i = 0; i < g_call_graph.edge_count; i++) {
+        unsigned int h = caller_hash(g_call_graph.edges[i].caller);
+        edge_node_t* n = malloc(sizeof(edge_node_t));
+        if (!n) return;
+        n->idx = i;
+        n->next = g_caller_hash[h];
+        g_caller_hash[h] = n;
+    }
+}
+
+// 实参表达式里这个变量是不是「直接」传过去的：`buf` 不算 `bufsize`，
+// `f(g(x), 1)` 里的 x 也不算传给 f（它传给 g）——旧版 strstr 两个都错。
+static int arg_refers_to(const char* arg, const char* var) {
+    if (!arg || !*arg || !var || !*var) return 0;
+    size_t vl = strlen(var);
+    for (const char* q = arg; *q; q++) {
+        if (*q == '"') break;  // 字符串字面量后面不是代码
+        if (!(isalpha((unsigned char)*q) || *q == '_')) continue;
+        const char* s = q;
+        while (*q && (isalnum((unsigned char)*q) || *q == '_')) q++;
+        const char* after = q;
+        while (*after == ' ' || *after == '\t') after++;
+        if (*after == '(') return 0;   // 嵌套调用：实参属于内层函数
+        (void)s;
+    }
+    const char* p = arg;
+    while ((p = strstr(p, var)) != NULL) {
+        if (p > arg && (isalnum((unsigned char)p[-1]) || p[-1] == '_')) { p += vl; continue; }
+        char nb = p[vl];
+        if (!(isalnum((unsigned char)nb) || nb == '_')) return 1;
+        p += vl;
+    }
+    return 0;
+}
+
+static void add_hop(var_record_t* var, const call_edge_t* e, int pos, const char* param) {
+    if (!var || !e) return;
+    for (int i = 0; i < var->hop_count; i++) {
+        hop_t* h = &var->hops[i];
+        if (h->line == e->call_site_line && h->pos == pos &&
+            strcmp(h->callee, e->callee) == 0) return;   // 同一调用点已记
+    }
+    if (var->hop_count >= MAX_HOPS) return;
+    if (var->hop_count >= var->hop_capacity) {
+        int newcap = var->hop_capacity ? var->hop_capacity * 2 : 4;
+        if (newcap > MAX_HOPS) newcap = MAX_HOPS;
+        hop_t* nh = realloc(var->hops, (size_t)newcap * sizeof(hop_t));
+        if (!nh) return;
+        var->hops = nh;
+        var->hop_capacity = newcap;
+    }
+    hop_t* h = &var->hops[var->hop_count++];
+    memset(h, 0, sizeof(*h));
+    strncpy(h->caller, e->caller, sizeof(h->caller) - 1);
+    strncpy(h->callee, e->callee, sizeof(h->callee) - 1);
+    strncpy(h->file, e->call_site_file, sizeof(h->file) - 1);
+    h->line = e->call_site_line;
+    if (param) strncpy(h->param, param, sizeof(h->param) - 1);
+    h->pos = pos;
+    h->scope = e->scope;
+    strncpy(h->def, e->def, sizeof(h->def) - 1);
+    h->defs = e->defs;
+}
+
+#define MAX_FUNCS_PER_VAR 64   // 一个变量跨过太多函数时只取前 64 个（hop 上限已是 48）
+
+static void build_hops(void) {
+    build_caller_index();
+    if (!g_caller_hash) return;
+    int total = 0;
+    for (int v = 0; v < g_var_count; v++) {
+        var_record_t* var = &g_vars[v];
+        if (var->occur_count == 0) continue;
+        char seen[MAX_FUNCS_PER_VAR][256];
+        int nf = 0;
+        for (int o = 0; o < var->occur_count && var->hop_count < MAX_HOPS; o++) {
+            const char* fn = var->occurs[o].func;
+            if (!fn || !*fn) continue;
+            int dup = 0;
+            for (int i = 0; i < nf; i++) {
+                if (strcmp(seen[i], fn) == 0) { dup = 1; break; }
+            }
+            if (dup) continue;
+            if (nf >= MAX_FUNCS_PER_VAR) continue;
+            strncpy(seen[nf], fn, sizeof(seen[0]) - 1);
+            seen[nf][sizeof(seen[0]) - 1] = '\0';
+            nf++;
+            for (edge_node_t* nd = g_caller_hash[caller_hash(fn)]; nd; nd = nd->next) {
+                if (var->hop_count >= MAX_HOPS) break;
+                call_edge_t* e = &g_call_graph.edges[nd->idx];
+                if (strcmp(e->caller, fn) != 0) continue;
+                func_param_t* fp = func_params(e->callee);
+                for (int k = 0; k < e->arg_count && k < MAX_PARAMS; k++) {
+                    if (!arg_refers_to(e->arg_list[k], var->name)) continue;
+                    // sig 解析不出来（或无此位形参）时 param 留空，pos 照样有效
+                    const char* pname = (fp && k < fp->count) ? fp->params[k].name : "";
+                    int before = var->hop_count;
+                    add_hop(var, e, k, pname);
+                    if (var->hop_count > before) total++;
+                }
+            }
+        }
+    }
+    g_hop_total = total;
+    printf("Cross-proc hops: %d\n", total);
+}
+
+// dataflow_meta.json：这份分析到底覆盖了什么。以前只有 stdout 上的
+// "Found N variables"，import 之后查询侧一无所知 —— 非 C 语言（python/go/ts）
+// 命中 0 条时看起来和「拼错名字」没区别。落盘后 query 能在空结果里说清原因。
+static void write_dataflow_meta(const char* cache_dir) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/dataflow_meta.json", cache_dir);
+    json_t* root = json_object();
+    if (!root) return;
+    json_object_set_new(root, "functions", json_integer(g_funcs_total));
+    json_object_set_new(root, "variables", json_integer(g_var_count));
+    json_object_set_new(root, "hops", json_integer(g_hop_total));
+    int c_funcs = 0, other_funcs = 0;
+    json_t* langs = json_object();
+    for (int i = 0; i < g_lang_count; i++) {
+        json_object_set_new(langs, g_langs[i].name, json_integer(g_langs[i].funcs));
+        if (lang_is_c_family(g_langs[i].name)) c_funcs += g_langs[i].funcs;
+        else other_funcs += g_langs[i].funcs;
+    }
+    json_object_set_new(root, "langs", langs);
+    json_object_set_new(root, "c_family_functions", json_integer(c_funcs));
+    json_object_set_new(root, "other_language_functions", json_integer(other_funcs));
+    json_object_set_new(root, "lexer", json_string("c-family"));
+
+    // 覆盖范围内但为空、或压根没有 C 族函数时，把话说在明面上
+    if (other_funcs > 0 && c_funcs == 0) {
+        json_object_set_new(root, "note", json_string(
+            "dataflow only lexes C-family (c/cpp/objc) function bodies; this index has "
+            "0 such functions, so cross-function data flow is empty by design — use "
+            "action=context / action=grep for other languages"));
+    } else if (other_funcs > 0) {
+        json_object_set_new(root, "note", json_string(
+            "dataflow only lexes C-family (c/cpp/objc) function bodies; "
+            "other_language_functions are parsed with the C lexer and their "
+            "variables/uses are largely missing"));
+    }
+    char* str = json_dumps(root, JSON_COMPACT | JSON_PRESERVE_ORDER);
+    if (str) {
+        FILE* fp = fopen(path, "w");
+        if (fp) {
+            fputs(str, fp);
+            fclose(fp);
+        }
+        free(str);
+    }
+    json_decref(root);
 }
 
 // ============================================
@@ -1110,6 +1388,23 @@ static void print_dataflow(const char* var_name) {
     }
     
     // 5. 跨函数数据流
+    if (var->hop_count > 0) {
+        printf("🌉 CROSS-PROC HOPS (explicit, arg position → param):\n");
+        printf("─────────────────────────────────────────────────────────────────\n");
+        static const char* scope_names[4] = {"external", "local", "global", "ambiguous"};
+        for (int i = 0; i < var->hop_count; i++) {
+            hop_t* h = &var->hops[i];
+            printf("  %s:%d  %s() → %s(", h->file, h->line, h->caller, h->callee);
+            if (h->param[0]) printf("%s", h->param);
+            else printf("arg%d", h->pos);
+            printf(")  [pos %d, %s]", h->pos, scope_names[h->scope & 3]);
+            if (h->def[0]) printf(" def=%s", h->def);
+            if (h->defs > 1) printf(" (%d impls)", h->defs);
+            printf("\n");
+        }
+        printf("\n");
+    }
+
     if (g_call_graph.edge_count > 0) {
         printf("🌐 CROSS-FUNCTION FLOW:\n");
         printf("─────────────────────────────────────────────────────────────────\n");
@@ -1268,7 +1563,30 @@ static void save_dataflow(const char* output_file) {
             fprintf(fp, "      {\"file\":\"%s\",\"func\":\"%s\",\"line\":%d,\"type\":\"%s\",\"context\":\"%s\"}",
                    escaped_file, escaped_func, occ->line, type_str, escaped_context);
         }
-        fprintf(fp, "\n    ]\n  }");
+        fprintf(fp, "\n    ]");
+        // 跨过程跳：之前这些边只活在查询侧的一次 strstr 猜测里，进不了盘。
+        if (var->hop_count > 0) {
+            fprintf(fp, ",\n    \"hops\": [\n");
+            static const char* scope_names[4] = {"external", "local", "global", "ambiguous"};
+            for (int i = 0; i < var->hop_count; i++) {
+                hop_t* h = &var->hops[i];
+                char ec[512], ee[512], ef[1024], ep[128], ed[1024];
+                json_escape(ec, h->caller, sizeof(ec));
+                json_escape(ee, h->callee, sizeof(ee));
+                json_escape(ef, h->file, sizeof(ef));
+                json_escape(ep, h->param, sizeof(ep));
+                json_escape(ed, h->def, sizeof(ed));
+                fprintf(fp, "%s      {\"caller\":\"%s\",\"callee\":\"%s\",\"file\":\"%s\","
+                            "\"line\":%d,\"pos\":%d,\"param\":\"%s\",\"scope\":\"%s\"",
+                        i ? ",\n" : "", ec, ee, ef, h->line, h->pos, ep,
+                        scope_names[h->scope & 3]);
+                if (h->def[0]) fprintf(fp, ",\"def\":\"%s\"", ed);
+                if (h->defs > 0) fprintf(fp, ",\"defs\":%d", h->defs);
+                fprintf(fp, "}");
+            }
+            fprintf(fp, "\n    ]");
+        }
+        fprintf(fp, "\n  }");
     }
     fprintf(fp, "\n}\n");
     fclose(fp);
@@ -1309,8 +1627,10 @@ int lite_cs_dataflow_main(int argc, char** argv) {
         if (analyze_meta(meta_file) != 0) return 1;
         
         load_call_graph(cache_dir);
+        build_hops();
         
         save_dataflow(out_file);
+        write_dataflow_meta(cache_dir);
         printf("Saved data flow to %s\n", out_file);
         printf("Found %d variables, %d fields tracked\n", g_var_count, count_total_fields());
         
@@ -1328,6 +1648,7 @@ int lite_cs_dataflow_main(int argc, char** argv) {
         if (analyze_meta(meta_file) != 0) return 1;
         
         load_call_graph(cache_dir);
+        build_hops();
         
         print_dataflow(var_name);
         

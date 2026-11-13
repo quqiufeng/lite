@@ -765,7 +765,11 @@ static void extract_call_args(const char* after, char* args_out, int args_out_si
             continue;
         }
 
-        if (arg_len < 127 && depth == 1) arg[arg_idx][arg_len++] = *after;
+        // 嵌套调用的实参要原样保留（含内层括号与逗号）：`f(g(1, 2))` 的第二段
+        // 曾经只剩 `g)`，hop 也就说不出「传的是哪个实参」。depth>1 的字符照抄，
+        // 内层逗号天然不会被当成实参分隔符（上面只在 depth==1 才切）。
+        if (arg_len < 127) arg[arg_idx][arg_len++] = *after;
+
         after++;
     }
 
