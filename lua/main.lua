@@ -109,15 +109,42 @@ local SUBCOMMANDS = {
     ["--gui"] = true,
 }
 
-local cmd = clean[1]
-local rest = {}
-if cmd == nil then
-    cmd = "--tui"
-elseif cmd:sub(1, 1) == "-" and not SUBCOMMANDS[cmd] then
-    rest[1] = cmd
-    cmd = "--tui"
+-- 子命令不必是首个参数：`lite --readonly --once "..."` 里 `--readonly` 不是子命令，
+-- 但后面还有个真的。旧逻辑只看 clean[1]，于是 --once 退化成 TUI 的「多余参数」
+-- 被静默忽略（实测：本该跑单轮，结果开了交互界面，task 白跑）。现在整串扫一遍找
+-- 第一个子命令，把其余参数按原序留给它。
+-- 取值选项的名字要先登记，否则 `lite --snapshot serve` 会把 serve 当子命令。
+local VALUE_FLAGS = {
+    ["--port"] = true, ["--host"] = true, ["--probe"] = true, ["--samples"] = true,
+    ["--interval"] = true, ["--probe-timeout"] = true, ["--http-timeout"] = true,
+    ["--wake"] = true, ["--wake-max"] = true, ["--task"] = true, ["--task-file"] = true,
+    ["--snapshot"] = true, ["--snapshot-text"] = true, ["--width"] = true,
+    ["--height"] = true, ["--session"] = true, ["--reasoning-effort"] = true,
+    ["--approval"] = true, ["--max-turns"] = true, ["--debug-log"] = true,
+    ["--prefix"] = true,
+}
+
+local cmd, cmd_at, rest = nil, nil, {}
+do
+    local i = 1
+    while i <= #clean do
+        if SUBCOMMANDS[clean[i]] then cmd, cmd_at = clean[i], i break end
+        if VALUE_FLAGS[clean[i]] then i = i + 1 end
+        i = i + 1
+    end
 end
-for i = 2, #clean do rest[#rest + 1] = clean[i] end
+if cmd == nil then
+    -- 没有子命令：首参是非选项就照旧当未知子命令报错（别降级成 TUI 的普通参数），
+    -- 否则（空/纯选项）就是交互 TUI，选项原样转发。
+    if clean[1] and clean[1]:sub(1, 1) ~= "-" then
+        cmd, cmd_at = clean[1], 1
+    else
+        cmd = "--tui"
+    end
+end
+for i = 1, #clean do
+    if i ~= cmd_at then rest[#rest + 1] = clean[i] end
+end
 
 local function default_debug_log()
     return (os.getenv("TMPDIR") or "/tmp") .. "/lite-debug.jsonl"
@@ -215,6 +242,23 @@ local function parse_flags(list)
         elseif a == "--readonly" then
             -- 显式认领"本次不落盘"：抢不到 mem.lock 时不再拒绝启动。
             flags.readonly = true
+            i = i + 1
+        elseif a == "--prefix" then
+            -- 可重复（--memory-export 一次挑几个前缀）；缺值当场报错，
+            -- 别让 nil 一路传到 export 里变成"筛掉一切"的空结果。
+            local v = list[i + 1]
+            if not v then
+                io.stderr:write("lite: --prefix needs a value\n")
+                os.exit(2)
+            end
+            flags.prefix = flags.prefix or {}
+            flags.prefix[#flags.prefix + 1] = v
+            i = i + 2
+        elseif a == "--all" then
+            flags.all = true
+            i = i + 1
+        elseif a == "--dry-run" then
+            flags.dry_run = true
             i = i + 1
         else
             pos[#pos + 1] = a
@@ -529,7 +573,10 @@ elseif cmd == "--check" then
     end
     os.exit(ok and 0 or 1)
 elseif cmd == "--recall" then
-    local query = rest[1] or ""
+    -- 走 parse_flags 的 pos，别再拿 rest[1]：`lite --readonly --recall x` 时
+    -- rest[1] 是 --readonly，会把选项名当查询词（查空还要以为记忆没了）。
+    local _, pos = parse_flags(rest)
+    local query = table.concat(pos, " ")
     local config = require("core.config").load()
     local Memory = require("core.memory")
     local memory, merr = Memory.new({
@@ -560,7 +607,9 @@ elseif cmd == "--memdb" or cmd == "--memdb-search" then
     -- 所以 CLI 也只给两个动作——看有什么、搜一下。
     local Memdb = require("core.memdb")
     if cmd == "--memdb-search" then
-        local query = table.concat(rest, " ")
+        -- 同 --recall：只把 pos 当查询词，选项留在 flags 里
+        local _, pos = parse_flags(rest)
+        local query = table.concat(pos, " ")
         local hits, scanned = Memdb.search(query, 20)
         if json then
             emit({ type = "memdb_search", dir = Memdb.dir(), scanned = scanned, items = hits })
@@ -595,26 +644,12 @@ elseif cmd == "--memory-export" or cmd == "--memory-import" then
     local mio = require("core.memory_io")
     local exporting = cmd == "--memory-export"
 
-    -- 手写解析：这两个子命令的参数很少，走 parse_flags 反而要加一堆分支
-    local path, prefixes, dry_run, all = nil, {}, false, false
-    local i = 1
-    while i <= #rest do
-        local a = rest[i]
-        if a == "--prefix" then
-            local v = rest[i + 1]
-            if not v then io.stderr:write("lite: --prefix needs a value\n") os.exit(2) end
-            prefixes[#prefixes + 1] = v
-            i = i + 2
-        elseif a == "--all" then
-            all = true i = i + 1
-        elseif a == "--dry-run" then
-            dry_run = true i = i + 1
-        elseif a:sub(1, 1) == "-" and a ~= "-" then
-            io.stderr:write("lite: unknown option " .. a .. "\n") os.exit(2)
-        else
-            path = a i = i + 1
-        end
-    end
+    -- 子命令级参数（--prefix 可重复 / --all / --dry-run）已由 parse_flags 认领，
+    -- 这里只取位置参数：否则 `lite --readonly --memory-export` 会把 --readonly
+    -- 当成"unknown option"直接退 2，选项写在子命令前面就等于不能用。
+    local flags, pos = parse_flags(rest)
+    local path, dry_run, all = pos[1], flags.dry_run or false, flags.all or false
+    local prefixes = flags.prefix or {}
     if all and #prefixes == 0 then
         prefixes = { "/agent/knowledge/", "/agent/session/", "/agent/working/" }
     end
