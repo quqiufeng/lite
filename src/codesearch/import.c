@@ -526,6 +526,53 @@ static const char* call_args_text(json_t* call, char* buf, size_t cap) {
     return buf;
 }
 
+// callers/ 与 callees/ 是「本次产出什么就写什么」的键：新图里消失的名字
+// 不会被重写，旧值就永久留在 KV 里。后果是 lens 一直报已经不存在的调用边
+// （改 callgraph 的注释剥离后，tcp_v4_rcv 的注释伪边就是这么留下的）。
+// chunks 侧已有 purge_stale_chunks，这里按同样的口径清：本次没写过的键 = 残留。
+static void purge_stale_call_edges(const char* namespace, const char* kind,
+                                   const pathset_t* seen) {
+    char prefix[512];
+    snprintf(prefix, sizeof(prefix), "%s/%s", namespace, kind);
+    size_t plen = strlen(prefix);
+
+    char** stale = NULL;
+    size_t nstale = 0, capstale = 0;
+
+    void* it = cache_iter_create(g_cache);
+    if (!it) return;
+    const char* key = NULL;
+    const char* val = NULL;
+    while (cache_iter_ns_next(it, prefix, &key, &val) == 1 && key) {
+        if (key[plen] != '/') continue;              // 形态不认识就别动
+        const char* name = key + plen + 1;
+        if (pathset_has(seen, name, strlen(name))) continue;
+        if (nstale == capstale) {
+            size_t ncap = capstale ? capstale * 2 : 64;
+            char** grown = realloc(stale, ncap * sizeof(char*));
+            if (!grown) break;
+            stale = grown;
+            capstale = ncap;
+        }
+        char* dup = strdup(key);
+        if (!dup) break;
+        stale[nstale++] = dup;
+    }
+    cache_iter_destroy(it);
+
+    for (size_t i = 0; i < nstale; i++) {
+        cache_del(g_cache, stale[i]);
+        free(stale[i]);
+    }
+    free(stale);
+
+    if (nstale > 0) {
+        char msg[160];
+        snprintf(msg, sizeof(msg), "Purged %zu stale %s keys", nstale, kind);
+        log_info(msg);
+    }
+}
+
 // Import call_graph.json
 static void import_callgraph(const char* analysis_dir, const char* namespace) {
     char path[512];
@@ -544,6 +591,7 @@ static void import_callgraph(const char* analysis_dir, const char* namespace) {
     json_t* func_data;
     int stored_callers = 0;
     int stored_callees = 0;
+    pathset_t seen_callers = {0}, seen_callees = {0};
 
     // 正向表：caller → [callee 调用点]。call_graph.json 是反向图（key=callee，
     // "function"=caller），旧版把 func_name(callee 自己) 当 callee 存 → 全自指。
@@ -646,6 +694,7 @@ static void import_callgraph(const char* analysis_dir, const char* namespace) {
                 safe_set_json(key, str);
                 free(str);
                 stored_callers++;
+                pathset_add(&seen_callers, func_name, strlen(func_name));
             }
             json_decref(val);
         } else {
@@ -668,11 +717,19 @@ static void import_callgraph(const char* analysis_dir, const char* namespace) {
                 safe_set_json(key, str);
                 free(str);
                 stored_callees++;
+                pathset_add(&seen_callees, caller_name, strlen(caller_name));
             }
             json_decref(val);
         }
     }
     json_decref(callee_map);
+    
+    // 先把这一批新值落盘，再清残留：顺序反了会把刚写、还没 flush 的键当残留删掉
+    flush_batch();
+    purge_stale_call_edges(namespace, "callers", &seen_callers);
+    purge_stale_call_edges(namespace, "callees", &seen_callees);
+    pathset_free(&seen_callers);
+    pathset_free(&seen_callees);
     
     json_decref(root);
     
@@ -1271,6 +1328,30 @@ int lite_cs_import_main(int argc, char** argv) {
     if (kv_max_env && *kv_max_env) {
         long g = atol(kv_max_env);
         if (g > 0 && g <= 64) max_gb = (unsigned long long)g;
+    }
+
+    // 增量导入会打开一个已经很大的库：如果上限小于现有体积，cache_open_ex 之后
+    // 每次 cache_set 都判定「空间不足」→ 全量淘汰（遍历全部 entry + qsort +
+    // 压实 sorted offsets，大库上是三次 O(n)），几十万次写入直接退化成小时级。
+    // 8512 那次 18 分钟卡死在 Phase 1b，根因就是 13GB 的库配了 8GiB 上限。
+    // 上限是「能写多少」的上界，绝不能小于「已经写了多少」，所以按现有体积兜底。
+    {
+        char mem_path[600];
+        snprintf(mem_path, sizeof(mem_path), "%s/mem.bin", cache_dir);
+        struct stat st;
+        if (stat(mem_path, &st) == 0 && st.st_size > 0) {
+            unsigned long long need_gb =
+                (unsigned long long)(st.st_size + (1ULL << 30) - 1) >> 30;
+            // 留 1.5 倍余量，避免「刚好装下 → 后续每条都碰上限」
+            need_gb = need_gb + need_gb / 2 + 1;
+            if (need_gb > 64) need_gb = 64;
+            if (need_gb > max_gb) {
+                printf("  KV 已有 %llu MiB，上限从 %llu GiB 抬到 %llu GiB"
+                       "（LITE_CS_KV_MAX_GB 可覆盖）\n",
+                       (unsigned long long)(st.st_size >> 20), max_gb, need_gb);
+                max_gb = need_gb;
+            }
+        }
     }
     g_cache = cache_open_ex(cache_dir, (size_t)(max_gb * 1024ULL * 1024ULL * 1024ULL),
                             CACHE_OPEN_NO_TAG_INDEX | CACHE_OPEN_NO_VECTOR_INDEX);
