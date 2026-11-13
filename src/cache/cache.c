@@ -486,6 +486,19 @@ cache_t* cache_open_ex(const char* db_dir, size_t max_memory, unsigned flags) {
         }
     }
 
+    // 打开时库已经比上限大，会静默进入「每次 cache_set 都全量淘汰」的病理状态：
+    // 淘汰路径每次都要遍历全部 entry 建候选 + qsort + 全量压实 sorted offsets，
+    // 3.4M 条 key 的库上是三次 O(n)，几十万次写入就是小时级任务（8512 那次 18 分钟
+    // 卡在 Phase 1b 就是这么来的：13GB 的库被用 8GiB 的 LITE_CS_KV_MAX_GB 打开）。
+    // 上限配错是调用方的错，但不能靠「跑 18 分钟」来发现，这里必须响亮地说出来。
+    if (cache->memory_used > cache->memory_max) {
+        fprintf(stderr,
+            "[WARN] cache %s: 已用 %zu MiB > 上限 %zu MiB；"
+            "此后每次写入都会触发全量淘汰，写入会慢几个数量级。"
+            "请调大 max_memory / LITE_CS_KV_MAX_GB 后重开。\n",
+            db_dir, cache->memory_used >> 20, cache->memory_max >> 20);
+    }
+
     return cache;
 }
 
@@ -864,6 +877,29 @@ int cache_batch_set(cache_t* cache, const cache_batch_item_t* items, size_t coun
     for (size_t i = 0; i < count; i++) {
         const char* key = items[i].key;
         size_t key_len = strlen(key);
+        // 同 cache_set 的「更新已有 key」分支：key 已存在（含本批前面刚写的同 key）就把旧 entry
+        // 标墓碑并摘出各索引。少了这段，重复写同一批 key 会留下多条活副本：hash 指向最新一条，
+        // 旧 entry 仍是活的（entry_count/memory_used/ns/tag/sorted 全留着）且没标 DELETED，
+        // 于是 cache_compact 也回收不到 → KV 文件按导入轮次线性翻倍（复现：3 轮 count 2→4→6，
+        // compact reclaimed=0，reopen 后 pool_used 1216→5568）。
+        size_t old_offset = cache_hash_lookup(cache, key, key_len);
+        if (old_offset && old_offset != offsets[i]) {
+            cache_entry_header_t* old_header = (cache_entry_header_t*)CACHE_PTR(cache, old_offset);
+            if (!(old_header->flags & CACHE_ENTRY_DELETED)) {
+                old_header->flags |= CACHE_ENTRY_DELETED;
+                cache->entry_count--;
+                cache->deleted_count++;
+                cache->memory_used -= cache_entry_total_size(old_header);
+                cache_hash_remove(cache, key, key_len);
+                cache_sorted_remove(cache, key, key_len);
+                cache_ns_remove(cache, key);
+                const char* old_value = (const char*)CACHE_PTR(
+                    cache, old_offset + sizeof(cache_entry_header_t) + old_header->key_len + 1);
+                cache_tag_index_remove(cache, old_offset, old_value, old_header->value_len);
+                cache_vector_index_remove(cache, old_offset);
+                hot_cache_invalidate(cache, key, key_len);
+            }
+        }
         // 同 cache_set：hash 插入失败就把这条回滚成墓碑，否则数据在、查不到
         if (cache_hash_insert(cache, offsets[i], key, key_len) < 0) {
             cache_entry_header_t* h = (cache_entry_header_t*)CACHE_PTR(cache, offsets[i]);
