@@ -3,6 +3,7 @@
 #include <string.h>
 #include <ctype.h>
 #include "cs_compat.h"
+#include "cs_internal.h"   // cs_lang_from_file：扩展名→语言，全仓只此一份
 
 #define MAX_NAME_LEN 256
 #define MAX_FUNC 1200000
@@ -208,10 +209,22 @@ static int g_bare_count = 0;
 #define DEF_HASH_SIZE 262147
 #define MAX_DEFS_PER_NAME 32
 
+// 语言族：跨文件解析时按族比较，不按语言名逐字比较。objc/objcpp 调 C、.cpp
+// include C 头都是正常调用；把 c/cpp/objc/objcpp 归一族能避免把正常边判成
+// 跨语言而漏掉（旧逻辑如果直接比 "c" != "cpp" 会一口气毁掉 C++ 项目的所有边）。
+// 返回 NULL = 认不出（"unknown"/NULL），此时不做族收窄，走老逻辑。
+static const char* lang_family(const char* lang) {
+    if (!lang || strcmp(lang, "unknown") == 0) return NULL;
+    if (strcmp(lang, "c") == 0 || strcmp(lang, "cpp") == 0 ||
+        strcmp(lang, "objc") == 0 || strcmp(lang, "objcpp") == 0) return "c";
+    return lang;
+}
+
 typedef struct def_rec {
     const char* file;   // 指向 file 池（interned），不单独 free
     int is_static;
     int is_header;      // .h/.hpp/... 里的 `static inline` 对所有包含者可见
+    const char* lang;   // 扩展名推出来的语言（cs_lang_from_file，静态串）
 } def_rec_t;
 
 typedef struct def_list {
@@ -319,6 +332,7 @@ static void add_def(const char* name, const char* file, int is_static) {
     d->recs[d->count].file = intern_file(file);
     d->recs[d->count].is_static = is_static;
     d->recs[d->count].is_header = is_header_path(file);
+    d->recs[d->count].lang = cs_lang_from_file(file);
     d->count++;
 }
 
@@ -354,6 +368,33 @@ static int resolve_def(const char* caller_file, const char* tok,
         if (!d->recs[i].is_static || d->recs[i].is_header) {
             visible++;
             only = d->recs[i].file;
+        }
+    }
+    // ②' 跨语言同名消歧（必须排在 ② 前）：C 的 `xchg` 与 Rust 的 `xchg`
+    //    在内核里同名。旧逻辑只看「可见定义数」：2 份判 ambiguous，1 份就落到
+    //    另一种语言的实现上 —— 后者错得很像真的。裸名不跨语言绑定，所以先按
+    //    调用点文件的**语言族**收窄（objc/cpp 调 C 是正常，不能算跨语言）。
+    {
+        const char* fam = lang_family(cs_lang_from_file(caller_file));
+        if (fam) {
+            int same = 0;
+            const char* same_only = NULL;
+            for (int i = 0; i < d->count; i++) {
+                if (d->recs[i].is_static && !d->recs[i].is_header) continue;
+                const char* rf = lang_family(d->recs[i].lang);
+                if (!rf || strcmp(rf, fam) != 0) continue;
+                same++;
+                same_only = d->recs[i].file;
+            }
+            if (same == 1) {
+                snprintf(def_out, defsz, "%s", same_only);
+                if (def_count_out) *def_count_out = d->count;
+                return SCOPE_GLOBAL;
+            }
+            if (same > 1) {
+                if (def_count_out) *def_count_out = same;
+                return SCOPE_AMBIGUOUS;
+            }
         }
     }
     if (visible == 1) {

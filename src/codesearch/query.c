@@ -26,6 +26,7 @@
 #include <jansson.h>
 #include "cache.h"
 #include "vector_engine.h"
+#include "cs_internal.h"
 
 static cache_t* g_cache = NULL;
 // symbol 走的 `/symbols/<name>` 键里，一个名字可能挂着多种语言的同名实现
@@ -254,25 +255,9 @@ static void add_line_alias(json_t* obj) {
 // --lang 的扩展名映射（indexer.c 的 detect_language 是 static，这里只做过滤用）。
 // 别名都认：c++/js/ts/py 各归一到 detect_language 的写法。
 static const char* sym_file_lang(const char* file) {
-    const char* ext = file ? strrchr(file, '.') : NULL;
-    if (!ext) return NULL;
-    if (!strcmp(ext, ".c") || !strcmp(ext, ".h")) return "c";
-    if (!strcmp(ext, ".cpp") || !strcmp(ext, ".cc") || !strcmp(ext, ".cxx") ||
-        !strcmp(ext, ".hpp") || !strcmp(ext, ".hh")) return "cpp";
-    if (!strcmp(ext, ".py")) return "python";
-    if (!strcmp(ext, ".lua")) return "lua";
-    if (!strcmp(ext, ".js") || !strcmp(ext, ".jsx")) return "javascript";
-    if (!strcmp(ext, ".ts") || !strcmp(ext, ".tsx")) return "typescript";
-    if (!strcmp(ext, ".go")) return "go";
-    if (!strcmp(ext, ".rs")) return "rust";
-    if (!strcmp(ext, ".java")) return "java";
-    if (!strcmp(ext, ".kt") || !strcmp(ext, ".kts")) return "kotlin";
-    if (!strcmp(ext, ".rb")) return "ruby";
-    if (!strcmp(ext, ".php")) return "php";
-    if (!strcmp(ext, ".m")) return "objc";
-    if (!strcmp(ext, ".mm")) return "objcpp";
-    if (!strcmp(ext, ".cs")) return "csharp";
-    return NULL;
+    if (!file || !*file) return NULL;
+    const char* lang = cs_lang_from_file(file);
+    return (lang && strcmp(lang, "unknown") != 0) ? lang : NULL;
 }
 
 // 该文件是否属于 --lang 指定的语言：没设过滤就放行；认不出扩展名也放行
@@ -649,6 +634,53 @@ static int site_def_count(json_t* site) {
     return n > 0 ? (int)n : 2;
 }
 
+// 裸名跨语言消歧（读时标注，不改 KV 格式）：调用边只有 file（调用点）和
+// def（解析到的定义文件），语言从扩展名就能读出来。lang ≠ def_lang = 这条边
+// 穿到了另一种语言的同名实现（内核里 C 的 xchg 落到 rust/atomic.rs 就这形态），
+// 标 cross_lang=true 让调用方打折，别当精确边下结论。
+// 旧 KV（没存 lang 字段）也因此立刻受益，不需要重 import。
+static void annotate_site_langs(json_t* sites) {
+    size_t idx;
+    json_t* site;
+    json_array_foreach(sites, idx, site) {
+        if (!json_is_object(site)) continue;
+        const char* lang = sym_file_lang(json_string_value(json_object_get(site, "file")));
+        if (lang) json_object_set_new(site, "lang", json_string(lang));
+        const char* def_lang = sym_file_lang(site_def_file(site));
+        if (def_lang) json_object_set_new(site, "def_lang", json_string(def_lang));
+        if (lang && def_lang && strcmp(lang, def_lang) != 0) {
+            json_object_set_new(site, "cross_lang", json_true());
+        }
+    }
+}
+
+// 跨语言边计数（stats.cross_lang）。0 就当没有，调用方不必每条边都看。
+static int count_cross_lang(json_t* sites) {
+    size_t idx;
+    json_t* site;
+    int n = 0;
+    json_array_foreach(sites, idx, site) {
+        if (json_is_object(site) && json_is_true(json_object_get(site, "cross_lang"))) n++;
+    }
+    return n;
+}
+
+// --lang 对调用边也生效：只留调用点语言匹配的边，认不出语言的边保留
+// （宁可多给，也不因为路径不认识就把真边藏掉）。
+static json_t* filter_sites_by_lang(json_t* sites, const char* want, int* dropped) {
+    if (!want || !*want) return json_incref(sites);
+    json_t* out = json_array();
+    size_t idx;
+    json_t* site;
+    json_array_foreach(sites, idx, site) {
+        const char* lang = json_is_object(site)
+            ? json_string_value(json_object_get(site, "lang")) : NULL;
+        if (!lang || !strcasecmp(lang, want)) json_array_append(out, site);
+        else if (dropped) (*dropped)++;
+    }
+    return out;
+}
+
 // 边的解析状态分档计数：0=external 1=local 2=global 3=ambiguous
 static void count_scopes(json_t* sites, int counts[4]) {
     size_t idx;
@@ -726,6 +758,8 @@ static json_t* do_context(const char* name, const char* repo, int depth,
     // def：按「解析到的定义文件」收窄。同名多定义（arch/ 里几十份 do_page_fault）时，
     // path_prefix 只能治调用点目录，def 才是按实现收窄的那把刀。
     int callers_def_dropped = 0, callees_def_dropped = 0;
+    int callers_lang_dropped = 0, callees_lang_dropped = 0;
+    int definitions_lang_dropped = 0;
     {
         json_t* fc = filter_sites_by_def(callers, def_filter, &callers_def_dropped);
         json_decref(callers);
@@ -733,6 +767,22 @@ static json_t* do_context(const char* name, const char* repo, int depth,
         json_t* fe = filter_sites_by_def(callees, def_filter, &callees_def_dropped);
         json_decref(callees);
         callees = fe;
+    }
+
+    // 跨语言标注 + `--lang` 收窄调用边：裸名边的语言只能从 file/def 扩展名读，
+    // 标注必须在过滤之前（filter_sites_by_lang 吃 site.lang）。
+    {
+        annotate_site_langs(callers);
+        annotate_site_langs(callees);
+        int lc = 0, le = 0;
+        json_t* fc = filter_sites_by_lang(callers, g_lang_filter, &lc);
+        json_decref(callers);
+        callers = fc;
+        json_t* fe = filter_sites_by_lang(callees, g_lang_filter, &le);
+        json_decref(callees);
+        callees = fe;
+        callers_lang_dropped = lc;
+        callees_lang_dropped = le;
     }
 
     // 定义清单：同名多定义时把几份实现列出来（symbols/<name> 里已有 file/line）。
@@ -750,12 +800,19 @@ static json_t* do_context(const char* name, const char* repo, int depth,
                 json_array_foreach(darr, i, d) {
                     const char* df = json_string_value(json_object_get(d, "file"));
                     if (!df || !*df) continue;
+                    // --lang 与符号解析/调用边同一条口径：别在定义清单里漏掉过滤，
+                    // 否则 lang=rust 仍会列出 c 的实现，调用方以为「只有 rust 有」。
+                    if (!sym_lang_ok(df)) { definitions_lang_dropped++; continue; }
                     json_t* e = json_object();
                     json_object_set_new(e, "file", json_string(df));
                     json_object_set_new(e, "line",
                         json_integer(json_integer_value(json_object_get(d, "line"))));
                     json_object_set_new(e, "kind", json_string(
                         json_string_value(json_object_get(d, "kind")) ?: ""));
+                    {
+                        const char* dl = sym_file_lang(df);
+                        if (dl) json_object_set_new(e, "lang", json_string(dl));
+                    }
                     json_array_append_new(definitions, e);
                     if (json_array_size(definitions) >= 64) break;
                 }
@@ -838,6 +895,45 @@ static json_t* do_context(const char* name, const char* repo, int depth,
         json_object_set_new(stats, "definition_count", json_integer(json_array_size(definitions)));
         if (json_array_size(definitions) > 1)
             json_object_set_new(context, "definitions", json_incref(definitions));
+    }
+    // 跨语言：callers/callees 里 lang≠def_lang 的边数 + 定义分布（同名多语言
+    // 定义 = 裸名查询天然歧义，调用方该按 --lang / def 收窄）。
+    {
+        int xc = count_cross_lang(callers);
+        int xe = count_cross_lang(callees);
+        if (xc || xe) {
+            json_t* x = json_object();
+            json_object_set_new(x, "callers", json_integer(xc));
+            json_object_set_new(x, "callees", json_integer(xe));
+            json_object_set_new(stats, "cross_lang", x);
+        }
+        json_t* langs = json_object();
+        size_t i;
+        json_t* d;
+        json_array_foreach(definitions, i, d) {
+            const char* l = json_string_value(json_object_get(d, "lang"));
+            if (!l) continue;
+            json_t* cur = json_object_get(langs, l);
+            json_object_set_new(langs, l, json_integer(
+                (cur && json_is_integer(cur) ? json_integer_value(cur) : 0) + 1));
+        }
+        if (json_object_size(langs) > 0) {
+            json_object_set_new(stats, "definition_langs", langs);
+            if (json_object_size(langs) > 1)
+                json_object_set_new(context, "cross_language", json_true());
+        } else {
+            json_decref(langs);
+        }
+    }
+    if (g_lang_filter && *g_lang_filter &&
+        (callers_lang_dropped || callees_lang_dropped || definitions_lang_dropped)) {
+        json_t* filtered = json_object();
+        json_object_set_new(filtered, "lang", json_string(g_lang_filter));
+        json_object_set_new(filtered, "callers", json_integer(callers_lang_dropped));
+        json_object_set_new(filtered, "callees", json_integer(callees_lang_dropped));
+        if (definitions_lang_dropped)
+            json_object_set_new(filtered, "definitions", json_integer(definitions_lang_dropped));
+        json_object_set_new(stats, "filtered_by_lang", filtered);
     }
     if (def_filter && *def_filter) {
         json_t* filtered = json_object();

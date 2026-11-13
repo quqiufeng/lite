@@ -567,13 +567,19 @@ static int json_extract_int(const char* json, const char* key) {
     return sign * val;
 }
 
-static const char* detect_language(const char* filepath) {
+// 扩展名 → 语言名：**唯一一份**映射。indexer 写 chunk 的 language 字段、query 判
+// --lang 过滤、query 给调用边打 lang/def_lang 都走这里。三处各写一份的旧状况已经
+// 让 .hh 在一处算 cpp、在另一处落到 unknown（跨语言判断随之漏判）。
+// 未知扩展返回 "unknown"（不是 NULL：调用方直接 strcmp 更省事）。
+const char* cs_lang_from_file(const char* filepath) {
+    if (!filepath) return "unknown";
     const char* ext = strrchr(filepath, '.');
     if (!ext) return "unknown";
     if (strcmp(ext, ".c") == 0) return "c";
     if (strcmp(ext, ".h") == 0) return "c";
-    if (strcmp(ext, ".cpp") == 0 || strcmp(ext, ".cc") == 0 || 
-        strcmp(ext, ".cxx") == 0 || strcmp(ext, ".hpp") == 0) return "cpp";
+    if (strcmp(ext, ".cpp") == 0 || strcmp(ext, ".cc") == 0 ||
+        strcmp(ext, ".cxx") == 0 || strcmp(ext, ".hpp") == 0 ||
+        strcmp(ext, ".hh") == 0 || strcmp(ext, ".hxx") == 0) return "cpp";
     if (strcmp(ext, ".py") == 0) return "python";
     if (strcmp(ext, ".lua") == 0) return "lua";
     if (strcmp(ext, ".js") == 0 || strcmp(ext, ".jsx") == 0) return "javascript";
@@ -588,6 +594,10 @@ static const char* detect_language(const char* filepath) {
     if (strcmp(ext, ".mm") == 0) return "objcpp";
     if (strcmp(ext, ".cs") == 0 || strcmp(ext, ".sol") == 0) return "csharp";
     return "unknown";
+}
+
+static const char* detect_language(const char* filepath) {
+    return cs_lang_from_file(filepath);
 }
 
 static int needs_range(const char* kind) {
