@@ -94,6 +94,9 @@
 --       · build 阶段缺模型/ORT 会跳过 vectorize（输出 "vectorize skipped
 --         (model/onnxruntime missing)"），status 的 vectors 字段随之变成 none；
 --       · 缺向量时查符号要走 symbol/exact/context，别用 search，也别信它的空结果。
+--       · locate 侧已按这条兜底：先剥掉 _note 占位（它不算命中，也不该顶掉
+--         「退回 symbol」的重试），再判定有没有真结果；一条都没有就打印
+--         `no hit` + grep/symbol/build 三条下一步，而不是渲染 "[1] ? nil:1" 的空壳。
 --
 -- [15] analysis_dir 与 kv_dir 是两样东西，别混：analysis 放 chunks/call_graph/
 --     dataflow.json 与向量，kv 才是查询真正读的键值库（默认 <analysis>/kv）。
@@ -740,7 +743,7 @@ local function cs_query(args, kv, ns, analysis, t, maxr)
     })
 end
 
-local function do_locate(args, ctx, analysis, kv, ns)
+local function do_locate(args, ctx, analysis, kv, ns, repo)
     if not args.query or args.query == "" then
         error("codesearch: query required for locate (symbol name or natural language)\n"
             .. "required: query (string); optional: max_results (default 3), lines (default 40), "
@@ -760,17 +763,61 @@ local function do_locate(args, ctx, analysis, kv, ns)
     if pre then need_built(pre, "kv") end
 
     local notes = {}
+    -- 去重：search 的 _note 会在「首查」和「退回 symbol」两次都回来，原样拼两遍
+    -- 会把同一条「引擎没开」刷成两条，看着像两个独立故障。
+    local function add_note(s)
+        s = tostring(s)
+        for _, e in ipairs(notes) do if e == s then return end end
+        notes[#notes + 1] = s
+    end
     local d, err = cs_query(args, kv, ns, analysis, t, maxr)
-    if (not d or #((d or {}).results or {}) == 0) and not args.type then
+
+    -- [14] search 在没有向量时不退化，只回一条 {"_note":"Vector engine not
+    -- initialized..."} 占位（query.c 的 !g_ve 分支）。它是「引擎没开」不是命中：
+    -- 混进 rs 会渲染成 "[1] ?  nil:1  kind=" + "(no path)" 的假结果，还会让
+    -- 「结果非空就重试」的判断失效（#rs==1）。先剥成「真命中 / 说明」两堆。
+    local function split_results(dd)
+        local ok, junk = {}, {}
+        for _, r in ipairs((dd or {}).results or {}) do
+            if type(r) == "table" and r._note then
+                junk[#junk + 1] = one_line(r._note, 300)
+            elseif type(r) == "table" and (r.file or r.entries) then
+                ok[#ok + 1] = r        -- 没 file 又没 entries 的条目渲染不出窗口
+            end
+        end
+        return ok, junk
+    end
+
+    local rs, junk = split_results(d)
+    local first_note = junk[1]
+    if first_note then add_note(first_note) end
+    if #rs == 0 and not args.type then
         -- 没向量 / 没命中就退回 KV 符号查找，别让调用方自己猜该用哪个 action
-        notes[#notes + 1] = string.format('%s: %s -> retried as symbol',
-            t, tostring(err or "no hit"))
+        add_note(string.format('%s: %s -> retried as symbol',
+            t, tostring(err or first_note or "no hit")))
         d, err = cs_query(args, kv, ns, analysis, "symbol", maxr)
         t = "symbol"
+        rs, junk = split_results(d)
+        if junk[1] then add_note(junk[1]) end
     end
     if not d then error("codesearch: locate failed: " .. tostring(err), 0) end
 
-    local rs = d.results or {}
+    -- 真的一条都没有：不输出空壳表头（"1 result(s)" + "[1] ? nil:1"），给可执行的下一步
+    if #rs == 0 then
+        local out = { string.format('locate "%s" — no hit (type=%s)',
+            tostring(args.query), t) }
+        if #notes > 0 then out[#out + 1] = "note: " .. table.concat(notes, "; ") end
+        out[#out + 1] = "next:"
+        out[#out + 1] = string.format(
+            "  action=grep pattern=%s path=%s   # 词面兜底，不需要向量",
+            tostring(args.query), tostring(repo or args.path or (ctx and ctx.cwd) or "."))
+        out[#out + 1] = string.format(
+            "  action=symbol query=%s          # 结构化符号，走 KV 直查",
+            tostring(args.query))
+        out[#out + 1] = "  action=build vector=true        # 要语义 search 必须先建向量索引"
+        return table.concat(out, "\n")
+    end
+
     -- best practices §10 的不变量：语义 top1 score 应 > 0.3；低分说明索引或措辞有问题，
     -- 别让噪声命中被当成「找到了」。
     if rs[1] and rs[1].score and rs[1].score < 0.35 then
@@ -784,10 +831,12 @@ local function do_locate(args, ctx, analysis, kv, ns)
             .. "先看 why 行确认命中理由; 需要确定答案用 action=symbol/grep",
             tonumber(rs[1].confidence) or 0)
     end
-    local out = { string.format('%s "%s" -> %d result(s), %d with source [static]',
-        d.type or t, tostring(args.query), #rs, math.min(#rs, maxr)) }
-    local used = #out[1]
+    -- 表头晚一步拼：`with source` 要数「真读到窗口的条数」，不能拿 #rs 冒充
+    -- （否则命中文件不在 repo 里、或预算截断时也报成满额）。
+    local out = {}
+    local used = 0
     local nxt = {}
+    local withsrc = 0
     for i = 1, math.min(#rs, maxr) do
         local r = rs[i]
         local line = tonumber(r.line_start or r.line) or 1
@@ -811,8 +860,9 @@ local function do_locate(args, ctx, analysis, kv, ns)
         snip = snip or ("      (" .. tostring(serr) .. ")")
         if used + #snip > budget then
             out[#out + 1] = "      ... (budget reached: lower max_results/lines or raise max_chars)"
-            break
+            break            -- 被预算砍掉的不算 with source：它没出现在输出里
         end
+        if not serr then withsrc = withsrc + 1 end
         out[#out + 1] = snip
         used = used + #snip + 1
         if r.name then
@@ -820,6 +870,9 @@ local function do_locate(args, ctx, analysis, kv, ns)
                 r.name, tostring(r.file))
         end
     end
+    -- withsrc 只数到「预算内真读到」的条数，表头这才成立
+    table.insert(out, 1, string.format('%s "%s" -> %d result(s), %d with source [static]',
+        d.type or t, tostring(args.query), #rs, withsrc))
     if #notes > 0 then
         out[#out + 1] = "note: " .. table.concat(notes, "; ")
     end
@@ -1043,7 +1096,9 @@ local function run_inner(args, ctx)
             if args.json then return cjson.encode(d) end
             return fmt_dataflow(d)
         elseif action == "locate" then
-            return do_locate(args, ctx, analysis, kv, ns)
+            -- repo 往下传：locate 的「没命中」提示里要给出 grep 的 path，
+            -- 拿 ctx.cwd（lite 自己的仓库）当 path 会把调用方带到错的树里。
+            return do_locate(args, ctx, analysis, kv, ns, repo)
         elseif action == "peek" then
             return do_peek(args, ctx, kv, ns)
         elseif action == "grep" then
