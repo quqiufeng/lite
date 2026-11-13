@@ -39,16 +39,40 @@ extern int cache_batch_set(void* cache, const cache_batch_item_t* items, size_t 
 static void* g_cache = NULL;
 static int g_total_keys = 0;
 
+// 必须逐行 flush：stdout 重定向到构建日志时是全缓冲（4KB 一块），
+// import 一跑几十分钟、进程被杀/崩溃时缓冲区直接丢光 —— 表现就是
+// "日志停在 Mode: full import，之后 2 小时全空"，把「慢」和「死」变得无法区分
+// （2026-11-13 reasonix 那次就是这么瞎猜了两小时）。stderr 同理。
 static void log_info(const char* msg) {
     time_t now = time(NULL);
     struct tm* tm = localtime(&now);
     char time_str[32];
     strftime(time_str, sizeof(time_str), "%H:%M:%S", tm);
     printf("[%s] %s\n", time_str, msg);
+    fflush(stdout);
 }
 
 static void log_warn(const char* msg) {
     fprintf(stderr, "[WARN] %s\n", msg);
+    fflush(stderr);
+}
+
+// 时间节流打点：长循环里没有天然的 10000 行边界（dataflow 的 funcs/fields
+// 聚合按 key 逐个走），只有"卡住了"和"在跑"的区别。每 TICK_SEC 秒最多一行。
+#define TICK_SEC 5
+static time_t g_last_tick = 0;
+static void log_tick(const char* phase, int done, int total) {
+    time_t now = time(NULL);
+    if (g_last_tick && difftime(now, g_last_tick) < TICK_SEC) return;
+    g_last_tick = now;
+    char msg[160];
+    if (total > 0) {
+        snprintf(msg, sizeof(msg), "%s: %d/%d (%d%%)", phase, done, total,
+                 done * 100 / total);
+    } else {
+        snprintf(msg, sizeof(msg), "%s: %d", phase, done);
+    }
+    log_info(msg);
 }
 
 // Elapsed time since start (for progress estimates)
@@ -294,10 +318,12 @@ static void purge_stale_chunks(const char* analysis_dir, const char* namespace) 
 
     // 迭代中不能删：迭代器按 sorted 槽位下标走，删 entry 会让槽位移动。
     size_t deleted = 0;
+    cache_bulk_begin(g_cache);   // 万级删除：窗口内不做全量 qsort
     for (size_t i = 0; i < nstale; i++) {
         if (cache_del(g_cache, stale[i]) == 0) deleted++;
         free(stale[i]);
     }
+    cache_bulk_end(g_cache);
     free(stale);
     pathset_free(&set);
 
@@ -320,6 +346,19 @@ static void import_chunks(const char* analysis_dir, const char* namespace) {
     
     log_info("Phase 1: Importing chunks...");
     
+    // 进度分母用真实行数（原先硬编码 100000，122k 行的仓库会打出 120% 这种滑稽输出）
+    int total_lines = 0;
+    {
+        FILE* cf = fopen(path, "r");
+        if (cf) {
+            char buf[65536];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof(buf), cf)) > 0) {
+                for (size_t i = 0; i < n; i++) if (buf[i] == '\n') total_lines++;
+            }
+            fclose(cf);
+        }
+    }
     char* line = malloc(MAX_LINE);
     int line_count = 0;
     int valid = 0;
@@ -329,7 +368,7 @@ static void import_chunks(const char* analysis_dir, const char* namespace) {
     while (fgets(line, MAX_LINE, fp)) {
         line_count++;
         if (line_count % 10000 == 0) {
-            log_progress("Phase 1: chunks", line_count, 100000);
+            log_progress("Phase 1: chunks", line_count, total_lines > 0 ? total_lines : 100000);
         }
 
         // Strip trailing newline
@@ -560,10 +599,12 @@ static void purge_stale_call_edges(const char* namespace, const char* kind,
     }
     cache_iter_destroy(it);
 
+    cache_bulk_begin(g_cache);
     for (size_t i = 0; i < nstale; i++) {
         cache_del(g_cache, stale[i]);
         free(stale[i]);
     }
+    cache_bulk_end(g_cache);
     free(stale);
 
     if (nstale > 0) {
@@ -1008,7 +1049,11 @@ static void import_dataflow(const char* analysis_dir, const char* namespace) {
     const char* fname;
     json_t* fvars;
     int stored_funcs = 0;
+    int seen_funcs = 0;
+    int total_funcs = (int)json_object_size(func_index);
     json_object_foreach(func_index, fname, fvars) {
+        // 这里在 reasonix 上要逐个 key 写盘，几分钟没输出——打时间节流心跳
+        if ((++seen_funcs & 0x1f) == 0) log_tick("Phase 3: funcs", seen_funcs, total_funcs);
         if (!fname || !*fname || strcmp(fname, "unknown") == 0) continue;
         if (strlen(fname) > 200) continue;
         json_t* val = json_object();
@@ -1039,7 +1084,10 @@ static void import_dataflow(const char* analysis_dir, const char* namespace) {
     // funcs 计数 + 行号 + 样本文件，**丢掉每条 occurrence 的 context 大字符串**
     // （内核字段访问总量 22 万条，带 context 会把 KV 撑大一倍）。
     json_t* field_index = json_object();  // field -> {count, structs, funcs{func:...}}
+    int seen_vars = 0;
+    int total_vars = (int)json_object_size(root);
     json_object_foreach(root, var_name, var_data) {
+        if ((++seen_vars & 0x3f) == 0) log_tick("Phase 3: field agg", seen_vars, total_vars);
         json_t* vfields = json_object_get(var_data, "fields");
         if (!vfields || !json_is_object(vfields)) continue;
         const char* fname;
@@ -1321,7 +1369,10 @@ int lite_cs_import_main(int argc, char** argv) {
            skip_chunks && skip_callgraph && !skip_dataflow ? "dataflow only" :
            skip_chunks && skip_callgraph && skip_dataflow ? "register only" :
            "full import");
-    
+    fflush(stdout);  // 表头也走 printf，不 flush 会一起卡在缓冲区里
+    // 不用 setvbuf：本函数是 FFI 进程内调用，进入时 stdout 往往已有输出，
+    // 改缓冲模式是 UB；逐行 fflush 就够了。
+
     // Linux 内核这种百万级 chunks 的导入会超过 4GiB；默认放宽到 8GiB。
     unsigned long long max_gb = 8;
     const char* kv_max_env = getenv("LITE_CS_KV_MAX_GB");
@@ -1353,11 +1404,25 @@ int lite_cs_import_main(int argc, char** argv) {
             }
         }
     }
-    g_cache = cache_open_ex(cache_dir, (size_t)(max_gb * 1024ULL * 1024ULL * 1024ULL),
-                            CACHE_OPEN_NO_TAG_INDEX | CACHE_OPEN_NO_VECTOR_INDEX);
-    if (!g_cache) {
-        fprintf(stderr, "[ERROR] Failed to open cache: %s\n", cache_dir);
-        return 1;
+    // cache_open_ex 是第二个黑盒：大库上要读 1GiB+ 的 mem.bin 建索引，
+    // 耗时从秒级到分钟级，而它前后一行日志都没有（2026-11-13 那次 2 小时
+    // 无输出的嫌疑犯之一）。进出各打一行，带体积和耗时。
+    log_info("Opening KV cache...");
+    {
+        time_t t_open = time(NULL);
+        g_cache = cache_open_ex(cache_dir,
+                                (size_t)(max_gb * 1024ULL * 1024ULL * 1024ULL),
+                                CACHE_OPEN_NO_TAG_INDEX | CACHE_OPEN_NO_VECTOR_INDEX);
+        if (!g_cache) {
+            fprintf(stderr, "[ERROR] Failed to open cache: %s\n", cache_dir);
+            return 1;
+        }
+        char omsg[192];
+        snprintf(omsg, sizeof(omsg),
+                 "KV cache opened in %.0fs (cap %llu GiB, used %zu MiB)",
+                 difftime(time(NULL), t_open), max_gb,
+                 cache_memory_used(g_cache) >> 20);
+        log_info(omsg);
     }
     
     if (!skip_chunks) {

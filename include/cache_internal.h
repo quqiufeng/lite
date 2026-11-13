@@ -177,6 +177,13 @@ struct cache {
     size_t memory_used;         // 已用内存（估算）
     size_t memory_max;          // 最大内存限制
     unsigned open_flags;        // CACHE_OPEN_* 打开选项
+
+    // 批量写入窗口（cache_bulk_begin/end 或 cache_batch_set 内部置位）。
+    // 置位时 cache_sorted_remove 只记账不动数组：CACHE_SKIPLIST_THRESHOLD(1e6) 之下
+    // 跳表从不建，每次删除都走 ensure_sorted() 全量 qsort —— 49 万 offset 的库单次
+    // ≈0.4s，8192 个重复 key 的一批就是 1 小时（2026-11-13 reasonix 导入卡 2 小时的真因）。
+    int sorted_defer;
+    int sorted_defer_pending;   // 延迟删除计数，攒够一批统一摘墓碑
     
     // 状态
     char db_dir[256];           // 数据库目录
@@ -207,6 +214,8 @@ size_t cache_sorted_get(cache_t* cache, size_t index);
 void cache_sorted_destroy(cache_t* cache);
 void cache_sorted_rebuild(cache_t* cache);
 void cache_sorted_ensure_sorted(cache_t* cache);
+// 摘掉指向墓碑条目的偏移量（批量写入窗口里 cache_sorted_remove 只记账不清理）。
+void cache_sorted_purge_tombstones(cache_t* cache);
 
 // Namespace 操作
 int cache_ns_init(cache_t* cache);

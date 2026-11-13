@@ -122,11 +122,41 @@ int cache_sorted_insert(cache_t* cache, size_t entry_offset) {
 }
 
 // O(1) 删除：swap-with-last + pop，标记 dirty
+// 批量写入窗口里 cache_sorted_remove 只记账不动数组，墓碑偏移量攒着；
+// 这里一次性把它们摘掉（O(n) 顺序过滤，比 qsort 便宜），并把 dirty 置位交给
+// 下一次 ensure_sorted / rebuild 统一排序。
+void cache_sorted_purge_tombstones(cache_t* cache) {
+    if (!cache) return;
+    cache_sorted_array_t* sorted = &cache->sorted;
+    size_t w = 0;
+    for (size_t i = 0; i < sorted->count; i++) {
+        size_t off = sorted->offsets[i];
+        if (off >= cache->pool.used) continue;           // 越界防御：坏偏移直接丢
+        cache_entry_header_t* h = (cache_entry_header_t*)CACHE_PTR(cache, off);
+        if (h->flags & CACHE_ENTRY_DELETED) continue;
+        sorted->offsets[w++] = off;
+    }
+    sorted->count = w;
+    sorted->dirty = 1;
+    cache->sorted_defer_pending = 0;
+}
+
 int cache_sorted_remove(cache_t* cache, const char* key, size_t key_len) {
     if (!cache || !key || key_len == 0) return -1;
     
     cache_sorted_array_t* sorted = &cache->sorted;
     if (sorted->count == 0) return -1;
+
+    // 批量窗口：调用方已经把旧 entry 标了墓碑，这里不清数组也不会让人读到旧值
+    // （cache_get 走 hash，排序数组只服务范围/前缀扫描，而墓碑会被过滤掉）。
+    // 没有这一步，CACHE_SKIPLIST_THRESHOLD(1e6) 之下的库每次删除都全量 qsort：
+    // 49 万 offset 单次 ≈0.4s，8192 个重复 key 的批 ≈ 1 小时。
+    if (cache->sorted_defer && !sorted->skiplist) {
+        if (++cache->sorted_defer_pending >= 4096) {
+            cache_sorted_purge_tombstones(cache);
+        }
+        return 0;
+    }
     
     // 大库上的隐患：跳表从未被建过（cache_skiplist_build 只有 cache_sorted_rebuild 调用，
     // 而 rebuild 此前没有任何调用者），于是每次删除都掉进下面的 fallback：一次全量 qsort。

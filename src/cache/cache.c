@@ -688,7 +688,13 @@ int cache_set(cache_t* cache, const char* key, const char* value, uint64_t ttl_m
             
             // 从索引中移除旧条目
             cache_hash_remove(cache, key, key_len);
-            cache_sorted_remove(cache, key, key_len);
+            // 同 cache_batch_set：单条更新也走延迟清理，避免每次删除都全量 qsort
+            {
+                int defer_saved = cache->sorted_defer;
+                cache->sorted_defer = 1;
+                cache_sorted_remove(cache, key, key_len);
+                cache->sorted_defer = defer_saved;
+            }
             cache_ns_remove(cache, key);
             
             // 从 tag 索引中移除
@@ -899,7 +905,13 @@ int cache_batch_set(cache_t* cache, const cache_batch_item_t* items, size_t coun
                 cache->deleted_count++;
                 cache->memory_used -= cache_entry_total_size(old_header);
                 cache_hash_remove(cache, key, key_len);
-                cache_sorted_remove(cache, key, key_len);
+                // 批量窗口内只记账：每 4096 次统一摘墓碑，别在这里做全量 qsort
+                {
+                    int defer_saved = cache->sorted_defer;
+                    cache->sorted_defer = 1;
+                    cache_sorted_remove(cache, key, key_len);
+                    cache->sorted_defer = defer_saved;
+                }
                 cache_ns_remove(cache, key);
                 const char* old_value = (const char*)CACHE_PTR(
                     cache, old_offset + sizeof(cache_entry_header_t) + old_header->key_len + 1);
@@ -998,6 +1010,24 @@ const char* cache_get(cache_t* cache, const char* key) {
     METRIC_COUNTER_INC("mydb_cache_hit_total", "");
     metric_timer_stop(&timer);
     return (const char*)CACHE_PTR(cache, offset + sizeof(cache_entry_header_t) + header->key_len + 1);
+}
+
+// 批量写入/删除窗口：窗口内 sorted 数组只记账（见 sorted_array.c 的说明），
+// 窗口关闭时统一摘墓碑 + 排序一次。import 的 upsert 和「清理陈旧 key」都是
+// 万级批量，逐个走 cache_del/cache_set 原本是 N 次 553k 全量 qsort（分钟级→小时级）。
+void cache_bulk_begin(void* cache_v) {
+    cache_t* cache = (cache_t*)cache_v;
+    if (cache) cache->sorted_defer++;
+}
+
+void cache_bulk_end(void* cache_v) {
+    cache_t* cache = (cache_t*)cache_v;
+    if (!cache) return;
+    if (cache->sorted_defer > 0) cache->sorted_defer--;
+    if (cache->sorted_defer == 0) {
+        cache_sorted_purge_tombstones(cache);
+        cache_sorted_ensure_sorted(cache);
+    }
 }
 
 int cache_del(cache_t* cache, const char* key) {

@@ -67,6 +67,10 @@ int cache_sync(cache_t* cache);
 int cache_set(cache_t* cache, const char* key, const char* value, uint64_t ttl_ms);
 const char* cache_get(cache_t* cache, const char* key);  // 返回指针，不拷贝，NULL = 不存在或过期
 int cache_del(cache_t* cache, const char* key);
+// 批量窗口：期间 sorted 数组只记账，close 时统一摘墓碑 + 排序一次。
+// 万级 upsert/删除必须用它，否则每次 set/del 都可能全量 qsort（见 cache.c 注释）。
+void cache_bulk_begin(void* cache);
+void cache_bulk_end(void* cache);
 int cache_exists(cache_t* cache, const char* key);
 
 // ====== 批量操作 ======
