@@ -231,6 +231,32 @@ local function one_line(s, n)
     return s
 end
 
+-- 置信度标签：score 只说明「排第几」，confidence 说明「该不该信」。
+-- 缺字段（旧的 .so / non-vector 结果）就退回 score，不硬造数字。
+local function conf_tag(r)
+    local c = tonumber(r and r.confidence)
+    if not c then
+        return (r and r.score) and string.format("  conf=%.2f", r.score) or ""
+    end
+    return string.format("  conf=%.2f(%s)", c, tostring(r.confidence_label or "?"))
+end
+
+-- 证据来源一行：只挑最关键的两条（vector/keyword/graph/penalty），
+-- metadata 那条是每条都有的出处，进正文反而占地方；全量看 json=true。
+local function fmt_evidence(r, max_items)
+    local ev = r and r.evidence
+    if type(ev) ~= "table" or #ev == 0 then return nil end
+    local parts = {}
+    for _, e in ipairs(ev) do
+        if type(e) == "table" and e.source and e.source ~= "metadata" then
+            parts[#parts + 1] = e.source .. ": " .. tostring(e.detail)
+        end
+        if #parts >= (max_items or 2) then break end
+    end
+    if #parts == 0 then return nil end
+    return "    why: " .. table.concat(parts, " | ")
+end
+
 local function fmt_status(d)
     local out = { string.format("analysis: %s", d.analysis_dir) }
     local f = d.files or {}
@@ -297,6 +323,7 @@ local function fmt_results(d, max_chars)
             line = string.format("[%d] %s  %s:%s  kind=%s", i,
                 r.name or "?", r.file or "?", tostring(r.line_start or "?"), r.kind or "")
             if r.score then line = line .. string.format("  score=%.3f", r.score) end
+            line = line .. conf_tag(r)
             out[#out + 1] = line
             if r.signature and r.signature ~= "" then
                 out[#out + 1] = "    sig: " .. one_line(r.signature, 200)
@@ -328,6 +355,8 @@ local function fmt_context(d, max_chars)
                 -- 间接调用：obj->fn()/obj.fn() 只能按裸名挂边，标出来让调用方打折
                 local s = v.name or "?"
                 if v.indirect then s = s .. "[via " .. (v.via or "?") .. "]" end
+                -- 同名多份实现混在这条边上：不是精确边，用 def= 收窄
+                if v.scope == "ambiguous" then s = s .. "[?def " .. tostring(v.defs or 2) .. "]" end
                 t[#t + 1] = s
             else
                 t[#t + 1] = tostring(v)
@@ -383,6 +412,29 @@ local function fmt_context(d, max_chars)
     if fo then
         out[#out + 1] = string.format("filtered by path_prefix=%s: -%d callers, -%d callees",
             fo.path_prefix or "?", tonumber(fo.callers) or 0, tonumber(fo.callees) or 0)
+    end
+    -- 同名多定义：把几份实现与解析分档摊开。ambiguous>0 说明这些边混了同名实现，
+    -- 不是精确事实 —— 先用 def= 收窄再下「谁调用谁」的结论。
+    local defs = ctx.definitions or {}
+    if #defs > 1 then
+        local t = {}
+        for i, dv in ipairs(defs) do
+            if i > 8 then t[#t + 1] = "..."; break end
+            t[#t + 1] = string.format("%s:%s", dv.file or "?", tostring(dv.line or "?"))
+        end
+        out[#out + 1] = string.format("definitions(%d): %s", #defs, table.concat(t, ", "))
+    end
+    local rs = (d.stats or {}).resolution
+    if rs then
+        out[#out + 1] = string.format(
+            "resolution: local=%d global=%d ambiguous=%d external=%d",
+            tonumber(rs["local"]) or 0, tonumber(rs.global) or 0,
+            tonumber(rs.ambiguous) or 0, tonumber(rs.external) or 0)
+    end
+    local fd = (d.stats or {}).filtered_by_def
+    if fd then
+        out[#out + 1] = string.format("filtered by def=%s: -%d callers, -%d callees",
+            fd.def or "?", tonumber(fd.callers) or 0, tonumber(fd.callees) or 0)
     end
     local s = table.concat(out, "\n")
     if #s > (max_chars or 8000) then s = s:sub(1, max_chars or 8000) .. "\n... (capped)" end
@@ -649,7 +701,7 @@ local function cs_query(args, kv, ns, analysis, t, maxr)
         model = args.model or "jina",
         max_results = maxr or args.max_results or 10, depth = args.depth or 0,
         no_boost = args.no_boost, kind = args.kind, lang = args.lang, file = args.file,
-        path_prefix = args.path_prefix,
+        path_prefix = args.path_prefix, def = args.def,
     })
 end
 
@@ -690,6 +742,13 @@ local function do_locate(args, ctx, analysis, kv, ns)
         notes[#notes + 1] = string.format("top score %.3f < 0.35 — weak match, "
             .. "换个符号名/关键词或 action=grep pattern=...", rs[1].score)
     end
+    -- confidence 比 score 更严：它只认语义+词面共现+调用图三样实证，
+    -- 所以 low 意味着「排第一也只是排第一」，别直接信。
+    if rs[1] and rs[1].confidence_label == "low" then
+        notes[#notes + 1] = string.format("top confidence %.2f (low) — 证据不足, "
+            .. "先看 why 行确认命中理由; 需要确定答案用 action=symbol/grep",
+            tonumber(rs[1].confidence) or 0)
+    end
     local out = { string.format('%s "%s" -> %d result(s), %d with source [static]',
         d.type or t, tostring(args.query), #rs, math.min(#rs, maxr)) }
     local used = #out[1]
@@ -700,8 +759,14 @@ local function do_locate(args, ctx, analysis, kv, ns)
         local head = string.format("[%d] %s  %s:%d  kind=%s%s", i, r.name or "?",
             tostring(r.file), line, r.kind or "",
             r.score and string.format("  score=%.3f", r.score) or "")
+        head = head .. conf_tag(r)
         out[#out + 1] = head
         used = used + #head + 1
+        local why = fmt_evidence(r, 2)
+        if why then
+            out[#out + 1] = why
+            used = used + #why + 1
+        end
         local last = line + want - 1
         if tonumber(r.line_end) and tonumber(r.line_end) < last then
             last = tonumber(r.line_end)          -- chunk 边界更准：函数没被腰斩
@@ -856,6 +921,7 @@ local schema = {
                 lang = { type = "string", description = "按语言过滤：c/cpp/python/lua/javascript/typescript/go/rust/java/kotlin/ruby/php/objc/csharp" },
                 file = { type = "string", description = "按文件名子串过滤（语义搜索）" },
                 path_prefix = { type = "string", description = "按目录子树过滤（search/context/symbol），如 arch/x86、net/、drivers/gpu/" },
+                def = { type = "string", description = "context：按解析到的定义文件收窄（同名多定义时用），如 fs/ext4、arch/x86" },
                 model = { type = "string", description = "向量模型 jina（默认）或 mpnet" },
                 no_boost = { type = "boolean", description = "关闭 TF-IDF/调用者 boost" },
                 vector = { type = "boolean", description = "build 时是否做语义向量化（默认 true，缺模型自动跳过）" },
@@ -969,7 +1035,7 @@ local function run_inner(args, ctx)
                 kv_dir = kv, analysis_dir = analysis_arg, model = args.model or "jina",
                 max_results = args.max_results or 10, depth = args.depth or 0,
                 no_boost = args.no_boost, kind = args.kind, lang = args.lang, file = args.file,
-                path_prefix = args.path_prefix,
+                path_prefix = args.path_prefix, def = args.def,
             })
             if not d then error("codesearch: query failed: " .. tostring(err), 0) end
             -- C 侧对 context 查不到符号时会带 error（不再吐空壳），这里直接抛给调用方

@@ -625,15 +625,22 @@ static void free_call_graph(void) {
 // Internal: Boost functions
 // ============================================================
 
-static float keyword_boost(const char* query, const char* name) {
+// 词元口径与 keyword_boost 完全一致，只是顺便把「命中几个 / 命中哪些」
+// 带出来，给 query 层拼 evidence 用（不然命中了什么只能靠猜）。
+static float keyword_boost_ex(const char* query, const char* name,
+                              int* hits_out, int* terms_out,
+                              char* matched, size_t matched_sz) {
     char qcopy[1024];
     strncpy(qcopy, query, sizeof(qcopy) - 1);
     qcopy[sizeof(qcopy) - 1] = '\0';
-    
+
+    int hits = 0, terms = 0;
+    if (matched && matched_sz) matched[0] = '\0';
     float boost = 0.0f;
     char* token = strtok(qcopy, " _-.,;:!?()[]{}<>\"'\t\n");
     while (token) {
         if (strlen(token) >= 3) {
+            terms++;
             const char* p = name;
             size_t tlen = strlen(token);
             while (*p) {
@@ -641,6 +648,14 @@ static float keyword_boost(const char* query, const char* name) {
                     float idf = get_idf(token);
                     float weight = 0.01f + (idf / 9.0f) * 0.07f;
                     boost += weight;
+                    hits++;
+                    if (matched && matched_sz) {
+                        size_t cur = strlen(matched);
+                        if (cur < matched_sz - 1) {
+                            snprintf(matched + cur, matched_sz - cur, "%s%s",
+                                     cur ? "," : "", token);
+                        }
+                    }
                     break;
                 }
                 p++;
@@ -648,8 +663,22 @@ static float keyword_boost(const char* query, const char* name) {
         }
         token = strtok(NULL, " _-.,;:!?()[]{}<>\"'\t\n");
     }
-    
+
+    if (hits_out) *hits_out = hits;
+    if (terms_out) *terms_out = terms;
     return boost > 0.3f ? 0.3f : boost;
+}
+
+// "/test" 裸前缀会把 tests/ 整个目录都当测试（仓库自带 corpus 就被 ×0.85，
+// 置信度全被压低且证据写着「test path」）。只认 /test/ /test_ /test. 结尾形式。
+static int looks_like_test_path(const char* fp) {
+    const char* p = fp;
+    while ((p = strstr(p, "/test")) != NULL) {
+        char n = p[5];
+        if (n == '\0' || n == '/' || n == '_' || n == '.') return 1;
+        p += 5;
+    }
+    return 0;
 }
 
 static float caller_boost(const char* name) {
@@ -668,6 +697,15 @@ static float caller_boost(const char* name) {
 typedef struct {
     char name[VE_MAX_NAME_LEN];
     float score;
+    // 证据分量（不改排序，只解释这条命中是怎么来的）
+    float semantic;
+    float kw_boost;
+    float caller_boost;
+    float noise_factor;
+    int caller_count;
+    int kw_hits;
+    int kw_terms;
+    char kw_matched[128];
 } ve_search_result_t;
 
 static int cmp_result(const void* a, const void* b) {
@@ -723,6 +761,14 @@ static int search_hnsw(ve_source_t* source, const float* query_vec, int top_k,
     typedef struct {
         char name[VE_MAX_NAME_LEN];
         float score;
+        float semantic;
+        float kw_boost;
+        float caller_boost;
+        float noise_factor;
+        int caller_count;
+        int kw_hits;
+        int kw_terms;
+        char kw_matched[128];
     } temp_result_t;
     temp_result_t* temp = malloc(found * sizeof(temp_result_t));
     int temp_count = 0;
@@ -741,16 +787,28 @@ static int search_hnsw(ve_source_t* source, const float* query_vec, int top_k,
         float centered = (sim - 0.5f) * 2.0f;  // map [0,1] to [-1,1], baseline at 0.5
         float sharpened = tanhf(centered * 1.5f) * 0.5f + 0.5f;  // gentle S-curve
         sim = sharpened;
+        // 纯语义分（S 曲线后、加 boost 前）留一份：置信度拿它当主体，
+        // 不然 boost 叠上去以后「像不像」被文字巧合和图热度糊住。
+        float semantic = sim;
+
+        int kw_hits = 0, kw_terms = 0;
+        char kw_matched[128] = "";
         
         // Keyword boost
         if (query_text && query_text[0] && opts && opts->use_keyword_boost) {
-            sim += keyword_boost(query_text, name);
+            float kb = keyword_boost_ex(query_text, name, &kw_hits, &kw_terms,
+                                        kw_matched, sizeof(kw_matched));
+            sim += kb;
             if (sim > 1.0f) sim = 1.0f;
         }
+        float kw_boost_applied = sim - semantic;
         
         // Caller boost
+        int caller_count = get_caller_count(name);
+        float cb_boost = 0.0f;
         if (opts && opts->use_caller_boost) {
-            sim += caller_boost(name);
+            cb_boost = caller_boost(name);
+            sim += cb_boost;
             if (sim > 1.0f) sim = 1.0f;
         }
         
@@ -762,12 +820,14 @@ static int search_hnsw(ve_source_t* source, const float* query_vec, int top_k,
         
         // Noise penalty: 测试/自测路径降权 15%（实测：抽象算法查询曾被
         // kasan_test_c / locktorture / torture_* 噪音顶到前排，盖过真实核心函数）
+        float noise_factor = 1.0f;
         if (meta && meta->file) {
             const char* fp = meta->file;
-            if (strstr(fp, "/test") || strstr(fp, "torture") || strstr(fp, "kunit")
+            if (looks_like_test_path(fp) || strstr(fp, "torture") || strstr(fp, "kunit")
                 || strstr(fp, "selftest") || strstr(fp, "/tools/testing")
                 || strstr(fp, "mock") || strstr(fp, "fuzzer")) {
                 sim *= 0.85f;
+                noise_factor = 0.85f;
             }
         }
         
@@ -790,6 +850,15 @@ static int search_hnsw(ve_source_t* source, const float* query_vec, int top_k,
         strncpy(temp[temp_count].name, name, VE_MAX_NAME_LEN - 1);
         temp[temp_count].name[VE_MAX_NAME_LEN - 1] = '\0';
         temp[temp_count].score = sim;
+        temp[temp_count].semantic = semantic;
+        temp[temp_count].kw_boost = kw_boost_applied;
+        temp[temp_count].caller_boost = cb_boost;
+        temp[temp_count].noise_factor = noise_factor;
+        temp[temp_count].caller_count = caller_count;
+        temp[temp_count].kw_hits = kw_hits;
+        temp[temp_count].kw_terms = kw_terms;
+        strncpy(temp[temp_count].kw_matched, kw_matched, sizeof(temp[temp_count].kw_matched) - 1);
+        temp[temp_count].kw_matched[sizeof(temp[temp_count].kw_matched) - 1] = '\0';
         temp_count++;
     }
     
@@ -815,6 +884,16 @@ static int search_hnsw(ve_source_t* source, const float* query_vec, int top_k,
         strncpy(results[count].name, temp[i].name, VE_MAX_NAME_LEN - 1);
         results[count].name[VE_MAX_NAME_LEN - 1] = '\0';
         results[count].score = temp[i].score;
+        results[count].semantic = temp[i].semantic;
+        results[count].kw_boost = temp[i].kw_boost;
+        results[count].caller_boost = temp[i].caller_boost;
+        results[count].noise_factor = temp[i].noise_factor;
+        results[count].caller_count = temp[i].caller_count;
+        results[count].kw_hits = temp[i].kw_hits;
+        results[count].kw_terms = temp[i].kw_terms;
+        strncpy(results[count].kw_matched, temp[i].kw_matched,
+                sizeof(results[count].kw_matched) - 1);
+        results[count].kw_matched[sizeof(results[count].kw_matched) - 1] = '\0';
         count++;
     }
     
@@ -1070,9 +1149,21 @@ int vector_engine_search_ex(vector_engine_t* engine, const char* query,
     int count = 0;
     for (int i = 0; i < total_found && count < top_k; i++) {
         meta_entry_t* meta = lookup_meta(raw_results[i].name);
+        // 证据分量（语义/关键词/图/降权）原样带出去，缺 meta 的分支也要带，
+        // 否则调用方拿到 score 却解释不了它是怎么来的。
         if (!meta && !engine->meta_loaded) {
             strncpy(results[count].name, raw_results[i].name, VE_MAX_NAME_LEN - 1);
             results[count].score = raw_results[i].score;
+            results[count].semantic = raw_results[i].semantic;
+            results[count].kw_boost = raw_results[i].kw_boost;
+            results[count].caller_boost = raw_results[i].caller_boost;
+            results[count].noise_factor = raw_results[i].noise_factor;
+            results[count].caller_count = raw_results[i].caller_count;
+            results[count].kw_hits = raw_results[i].kw_hits;
+            results[count].kw_terms = raw_results[i].kw_terms;
+            strncpy(results[count].kw_matched, raw_results[i].kw_matched,
+                    sizeof(results[count].kw_matched) - 1);
+            results[count].kw_matched[sizeof(results[count].kw_matched) - 1] = '\0';
             count++;
             continue;
         }
@@ -1088,6 +1179,16 @@ int vector_engine_search_ex(vector_engine_t* engine, const char* query,
         results[count].line_start = meta->line_start;
         results[count].line_end = meta->line_end;
         results[count].score = raw_results[i].score;
+        results[count].semantic = raw_results[i].semantic;
+        results[count].kw_boost = raw_results[i].kw_boost;
+        results[count].caller_boost = raw_results[i].caller_boost;
+        results[count].noise_factor = raw_results[i].noise_factor;
+        results[count].caller_count = raw_results[i].caller_count;
+        results[count].kw_hits = raw_results[i].kw_hits;
+        results[count].kw_terms = raw_results[i].kw_terms;
+        strncpy(results[count].kw_matched, raw_results[i].kw_matched,
+                sizeof(results[count].kw_matched) - 1);
+        results[count].kw_matched[sizeof(results[count].kw_matched) - 1] = '\0';
         count++;
     }
     

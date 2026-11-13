@@ -28,7 +28,7 @@ char* lite_cs_query(const char* query, const char* repo, const char* type,
                     const char* kv_dir, const char* analysis_dir, const char* model,
                     int max_results, int depth, int no_boost,
                     const char* kind, const char* lang, const char* file,
-                    const char* path_prefix);
+                    const char* path_prefix, const char* def_filter);
 char* lite_cs_check(const char* analysis_dir);
 char* lite_cs_capabilities(void);
 const char* lite_cs_error(void);
@@ -183,7 +183,8 @@ function M.query(opts)
     return call("lite_cs_query", opts.query, opts.repo or "", opts.type or "auto",
                 opts.kv_dir, opts.analysis_dir or "", opts.model or "jina",
                 opts.max_results or 10, opts.depth or 0, opts.no_boost and 1 or 0,
-                opts.kind or "", opts.lang or "", opts.file or "", opts.path_prefix or "")
+                opts.kind or "", opts.lang or "", opts.file or "", opts.path_prefix or "",
+                opts.def or "")
 end
 
 function M.check(dir) return call("lite_cs_check", dir) end

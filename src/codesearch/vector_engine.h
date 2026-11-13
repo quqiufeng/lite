@@ -40,7 +40,16 @@ typedef struct {
     char content[VE_MAX_CONTENT_LEN];     // code content (first ~50 lines)
     int line_start;
     int line_end;
-    float score;               // similarity score (0-1)
+    float score;               // similarity score (0-1)，已含 boost，排序用
+    // ── 证据分量（置信度/来源解释用，不参与排序）────────────────────
+    float semantic;            // S 曲线后的纯向量相似度
+    float kw_boost;            // 关键词 boost 的实际增量（word_freq.json）
+    float caller_boost;        // 调用者 boost 的实际增量（call_graph.json）
+    float noise_factor;        // 噪音降权系数（1.0 = 未降权）
+    int caller_count;          // 调用者个数（0 = 无图证据）
+    int kw_hits;               // query 词元在符号名里命中的个数
+    int kw_terms;              // query 词元总数
+    char kw_matched[128];      // 命中的词元，逗号分隔
 } vector_result_t;
 
 // Opaque engine handle

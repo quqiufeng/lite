@@ -20,6 +20,7 @@
 #include <ctype.h>
 #include <time.h>
 #include <getopt.h>
+#include <math.h>
 #include <sys/stat.h>
 #include <jansson.h>
 #include "cache.h"
@@ -525,9 +526,62 @@ static json_t* filter_sites_by_prefix(json_t* sites, const char* prefix, int* dr
     return out;
 }
 
+// 跨文件同名多定义时，唯一能精确收窄的是「这条边解析到哪个定义」（site.def）。
+// scope=local 的站点 KV 里不存 def（def 就是调用点自己的 file），这里补齐。
+static const char* site_def_file(json_t* site) {
+    if (!json_is_object(site)) return NULL;
+    const char* def = json_string_value(json_object_get(site, "def"));
+    if (def && *def) return def;
+    const char* scope = json_string_value(json_object_get(site, "scope"));
+    if (scope && strcmp(scope, "local") == 0)
+        return json_string_value(json_object_get(site, "file"));
+    return NULL;
+}
+
+static json_t* filter_sites_by_def(json_t* sites, const char* needle, int* dropped) {
+    if (!needle || !*needle) return json_incref(sites);
+    const char* p = needle;
+    if (*p == '/') p++;
+    json_t* out = json_array();
+    size_t idx;
+    json_t* site;
+    json_array_foreach(sites, idx, site) {
+        const char* def = site_def_file(site);
+        if (def && strstr(def, p)) json_array_append(out, site);
+        else if (dropped) (*dropped)++;
+    }
+    return out;
+}
+
+static int is_ambiguous_site(json_t* site) {
+    if (!json_is_object(site)) return 0;
+    const char* scope = json_string_value(json_object_get(site, "scope"));
+    return scope && strcmp(scope, "ambiguous") == 0;
+}
+
+static int site_def_count(json_t* site) {
+    if (!json_is_object(site)) return 2;
+    long n = (long)json_integer_value(json_object_get(site, "defs"));
+    return n > 0 ? (int)n : 2;
+}
+
+// 边的解析状态分档计数：0=external 1=local 2=global 3=ambiguous
+static void count_scopes(json_t* sites, int counts[4]) {
+    size_t idx;
+    json_t* site;
+    json_array_foreach(sites, idx, site) {
+        const char* scope = json_is_object(site)
+            ? json_string_value(json_object_get(site, "scope")) : NULL;
+        if (!scope) counts[0]++;
+        else if (strcmp(scope, "local") == 0) counts[1]++;
+        else if (strcmp(scope, "global") == 0) counts[2]++;
+        else if (strcmp(scope, "ambiguous") == 0) counts[3]++;
+    }
+}
+
 // Context query: symbol + callers + callees + call_sites + dataflow + call_paths
 static json_t* do_context(const char* name, const char* repo, int depth,
-                          const char* path_prefix) {
+                          const char* path_prefix, const char* def_filter) {
     json_t* context = json_object();
     
     // Get symbol（后缀回退也走这里，M.foo 之类能命中）
@@ -583,6 +637,47 @@ static json_t* do_context(const char* name, const char* repo, int depth,
         json_t* fe = filter_sites_by_prefix(callees, path_prefix, &callees_dropped);
         json_decref(callees);
         callees = fe;
+    }
+
+    // def：按「解析到的定义文件」收窄。同名多定义（arch/ 里几十份 do_page_fault）时，
+    // path_prefix 只能治调用点目录，def 才是按实现收窄的那把刀。
+    int callers_def_dropped = 0, callees_def_dropped = 0;
+    {
+        json_t* fc = filter_sites_by_def(callers, def_filter, &callers_def_dropped);
+        json_decref(callers);
+        callers = fc;
+        json_t* fe = filter_sites_by_def(callees, def_filter, &callees_def_dropped);
+        json_decref(callees);
+        callees = fe;
+    }
+
+    // 定义清单：同名多定义时把几份实现列出来（symbols/<name> 里已有 file/line）。
+    json_t* definitions = json_array();
+    {
+        char dkey[512];
+        snprintf(dkey, sizeof(dkey), "%s/symbols/%s", repo, name);
+        const char* dv = cache_get(g_cache, dkey);
+        if (dv) {
+            json_error_t derr;
+            json_t* darr = json_loads(dv, 0, &derr);
+            if (darr && json_is_array(darr)) {
+                size_t i;
+                json_t* d;
+                json_array_foreach(darr, i, d) {
+                    const char* df = json_string_value(json_object_get(d, "file"));
+                    if (!df || !*df) continue;
+                    json_t* e = json_object();
+                    json_object_set_new(e, "file", json_string(df));
+                    json_object_set_new(e, "line",
+                        json_integer(json_integer_value(json_object_get(d, "line"))));
+                    json_object_set_new(e, "kind", json_string(
+                        json_string_value(json_object_get(d, "kind")) ?: ""));
+                    json_array_append_new(definitions, e);
+                    if (json_array_size(definitions) >= 64) break;
+                }
+            }
+            if (darr) json_decref(darr);
+        }
     }
 
     // Get dataflow
@@ -642,6 +737,33 @@ static json_t* do_context(const char* name, const char* repo, int depth,
         json_object_set_new(stats, "filtered_out", filtered);
         json_object_set_new(context, "path_prefix", json_string(path_prefix));
     }
+
+    // 跨文件解析状态：local=同文件定义，global=唯一定义，ambiguous=多份实现混在边上，
+    // 其余 = external（索引里没定义）。ambiguous 高就得先按 def 收窄再下结论。
+    {
+        int sc[4] = {0, 0, 0, 0};
+        int cc[4] = {0, 0, 0, 0};
+        count_scopes(callers, sc);
+        count_scopes(callees, cc);
+        json_t* res = json_object();
+        json_object_set_new(res, "local", json_integer(sc[1] + cc[1]));
+        json_object_set_new(res, "global", json_integer(sc[2] + cc[2]));
+        json_object_set_new(res, "ambiguous", json_integer(sc[3] + cc[3]));
+        json_object_set_new(res, "external", json_integer(sc[0] + cc[0]));
+        json_object_set_new(stats, "resolution", res);
+        json_object_set_new(stats, "definition_count", json_integer(json_array_size(definitions)));
+        if (json_array_size(definitions) > 1)
+            json_object_set_new(context, "definitions", json_incref(definitions));
+    }
+    if (def_filter && *def_filter) {
+        json_t* filtered = json_object();
+        json_object_set_new(filtered, "def", json_string(def_filter));
+        json_object_set_new(filtered, "callers", json_integer(callers_def_dropped));
+        json_object_set_new(filtered, "callees", json_integer(callees_def_dropped));
+        json_object_set_new(stats, "filtered_by_def", filtered);
+        json_object_set_new(context, "def", json_string(def_filter));
+    }
+    json_decref(definitions);
     
     // Build result
     json_t* result = json_object();
@@ -954,6 +1076,49 @@ static json_t* do_dataflow(const char* query, const char* repo, int max_results)
     return results;
 }
 
+// 置信度：语义为主体（0.6），词面共现（0.25）与调用图热度（0.15）为辅。
+// 刻意不让 boost 独大——「名字里恰好有 query 词」和「被很多函数调用」都不是
+// 「这就是你要的语义」的直接证据，只是旁证；boost 已经在 score 里参与排序了。
+static double result_confidence(const vector_result_t* r, double* pre_penalty) {
+    double sem = r->semantic;
+    if (sem <= 0.0 || isnan(sem)) sem = r->score;
+    if (sem < 0.0) sem = 0.0;
+    if (sem > 1.0) sem = 1.0;
+
+    double lex = 0.0;
+    if (r->kw_terms > 0) lex = (double)r->kw_hits / (double)r->kw_terms;
+    if (lex > 1.0) lex = 1.0;
+
+    double graph = 0.0;
+    if (r->caller_count > 0) {
+        graph = log(1.0 + (double)r->caller_count) / log(21.0);
+        if (graph > 1.0) graph = 1.0;
+    }
+
+    double conf = 0.60 * sem + 0.25 * lex + 0.15 * graph;
+    if (conf < 0.0) conf = 0.0;
+    if (pre_penalty) *pre_penalty = conf;
+    if (r->noise_factor > 0.0f && r->noise_factor < 1.0f) conf *= r->noise_factor;
+    if (conf > 1.0) conf = 1.0;
+    return conf;
+}
+
+static const char* confidence_label(double conf) {
+    if (conf >= 0.66) return "high";
+    if (conf >= 0.45) return "medium";
+    return "low";
+}
+
+// 证据条：每条自带来源（哪份产物/哪一步算出来的）+ 数值 + 对置信度的贡献。
+static void evidence_push(json_t* ev, const char* source, const char* detail,
+                          double weight) {
+    json_t* obj = json_object();
+    json_object_set_new(obj, "source", json_string(source));
+    json_object_set_new(obj, "detail", json_string(detail));
+    json_object_set_new(obj, "weight", json_real(weight));
+    json_array_append_new(ev, obj);
+}
+
 // Search query using vector engine (semantic search) with advanced options
 static json_t* do_search(const char* query, const char* repo, 
                          const vector_search_opts_t* opts, int max_results) {
@@ -985,6 +1150,59 @@ static json_t* do_search(const char* query, const char* repo,
         json_object_set_new(obj, "content", json_string(results[i].content));
         json_object_set_new(obj, "score", json_real(results[i].score));
         json_object_set_new(obj, "_source", json_string("vector"));
+
+        // ── 置信度 + 证据来源 ─────────────────────────────────────────
+        // 光有 score 没法判断该不该信：0.72 可能是真命中，也可能是
+        // 关键词 boost 把同名词顶上来。所以每条结果都带一份可核对的拆解。
+        double pre_penalty = 0.0;
+        double conf = result_confidence(&results[i], &pre_penalty);
+        char buf[512];
+        json_t* ev = json_array();
+
+        snprintf(buf, sizeof(buf), "cosine-sim %.3f (rank %d/%d)%s",
+                 results[i].semantic, i + 1, n,
+                 (opts && opts->use_keyword_boost) ? "" : ", boosts off");
+        evidence_push(ev, "vector", buf, 0.60 * results[i].semantic);
+
+        if (results[i].kw_terms > 0) {
+            if (results[i].kw_hits > 0) {
+                snprintf(buf, sizeof(buf),
+                         "%d/%d query terms in symbol name (%s), boost +%.3f",
+                         results[i].kw_hits, results[i].kw_terms,
+                         results[i].kw_matched, results[i].kw_boost);
+            } else {
+                snprintf(buf, sizeof(buf),
+                         "0/%d query terms in symbol name — semantic-only hit",
+                         results[i].kw_terms);
+            }
+            evidence_push(ev, "keyword", buf,
+                          0.25 * ((double)results[i].kw_hits / results[i].kw_terms));
+        }
+
+        if (results[i].caller_count > 0) {
+            snprintf(buf, sizeof(buf),
+                     "%d callers in call_graph.json, boost +%.3f",
+                     results[i].caller_count, results[i].caller_boost);
+            double g = log(1.0 + results[i].caller_count) / log(21.0);
+            evidence_push(ev, "graph", buf, 0.15 * (g > 1.0 ? 1.0 : g));
+        }
+
+        if (results[i].noise_factor < 1.0f) {
+            snprintf(buf, sizeof(buf),
+                     "test/mock/selftest path, confidence ×%.2f",
+                     results[i].noise_factor);
+            evidence_push(ev, "penalty", buf, conf - pre_penalty);
+        }
+
+        snprintf(buf, sizeof(buf), "%s %s @ %s:%d-%d from chunks_meta.jsonl",
+                 results[i].kind[0] ? results[i].kind : "symbol",
+                 results[i].name, results[i].file ? results[i].file : "?",
+                 results[i].line_start, results[i].line_end);
+        evidence_push(ev, "metadata", buf, 0.0);
+
+        json_object_set_new(obj, "confidence", json_real(conf));
+        json_object_set_new(obj, "confidence_label", json_string(confidence_label(conf)));
+        json_object_set_new(obj, "evidence", ev);
         json_array_append_new(arr, obj);
     }
     
@@ -1004,6 +1222,7 @@ static void print_usage(const char* prog) {
     printf("  --lang <lang>            Filter by language: c, cpp, python, javascript, go, rust\n");
     printf("  --file <pattern>        Filter by filename pattern (substring match)\n");
     printf("  --path-prefix <prefix>   Filter by directory subtree, e.g. arch/x86, net/, drivers/gpu/\n");
+    printf("  --def <file-substr>      context only: keep edges that resolve to this definition\n");
     printf("  --no-boost              Disable TF-IDF keyword boost and caller count boost\n");
     printf("  --max-results <n>       Maximum number of results (default: 10)\n");
     printf("  --model <model>         Model type: jina (default) or mpnet\n");
@@ -1016,6 +1235,32 @@ static void print_usage(const char* prog) {
     printf("  %s \"memory pool\" --repo /code/nginx --type search --analysis-dir /opt/code_caches/nginx_cache\n", prog);
     printf("  %s \"event loop\" --repo /code/nginx --type search --analysis-dir /opt/code_caches/nginx_cache --kind function --lang c\n", prog);
     printf("  %s \"GPU kernel\" --repo /code/project --type search --analysis-dir /opt/code_caches/project_cache --file cuda\n", prog);
+}
+
+// 定义清单 + 解析分档：ambiguous 不为 0 就说明这几条边混了多份同名实现，
+// 不是精确事实，收窄用 --def（按定义文件）或 --path-prefix（按调用点目录）。
+static void print_context_resolution(json_t* response) {
+    json_t* ctx = json_object_get(response, "context");
+    json_t* stats = json_object_get(response, "stats");
+    json_t* defs = ctx ? json_object_get(ctx, "definitions") : NULL;
+    if (defs && json_array_size(defs) > 1) {
+        printf("definitions(%zu): ", json_array_size(defs));
+        for (size_t i = 0; i < json_array_size(defs); i++) {
+            json_t* d = json_array_get(defs, i);
+            const char* f = json_string_value(json_object_get(d, "file"));
+            printf("%s%s:%ld", i ? ", " : "", f ? f : "?",
+                   (long)json_integer_value(json_object_get(d, "line")));
+        }
+        printf("\n");
+    }
+    json_t* res = stats ? json_object_get(stats, "resolution") : NULL;
+    if (res) {
+        printf("resolution: local=%ld global=%ld ambiguous=%ld external=%ld\n",
+               (long)json_integer_value(json_object_get(res, "local")),
+               (long)json_integer_value(json_object_get(res, "global")),
+               (long)json_integer_value(json_object_get(res, "ambiguous")),
+               (long)json_integer_value(json_object_get(res, "external")));
+    }
 }
 
 // 简洁文本输出（agent 友好）：只给符号 + caller/callee 名，省 context。
@@ -1059,6 +1304,8 @@ static void print_brief(json_t* response) {
                 // 间接调用（obj->fn / obj.fn）标注：边只能按裸名解析，可能混入同名直接调用
                 if (json_is_true(json_object_get(c, "indirect")))
                     printf("[via %s]", via ? via : "?");
+                // 同名多份实现混在这条边上：不是精确边，收窄用 --def
+                if (is_ambiguous_site(c)) printf("[?def %d]", site_def_count(c));
             }
             printf("\n");
         }
@@ -1072,9 +1319,11 @@ static void print_brief(json_t* response) {
                 printf("%s%s", i ? ", " : "", n ? n : "?");
                 if (json_is_true(json_object_get(c, "indirect")))
                     printf("[via %s]", via ? via : "?");
+                if (is_ambiguous_site(c)) printf("[?def %d]", site_def_count(c));
             }
             printf("\n");
         }
+        print_context_resolution(response);
     }
 
     // 无语义符号时（如 search 结果），列出 name+file
@@ -1105,7 +1354,8 @@ int lite_cs_query_main(int argc, char** argv) {
     int no_boost = 0;
     int max_results = 10;
     int call_depth = 0;
-    
+    const char* def_filter = NULL;   // context 专用：按解析到的定义文件收窄
+
     // Search options
     vector_search_opts_t opts = {0};
     opts.use_keyword_boost = 1;
@@ -1129,6 +1379,8 @@ int lite_cs_query_main(int argc, char** argv) {
             opts.file_filter = argv[++i];
         } else if (strcmp(argv[i], "--path-prefix") == 0 && i + 1 < argc) {
             opts.path_prefix = argv[++i];
+        } else if (strcmp(argv[i], "--def") == 0 && i + 1 < argc) {
+            def_filter = argv[++i];
         } else if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
             model_type = argv[++i];
         } else if (strcmp(argv[i], "--max-results") == 0 && i + 1 < argc) {
@@ -1248,7 +1500,7 @@ int lite_cs_query_main(int argc, char** argv) {
         json_object_set_new(response, "context", json_object());
         json_object_set_new(response, "stats", json_object());
     } else if (strcmp(type, "context") == 0) {
-        json_t* result = do_context(query, repo, call_depth, opts.path_prefix);
+        json_t* result = do_context(query, repo, call_depth, opts.path_prefix, def_filter);
         json_t* results = json_object_get(result, "results");
         json_t* ctx = json_object_get(result, "context");
         json_t* stats = json_object_get(result, "stats");

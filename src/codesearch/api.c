@@ -264,7 +264,7 @@ char* lite_cs_query(const char* query, const char* repo, const char* type,
                     const char* kv_dir, const char* analysis_dir, const char* model,
                     int max_results, int depth, int no_boost,
                     const char* kind, const char* lang, const char* file,
-                    const char* path_prefix) {
+                    const char* path_prefix, const char* def_filter) {
     if (!query || !*query) return json_fail("query required");
     if (!kv_dir || !*kv_dir) return json_fail("kv_dir required");
 
@@ -289,6 +289,9 @@ char* lite_cs_query(const char* query, const char* repo, const char* type,
     if (file && *file) { argv[argc++] = (char*)"--file"; argv[argc++] = (char*)file; }
     if (path_prefix && *path_prefix) {
         argv[argc++] = (char*)"--path-prefix"; argv[argc++] = (char*)path_prefix;
+    }
+    if (def_filter && *def_filter) {
+        argv[argc++] = (char*)"--def"; argv[argc++] = (char*)def_filter;
     }
     char mbuf[32], dbuf[32];
     snprintf(mbuf, sizeof(mbuf), "%d", max_results);

@@ -536,6 +536,13 @@ static void import_callgraph(const char* analysis_dir, const char* namespace) {
             json_t* indirect_j = json_object_get(call, "indirect");
             int indirect = (indirect_j && json_is_true(indirect_j)) ? 1 : 0;
             const char* via = json_string_value(json_object_get(call, "via"));
+            // 跨文件解析结果（callgraph.c 写）：local=同文件定义，def=唯一定义文件，
+            // ambiguous=多份同名实现混在这条边上。三者全空 = external。
+            const char* def = json_string_value(json_object_get(call, "def"));
+            const char* scope_j = json_string_value(json_object_get(call, "scope"));
+            int scope_ambiguous = (scope_j && strcmp(scope_j, "ambiguous") == 0);
+            int scope_local = (scope_j && strcmp(scope_j, "local") == 0);
+            int defs_n = (int)json_integer_value(json_object_get(call, "defs"));
             
             if (!caller) continue;
             
@@ -547,6 +554,16 @@ static void import_callgraph(const char* analysis_dir, const char* namespace) {
             if (indirect) {
                 json_object_set_new(site, "indirect", json_true());
                 if (via) json_object_set_new(site, "via", json_string(via));
+            }
+            if (scope_local) json_object_set_new(site, "scope", json_string("local"));
+            if (def) {
+                json_object_set_new(site, "def", json_string(def));
+                if (!json_object_get(site, "scope"))
+                    json_object_set_new(site, "scope", json_string("global"));
+            }
+            if (scope_ambiguous) {
+                json_object_set_new(site, "scope", json_string("ambiguous"));
+                json_object_set_new(site, "defs", json_integer(defs_n > 0 ? defs_n : 2));
             }
             json_array_append_new(callers, site);
 
@@ -564,6 +581,16 @@ static void import_callgraph(const char* analysis_dir, const char* namespace) {
             if (indirect) {
                 json_object_set_new(site2, "indirect", json_true());
                 if (via) json_object_set_new(site2, "via", json_string(via));
+            }
+            if (scope_local) json_object_set_new(site2, "scope", json_string("local"));
+            if (def) {
+                json_object_set_new(site2, "def", json_string(def));
+                if (!json_object_get(site2, "scope"))
+                    json_object_set_new(site2, "scope", json_string("global"));
+            }
+            if (scope_ambiguous) {
+                json_object_set_new(site2, "scope", json_string("ambiguous"));
+                json_object_set_new(site2, "defs", json_integer(defs_n > 0 ? defs_n : 2));
             }
             json_array_append_new(carr, site2);
         }

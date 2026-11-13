@@ -758,7 +758,25 @@ print(CS.check("/home/quqiufeng/.local/share/lite/codesearch/nginx"))
 
 ### 5.2 语义搜索：`search`
 
-自然语言描述功能，返回 `name / file:line / kind / score / 代码摘要`。
+自然语言描述功能，返回 `name / file:line / kind / score / confidence / evidence / 代码摘要`。
+
+`score` 只管排序，`confidence`（0..1，配 `confidence_label` = high/medium/low）说
+「该不该信」：它是 `0.6×语义相似度 + 0.25×query 词元在符号名里的命中比 + 0.15×调用者
+热度(归一化)`，再乘噪音降权（test/mock 路径 ×0.85）。boost 不主导置信度，因为「名字里
+恰好撞上 query 词」和「被很多函数调用」都只是旁证。
+
+`evidence` 是逐条来源，`{source, detail, weight}` 数组：
+
+| source | detail 示例 | 说明 |
+|---|---|---|
+| `vector` | `cosine-sim 0.712 (rank 1/10)` | HNSW + 嵌入模型，S 曲线后、加 boost 前 |
+| `keyword` | `2/3 query terms in symbol name (mem,page), boost +0.041` | `word_freq.json` 的 IDF 加权 |
+| `graph` | `12 callers in call_graph.json, boost +0.055` | 调用图热度 |
+| `penalty` | `test/mock/selftest path, confidence ×0.85` | 权重为负贡献 |
+| `metadata` | `function mem_read_page @ mm/mem.c:120-140 from chunks_meta.jsonl` | 每条都有：命中块本身的出处 |
+
+置信度 low 且排在 top1 时，`lens locate` 会打警告并提示改 `symbol`/`grep`——
+排名第一不等于答案正确。
 
 ```text
 codesearch action=search query="事件循环怎么处理 epoll" max_results=8

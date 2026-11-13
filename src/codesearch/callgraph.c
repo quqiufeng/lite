@@ -169,6 +169,11 @@ typedef struct call_edge {
     // 否则 `i_fop->write_iter()` 与真的 `write_iter()` 调用在图里长得一模一样。
     char via[MAX_NAME_LEN];
     int indirect;
+    // 跨文件符号解析（2026-11-13）：def = 这条边落到哪个定义文件（仅 local/global），
+    // ambiguous/defs = 同名多份非 static 定义、又没能按文件收敛，不能当成精确边。
+    char def[512];
+    int scope;   // SCOPE_EXTERNAL / LOCAL / GLOBAL / AMBIGUOUS
+    int defs;    // 候选定义数（ambiguous 时是"几份实现混在这里"）
     struct call_edge* next;
 } call_edge_t;
 
@@ -179,6 +184,7 @@ typedef struct func_node {
 } func_node_t;
 
 static func_node_t* g_func_nodes = NULL;
+static int g_scope_count[4] = {0, 0, 0, 0};
 
 // Go/C++ 裸名 -> 唯一作用域名（用于把跨包/跨类的调用边挂回 scoped symbol）
 typedef struct {
@@ -189,6 +195,181 @@ typedef struct {
 static bare_entry_t* g_bares = NULL;
 static int g_bare_hash[HASH_SIZE];
 static int g_bare_count = 0;
+
+// =============================================================================
+// 定义表（2026-11-13）：name -> 定义点列表 {file, is_static}
+//
+// 旧行为：调用图节点/边只按裸名解析，`static int open(...)` 在 20 个 .c 里各有一份时，
+// 所有调用点被糊成同一条 `open` 边，`context` 出来的「谁调用它」跨文件互相污染
+// （内核 arch/ 那份 142 条扇入就是这么来的）。定义表让每条边至少知道自己落在
+// 哪个定义上：同文件定义优先（C 的 static 语义），否则取唯一的非 static 定义，
+// 多份非 static 定义则标 ambiguous，绝不静默合并。
+// =============================================================================
+#define DEF_HASH_SIZE 262147
+#define MAX_DEFS_PER_NAME 32
+
+typedef struct def_rec {
+    const char* file;   // 指向 file 池（interned），不单独 free
+    int is_static;
+    int is_header;      // .h/.hpp/... 里的 `static inline` 对所有包含者可见
+} def_rec_t;
+
+typedef struct def_list {
+    char* name;
+    def_rec_t recs[MAX_DEFS_PER_NAME];
+    int count;
+    struct def_list* next;
+} def_list_t;
+
+static def_list_t** g_def_hash = NULL;
+
+// file 池：同一条边/同一个函数共用一份路径字符串，避免 120 万 chunk 各 strdup 一遍。
+typedef struct file_node {
+    char* path;
+    struct file_node* next;
+} file_node_t;
+static file_node_t** g_file_hash = NULL;
+
+static unsigned int hash_str_n(const char* s, unsigned int mod) {
+    unsigned int h = 5381;
+    while (*s) h = ((h << 5) + h) + (unsigned char)*s++;
+    return h % mod;
+}
+
+static const char* intern_file(const char* path) {
+    if (!path || !*path) return "";
+    if (!g_file_hash) {
+        g_file_hash = calloc(DEF_HASH_SIZE, sizeof(file_node_t*));
+        if (!g_file_hash) return path;
+    }
+    unsigned int h = hash_str_n(path, DEF_HASH_SIZE);
+    for (file_node_t* n = g_file_hash[h]; n; n = n->next) {
+        if (strcmp(n->path, path) == 0) return n->path;
+    }
+    file_node_t* n = malloc(sizeof(file_node_t));
+    if (!n) return path;
+    n->path = strdup(path);
+    if (!n->path) { free(n); return path; }
+    n->next = g_file_hash[h];
+    g_file_hash[h] = n;
+    return n->path;
+}
+
+// 签名里 `static` 才算文件内定义：只看第一行，且必须出现在函数名之前
+// （函数体里的 `static int x` 是局部静态变量，不算）。
+static int def_is_static(const char* content, const char* name) {
+    if (!content || !name || !*name) return 0;
+    const char* nl = strchr(content, '\n');
+    const char* sig_end = nl ? nl : content + strlen(content);
+    size_t nlen = strlen(name);
+    const char* nm = sig_end;
+    for (const char* p = content; p < sig_end && p; p = strstr(p, name)) {
+        int left_ok = (p == content) || !(isalnum((unsigned char)p[-1]) || p[-1] == '_');
+        int right_ok = !(isalnum((unsigned char)p[nlen]) || p[nlen] == '_');
+        if (left_ok && right_ok) { nm = p; break; }
+        p += nlen;
+        if (p >= sig_end) break;
+    }
+    for (const char* q = content; q + 6 <= nm; q++) {
+        if (strncmp(q, "static", 6) == 0 &&
+            (q == content || !(isalnum((unsigned char)q[-1]) || q[-1] == '_')) &&
+            !(isalnum((unsigned char)q[6]) || q[6] == '_')) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// 头文件里的定义对所有包含者可见（`static inline` 助手），不能当文件内符号处理。
+static int is_header_path(const char* file) {
+    static const char* EXTS[] = { ".h", ".hpp", ".hh", ".hxx", ".inc", ".inl", ".ipp" };
+    size_t n = strlen(file);
+    for (size_t i = 0; i < sizeof(EXTS) / sizeof(EXTS[0]); i++) {
+        size_t e = strlen(EXTS[i]);
+        if (n > e && strcmp(file + n - e, EXTS[i]) == 0) return 1;
+    }
+    return 0;
+}
+
+static void add_def(const char* name, const char* file, int is_static) {
+    if (!name || !*name || !file || !*file) return;
+    if (!g_def_hash) {
+        g_def_hash = calloc(DEF_HASH_SIZE, sizeof(def_list_t*));
+        if (!g_def_hash) return;
+    }
+    unsigned int h = hash_str_n(name, DEF_HASH_SIZE);
+    def_list_t* d = g_def_hash[h];
+    while (d && strcmp(d->name, name) != 0) d = d->next;
+    if (!d) {
+        d = calloc(1, sizeof(def_list_t));
+        if (!d) return;
+        d->name = strdup(name);
+        if (!d->name) { free(d); return; }
+        d->next = g_def_hash[h];
+        g_def_hash[h] = d;
+    }
+    for (int i = 0; i < d->count; i++) {
+        if (strcmp(d->recs[i].file, file) == 0) {
+            // 同一文件里同名多份（重载/嵌套/分 Part）：非 static 优先
+            if (!is_static) d->recs[i].is_static = 0;
+            return;
+        }
+    }
+    if (d->count >= MAX_DEFS_PER_NAME) return;   // 溢出保护，别越界
+    d->recs[d->count].file = intern_file(file);
+    d->recs[d->count].is_static = is_static;
+    d->recs[d->count].is_header = is_header_path(file);
+    d->count++;
+}
+
+// 解析结果：0=external(索引里没有定义/只有别的文件的 static) 1=local 2=global 3=ambiguous
+enum { SCOPE_EXTERNAL = 0, SCOPE_LOCAL = 1, SCOPE_GLOBAL = 2, SCOPE_AMBIGUOUS = 3 };
+
+// 按 caller 文件解析 tok 指向哪个定义。def_out 只在 local/global 时写入。
+static int resolve_def(const char* caller_file, const char* tok,
+                       char* def_out, size_t defsz, int* def_count_out) {
+    def_out[0] = '\0';
+    if (def_count_out) *def_count_out = 0;
+    if (!g_def_hash || !tok || !*tok) return SCOPE_EXTERNAL;
+    unsigned int h = hash_str_n(tok, DEF_HASH_SIZE);
+    def_list_t* d = g_def_hash[h];
+    while (d && strcmp(d->name, tok) != 0) d = d->next;
+    if (!d || d->count == 0) return SCOPE_EXTERNAL;
+
+    // ① 同文件定义：C 的 static 只在文件内可见，Python/JS 的同名嵌套函数同理。
+    if (caller_file && *caller_file) {
+        for (int i = 0; i < d->count; i++) {
+            if (strcmp(d->recs[i].file, caller_file) == 0) {
+                snprintf(def_out, defsz, "%s", caller_file);
+                if (def_count_out) *def_count_out = d->count;
+                return SCOPE_LOCAL;
+            }
+        }
+    }
+    // ② 唯一可见定义：非 static 的 .c 定义，或头文件里的 static inline。
+    //    头文件里的 static inline 对所有包含者可见，所以也算「可见」，不按 static 丢弃。
+    const char* only = NULL;
+    int visible = 0;
+    for (int i = 0; i < d->count; i++) {
+        if (!d->recs[i].is_static || d->recs[i].is_header) {
+            visible++;
+            only = d->recs[i].file;
+        }
+    }
+    if (visible == 1) {
+        snprintf(def_out, defsz, "%s", only);
+        if (def_count_out) *def_count_out = d->count;
+        return SCOPE_GLOBAL;
+    }
+    // ③ 多份可见定义：不能静默合并，交查询侧标注。
+    if (visible > 1) {
+        if (def_count_out) *def_count_out = visible;
+        return SCOPE_AMBIGUOUS;
+    }
+    // 只剩别的文件里的 static 非头定义：这个调用点不可能落到它们身上（static 无外部可见性）。
+    if (def_count_out) *def_count_out = d->count;
+    return SCOPE_EXTERNAL;
+}
 
 typedef struct plugin_edge {
     char caller[MAX_NAME_LEN];
@@ -377,6 +558,14 @@ static void add_call_edge(const char* callee, const char* caller, const char* fi
         e->indirect = 1;
     } else {
         e->indirect = 0;
+    }
+    // 跨文件解析：边落在哪个定义上（local 优先，其次唯一可见定义，多份则标 ambiguous）
+    {
+        char def[512];
+        int defs = 0;
+        e->scope = resolve_def(file, callee, def, sizeof(def), &defs);
+        e->defs = defs;
+        snprintf(e->def, sizeof(e->def), "%s", def);
     }
     e->next = node->calls;
     node->calls = e;
@@ -787,6 +976,8 @@ int lite_cs_callgraph_main(int argc, char** argv) {
                 b->next = bodies;
                 bodies = b;
                 body_count++;
+                // 定义表：name -> {file, static}，供边解析「这条边到底指向哪个定义」
+                add_def(name, file, def_is_static(content, name));
             }
         }
 
@@ -910,6 +1101,7 @@ int lite_cs_callgraph_main(int argc, char** argv) {
         call_edge_t* e = node->calls;
         int first_edge = 1;
         while (e) {
+            g_scope_count[e->scope >= 0 && e->scope <= 3 ? e->scope : 0]++;
             char esc_caller[MAX_NAME_LEN * 2];
             char esc_file[1024];
             json_escape_str(e->caller, esc_caller, sizeof(esc_caller));
@@ -932,6 +1124,20 @@ int lite_cs_callgraph_main(int argc, char** argv) {
                     fprintf(out, ",\"via\":\"%s\"", esc_via);
                 }
             }
+            // 跨文件解析结果（省字节编码）：
+            //   scope=local      → 同文件定义（def 就是调用点自己的 file）
+            //   def=<file>       → 唯一全局/头文件可见定义
+            //   scope=ambiguous  → defs 份同名实现混在这条边上，别当精确边
+            //   三者都没有        → external（索引里没有对应定义，或只有别处的 static）
+            if (e->scope == SCOPE_LOCAL) {
+                fprintf(out, ",\"scope\":\"local\"");
+            } else if (e->scope == SCOPE_GLOBAL) {
+                char esc_def[1024];
+                json_escape_str(e->def, esc_def, sizeof(esc_def));
+                fprintf(out, ",\"def\":\"%s\"", esc_def);
+            } else if (e->scope == SCOPE_AMBIGUOUS) {
+                fprintf(out, ",\"scope\":\"ambiguous\",\"defs\":%d", e->defs > 0 ? e->defs : 2);
+            }
             fprintf(out, "}");
             e = e->next;
         }
@@ -943,6 +1149,9 @@ int lite_cs_callgraph_main(int argc, char** argv) {
     fprintf(out, "\n}\n");
     fclose(out);
     printf("Saved call graph to %s\n", out_file);
+    printf("  Symbol resolution: %d local, %d global, %d ambiguous, %d external\n",
+           g_scope_count[SCOPE_LOCAL], g_scope_count[SCOPE_GLOBAL],
+           g_scope_count[SCOPE_AMBIGUOUS], g_scope_count[SCOPE_EXTERNAL]);
 
     // Cleanup
     for (int i = 0; i < g_func_count; i++) free(g_func_names[i]);

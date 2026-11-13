@@ -287,6 +287,9 @@ lens action=dataflow query=vfs_read project=$P
 不变量：
 
 - **向量**：`.jina.bin` 存在、`.hnsw` 新于 `.bin`、`search` top1 `score > 0.3`；
+- **置信度**：每条 `search` 结果带 `confidence`/`confidence_label`/`evidence`；
+  `score` 只排序，`confidence` 才是「该不该信」（语义 0.6 + 词元命中 0.25 + 调用图 0.15，
+  再乘 test/mock 降权）。top1 是 `low` 就等于「排第一也只是排第一」，改 `symbol`/`grep`；
 - **KV**：`kv/mem.bin` 存在（否则 `context/symbol/exact` 直接报 "KV import missing"）；
 - **context**：callees 非空且**不全自指**（防 call_graph 反向图 bug）；
 - **dataflow**：不是 "not found"，且变量键里没有 `void`/`return` 噪声；

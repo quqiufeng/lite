@@ -11,8 +11,10 @@
 #define MAX_FIELDS 50
 #define MAX_FUNCS 5000
 
-// 前向声明（is_c_type 定义在后面）
+// 前向声明（is_c_type / is_type_word / is_type_qualifier 定义在后面）
 static int is_c_type(const char* word);
+static int is_type_word(const char* w);
+static int is_type_qualifier(const char* w);
 
 // C 控制关键字/字面量：不能作为变量名收集（否则 dataflow.json 出现 "void"/"return" 等噪声键）
 static int is_c_keyword(const char* word) {
@@ -52,6 +54,23 @@ typedef struct {
     int capacity;
 } field_record_t;
 
+// 跨过程数据流的一跳：变量在 caller 里作为第 pos 个实参传给 callee，
+// 落到 callee 的形参 param 上（sig 解析不出来时 param 为空）。
+// scope/def/defs 直接抄 call_graph.json 的跨文件解析结果：
+//   local=同文件定义 / def=唯一可见定义文件 / ambiguous=defs 份同名实现混在这条边上。
+#define MAX_HOPS 48
+typedef struct {
+    char caller[256];
+    char callee[256];
+    char file[512];
+    int line;
+    char param[64];
+    int pos;
+    int scope;          // 0=external 1=local 2=global 3=ambiguous
+    char def[512];
+    int defs;
+} hop_t;
+
 // 变量记录（增强版：支持字段）
 // occurs/fields 改为动态分配：旧版内联 occurs[MAX_OCCURS]（每变量 ~232KB），
 // 导致 MAX_VARS 无法上调、内核只覆盖前 1 万变量。
@@ -64,6 +83,9 @@ typedef struct {
     field_record_t* fields; // 动态，上限 MAX_FIELDS
     int field_count;
     int field_capacity;
+    hop_t* hops;            // 动态，上限 MAX_HOPS（跨过程实参传递）
+    int hop_count;
+    int hop_capacity;
 } var_record_t;
 
 static var_record_t* g_vars = NULL;
@@ -94,6 +116,9 @@ typedef struct {
     char call_site_file[512];
     int call_site_line;
     char args[1024];  // 参数字符串，如 "c, pool, log"
+    int scope;        // 0=external 1=local 2=global 3=ambiguous（call_graph.json）
+    char def[512];
+    int defs;
 } call_edge_t;
 
 // 调用图
@@ -157,6 +182,7 @@ static var_record_t* find_or_create_var(const char* name) {
     var->type[0] = '\0';
     var->occurs = NULL; var->occur_count = 0; var->occur_capacity = 0;
     var->fields = NULL; var->field_count = 0; var->field_capacity = 0;
+    var->hops = NULL; var->hop_count = 0; var->hop_capacity = 0;
 
     // 插入哈希
     g_var_hash[h] = idx + 1;
@@ -254,9 +280,155 @@ static void add_occurrence(var_record_t* var, const char* file, const char* func
 }
 
 // ============================================
+// 函数形参表（跨过程数据流的「落点」）
+//
+// 旧版跨函数流只做 `strstr(实参串, 变量名)`：`buf` 会命中 `bufsize`，嵌套调用
+// `f(g(x), 1)` 里的 x 被算成传给 f，而且从不记形参名 —— 于是「x 传到 helper_add
+// 的第几个形参、那里有没有被改写」在 dataflow.json 里根本不存在。
+// 这里从 chunks_meta 的 signature 解析形参（name + type），实参按顶层逗号切成
+// 位置索引 → 形参名，跨过程边才带得上 param/pos。
+// ============================================
+#define MAX_PARAMS 12
+#define PARAM_HASH_SIZE 65536
+
+typedef struct {
+    char name[64];
+    char type[64];
+} param_t;
+
+typedef struct func_param {
+    char func[256];
+    param_t params[MAX_PARAMS];
+    int count;
+    struct func_param* next;
+} func_param_t;
+
+static func_param_t** g_param_hash = NULL;
+
+static unsigned int param_hash(const char* s) {
+    unsigned int h = 5381;
+    while (*s) h = ((h << 5) + h) + (unsigned char)*s++;
+    return h % PARAM_HASH_SIZE;
+}
+
+static func_param_t* func_params(const char* func) {
+    if (!g_param_hash || !func || !*func) return NULL;
+    func_param_t* p = g_param_hash[param_hash(func)];
+    while (p && strcmp(p->func, func) != 0) p = p->next;
+    return p;
+}
+
+static func_param_t* func_params_create(const char* func) {
+    if (!g_param_hash) {
+        g_param_hash = calloc(PARAM_HASH_SIZE, sizeof(func_param_t*));
+        if (!g_param_hash) return NULL;
+    }
+    unsigned int h = param_hash(func);
+    func_param_t* p = g_param_hash[h];
+    while (p && strcmp(p->func, func) != 0) p = p->next;
+    if (p) return p;
+    p = calloc(1, sizeof(func_param_t));
+    if (!p) return NULL;
+    strncpy(p->func, func, sizeof(p->func) - 1);
+    p->next = g_param_hash[h];
+    g_param_hash[h] = p;
+    return p;
+}
+
+// ============================================
 // 字段访问提取
 // ============================================
 
+// 从一段形参声明里取 (name, type)。无名形参（只有类型，如 `int`）返回 0：
+// 位置仍然保留（实参按位置对齐），只是 param 为空。
+static int parse_param_decl(const char* part, int part_len, param_t* out) {
+    char buf[256];
+    int n = part_len < (int)sizeof(buf) - 1 ? part_len : (int)sizeof(buf) - 1;
+    memcpy(buf, part, (size_t)n);
+    buf[n] = '\0';
+    // 去掉默认值（C++）与数组维度 / 位域
+    for (char* q = buf; *q; q++) {
+        if (*q == '=' || *q == '[' || *q == ':') { *q = '\0'; break; }
+    }
+    const char* name = NULL;
+    int name_len = 0;
+    char* fp = strstr(buf, "(*");   // 函数指针 `int (*cb)(int)`
+    if (fp) {
+        const char* q = fp + 2;
+        while (*q == ' ' || *q == '*') q++;
+        name = q;
+        while (*q && (isalnum((unsigned char)*q) || *q == '_')) q++;
+        name_len = (int)(q - name);
+    } else {
+        // 取「最后一个不是类型词/关键字的标识符」：`const char *src` → src，
+        // `struct x *p` → p，无名形参 `int` → 没有
+        const char* q = buf;
+        while (*q) {
+            if (isalpha((unsigned char)*q) || *q == '_') {
+                const char* s = q;
+                while (*q && (isalnum((unsigned char)*q) || *q == '_')) q++;
+                int len = (int)(q - s);
+                char tok[64];
+                int tl2 = len < 63 ? len : 63;
+                memcpy(tok, s, (size_t)tl2);
+                tok[tl2] = '\0';
+                if (!is_type_word(tok) && !is_c_keyword(tok) && !is_type_qualifier(tok) &&
+                    strcmp(tok, "struct") != 0 && strcmp(tok, "union") != 0 &&
+                    strcmp(tok, "enum") != 0) {
+                    name = s;
+                    name_len = len;
+                }
+                continue;
+            }
+            q++;
+        }
+    }
+    if (!name || name_len <= 0 || name_len >= (int)sizeof(out->name)) return 0;
+    memcpy(out->name, name, (size_t)name_len);
+    out->name[name_len] = '\0';
+    // 类型 = 名字之前的文本，去掉尾部的 * 和空白
+    int tl = (int)(name - buf);
+    while (tl > 0 && (buf[tl - 1] == ' ' || buf[tl - 1] == '*' || buf[tl - 1] == '\t'))
+        tl--;
+    if (tl >= (int)sizeof(out->type)) tl = (int)sizeof(out->type) - 1;
+    memcpy(out->type, buf, (size_t)tl);
+    out->type[tl] = '\0';
+    return 1;
+}
+// signature 形如 `static int helper_add(int a, int b)` / `foo(void)`：
+// 只切括号内的顶层逗号，嵌套括号（函数指针）靠 depth 跳过。
+static void add_func_params(const char* func, const char* sig) {
+    if (!func || !*func || !sig || !*sig) return;
+    const char* open = strchr(sig, '(');
+    if (!open) return;
+    int depth = 0;
+    const char* close = NULL;
+    for (const char* p = open; *p; p++) {
+        if (*p == '(') depth++;
+        else if (*p == ')') { if (--depth == 0) { close = p; break; } }
+    }
+    if (!close) close = open + strlen(open);
+    func_param_t* fp = func_params_create(func);
+    if (!fp) return;
+    const char* start = open + 1;
+    depth = 0;
+    for (const char* p = open + 1; *p; p++) {
+        int boundary = (p == close);
+        if (!boundary) {
+            if (*p == '(') { depth++; continue; }
+            if (*p == ')') { depth--; continue; }
+            if (*p == ',' && depth == 0) boundary = 1;
+        }
+        int len = (int)(p - start);
+        if (len > 0 && fp->count < MAX_PARAMS) {
+            param_t pt;
+            if (parse_param_decl(start, len, &pt)) fp->params[fp->count++] = pt;
+        }
+        start = p + 1;
+        if (p == close) break;
+    }
+}
+// PARAM_PARSE_HERE
 static const char* extract_field_access(const char* line, const char* var_name) {
     static char field_name[128];
     field_name[0] = '\0';
@@ -400,6 +572,23 @@ typedef struct {
     int abs_line;
 } ctx_info_t;
 
+// 形参在函数体里被赋值（`a = a + b`）：旧版这条写完全不可见（形参从没被当成
+// 变量声明过），于是「x 传进 helper_add 后有没有被改写」永远判不出来。这里按
+// signature 解析出的形参表补一条赋值 occurrence，类型取形参类型。
+static var_record_t* implicit_param_var(const char* name, const char* func) {
+    func_param_t* fp = func_params(func);
+    if (!fp) return NULL;
+    for (int i = 0; i < fp->count; i++) {
+        if (strcmp(fp->params[i].name, name) != 0) continue;
+        var_record_t* var = find_or_create_var(name);
+        if (!var) return NULL;
+        if (!var->type[0])
+            strncpy(var->type, fp->params[i].type, sizeof(var->type) - 1);
+        return var;
+    }
+    return NULL;
+}
+
 static void analyze_line_impl(const char* line, ctx_info_t* ctx) {
     char tokens[64][128];
     int token_count = 0;
@@ -446,6 +635,7 @@ static void analyze_line_impl(const char* line, ctx_info_t* ctx) {
             if (strcmp(prev, "+") != 0 && strcmp(prev, "-") != 0 &&
                 strcmp(prev, "*") != 0 && strcmp(prev, "&") != 0) {
                 var_record_t* var = find_var(prev);
+                if (!var) var = implicit_param_var(prev, ctx->func);
                 if (var) {
                     const char* field = extract_field_access(line, prev);
                     add_occurrence(var, ctx->file, ctx->func, ctx->abs_line, 0, line, 2, field);
@@ -592,6 +782,7 @@ static int analyze_meta(const char* meta_file) {
         char* name_p = strstr(line, "\"name\":\"");
         char* file_p = strstr(line, "\"file\":\"");
         char* kind_p = strstr(line, "\"kind\":\"");
+        char* sig_p = strstr(line, "\"signature\":\"");
         char* line_p = strstr(line, "\"line_start\":");
         char* content_p = strstr(line, "\"content\":\"");
         
@@ -636,6 +827,20 @@ static int analyze_meta(const char* meta_file) {
         strncpy(ctx.func, name, sizeof(ctx.func) - 1);
         ctx.abs_line = line_start;
         
+        // 形参表：跨过程流要把实参位置映射到 callee 的形参名。
+        if (sig_p) {
+            char sig[512];
+            int si = 0;
+            const char* sp = sig_p + 12;
+            while (*sp && *sp != '"' && si < (int)sizeof(sig) - 1) {
+                if (*sp == '\\' && sp[1]) { sp++; if (*sp != 'n' && *sp != 't') sig[si++] = *sp; }
+                else sig[si++] = *sp;
+                sp++;
+            }
+            sig[si] = '\0';
+            add_func_params(name, sig);
+        }
+
         process_function_content(content, &ctx);
         func_count++;
     }
@@ -709,6 +914,25 @@ static int load_call_graph(const char* cache_dir) {
             }
             
             edge->call_site_line = (line_j && json_is_integer(line_j)) ? (int)json_integer_value(line_j) : 0;
+
+            // 跨文件解析结果（callgraph.c 写进 call_graph.json）：
+            // scope=local 同文件定义；def=唯一可见定义；scope=ambiguous 多份同名实现。
+            // 跨过程流直接带上，免得调用侧以为这条边是精确的。
+            edge->scope = 0;
+            edge->def[0] = '\0';
+            edge->defs = 0;
+            {
+                const char* scope_s = json_string_value(json_object_get(call, "scope"));
+                const char* def_s = json_string_value(json_object_get(call, "def"));
+                if (def_s && *def_s) {
+                    strncpy(edge->def, def_s, sizeof(edge->def) - 1);
+                    edge->scope = 2;
+                }
+                if (scope_s && strcmp(scope_s, "local") == 0) edge->scope = 1;
+                else if (scope_s && strcmp(scope_s, "ambiguous") == 0) edge->scope = 3;
+                json_t* defs_j = json_object_get(call, "defs");
+                if (defs_j && json_is_integer(defs_j)) edge->defs = (int)json_integer_value(defs_j);
+            }
             
             edge->args[0] = '\0';
             if (args_j && json_is_array(args_j)) {
