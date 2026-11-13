@@ -182,6 +182,19 @@ local function ns_from_dir(dir)
     return "/code/" .. safe_name((base:gsub("_cache$", "")))
 end
 
+-- 老索引（早于 namespace.txt 这个约定）只能靠目录名反推 ns。反推对了就顺手钉下来：
+-- 下次不用再猜，也挡住 `_cache` 后缀/改名差一格就静默 0 命中。只在查询**命中后**调用——
+-- 0 命中时写进去等于把错的 ns 固化。已有 marker 就不碰（可能是别人有意写的另一套）。
+local function pin_ns(analysis, ns)
+    if not analysis or analysis == "" or not ns or ns == "" then return false end
+    if marker_ns(analysis) then return false end
+    local f = io.open(analysis .. "/namespace.txt", "w")
+    if not f then return false end
+    f:write(ns, "\n")
+    f:close()
+    return true
+end
+
 -- 手工传 ns 时统一补前导 '/'。KV 键前缀就是 ns 原文，`code/x` 与 `/code/x` 是两套
 -- 互不可见的键空间：import 写错一个斜杠，查询侧仍是 /code/x → 读到的是上一次构建留下的
 -- 旧 key，表现为「重建了但 dataflow 还是垃圾」，且不报错。归一化让两种写法都落到 /code/x；
@@ -232,6 +245,32 @@ local function one_line(s, n)
     s = tostring(s):gsub("%s+", " ")
     if #s > n then s = s:sub(1, n) .. "..." end
     return s
+end
+
+-- 单行硬上限（read_window / fmt_content_window 共用）。
+local SNIP_LINE_MAX = 200
+
+-- search/symbol 的 r.content 是一整块源码（chunk）。压成一行只剩开头几百字，
+-- 调用方拿不到行号还得自己数 → 没法直接引用 file:line。这里按 chunk 起行右对齐编号，
+-- 与 locate/peek 的窗口格式一致（`  123| code`）。
+local function fmt_content_window(r, cap, indent)
+    local text = tostring(r and r.content or "")
+    if text == "" then return nil end
+    -- content 里的换行是 JSON 层的字面 `\n`（两字符），不还原的话整块挤成一行，
+    -- 编号就只剩第一个行号，窗口看着像「这函数只有一行」。
+    if not text:find("\n", 1, true) and text:find("\\n", 1, true) then
+        text = text:gsub('\\"', '"'):gsub("\\r", ""):gsub("\\n", "\n"):gsub("\\t", "\t")
+    end
+    local first = tonumber(r.line_start or r.line) or 1
+    local out, n = {}, 0
+    for ln in (text .. "\n"):gmatch("([^\n]*)\n") do
+        n = n + 1
+        ln = ln:gsub("\r$", "")
+        if #ln > SNIP_LINE_MAX then ln = ln:sub(1, SNIP_LINE_MAX) .. " …" end
+        out[#out + 1] = string.format("%s%5d| %s", indent or "      ", first + n - 1, ln)
+        if n >= (cap or 12) then out[#out + 1] = (indent or "      ") .. "     …"; break end
+    end
+    return table.concat(out, "\n")
 end
 
 -- 置信度标签：score 只说明「排第几」，confidence 说明「该不该信」。
@@ -307,13 +346,20 @@ local function fmt_status(d)
     return table.concat(out, "\n")
 end
 
-local function fmt_results(d, max_chars)
+local function fmt_results(d, max_chars, ns)
     local rs = d.results or {}
     local out = { string.format('%s "%s" -> %d result(s), %d ms',
         d.type or "?", d.query or "", #rs, d.timing_ms or 0) }
     if #rs == 0 and (d.type or "") == "exact" then
+        -- 0 命中绝大多数不是「键不存在」，而是查询走的前缀和 import 写的不是一套
+        -- （namespace.txt 缺失时只能靠目录名反推）。把实际用的 ns 报出来才可自修。
         out[#out + 1] = "hint: exact 试过 <key> 直取 → <key>/... 子键 → /symbols/<name> → 文件路径，" ..
             "都没有；用 symbol/locate/grep 再收窄"
+        if ns then
+            out[#out + 1] = string.format(
+                "      查询前缀 ns=%s（KV 键就是它拼出来的；索引前缀不同时稳定 0 命中且不报错）"
+                .. " → 确认前缀用 action=status，或显式 ns=/code/<repo>", tostring(ns))
+        end
     end
     local total = 0
     for i, r in ipairs(rs) do
@@ -331,9 +377,8 @@ local function fmt_results(d, max_chars)
             if r.signature and r.signature ~= "" then
                 out[#out + 1] = "    sig: " .. one_line(r.signature, 200)
             end
-            if r.content and r.content ~= "" then
-                out[#out + 1] = "    " .. one_line(r.content, 400)
-            end
+            local win = fmt_content_window(r, 12)
+            if win then out[#out + 1] = win end
         end
         total = total + #line
         if total > (max_chars or 8000) then
@@ -527,13 +572,22 @@ end
 local function fmt_symbols(d)
     local rs = d.results or {}
     if #rs == 0 then return string.format('symbol "%s" not found', d.query or "") end
-    local out = {}
-    for i, r in ipairs(rs) do
-        out[#out + 1] = string.format("[%d] %s  %s:%s  kind=%s", i, r.name or "?",
-            r.file or "?", tostring(r.line or r.line_start or "?"), r.kind or "")
-        if r.content and r.content ~= "" then
-            out[#out + 1] = "    " .. one_line(r.content, 400)
+    local out, seen, shown = {}, {}, 0
+    for _, r in ipairs(rs) do
+        -- 同名符号在别的文件里也有一份（内核里同名 static 满地是）：按 file:line 去重，
+        -- 否则 max_results 全被同一个定义的多个 chunk 吃掉。
+        local key = tostring(r.file or "?") .. ":" .. tostring(r.line or r.line_start or "?")
+        if not seen[key] then
+            seen[key] = true
+            shown = shown + 1
+            out[#out + 1] = string.format("[%d] %s  %s:%s  kind=%s", shown, r.name or "?",
+                r.file or "?", tostring(r.line or r.line_start or "?"), r.kind or "")
+            local win = fmt_content_window(r, 8)
+            if win then out[#out + 1] = win end
         end
+    end
+    if shown < #rs then
+        out[#out + 1] = string.format("(%d 条同名/同位置重复已折叠)", #rs - shown)
     end
     return table.concat(out, "\n")
 end
@@ -673,8 +727,8 @@ end
 --   search → 人工拼 read（两次往返，且常读错行）⇒ locate 直接内联源码窗口
 --   整仓 grep（慢 + 噪声命中）                  ⇒ grep 先按目录/文件收窄 + 护栏
 --   read 文件再数行号                            ⇒ peek 给 file:line 直接读窗口
--- 读源码的硬上限：单行 200 字符、总输出 8000 字符，超了明确说怎么调。
-local SNIP_LINE_MAX = 200
+-- 读源码的硬上限：单行 200 字符（SNIP_LINE_MAX，见 one_line 上方）、总输出 8000 字符，
+-- 超了明确说怎么调。
 local GREP_MAX_FILES_DEFAULT = 3000
 
 local function shell_quote(s)
@@ -818,6 +872,11 @@ local function do_locate(args, ctx, analysis, kv, ns, repo)
         return table.concat(out, "\n")
     end
 
+    -- 命中说明 ns 是对的：顺手给没有 namespace.txt 的老索引钉一份，后续查询不再猜。
+    if pin_ns(analysis, ns) then
+        add_note("ns pinned -> " .. analysis .. "/namespace.txt = " .. ns)
+    end
+
     -- best practices §10 的不变量：语义 top1 score 应 > 0.3；低分说明索引或措辞有问题，
     -- 别让噪声命中被当成「找到了」。
     if rs[1] and rs[1].score and rs[1].score < 0.35 then
@@ -831,6 +890,29 @@ local function do_locate(args, ctx, analysis, kv, ns, repo)
             .. "先看 why 行确认命中理由; 需要确定答案用 action=symbol/grep",
             tonumber(rs[1].confidence) or 0)
     end
+    -- 同名精确命中置顶：语义 search 的排序会把真正要找的那个定义压到 [3] 之后
+    -- （例如 locate "do_peek" 时 [1] 是别的 do_* 函数），调用方只读前两条就判断「没找到」。
+    -- 只在 score 相差不大时才提：宁可少提，不要把语义排序整体打乱。
+    do
+        local q = tostring(args.query)
+        local bare = q:match("([%w_~]+)$") or q
+        local function hit(r)
+            local n = tostring(r.name or "")
+            return n == q or n == bare or (n:match("([%w_~]+)$") or "") == bare
+        end
+        if #rs > 1 and not hit(rs[1]) then
+            local top, moved, at = rs[1], nil, nil
+            for i = 2, #rs do
+                if hit(rs[i]) then moved, at = table.remove(rs, i), i; break end
+            end
+            if moved and (not moved.score or not top.score or moved.score >= top.score - 0.25) then
+                table.insert(rs, 1, moved)
+                add_note(string.format("hoisted exact name match %s from #%d",
+                    tostring(moved.name), at))
+            end
+        end
+    end
+
     -- 表头晚一步拼：`with source` 要数「真读到窗口的条数」，不能拿 #rs 冒充
     -- （否则命中文件不在 repo 里、或预算截断时也报成满额）。
     local out = {}
@@ -955,6 +1037,12 @@ end
 local function do_peek(args, ctx, kv, ns)
     local path = args.path or args.file
     local line = tonumber(args.line)
+    -- peek 的 path 经常是直接抄过来的 `file:line`（grep/locate/编译器报错都是这个形状）。
+    -- 原样当路径 open 必然 ENOENT，还报成「peek failed: cannot open ...」，看着像文件不在。
+    if path and path ~= "" and not line then
+        local p, l = tostring(path):match("^(.-):(%d+)$")
+        if p and p ~= "" then path, line = p, tonumber(l) end
+    end
     local out = {}
     if (not path or path == "") and args.query and args.query ~= "" then
         local d, err = CS.query({ query = args.query, repo = ns, type = "symbol",
@@ -1132,8 +1220,10 @@ local function run_inner(args, ctx)
             if d.error then error("lens: " .. tostring(d.error), 0) end
             if args.json then return cjson.encode(d) end
             if action == "context" then return fmt_context(d, tonumber(args.max_chars)) end
+            -- 命中就说明 ns 对：老索引顺手钉一份 namespace.txt，别再靠目录名反推。
+            if #(d.results or {}) > 0 then pin_ns(analysis, ns) end
             if action == "symbol" then return fmt_symbols(d) end
-            return fmt_results(d, tonumber(args.max_chars))
+            return fmt_results(d, tonumber(args.max_chars), ns)
         end
 
         error("codesearch: unknown action " .. tostring(action), 0)
