@@ -193,6 +193,16 @@ import 跳过 `dataflow/_func_index` 这一整块，只写逐函数键 `dataflow
 再看长度决定是否分片」——内核 19 万个函数那次，为了知道它太大先拼出几 GB 字符串，
 在 8 GiB RSS + swap 抖动下卡在 `json_dumps` 里 29 分钟、盘上一行没动。
 
+**`dataflow` 产物的口径**（查不对先看这几条，都是踩过的）：
+
+- `content` 含 ` // Part ` 的 chunk 是 `indexer.c` 给检索/向量切的长函数窗口，**不参与
+  dataflow**（行号都是函数起始行，会造出假的 `in`/`last` 和 4~5 倍重复计数）。
+- 声明按作用域记：`definition` 取本函数内那条，`query.c` 只在退回全局时才给
+  `decl_scope="module"`（lens 显示 `[module-scope]`），同名局部不会串到别的文件。
+- 不统计的东西：`goto X` 的操作数、语句开头的 `X:` 标签、后面跟 `(` 的标识符（函数调用）。
+- `occurrences_total` / `truncated` / `limit` 三个字段贯穿 analyzer→import→query→lens：
+  默认只留 `MAX_OCCURS`（2000）条，`i`/`skb` 这种超高频变量会截断，**不是"只有这么多用法"**。
+
 ### 1.1 本机已经建好的索引（2026-11-10 快照，已清掉源码丢失的 5 份）
 
 **lite 自身不建索引**：`~/.local/share/lite/codesearch/` 下**不留** `lite` 那一份
