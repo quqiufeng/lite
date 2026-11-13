@@ -42,8 +42,10 @@ lens action=grep   pattern=<re> path=<file|dir> [fixed=true]
   `fs/ntfs3/inode.c`(0.861)——**都是具体文件系统，没有一个是 VFS 门面**。
   想要门面（`read_mapping_folio`/`filemap_read`）就把 query 写具体，或直接 `symbol`。
 - **`peek` 用于二次落地**：`locate` 给的窗口不够，就按 `file:line` 精确开窗，别整文件读。
-- **`grep` 只用于字面/正则**（`\.read\s*=\s*`、`EXPORT_SYMBOL\(`）；整仓 grep 会被护栏拒掉
-  （>3000 文件的目录直接拒扫），这是**特性不是限制**：它逼你先收窄。
+- **`grep` 只用于字面/正则**（`\.read\s*=\s*`、`EXPORT_SYMBOL\(`）；护栏按「cgrep 真会扫的
+  文件数」算（node_modules/dist/build 等先 prune 掉），上限 20000：opencode 这类多包仓
+  prune 后 11233 个文件可以全树扫（实测 914 ms），内核树 ~80k 仍会被拒并提示先 locate 收窄。
+  全树 grep 的产物是**热度表头**，不是全部命中——`max_hits` 给 5~20 就够定位。
 
 探索任何项目**第一步**永远是对齐索引状态：
 
@@ -290,10 +292,15 @@ lens action=dataflow query=vfs_read project=$P
 - **置信度**：每条 `search` 结果带 `confidence`/`confidence_label`/`evidence`；
   `score` 只排序，`confidence` 才是「该不该信」（语义 0.6 + 词元命中 0.25 + 调用图 0.15，
   再乘 test/mock 降权）。top1 是 `low` 就等于「排第一也只是排第一」，改 `symbol`/`grep`；
+  词元命中的分母只数实词——冠词/介词/助动词/wh-词（the/how/does/with…）不算 term，也不
+  参与名字匹配，否则 `how does the retry backoff work` 的 lex 只有 2/6、置信度被凭功
+  能词压低；语义分缺失时从 `score` 减去 kw/caller boost 回推，不拿含 boost 的分当语义证据；
 - **KV**：`kv/mem.bin` 存在（否则 `context/symbol/exact` 直接报 "KV import missing"）；
 - **context**：callees 非空且**不全自指**（防 call_graph 反向图 bug）；
 - **dataflow**：不是 "not found"，且变量键里没有 `void`/`return` 噪声；
-- **grep**：`path=fs/` 能扫、`path=.` 在 >3000 文件目录被拒（护栏生效）。
+- **grep**：`path=fs/` 能扫；`path=.` 在多包仓（prune 后 ≤20000 文件）也能扫，内核树被拒（护栏生效）。
+- **降权**：`*.test.ts`/`*.spec.ts`/`__tests__/`/`fixtures/` 与内核 `test/` 同级降权 ×0.85
+  （早先只认 `/test` 前缀，JS/TS 仓里 22% 的 chunk 是测试却一次没降过权）。
 
 **一句话**：lens 给的是「读得快、看得全、能横向对比」的坐标系统，
 真相永远在运行里；把两者混为一谈，报告就是自欺。

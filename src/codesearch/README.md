@@ -822,6 +822,19 @@ print(CS.check("/home/quqiufeng/.local/share/lite/codesearch/nginx"))
 | `penalty` | `test/mock/selftest path, confidence ×0.85` | 权重为负贡献 |
 | `metadata` | `function mem_read_page @ mm/mem.c:120-140 from chunks_meta.jsonl` | 每条都有：命中块本身的出处 |
 
+两处口径细节（改过就同步这里，别只看代码）：
+
+- **词的计数与匹配都跳过功能词**（the/and/for/with/how/does/which…，名单见
+  `vector_engine.c:cs_stopword`）。自然语言 query 的功能词既不该拉低「词元命中比」，
+  也会造成子串巧合（`for` 撞 `format`、`the` 撞 `theme`）。名词/动词（set/get/use/walk）
+  是真实线索，不跳。
+- **语义分缺失时不算 boost**：`semantic` 为 0/NaN（引擎换数据源只回 `score`）时，
+  有效语义分 = `score − kw_boost − caller_boost`，`vector` 证据会附
+  `, reconstructed from score`。直接拿 `score` 顶替会把 boost 也算成语义证据——正是置信度
+  要防的虚高。
+- `boost` 记的是**实际加进去的量**（撞 1.0 天花板后会小于函数返回值），所以
+  `semantic + kw_boost + caller_boost` 与 `score` 只差 test 路径降权 ×0.85。
+
 置信度 low 且排在 top1 时，`lens locate` 会打警告并提示改 `symbol`/`grep`——
 排名第一不等于答案正确。
 

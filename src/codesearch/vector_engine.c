@@ -625,6 +625,31 @@ static void free_call_graph(void) {
 // Internal: Boost functions
 // ============================================================
 
+// 纯功能词（冠词/介词/助动词/wh-词）不是「符号名里该出现的词」：
+//   · 当 terms 分母 → 把 lex 稀释掉。实测 `stream abort signal` 的 top1 明明名字里
+//     同时有 abort+signal，lex 只算到 2/3，confidence 被压到 0.39(low)；
+//     `how does the retry backoff work` 更狠：6 个 term 里 4 个是功能词，lex=2/6。
+//   · 当 hits 分子 → 纯靠子串巧合得分：`for` 命中 `format`、`the` 命中 `theme`。
+// 所以既不计数也不参与匹配。只收语法词，动词/名词（set/get/use/walk…）留着重，
+// 它们在符号名里是真的语义线索。
+static int cs_stopword(const char* t) {
+    static const char* W[] = {
+        "the", "and", "for", "with", "that", "this", "these", "those", "from",
+        "into", "onto", "over", "under", "about", "above", "after", "before",
+        "between", "during", "than", "then", "them", "they", "their", "there",
+        "was", "were", "are", "has", "have", "had", "been", "being", "does",
+        "did", "done", "not", "nor", "but", "all", "any", "can", "could",
+        "should", "would", "will", "shall", "may", "might", "must", "you",
+        "your", "its", "our", "his", "her", "how", "what", "when", "where",
+        "which", "while", "who", "whom", "whose", "why", "also", "again",
+        "such", "same", "more", "most", "some", "very", "just", "only",
+        "both", "each", "other", "others", "via", "yet", "too", "off", "out",
+        NULL
+    };
+    for (int i = 0; W[i]; i++) if (strcasecmp(t, W[i]) == 0) return 1;
+    return 0;
+}
+
 // 词元口径与 keyword_boost 完全一致，只是顺便把「命中几个 / 命中哪些」
 // 带出来，给 query 层拼 evidence 用（不然命中了什么只能靠猜）。
 static float keyword_boost_ex(const char* query, const char* name,
@@ -639,7 +664,7 @@ static float keyword_boost_ex(const char* query, const char* name,
     float boost = 0.0f;
     char* token = strtok(qcopy, " _-.,;:!?()[]{}<>\"'\t\n");
     while (token) {
-        if (strlen(token) >= 3) {
+        if (strlen(token) >= 3 && !cs_stopword(token)) {
             terms++;
             const char* p = name;
             size_t tlen = strlen(token);
@@ -671,7 +696,34 @@ static float keyword_boost_ex(const char* query, const char* name,
 
 // "/test" 裸前缀会把 tests/ 整个目录都当测试（仓库自带 corpus 就被 ×0.85，
 // 置信度全被压低且证据写着「test path」）。只认 /test/ /test_ /test. 结尾形式。
+//
+// 但只认 `/test` 前缀在 JS/TS/Go/Python 生态里等于没写：`foo.test.ts`（点号前缀，
+// 不在 "/test" 里）、`__tests__/`（p[5]=='s'）、`foo.spec.ts`、`foo_test.go` 全都漏掉。
+// opencode 实测 104598 个 chunk 里 22899 个（21.9%）是测试文件，降权一次都没生效；
+// `stream abort signal` 查询的 top10 里第 3、9 名都是 *.test.ts。所以补三类形态：
+// 目录形（__tests__/fixtures/stories/e2e…）、点号形（.test./.spec.）、下划线/连字符形。
 static int looks_like_test_path(const char* fp) {
+    static const char* SEGS[] = {
+        "/test/", "/tests/", "/__tests__/", "/__test__/",
+        "/spec/", "/specs/", "/__spec__/",
+        "/e2e/", "/__e2e__/", "/fixtures/", "/__fixtures__/", "/__mocks__/",
+        "/stories/", "/.storybook/", "/bench/", "/benchmark/", "/benchmarks/",
+        NULL
+    };
+    for (int i = 0; SEGS[i]; i++) if (strstr(fp, SEGS[i])) return 1;
+
+    // 文件名形：foo.test.ts / foo.spec.ts / foo_test.go / foo-test.js / FooTest.cpp
+    // 只在 basename 里找，避免 `dist/latest.` 这类目录名误伤。
+    const char* base = strrchr(fp, '/');
+    base = base ? base + 1 : fp;
+    static const char* SUFX[] = {".test.", ".spec.", "_test.", "-test.", "_spec.",
+                                 "-spec.", ".stories.", ".story.", NULL};
+    for (int i = 0; SUFX[i]; i++) if (strstr(base, SUFX[i])) return 1;
+    size_t n = strlen(base);
+    if (n > 8 && strcmp(base + n - 8, "Test.cpp") == 0) return 1;
+    if (n > 7 && strcmp(base + n - 7, "Test.cc") == 0) return 1;
+    if (n > 8 && strcmp(base + n - 8, "Test.java") == 0) return 1;
+
     const char* p = fp;
     while ((p = strstr(p, "/test")) != NULL) {
         char n = p[5];
@@ -807,9 +859,12 @@ static int search_hnsw(ve_source_t* source, const float* query_vec, int top_k,
         int caller_count = get_caller_count(name);
         float cb_boost = 0.0f;
         if (opts && opts->use_caller_boost) {
-            cb_boost = caller_boost(name);
-            sim += cb_boost;
+            float before = sim;
+            sim += caller_boost(name);
             if (sim > 1.0f) sim = 1.0f;
+            // 记「实际加进去多少」而不是函数返回值：语义已经 0.95 时 boost 会被
+            // 1.0 天花板吃掉，证据里却写着 +0.100，对不上账。
+            cb_boost = sim - before;
         }
         
         // Lookup metadata once (noise penalty + filters 共用)

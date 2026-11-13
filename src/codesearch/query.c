@@ -1353,14 +1353,26 @@ static json_t* do_dataflow(const char* query, const char* repo, int max_results)
     return results;
 }
 
+// 有效语义分：boost 之前的「像不像」。semantic 缺失（0/NaN，例如引擎换了数据源
+// 只回了 score）时从 score 回推——不能直接拿 score 顶替：score 里已经含 kw/caller
+// boost 和测试路径惩罚，顶替等于把「名字里恰好有 query 词」也算成语义证据，
+// 正是 confidence 要防的那种虚高。所以扣掉 boost 分量再当语义分。
+static double effective_semantic(const vector_result_t* r) {
+    double sem = r->semantic;
+    if (isnan(sem)) sem = 0.0;
+    if (sem <= 0.0) {
+        sem = (double)r->score - (double)r->kw_boost - (double)r->caller_boost;
+        if (isnan(sem) || sem < 0.0) sem = 0.0;
+    }
+    if (sem > 1.0) sem = 1.0;
+    return sem;
+}
+
 // 置信度：语义为主体（0.6），词面共现（0.25）与调用图热度（0.15）为辅。
 // 刻意不让 boost 独大——「名字里恰好有 query 词」和「被很多函数调用」都不是
 // 「这就是你要的语义」的直接证据，只是旁证；boost 已经在 score 里参与排序了。
 static double result_confidence(const vector_result_t* r, double* pre_penalty) {
-    double sem = r->semantic;
-    if (sem <= 0.0 || isnan(sem)) sem = r->score;
-    if (sem < 0.0) sem = 0.0;
-    if (sem > 1.0) sem = 1.0;
+    double sem = effective_semantic(r);
 
     double lex = 0.0;
     if (r->kw_terms > 0) lex = (double)r->kw_hits / (double)r->kw_terms;
@@ -1433,13 +1445,15 @@ static json_t* do_search(const char* query, const char* repo,
         // 关键词 boost 把同名词顶上来。所以每条结果都带一份可核对的拆解。
         double pre_penalty = 0.0;
         double conf = result_confidence(&results[i], &pre_penalty);
+        double sem_eff = effective_semantic(&results[i]);
         char buf[512];
         json_t* ev = json_array();
 
-        snprintf(buf, sizeof(buf), "cosine-sim %.3f (rank %d/%d)%s",
-                 results[i].semantic, i + 1, n,
-                 (opts && opts->use_keyword_boost) ? "" : ", boosts off");
-        evidence_push(ev, "vector", buf, 0.60 * results[i].semantic);
+        snprintf(buf, sizeof(buf), "cosine-sim %.3f (rank %d/%d)%s%s",
+                 sem_eff, i + 1, n,
+                 (opts && opts->use_keyword_boost) ? "" : ", boosts off",
+                 (results[i].semantic > 0.0f) ? "" : ", reconstructed from score");
+        evidence_push(ev, "vector", buf, 0.60 * sem_eff);
 
         if (results[i].kw_terms > 0) {
             if (results[i].kw_hits > 0) {
