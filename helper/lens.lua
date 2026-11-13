@@ -5,22 +5,64 @@
 -- mem.bin 写实例抢锁。实现是 liblite_codesearch.so（从 /opt/my_db 全量迁移），
 -- 语义向量需要 /opt/models 下的 Jina 模型与 ONNX Runtime。
 --
--- ════════ 实战手册：Linux 内核（v7.2.12，36934 个 .c）上摸出来的用法纪律 ════════
+-- ═══════════════ 最佳实践：按使用顺序排的行为边界 ═══════════════════════════════
 -- 下面每条都是「工具的真实行为边界」，不是理想设计；括号里是当初踩出来的证据，
--- 别当成可以随手改掉的注释。改行为前先重跑一次证据里的命令。
+-- 别当成可以随手改掉的注释。改行为前先重跑一次证据里的命令（入口都在
+-- helper/lens.lua:run_inner / do_locate / do_peek / do_grep）。
 --
--- [1] 起手式固定 locate → peek → grep。
---     locate（query=符号名）一次往返就给出 签名 + callers/callees + 内联源码窗口，
---     等价于原来 grep + read 两次；peek 补读别的窗口；grep 只用来兜底复核。
+-- [0] 先判该不该用 lens。它只索引 cwd 之外的项目（AGENTS.md §7）：改 lite 自己用
+--     read/cgrep/edit，别为 lite 建索引。索引是一次性成本、查询才是毫秒级；只查一次
+--     的小问题直接 action=grep 更省，别为它跑几十分钟 build。
 --
--- [2] 语义检索只吃英文标识符/短语。中文 query 基本 0 命中（无向量、纯词面）。
+-- [1] 起手式 = 只给一个参数，让 run_inner 推断 action：
+--       query=<符号名|英文短语>  → locate（默认起手式：签名 + callers/callees + 源码窗口）
+--       pattern=<正则>           → grep（作用域 cgrep）
+--       path=<file|file:line>    → peek（定点读窗口）
+--       都不给                   → status（看产物）
+--     显式 action= 只是覆盖推断，不再是必需项；推断不合意就补一个 action。
+--     locate 一次往返 ≈ 原来 grep + read 两次，所以先 locate，peek 补别的窗口，
+--     grep 只用来兜底复核。
+--
+-- [2] locate 的输出怎么读（默认 max_results=3、lines=40、before=2、max_chars=8000）：
+--       · 表头 `search "x" -> N result(s), M with source [static]` 里的 M 是**真读到盘**
+--         的条数，不是 N（预算砍掉、文件不在 repo 都不算），别拿 N 当证据量。
+--       · score 只说「排第几」，confidence 才说「该不该信」（语义+词面+调用图三样实证）。
+--         top score < 0.35 或 confidence=low 会直接给 note —— 那意思是别当成找到了，
+--         换 action=symbol（定义直查）或 action=grep（词面兜底）。
+--       · 同名精确命中会置顶（与 top 分差 ≤0.25 才提），note 写 `hoisted exact name match`：
+--         语义排序会把真定义压到 [3] 之后（locate "do_peek" 时 [1] 是别的 do_* 函数），
+--         只读前两条就判「没找到」正是这条要防的。
+--       · 窗口**读盘优先**：盘上首行与索引 chunk 首行不一致时标 stale。索引是建索引
+--         那一刻的快照，文件改过后行号会错开，看着正常但引用出去就是错的，以盘上为准。
+--       · `no hit` 会打印 grep / symbol / build 三条下一步，照抄一条改 action 即可。
+--
+-- [3] locate 的 type 与自动退回：默认 type=search（语义）。一条真命中都没有（或缺向量）
+--     时它**自动**退回 symbol，note 写 `retried as symbol`；显式给了 type= 就不退
+--     （那时你要的就是那一种）。查定义更省的路：action=symbol 或 type=symbol，
+--     不加载 ONNX 模型（tools:run_inner 只对 search 传 analysis_dir）。
+--
+-- [4] 语义检索只吃英文标识符/短语。中文 query 基本 0 命中（无向量时纯词面）。
 --     实测：「NAPI 轮询收包」→ 0 命中；换 "napi poll receive packets" → napi_poll 0.921。
---     内核里 ship 的名字本来就是英文，query 直接用符号名或英文短语，别翻译。
+--     仓库里 ship 的名字本来就是英文，query 直接用符号名或英文短语，别翻译。
 --
--- [3] path_prefix 是唯一有效的降噪手段。给了 path_prefix=net/core 就只翻该子树的
---     75 个文件、21ms 出结果；不给就是全仓噪声。查符号优先 symbol + path_prefix。
+-- [5] 降噪只有两个旋钮，别处调不动：path_prefix（子树）+ lang（语言）。
+--     path_prefix=net/core 就只翻该子树的 75 个文件、21ms 出结果；不给就是全仓噪声。
+--     lang=c/cpp/lua/... 同时收窄 symbol 的 definitions/callers/callees，被过滤掉的条数
+--     写进输出的 filtered_by_lang（不静默丢；数字对不上就看这个字段）。
 --
--- [4] 【最重要】call_graph 的边是「函数体文本扫到的标识符」，注释也算，不是语法解析。
+-- [6] peek 吃 `file:line` 原文（grep/locate/编译器报错都是这个形状），也吃 query=<符号>
+--     自己去找定义行（内部一次 symbol 查询）。相对 path 按 cwd 解析；打不开报
+--     `cannot open <path>` —— 先确认 repo 传的是不是你要的那棵树。
+--
+-- [7] grep 是 cgrep 的作用域版，不是整仓版（护栏都在 helper/lens.lua:do_grep）：
+--       · 超过 LITE_CS_GREP_MAX_FILES（默认 3000 文件）直接拒，并给「先 locate 收窄」
+--         的 fix。这是护栏不是 bug；单文件/小目录不受限。
+--       · 走 POSIX ERE，不是 Lua pattern：`%.`/`%d` 在这=字面 `%`，0 命中时会提示；
+--         要字面串用 fixed=true（查 `[`、`*`、`.` 这类必须）。
+--       · 输出先给热点（哪个文件最热、散在几处）再给正文；正文按 file:line 去重，
+--         per_file 默认 10、max_hits 默认 120，不够就显式调大。
+--
+-- [8] 【最重要】call_graph 的边是「函数体文本扫到的标识符」，注释也算，不是语法解析。
 --     所以任何 caller 结论都要 grep 兜底复核。
 --     证据 A：enqueue_task_fair 报 callers=remove_entity_load_avg / clear_delayed /
 --       tg_unthrottle_up —— 这三个函数体里只是在注释中提到了「enqueue_task_fair()」
@@ -32,41 +74,43 @@
 --     复核手法：被报成 caller 却看不出调用关系时，去对方函数体里 grep 这个名字，
 --     命中落在 /* */ 或 // 行内 → 伪边，直接丢弃。
 --
--- [5] call_graph.json 顶层 key 是裸函数名（无文件前缀），同名函数直接串边。
+-- [9] call_graph.json 顶层 key 是裸函数名（无文件前缀），同名函数直接串边。
 --     内核里 init / read / xmit 之类满地重名，这类边一律不可信。
 --     物证：arguments 字段里的 `ntttt` 是 ctags 输出 \n\t 的转义残留 ——
 --     这就是「按行抓文本」而非解析 AST 的铁证。
 --
--- [6] 函数指针注册出来的入口，调用图完全看不见，必须手工 grep 赋值点：
+-- [10] 函数指针注册出来的入口，调用图完全看不见，必须手工 grep 赋值点：
 --       .handler      = tcp_v4_rcv        → net/ipv4/af_inet.c:1937（inet_protos[]）
 --       .enqueue_task = enqueue_task_fair → kernel/sched/fair.c:15671（sched_class ops）
 --     同类断点：f_op->read_iter、ndo_start_xmit、irq handler 表、notifier/rcu 回调链、
 --     SYSCALL_DEFINE3(read,...)（生成 sys_read，但索引里搜不到 sys_read 的定义）。
 --     ⇒「这个函数谁调我」的两个真源只有：grep 调用点 + grep 表项赋值。
 --
--- [7] 间接边带 [via xxx] 标注（obj->fn() / obj.fn() / M.fn()），语义是
+-- [11] 间接边带 [via xxx] 标注（obj->fn() / obj.fn() / M.fn()），语义是
 --     「这条边可能混了同名直接调用」，不是精确虚调用解析；边仍按裸名解析（无类型信息）。
 --     看到 [via] 当「可能」，不要当「就是」。
 --
--- [8] context 的 depth 上限 5，但内核规模两层就够看清形状；再深一路穿到
+-- [12] context 的 depth 上限 5，但内核规模两层就够看清形状；再深一路穿到
 --     printk / kmalloc 这类公共出口，全是噪声。
 --
--- [9] dataflow 走 KV 键 funcs/<函数> 与 vars/<变量> 直取，不要去解析 dataflow.json。
+-- [13] dataflow 走 KV 键 funcs/<函数> 与 vars/<变量> 直取，不要去解析 dataflow.json。
+--     查变量时还带跨过程 hop（变量作为第 pos 个实参传给 callee 的哪个形参，最多显示
+--     8 条 + `... and N more`），这是 dataflow.json 里没有的落盘信息。
 --     注意旧 KV 可能根本没有这两类键（实测 /opt/code_caches/linux_7212_cache 下
 --     连 dataflow/ 目录都没有，只有 58M 的 call_graph.json），要 only_dataflow=true
 --     重跑一次 import 才查得到。
 --
--- [10] 内核建索引的参数（一次成功，别重来）：excludes 掉
+-- [14] 内核建索引的参数（一次成功，别重来）：excludes 掉
 --      Documentation,tools,samples,scripts（除非专门要查），
 --      skip_kinds=header,file,enumerator,macro（头文件声明和宏会淹没符号表），
 --      先 index 看切块量再 import。产物按 G 算（该 cache 8.0G），磁盘先腾。
 --
--- [11] 复用已有索引靠 analysis_dir / kv_dir / project 三个覆盖参数，别在
+-- [15] 复用已有索引靠 analysis_dir / kv_dir / project 三个覆盖参数，别在
 --      /opt/linux 下重跑 build（几十分钟换不到新信息）。status 先看产物；
 --      报「找不到索引」时会列出磁盘上真实存在的那几个，按它给路径重试。
 --      lite 仓库自身不建索引（改自己用 read/cgrep/edit）。
 --
--- [12] 读代码前先确认版本：cat Makefile | head -6 拿 VERSION/PATCHLEVEL/SUBLEVEL，
+-- [16] 读代码前先确认版本：cat Makefile | head -6 拿 VERSION/PATCHLEVEL/SUBLEVEL，
 --      不要用记忆里的版本套结论。7.2.12 上已变、与 6.x 记忆冲突的例子：
 --        __schedule(int sched_mode)，preempt = sched_mode > SM_NONE
 --          （SM_NONE 定义在 core.c:6732；PREEMPT_RT 合并后把抢占来源压成一个参数）
@@ -76,7 +120,7 @@
 --        netif_receive_skb_core 是导出的非双下划线包装（dev.c:6289）
 --      结论标 [verified]（读到了具体源码行）/ [static]（仅从索引推断）。
 --
--- [13] 【静默坑】ns（KV 键前缀）错一个斜杠 = 读到旧数据却报 count=0。
+-- [17] 【静默坑】ns（KV 键前缀）错一个斜杠 = 读到旧数据却报 count=0。
 --     键就是 `<ns>/...` 原文，`code/x` 与 `/code/x` 是两套互不可见的前缀：import 用
 --     ns="code/linux" 写进 code/linux/*，查询默认拼 /code/linux/* → 一条不中，
 --     而 read 侧还可能命中上一次构建残留的旧 key（不报错，只给你旧答案）。
@@ -88,7 +132,7 @@
 --       c. 已有 namespace.txt 且与本次 ns 不同 → 只 WARN 不覆盖（可能是有意的另一套）。
 --     自查：build 输出里的 ns 与 `cat <analysis>/namespace.txt` 不一致 = 踩了这条。
 --
--- [14] 没有向量时 search 不会退化，它直接「没用」：do_search 在 g_ve 为空时只返回
+-- [18] 没有向量时 search 不会退化，它直接「没用」：do_search 在 g_ve 为空时只返回
 --     一条 {"_note":"Vector engine not initialized..."} 的假结果（query.c:934 的
 --     !g_ve 分支）；关键词 boost 只是在向量命中上重排，不是关键词兜底。所以：
 --       · build 阶段缺模型/ORT 会跳过 vectorize（输出 "vectorize skipped
@@ -98,12 +142,18 @@
 --         「退回 symbol」的重试），再判定有没有真结果；一条都没有就打印
 --         `no hit` + grep/symbol/build 三条下一步，而不是渲染 "[1] ? nil:1" 的空壳。
 --
--- [15] analysis_dir 与 kv_dir 是两样东西，别混：analysis 放 chunks/call_graph/
+-- [19] analysis_dir 与 kv_dir 是两样东西，别混：analysis 放 chunks/call_graph/
 --     dataflow.json 与向量，kv 才是查询真正读的键值库（默认 <analysis>/kv）。
 --     只拿到旧 cache 的 analysis 却没重跑 import → status 看得见几十 M 的
 --     call_graph.json，查询却全空（旧 KV 里连 /code 前缀的键都没有）；
 --     只拷 kv 没有 analysis → 符号/调用边能查，但 status 全是 missing、没有向量
 --     （search 只有 _note）、locate 的窗口还得靠 repo 文件本身在。两者要同源同版本。
+--
+-- [20] 输出预算与截断：单行 200 字符（SNIP_LINE_MAX），一次调用总预算 max_chars
+--      （默认 8000）。凡是有内容没显示都会明说：`… (function spans 100-220, shown
+--      100-139; next: peek ...)` / `budget reached: lower max_results/lines or raise
+--      max_chars`。别把窗口末尾当函数末尾，也别把「截断」当「没找到」；
+--      要看得全就一次调大 max_chars / lines，而不是原样重试同一调用。
 -- ═══════════════════════════════════════════════════════════════════════════════
 
 local CS = require("ffi.codesearch")
@@ -254,27 +304,71 @@ end
 -- 单行硬上限（read_window / fmt_content_window 共用）。
 local SNIP_LINE_MAX = 200
 
--- search/symbol 的 r.content 是一整块源码（chunk）。压成一行只剩开头几百字，
--- 调用方拿不到行号还得自己数 → 没法直接引用 file:line。这里按 chunk 起行右对齐编号，
--- 与 locate/peek 的窗口格式一致（`  123| code`）。
-local function fmt_content_window(r, cap, indent)
-    local text = tostring(r and r.content or "")
-    if text == "" then return nil end
-    -- content 里的换行是 JSON 层的字面 `\n`（两字符），不还原的话整块挤成一行，
-    -- 编号就只剩第一个行号，窗口看着像「这函数只有一行」。
-    if not text:find("\n", 1, true) and text:find("\\n", 1, true) then
-        text = text:gsub('\\"', '"'):gsub("\\r", ""):gsub("\\n", "\n"):gsub("\\t", "\t")
+-- fmt_content_window 要「窗口读盘优先」，但 read_window/abs_file 写在下面几百行：
+-- 这里前置声明，下面定义处必须写成 `function x(...)`（再写 `local function` 会新起一个
+-- 同名 local，遮蔽掉这个引用 → 运行期拿到 nil 报 "attempt to call a nil value"）。
+local read_window, abs_file
+
+-- 索引里的 chunk 是建索引那一刻的源码快照，文件改过之后它「看着像、行号错开」。
+-- 判定办法：chunk 首行 vs 盘上 line_start 那一行，都去空白后比较。
+local function norm_ws(s)
+    return (tostring(s or ""):gsub("%s+", ""))
+end
+
+-- content 里的换行是 JSON 层的字面 `\n`（两字符）。不还原的话整块挤成一行，
+-- 编号就只剩第一个行号，窗口看着像「这函数只有一行」。
+local function unescape_content(s)
+    s = tostring(s or "")
+    if not s:find("\n", 1, true) and s:find("\\n", 1, true) then
+        s = s:gsub('\\"', '"'):gsub("\\r", ""):gsub("\\n", "\n"):gsub("\\t", "\t")
     end
-    local first = tonumber(r.line_start or r.line) or 1
+    return s
+end
+
+-- 没有盘上内容时的退路：按 chunk 起行编号（与 locate/peek 的 `  123| code` 同格式）。
+local function window_from_text(text, first, cap, indent)
+    indent = indent or "      "
     local out, n = {}, 0
     for ln in (text .. "\n"):gmatch("([^\n]*)\n") do
         n = n + 1
         ln = ln:gsub("\r$", "")
         if #ln > SNIP_LINE_MAX then ln = ln:sub(1, SNIP_LINE_MAX) .. " …" end
-        out[#out + 1] = string.format("%s%5d| %s", indent or "      ", first + n - 1, ln)
-        if n >= (cap or 12) then out[#out + 1] = (indent or "      ") .. "     …"; break end
+        out[#out + 1] = string.format("%s%5d| %s", indent, first + n - 1, ln)
+        if n >= (cap or 12) then out[#out + 1] = indent .. "     …"; break end
     end
     return table.concat(out, "\n")
+end
+
+-- search/symbol 的 r.content 是一整块源码（chunk）。压成一行只剩开头几百字，
+-- 调用方拿不到行号还得自己数 → 没法直接引用 file:line。这里按 chunk 起行右对齐编号，
+-- 与 locate/peek 的窗口格式一致（`  123| code`）。
+--
+-- 窗口**读盘优先**：索引里的是建索引那一刻的快照，文件改过之后 chunk 会给出
+-- 「旧代码 + 对得上的行号」，看着完全正常，引用出去就是错的。所以能用 r.file
+-- 读到盘就显示盘上内容；盘上首行和 chunk 首行对不上时明说 stale（而不是静默）。
+-- 读不到盘（文件删了/不在 repo）才退回 chunk，并标 `(index copy)`。
+local function fmt_content_window(r, cap, indent, cwd)
+    indent = indent or "      "
+    cap = cap or 12
+    local text = unescape_content(r and r.content)
+    local first = tonumber(r.line_start or r.line) or 1
+    local path = r and r.file and abs_file(r.file, cwd)
+    local live = path and read_window(path, first, first + cap - 1)
+    if live then
+        local stale = ""
+        if text ~= "" then
+            local idx_first = norm_ws((text:match("^([^\n]*)") or ""))
+            local disk_first = norm_ws((live:match("^%s*%d+%|([^\n]*)") or ""))
+            if idx_first ~= "" and disk_first ~= "" and idx_first ~= disk_first then
+                stale = string.format("\n%s  [stale: index copy ≠ disk @%d — 显示的是盘上内容; "
+                    .. "要新索引跑 action=index]", indent, first)
+            end
+        end
+        return live .. stale
+    end
+    if text == "" then return nil end
+    return window_from_text(text, first, cap, indent)
+        .. string.format("\n%s  (index copy; %s)", indent, tostring(r.file or "no file"))
 end
 
 -- 置信度标签：score 只说明「排第几」，confidence 说明「该不该信」。
@@ -350,7 +444,7 @@ local function fmt_status(d)
     return table.concat(out, "\n")
 end
 
-local function fmt_results(d, max_chars, ns)
+local function fmt_results(d, max_chars, ns, cwd)
     local rs = d.results or {}
     local out = { string.format('%s "%s" -> %d result(s), %d ms',
         d.type or "?", d.query or "", #rs, d.timing_ms or 0) }
@@ -381,7 +475,7 @@ local function fmt_results(d, max_chars, ns)
             if r.signature and r.signature ~= "" then
                 out[#out + 1] = "    sig: " .. one_line(r.signature, 200)
             end
-            local win = fmt_content_window(r, 12)
+            local win = fmt_content_window(r, 12, nil, cwd)
             if win then out[#out + 1] = win end
         end
         total = total + #line
@@ -400,21 +494,32 @@ local function fmt_context(d, max_chars)
         sym.file or "?", tostring(sym.line or sym.line_start or "?"), sym.kind or "") }
     local function names(label, arr, cap)
         if not arr or #arr == 0 then return end
-        local t = {}
-        for i, v in ipairs(arr) do
-            if i > (cap or 30) then t[#t + 1] = "..."; break end
+        -- 一条边 = 一个调用点，不是一条「关系」：内核函数动辄 90+ callee 而其中
+        -- 三十个是同一个名字的多次调用（tcp_ack 里 tcp_sacktag_write_queue×3），
+        -- 不去重时长函数光重复就吃满 cap，真正独有的被挤掉。按名字合并成 name×N，
+        -- 顺序保留首次出现；cap 数的是「唯一名字」，表头仍报原始边数。
+        local order, cnt = {}, {}
+        for _, v in ipairs(arr) do
+            local s
             if type(v) == "table" then
                 -- 间接调用：obj->fn()/obj.fn() 只能按裸名挂边，标出来让调用方打折
-                local s = v.name or "?"
+                s = v.name or "?"
                 if v.indirect then s = s .. "[via " .. (v.via or "?") .. "]" end
                 -- 同名多份实现混在这条边上：不是精确边，用 def= 收窄
                 if v.scope == "ambiguous" then s = s .. "[?def " .. tostring(v.defs or 2) .. "]" end
-                t[#t + 1] = s
             else
-                t[#t + 1] = tostring(v)
+                s = tostring(v)
             end
+            if not cnt[s] then order[#order + 1] = s; cnt[s] = 0 end
+            cnt[s] = cnt[s] + 1
         end
-        out[#out + 1] = string.format("%s(%d): %s", label, #arr, table.concat(t, ", "))
+        local t = {}
+        for i, s in ipairs(order) do
+            if i > (cap or 30) then t[#t + 1] = "...(+" .. (#order - i + 1) .. " more)"; break end
+            t[#t + 1] = cnt[s] > 1 and (s .. "×" .. cnt[s]) or s
+        end
+        out[#out + 1] = string.format("%s(%d, %d unique): %s", label, #arr, #order,
+            table.concat(t, ", "))
     end
     names("callers", ctx.callers)
     names("callees", ctx.callees)
@@ -539,14 +644,19 @@ local function fmt_dataflow(d)
                     out[#out + 1] = string.format("  ... and %d more cross-proc hop(s)", more)
                 end
             end
+            -- 一行一个函数：`name ×count @file:行列表`。原来 `name (12) lines 1,2,3`
+            -- 每行多 8 字节前缀（"lines "），一对齐就看不清哪个函数命中最多；
+            -- file 只有字段聚合那一路会带，没有就只给行号（别硬造 "@?"）。
             for _, f in ipairs(entry.funcs or {}) do
                 local lines = {}
                 for i, l in ipairs(f.lines or {}) do
-                    if i > 8 then lines[#lines + 1] = "..."; break end
+                    if i > 8 then lines[#lines + 1] = "…"; break end
                     lines[#lines + 1] = tostring(l)
                 end
-                out[#out + 1] = string.format("  %s (%s) lines %s", f.func or "?",
-                    tostring(f.count or 0), table.concat(lines, ","))
+                out[#out + 1] = string.format("  %s ×%s  %s%s", f.func or "?",
+                    tostring(f.count or 0),
+                    f.file and (tostring(f.file) .. ":") or "line ",
+                    table.concat(lines, ","))
             end
         elseif entry.kind == "candidates" then
             out[#out + 1] = string.format('"%s" not found; similar functions: %s',
@@ -573,7 +683,7 @@ local function fmt_dataflow(d)
     return s
 end
 
-local function fmt_symbols(d)
+local function fmt_symbols(d, cwd)
     local rs = d.results or {}
     if #rs == 0 then return string.format('symbol "%s" not found', d.query or "") end
     local out, seen, shown = {}, {}, 0
@@ -586,7 +696,7 @@ local function fmt_symbols(d)
             shown = shown + 1
             out[#out + 1] = string.format("[%d] %s  %s:%s  kind=%s", shown, r.name or "?",
                 r.file or "?", tostring(r.line or r.line_start or "?"), r.kind or "")
-            local win = fmt_content_window(r, 8)
+            local win = fmt_content_window(r, 8, nil, cwd)
             if win then out[#out + 1] = win end
         end
     end
@@ -739,14 +849,15 @@ local function shell_quote(s)
     return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
 end
 
-local function abs_file(p, base)
+function abs_file(p, base)
     if not p or p == "" then return nil end
     if p:sub(1, 1) == "/" then return p end
     return ((base or env("PWD") or "."):gsub("/+$", "")) .. "/" .. p
 end
 
 -- 读 [first, last]；行号右对齐，输出可以直接当 file:line 引用回填。
-local function read_window(path, first, last)
+-- 末尾额外报「文件共几行」，好让调用方判断窗口之外还剩多少（read_window 只读数到 last）。
+function read_window(path, first, last)
     if not path then return nil, "no path" end
     local f = io.open(path, "rb")
     if not f then return nil, "cannot open " .. path end
@@ -951,6 +1062,27 @@ local function do_locate(args, ctx, analysis, kv, ns, repo)
         if not serr then withsrc = withsrc + 1 end
         out[#out + 1] = snip
         used = used + #snip + 1
+        -- 截断必须明说：函数 120 行只给 40 行时，调用方会把「窗口末尾」当成
+        -- 「函数末尾」——和 `read` 的 `…` 语义对齐，凡是有内容没显示就标出来。
+        local tail
+        local endline = tonumber(r.line_end)
+        local first_shown = math.max(1, line - before)
+        if endline and endline > last then
+            tail = string.format("      … (function spans %d-%d, shown %d-%d; next: peek path=%s line=%d)",
+                line, endline, first_shown, last, tostring(r.file), last + 1)
+        elseif not endline and last == line + want - 1 then
+            tail = string.format("      … (window capped at %d lines; next: peek path=%s line=%d lines=%d)",
+                want, tostring(r.file), last + 1, want)
+        end
+        if tail then
+            if used + #tail <= budget then
+                out[#out + 1] = tail
+                used = used + #tail + 1
+            else
+                out[#out + 1] = "      … (more lines; budget reached)"
+                break
+            end
+        end
         if r.name then
             nxt[#nxt + 1] = string.format("action=context query=%s depth=2   # %s",
                 r.name, tostring(r.file))
@@ -1003,12 +1135,37 @@ local function do_grep(args, ctx)
     if not ok or type(d) ~= "table" or not d.ok then
         error("codesearch: grep failed: " .. tostring(ok and d and d.error or res):sub(1, 300), 0)
     end
-    local nhits = d.count or (type(d.hits) == "table" and #d.hits) or 0
+    local hits = type(d.hits) == "table" and d.hits or {}
+    -- 表头先给「面」再给「点」：内核里一句 tcp_ack\( 能扫出几百条，调用方要的是
+    -- 「哪几个文件最热、一共散在几处」，逐条读原文是第二步。per-file 计数用去重后
+    -- 的 file:line（C 端一行多命中会重复），与下面正文口径一致。
+    local per, order, seen0 = {}, {}, {}
+    for _, h in ipairs(hits) do
+        local key = tostring(h.file) .. ":" .. tostring(h.line)
+        if not seen0[key] then
+            seen0[key] = true
+            if not per[h.file] then per[h.file] = 0; order[#order + 1] = h.file end
+            per[h.file] = per[h.file] + 1
+        end
+    end
+    table.sort(order, function(a, b)
+        if per[a] ~= per[b] then return per[a] > per[b] end
+        return a < b
+    end)
+    local nhits = d.count or #hits
     local out = { string.format('grep /%s/ in %s -> %d hit(s) in %d file(s), scanned %d, %d ms%s',
-        pattern, path, nhits, d.files or 0, d.scanned or 0, d.ms or 0,
+        pattern, path, nhits, d.files or #order, d.scanned or 0, d.ms or 0,
         d.truncated and " (truncated, raise max_hits)" or "") }
+    if #order > 1 then
+        local top = {}
+        for i = 1, math.min(#order, 5) do
+            top[#top + 1] = string.format("%s×%d", order[i], per[order[i]])
+        end
+        out[#out + 1] = string.format("  hot: %s%s", table.concat(top, "  "),
+            #order > 5 and string.format("  … (%d more)", #order - 5) or "")
+    end
     local seen, shown, used, files = {}, 0, 0, {}
-    for _, h in ipairs(type(d.hits) == "table" and d.hits or {}) do
+    for _, h in ipairs(hits) do
         local key = h.file .. ":" .. h.line
         if not seen[key] then                   -- C 端一行多命中会重复，按 file:line 去重
             seen[key] = true
@@ -1226,8 +1383,8 @@ local function run_inner(args, ctx)
             if action == "context" then return fmt_context(d, tonumber(args.max_chars)) end
             -- 命中就说明 ns 对：老索引顺手钉一份 namespace.txt，别再靠目录名反推。
             if #(d.results or {}) > 0 then pin_ns(analysis, ns) end
-            if action == "symbol" then return fmt_symbols(d) end
-            return fmt_results(d, tonumber(args.max_chars), ns)
+            if action == "symbol" then return fmt_symbols(d, ctx and ctx.cwd) end
+            return fmt_results(d, tonumber(args.max_chars), ns, ctx and ctx.cwd)
         end
 
         error("codesearch: unknown action " .. tostring(action), 0)
