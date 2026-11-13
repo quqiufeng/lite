@@ -1083,16 +1083,56 @@ static json_t* do_dataflow(const char* query, const char* repo, int max_results)
                             size_t oi;
                             json_t* o;
                             int same_func = 0;
+                            json_t* local_decl = NULL;
                             if (occ) json_array_foreach(occ, oi, o) {
                                 const char* f = json_string_value(json_object_get(o, "func"));
                                 if (!f || strcmp(f, query) != 0) continue;
                                 same_func++;
+                                // 同名变量在内核里遍地都是（last/in/reason…），
+                                // 全局 decl 常常指到另一个文件里的同名局部。
+                                // 本函数内有定义那条就以它为准。
+                                if (!local_decl) {
+                                    const char* ot = json_string_value(
+                                        json_object_get(o, "type"));
+                                    if (ot && strcmp(ot, "definition") == 0) local_decl = o;
+                                }
                                 if (json_array_size(hits) >= 12) continue;
                                 json_array_append(hits, o);
                             }
                             json_object_set_new(item, "occurrences", hits);
                             json_object_set_new(item, "occurrences_in_func",
                                                 json_integer(same_func));
+                            // 截断与真·声明行：occurrences 被 MAX_OCCURS 截过时
+                            // 必须说清总数，否则「就这么多用法」是假结论；
+                            // decl 是 analyzer 挑出的定义那条，不是遍历序第一条。
+                            json_t* tot = json_object_get(vdata, "occurrences_total");
+                            if (tot && json_is_integer(tot))
+                                json_object_set_new(item, "occurrences_total", json_incref(tot));
+                            if (json_is_true(json_object_get(vdata, "occurrences_truncated"))) {
+                                json_object_set_new(item, "occurrences_truncated", json_true());
+                                json_t* lim = json_object_get(vdata, "occurrences_limit");
+                                if (lim && json_is_integer(lim))
+                                    json_object_set_new(item, "occurrences_limit",
+                                                        json_incref(lim));
+                            }
+                            // 本函数内的定义优先；没有才退回全局 decl，
+                            // 并标 decl_scope=module 提醒「这个声明不是本函数的」。
+                            if (local_decl) {
+                                json_t* d = json_object();
+                                json_object_set_new(d, "file", json_incref(
+                                    json_object_get(local_decl, "file")));
+                                json_object_set_new(d, "func", json_string(query));
+                                json_object_set_new(d, "line", json_incref(
+                                    json_object_get(local_decl, "line")));
+                                json_object_set_new(item, "decl", d);
+                            } else {
+                                json_t* decl = json_object_get(vdata, "decl");
+                                if (decl && json_is_object(decl)) {
+                                    json_object_set_new(item, "decl", json_incref(decl));
+                                    json_object_set_new(item, "decl_scope",
+                                                        json_string("module"));
+                                }
+                            }
                             json_decref(vdata);
                         }
                     }
@@ -1128,6 +1168,25 @@ static json_t* do_dataflow(const char* query, const char* repo, int max_results)
             json_object_set_new(entry, "kind", json_string("variable"));
             json_object_set_new(entry, "var", json_string(query));
             json_object_set_new(entry, "occurrence_count", json_integer((json_int_t)occ_n));
+            // 落盘条数有上限（MAX_OCCURS）：真·总次数另给，截断时明确标出来。
+            json_t* dtot = json_object_get(data, "occurrences_total");
+            json_int_t total_n = (dtot && json_is_integer(dtot))
+                                 ? json_integer_value(dtot) : (json_int_t)occ_n;
+            if (total_n != (json_int_t)occ_n)
+                json_object_set_new(entry, "occurrence_total", json_integer(total_n));
+            if (json_is_true(json_object_get(data, "occurrences_truncated"))) {
+                json_object_set_new(entry, "occurrences_truncated", json_true());
+                json_t* dlim = json_object_get(data, "occurrences_limit");
+                if (dlim && json_is_integer(dlim))
+                    json_object_set_new(entry, "occurrences_limit", json_incref(dlim));
+            }
+            json_t* ddecl = json_object_get(data, "decl");
+            if (ddecl && json_is_object(ddecl)) {
+                // 变量视角没有「哪个函数」这一维，只能给全库第一条声明 ——
+                // 同名局部遍地都是，所以必须标 module，别让人当成唯一的声明。
+                json_object_set_new(entry, "decl", json_incref(ddecl));
+                json_object_set_new(entry, "decl_scope", json_string("module"));
+            }
             json_t* vtype = json_object_get(data, "type");
             if (vtype) json_object_set_new(entry, "type", json_incref(vtype));
             // 跨过程跳：analyzer 落盘的实参位 → 形参边，直接带着走（最多 12 条）

@@ -81,6 +81,7 @@ typedef struct {
     occurrence_t* occurs;   // 动态，上限 MAX_OCCURS
     int occur_count;
     int occur_capacity;
+    int occur_seen;         // 真·总次数（含被 MAX_OCCURS 挡掉的），落盘为 occurrences_total
     int occur_truncated;    // 1 = 撞 MAX_OCCURS 被截断，输出里要标出来
     field_record_t* fields; // 动态，上限 MAX_FIELDS
     int field_count;
@@ -216,6 +217,7 @@ static var_record_t* find_or_create_var(const char* name) {
     var->name[sizeof(var->name) - 1] = '\0';
     var->type[0] = '\0';
     var->occurs = NULL; var->occur_count = 0; var->occur_capacity = 0;
+    var->occur_seen = 0;
     var->occur_truncated = 0;
     var->fields = NULL; var->field_count = 0; var->field_capacity = 0;
     var->hops = NULL; var->hop_count = 0; var->hop_capacity = 0;
@@ -290,8 +292,12 @@ static void add_field_occurrence(field_record_t* field, occurrence_t* occ) {
 static void add_occurrence(var_record_t* var, const char* file, const char* func, 
                            int line, int col, const char* context, int is_def,
                            const char* field_name) {
-    if (!var || var->occur_count >= MAX_OCCURS) {
-        if (var) var->occur_truncated = 1;
+    // 截断不静默：occur_seen 记真·总次数，输出里带 occurrences_total，
+    // 调用方能看到「只落了 2000 条，实际 8721 次」而不是当成全部。
+    if (!var) return;
+    var->occur_seen++;
+    if (var->occur_count >= MAX_OCCURS) {
+        var->occur_truncated = 1;
         return;
     }
     if (var->occur_count >= var->occur_capacity) {
@@ -629,6 +635,30 @@ static var_record_t* implicit_param_var(const char* name, const char* func) {
     return NULL;
 }
 
+// 该变量在这个「文件+函数」作用域里是否已经记过声明（is_definition==1）。
+// 同名变量在不同函数里是不同实体，decl 必须按作用域取，不能全库取第一条。
+static int has_def_in(var_record_t* var, const char* file, const char* func) {
+    for (int i = 0; i < var->occur_count; i++) {
+        if (var->occurs[i].is_definition != 1) continue;
+        if (strcmp(var->occurs[i].file, file) != 0) continue;
+        if (strcmp(var->occurs[i].func, func) != 0) continue;
+        return 1;
+    }
+    return 0;
+}
+
+// 同一「文件+函数+行」是否已记过这个变量的任意一条 occurrence。
+// 去重只比行号不行（内核里不同文件的同名变量常撞行号）。
+static int has_occ_at(var_record_t* var, const char* file, const char* func, int line) {
+    for (int i = 0; i < var->occur_count; i++) {
+        if (var->occurs[i].line != line) continue;
+        if (strcmp(var->occurs[i].file, file) != 0) continue;
+        if (strcmp(var->occurs[i].func, func) != 0) continue;
+        return 1;
+    }
+    return 0;
+}
+
 static void analyze_line_impl(const char* line, ctx_info_t* ctx) {
     char tokens[64][128];
     int token_count = 0;
@@ -655,14 +685,21 @@ static void analyze_line_impl(const char* line, ctx_info_t* ctx) {
                 while (k < token_count && strcmp(tokens[k], "*") == 0) k++;
                 if (k < token_count && !is_decl_terminator(tokens[k])) continue;
                 var_record_t* var = find_or_create_var(tokens[j]);
-                if (var && var->occur_count == 0) {
+                // 以前只在 var->occur_count == 0（全库第一次见到）时记 definition，
+                // 于是「同名变量第二次声明」永远没有定义行 —— 查询里 decl 只能退回
+                // 全库那条，指到别的文件的同名局部（`reason` 的声明落在 ubsan.c:219）。
+                // 现在按「文件+函数」判重：每个作用域里的声明都记一条 definition。
+                if (var && !has_def_in(var, ctx->file, ctx->func)) {
                     // 类型取"变量名前面最后一个非 * token"：`const char *src` 记 char
                     // 而不是 const（旧版一律取第一个词）。
                     int ti = j - 1;
                     while (ti > i && strcmp(tokens[ti], "*") == 0) ti--;
                     if (ti < i) ti = i;
-                    strncpy(var->type, tokens[ti], sizeof(var->type) - 1);
-                    var->type[sizeof(var->type) - 1] = '\0';
+                    // 类型只认第一次声明：同名变量的第二个作用域不该改写全库 type
+                    if (!var->type[0]) {
+                        strncpy(var->type, tokens[ti], sizeof(var->type) - 1);
+                        var->type[sizeof(var->type) - 1] = '\0';
+                    }
                     add_occurrence(var, ctx->file, ctx->func, ctx->abs_line, 0, line, 1, NULL);
                 }
             }
@@ -686,7 +723,10 @@ static void analyze_line_impl(const char* line, ctx_info_t* ctx) {
                     !is_c_type(prev) && !is_c_keyword(prev) && !is_type_word(prev)) {
                     var = find_or_create_var(prev);
                 }
-                if (var) {
+                // `int flag = 0;` 走完上面的声明分支已经记过 definition，
+                // 这里再记一条 assignment 就是同一行两条（查询里 delta/reason
+                // 都是一定义一赋值重复出现，白占 occurrences 配额）。
+                if (var && !has_occ_at(var, ctx->file, ctx->func, ctx->abs_line)) {
                     const char* field = extract_field_access(line, prev);
                     add_occurrence(var, ctx->file, ctx->func, ctx->abs_line, 0, line, 2, field);
                 }
@@ -694,7 +734,28 @@ static void analyze_line_impl(const char* line, ctx_info_t* ctx) {
         }
 
         // 3. 使用（含字段访问）
-        if ((isalpha((unsigned char)tokens[i][0]) || tokens[i][0] == '_') &&
+        //    `p->slow.netdev` / `a.b` 里的 slow/netdev/b 是**成员名**，不是变量：
+        //    只要别处真有一个同名局部（内核里 `bool slow;` 到处都有），旧版就会把
+        //    全内核的 `->slow` 全算到那个变量头上（现场：`in`/`slow` 变成了「使用了
+        //    上千次的全局变量」，type 还是错的）。成员名的记录由基变量那条
+        //    extract_field_access 负责，这里直接跳过。
+        int is_member_name = (i > 0 && (strcmp(tokens[i - 1], "->") == 0 ||
+                                        strcmp(tokens[i - 1], ".") == 0));
+        //    标签不是变量：`goto validate;` 的操作数和 `validate:` 这个定义点都不该
+        //    落到某个同名变量头上（内核里 goto 极多，旧版让标签成了「用了 116 次的
+        //    变量 validate」，而它的声明指向任何同名局部）。判定要保守：`a ? b : c`
+        //    里的 b 后面也跟 ':'，所以只在「语句开头」或「goto 后面」才认标签。
+        int is_label = (i > 0 && strcmp(tokens[i - 1], "goto") == 0) ||
+                       (i + 1 < token_count && strcmp(tokens[i + 1], ":") == 0 &&
+                        (i == 0 || strcmp(tokens[i - 1], ";") == 0 ||
+                         strcmp(tokens[i - 1], "{") == 0 ||
+                         strcmp(tokens[i - 1], "}") == 0));
+        //    函数调用/类型转换不是变量：`tcp_sk(sk)`、`(struct sock *)x` 里的
+        //    标识符后面跟 '('，旧版把 tcp_sk 当成了「用过的变量」，decl 落到
+        //    别的文件的同名函数上。调用关系归 call_graph，不归 dataflow。
+        int is_call = (i + 1 < token_count && strcmp(tokens[i + 1], "(") == 0);
+        if (!is_member_name && !is_label && !is_call &&
+            (isalpha((unsigned char)tokens[i][0]) || tokens[i][0] == '_') &&
             !is_type_word(tokens[i])) {
             int is_lvalue = 0;
             if (i + 1 < token_count && strcmp(tokens[i + 1], "=") == 0) {
@@ -707,11 +768,7 @@ static void analyze_line_impl(const char* line, ctx_info_t* ctx) {
             if (!is_lvalue) {
                 var_record_t* var = find_var(tokens[i]);
                 if (var && var->occur_count > 0) {
-                    int dup = 0;
-                    for (int j = 0; j < var->occur_count; j++) {
-                        if (var->occurs[j].line == ctx->abs_line) { dup = 1; break; }
-                    }
-                    if (!dup) {
+                    if (!has_occ_at(var, ctx->file, ctx->func, ctx->abs_line)) {
                         const char* field = extract_field_access(line, tokens[i]);
                         add_occurrence(var, ctx->file, ctx->func, ctx->abs_line, 0, line, 3, field);
                     }
@@ -724,6 +781,16 @@ static void analyze_line_impl(const char* line, ctx_info_t* ctx) {
 // 去注释：//、/* */（跨行靠 in_block 传递），字符串字面量原样保留（tokenizer 会跳过，
 // 但 "http://x" 不能被当成行注释开头）。
 static void strip_comments_line(char* line, int* in_block) {
+    // 窗口/切片可能从块注释中间开始（上面 " // Part " 已跳过，但别的来源仍可能）：
+    // 一行里出现 `*/` 却没出现 `/*`，说明前文是这个注释的一部分，整行都是注释尾巴
+    // （`… check it more carefully in slow path */` 里的 in/slow/path 曾被当变量）。
+    if (!*in_block) {
+        const char* close = strstr(line, "*/");
+        if (close && !strstr(line, "/*") && !strstr(line, "//")) {
+            const char* after = close + 2;
+            memmove(line, after, strlen(after) + 1);
+        }
+    }
     char* out = line;
     const char* p = line;
     while (*p) {
@@ -872,6 +939,16 @@ static int analyze_meta(const char* meta_file) {
         }
         decode_json_string(cp, raw_len, content, (int)sizeof(content));
         if (!content[0]) continue;
+
+        // 长函数被切成 "sig // Part N" 窗口（indexer.c，每个窗口 1500B/重叠 500B），
+        // 但这些窗口的 line_start 都是函数起始行 —— 拿它们当函数体分析有三个连锁错：
+        //   ① 行号全挤在函数开头（tcp_rcv_established 的 `in`/`last` 都落到 6508）；
+        //   ② 窗口从注释中间切开（`/* If PAWS failed… */` 只剩尾巴），去注释器看不到
+        //      开头的 `/*`，注释里的 in/last/slow 被当成变量；
+        //   ③ 同一函数体被重复分析 4~5 次，occurrences 与 occurrences_total 一起虚高。
+        // 首个 chunk 已是完整函数体（≤16000B，行号正确），窗口只服务检索/向量，
+        // 这里直接跳过（import.c 的 KV 写入也做了同样的跳过）。
+        if (strstr(content, " // Part ")) continue;
         
         ctx_info_t ctx;
         strncpy(ctx.file, file, sizeof(ctx.file) - 1);
@@ -1557,9 +1634,23 @@ static void save_dataflow(const char* output_file) {
         
         // 撞 MAX_OCCURS 时条目是被截断的：不标出来，调用方会以为「这个变量
         // 全生命周期就这么多引用」（i/ret 这类高频变量最容易被误读）。
+        // occurrences_total 永远是真·总次数，truncated 时它 > 落盘条数。
+        fprintf(fp, "    \"occurrences_total\": %d,\n",
+                var->occur_seen > var->occur_count ? var->occur_seen : var->occur_count);
         if (var->occur_truncated) {
             fprintf(fp, "    \"occurrences_truncated\": true,\n");
             fprintf(fp, "    \"occurrences_limit\": %d,\n", MAX_OCCURS);
+        }
+        // 真·声明行：occurrences 是遍历序，第一条既不是声明也不是最小行，
+        // 下游拿 occurrences[0].line 当声明会指错行。这里直接给定义那条。
+        for (int i = 0; i < var->occur_count; i++) {
+            if (var->occurs[i].is_definition != 1) continue;
+            char df[1024], dfu[512];
+            json_escape(df, var->occurs[i].file ? var->occurs[i].file : "", sizeof(df));
+            json_escape(dfu, var->occurs[i].func ? var->occurs[i].func : "", sizeof(dfu));
+            fprintf(fp, "    \"decl\": {\"file\":\"%s\",\"func\":\"%s\",\"line\":%d},\n",
+                    df, dfu, var->occurs[i].line);
+            break;
         }
         fprintf(fp, "    \"occurrences\": [\n");
         for (int i = 0; i < var->occur_count; i++) {

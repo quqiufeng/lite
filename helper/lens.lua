@@ -444,6 +444,67 @@ local function fmt_status(d)
     return table.concat(out, "\n")
 end
 
+-- exact 能直取任意键，值形状五花八门：{entries=[路径]}、{callers=[边]}、{callees=[边]}、
+-- {occurrences=[…]}，还有单个 chunk。以前只认 entries 和 chunk 两种形状，其余渲染成
+-- `[1] ? ?:? kind=` —— 键明明取到了却显示成空的，比报错更坑（会误判「这个键没数据」）。
+-- 这里按 键 → 数组 → 一行一条 兜底；主数组（最长那个）排前面。
+local function fmt_payload(r, cap)
+    local keys = {}
+    for k, v in pairs(r) do
+        if type(k) == "string" and k:sub(1, 1) ~= "_" and type(v) == "table" then
+            keys[#keys + 1] = k
+        end
+    end
+    table.sort(keys, function(a, b)
+        local la, lb = #(r[a] or {}), #(r[b] or {})
+        if la ~= lb then return la > lb end
+        return a < b
+    end)
+    local lines = {}
+    for _, k in ipairs(keys) do
+        local arr = r[k]
+        if #arr == 0 and next(arr) ~= nil then
+            -- 不是数组而是 map（path → meta 之类的键值对）：一条一行
+            lines[#lines + 1] = "  " .. k
+            local n = 0
+            for kk, vv in pairs(arr) do
+                n = n + 1
+                if n > cap then
+                    lines[#lines + 1] = "    ... +more (json=true)"
+                    break
+                end
+                local vs = type(vv) == "table" and one_line(cjson.encode(vv), 200) or tostring(vv)
+                lines[#lines + 1] = "    " .. tostring(kk) .. ": " .. vs
+            end
+        else
+            lines[#lines + 1] = string.format("  %s (%d)", k, #arr)
+            local shown = 0
+            for _, item in ipairs(arr) do
+                if shown >= cap then
+                    lines[#lines + 1] = string.format("    ... +%d more (raise cap: json=true)", #arr - shown)
+                    break
+                end
+                shown = shown + 1
+                if type(item) ~= "table" then
+                    lines[#lines + 1] = "    " .. tostring(item)
+                elseif item.file then
+                    local s = string.format("%s:%s", tostring(item.file),
+                        tostring(item.line or item.line_start or "?"))
+                    if item.name then s = s .. "  " .. tostring(item.name) end
+                    if item.args and item.args ~= "" then s = s .. "(" .. tostring(item.args) .. ")" end
+                    if item.scope then s = s .. "  scope=" .. tostring(item.scope) end
+                    if item.type then s = s .. "  " .. tostring(item.type) end
+                    lines[#lines + 1] = "    " .. s
+                else
+                    lines[#lines + 1] = "    " .. one_line(cjson.encode(item), 240)
+                end
+            end
+        end
+    end
+    if #keys == 0 then lines[#lines + 1] = "  " .. one_line(cjson.encode(r), 400) end
+    return lines
+end
+
 local function fmt_results(d, max_chars, ns, cwd)
     local rs = d.results or {}
     local out = { string.format('%s "%s" -> %d result(s), %d ms',
@@ -465,7 +526,46 @@ local function fmt_results(d, max_chars, ns, cwd)
         if r.entries then
             line = string.format("[%d] %s (exact)", i, r._key or "?")
             out[#out + 1] = line
-            out[#out + 1] = "    " .. one_line(cjson.encode(r.entries), 800)
+            if type(r.entries[1]) == "string" then
+                -- 纯路径清单：一行一条（原来整坨 JSON 挤一行，还被 800 字静默砍掉）
+                for j, p in ipairs(r.entries) do
+                    if j > 40 then
+                        out[#out + 1] = string.format("    ... +%d more (json=true)", #r.entries - 40)
+                        break
+                    end
+                    out[#out + 1] = "    " .. tostring(p)
+                    total = total + #tostring(p)
+                end
+            else
+                for _, l in ipairs(fmt_payload(r, 20)) do
+                    out[#out + 1] = l
+                    total = total + #l
+                end
+            end
+        elseif type(r[1]) == "table" then
+            -- 值是 chunk 数组（如直取 /symbols/<name>）：以前落到标量兜底，整坨 JSON 挤一行。
+            -- 按普通结果逐条打，带源码窗口。
+            line = string.format("[%d] %s (exact)", i, r._key or "?")
+            out[#out + 1] = line
+            for j, it in ipairs(r) do
+                local s = string.format("  [%d] %s  %s:%s  kind=%s", j, it.name or "?",
+                    it.file or "?", tostring(it.line or it.line_start or "?"), it.kind or "")
+                out[#out + 1] = s
+                total = total + #s
+                local win = fmt_content_window(it, 12, nil, cwd)
+                if win then
+                    out[#out + 1] = win
+                    total = total + #win
+                end
+            end
+        elseif not r.name and not r.file and not r.content then
+            -- 不是 chunk、不是文件清单 = exact 直取的任意结构化键（callers/callees/…）
+            line = string.format("[%d] %s (exact)", i, r._key or "?")
+            out[#out + 1] = line
+            for _, l in ipairs(fmt_payload(r, 20)) do
+                out[#out + 1] = l
+                total = total + #l
+            end
         else
             line = string.format("[%d] %s  %s:%s  kind=%s", i,
                 r.name or "?", r.file or "?", tostring(r.line_start or "?"), r.kind or "")
@@ -611,19 +711,63 @@ local function fmt_dataflow(d)
                 tonumber(entry.var_count) or 0)
             for _, v in ipairs(entry.vars or {}) do
                 local occ = v.occurrences or {}
+                -- import 侧存的 occurrences 是遍历顺序、不是行号顺序（delta 会排成
+                -- 6551,6565,6568,…,6524,6538,…），不排就看着像乱跳；v.line 也只是
+                -- 「第一条命中行」，不是定义行 —— 所以标签写 first_occ，别让人当声明看。
+                -- 只列 6 条还不标总数，会被读成「这变量就这么多用法」。
+                local sorted = {}
+                for i, o in ipairs(occ) do sorted[i] = o end
+                table.sort(sorted, function(a, b) return (a.line or 0) < (b.line or 0) end)
                 local lines = {}
-                for i, o in ipairs(occ) do
-                    if i > 6 then lines[#lines + 1] = "..."; break end
+                for i, o in ipairs(sorted) do
+                    if i > 6 then
+                        lines[#lines + 1] = string.format("…+%d more", #sorted - 6)
+                        break
+                    end
                     lines[#lines + 1] = string.format("%s:%s %s", o.file or "?",
                         tostring(o.line or "?"), o.type or "")
                 end
-                out[#out + 1] = string.format("  %s line %s  occ_in_func=%s  %s",
-                    v.var or "?", tostring(v.line or "?"),
-                    tostring(v.occurrences_in_func or #occ), table.concat(lines, "; "))
+                -- v.line 是 import 时第一条命中（遍历序），跟行号最小值没关系；
+                -- 既然已经排过序，就报真正最小的那行，标签 first_occ 才不撒谎。
+                -- v.decl 存在时那是 analyzer 挑出的真·定义行，写 decl= 才叫声明。
+                local first = (sorted[1] and sorted[1].line) or v.line
+                local where = string.format("first_occ=%s", tostring(first or "?"))
+                if type(v.decl) == "table" and v.decl.line then
+                    where = string.format("decl=%s:%s", v.decl.file or "?", tostring(v.decl.line))
+                    -- decl_scope=module = 本函数里没找到声明，这个 decl 是全库同名的
+                    -- 另一处局部（内核里 last/in/reason 这种名字有成百上千个），
+                    -- 不标出来就会把别人的声明当本函数的。
+                    if v.decl_scope == "module" then where = where .. " [module-scope]" end
+                end
+                -- occurrences 被 MAX_OCCURS 截过时把总数说出来（「这么多用法」是假结论）。
+                local occ_note = string.format("occ_in_func=%s",
+                    tostring(v.occurrences_in_func or #occ))
+                if v.occurrences_truncated then
+                    occ_note = occ_note .. string.format(" (capped %s of %s total)",
+                        tostring(v.occurrences_limit or "?"),
+                        tostring(v.occurrences_total or "?"))
+                end
+                out[#out + 1] = string.format("  %s %s  %s  %s",
+                    v.var or "?", where, occ_note, table.concat(lines, "; "))
             end
         elseif entry.kind == "variable" then
-            out[#out + 1] = string.format("var %s — %s occurrence(s) across %d func(s)",
+            local head = string.format("var %s — %s occurrence(s) across %d func(s)",
                 entry.var or "?", tostring(entry.occurrence_count or 0), #(entry.funcs or {}))
+            -- 真·声明行 + 截断说明（occurrence_count 只是落盘条数，有上限）。
+            if type(entry.decl) == "table" and entry.decl.line then
+                head = head .. string.format("  decl=%s:%s",
+                    entry.decl.file or "?", tostring(entry.decl.line))
+                -- 变量视角永远是 module-scope（同一个名字在内核里有几十上百处声明）
+                if entry.decl_scope == "module" then
+                    head = head .. " [module-scope]"
+                end
+            end
+            if entry.occurrences_truncated then
+                head = head .. string.format("  (capped %s of %s total)",
+                    tostring(entry.occurrences_limit or "?"),
+                    tostring(entry.occurrence_total or "?"))
+            end
+            out[#out + 1] = head
             -- 跨过程跳：变量在 caller 里作为第 pos 个实参传给 callee 的哪个形参。
             -- 以前这条边只在查询侧用 strstr(args, var) 猜，既不落盘也不给形参名。
             local hops = entry.hops or {}

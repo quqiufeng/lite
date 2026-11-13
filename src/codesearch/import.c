@@ -787,6 +787,19 @@ static void import_dataflow(const char* analysis_dir, const char* namespace) {
         json_t* val = json_object();
         json_object_set_new(val, "count", json_integer(json_array_size(occurrences)));
         json_object_set_new(val, "occurrences", json_incref(occurrences));
+        // 截断不静默：dataflow.json 里落了 occurrences_total / occurrences_truncated /
+        // occurrences_limit，但 import 以前只搬 occurrences 数组 —— 于是查询侧看到
+        // 「2000 条」就当成全部（i/ret 这类高频变量最容易被误读）。
+        json_t* vtot = json_object_get(var_data, "occurrences_total");
+        if (vtot && json_is_integer(vtot))
+            json_object_set_new(val, "occurrences_total", json_incref(vtot));
+        json_t* vtr = json_object_get(var_data, "occurrences_truncated");
+        if (vtr && json_is_true(vtr)) {
+            json_object_set_new(val, "occurrences_truncated", json_true());
+            json_t* vlim = json_object_get(var_data, "occurrences_limit");
+            if (vlim && json_is_integer(vlim))
+                json_object_set_new(val, "occurrences_limit", json_incref(vlim));
+        }
         // type（int/void/struct/...）：查询时才知道这是结构体还是普通变量，
         // 之前一律丢掉，`dataflow address_space` 只看到一个光秃秃的变量名。
         json_t* vtype = json_object_get(var_data, "type");
@@ -815,6 +828,11 @@ static void import_dataflow(const char* analysis_dir, const char* namespace) {
             json_object_set_new(val, "hop_count", json_integer(
                 (json_int_t)json_array_size(vhops)));
         }
+        // 真·声明行（analyzer 从 definition 那条 occurrence 挑出来的）。
+        // 以前查询侧只能看 occurrences[0].line —— 那是遍历序，不是声明行。
+        json_t* vdecl = json_object_get(var_data, "decl");
+        if (vdecl && json_is_object(vdecl))
+            json_object_set_new(val, "decl", json_incref(vdecl));
         
         char* str = json_dumps(val, JSON_COMPACT);
         if (str) {
@@ -842,20 +860,33 @@ static void import_dataflow(const char* analysis_dir, const char* namespace) {
                 arr = json_array();
                 json_object_set_new(func_index, func, arr);
             }
+            const char* otype = json_string_value(json_object_get(occ, "type"));
+            int is_def = (otype && strcmp(otype, "definition") == 0);
             // 同一函数里同一个变量会出现多次（每个 use 一条 occurrence），
-            // 索引只保留首次声明行，否则 funcs/<func> 里全是重复项。
+            // 索引只保留一条，否则 funcs/<func> 里全是重复项。以前保留的是
+            // 遍历顺序的第一条，`line` 看着像声明行其实不是；现在定义（definition）
+            // 那条优先，没有定义才留第一条。
             int dup = 0;
             size_t ei;
             json_t* e;
             json_array_foreach(arr, ei, e) {
                 const char* ev = json_string_value(json_object_get(e, "var"));
-                if (ev && strcmp(ev, var_name) == 0) { dup = 1; break; }
+                if (ev && strcmp(ev, var_name) == 0) {
+                    dup = 1;
+                    if (is_def && !json_is_true(json_object_get(e, "def"))) {
+                        json_object_set_new(e, "line", json_integer(
+                            json_integer_value(json_object_get(occ, "line"))));
+                        json_object_set_new(e, "def", json_true());
+                    }
+                    break;
+                }
             }
             if (dup) continue;
             json_t* entry = json_object();
             json_object_set_new(entry, "var", json_string(var_name));
             json_object_set_new(entry, "line", json_integer(
                 json_integer_value(json_object_get(occ, "line"))));
+            if (is_def) json_object_set_new(entry, "def", json_true());
             json_array_append_new(arr, entry);
         }
     }
