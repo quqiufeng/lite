@@ -594,7 +594,7 @@ end
 ------------------------------------------------------------------------
 -- 参数
 ------------------------------------------------------------------------
-local opt = { mode = "count", duration = 2, keys = "comm", limit = 8 }
+local opt = { mode = "count", duration = 2, keys = "comm", limit = 8, limit_set = false }
 local probe_specs, entry_spec, exit_spec, args = {}, nil, nil, {}
 do
   local i = 1
@@ -610,7 +610,7 @@ do
     elseif a == "--key"      then opt.keys = val()
     elseif a == "--str"      then opt.strfield = val()
     elseif a == "--pid"      then opt.pid = tonumber(val())
-    elseif a == "--limit"    then opt.limit = tonumber(val())
+    elseif a == "--limit"    then opt.limit = tonumber(val()) opt.limit_set = true
     elseif a == "--freq"     then opt.freq = tonumber(val())
     elseif a == "--event"    then opt.event = val()
     elseif a == "--ring-size" then RING_PAGES = math.max(1, math.min(1024, tonumber(val()) or 8))
@@ -625,6 +625,17 @@ do
     else io.stderr:write("未知参数: "..tostring(a).."\n") os.exit(2) end
     i = i + 1
   end
+end
+
+-- 出图（flame/heat/rank）吃的是 result.top/folded 全量栈：以前这里按 opt.limit（默认 8）
+-- 截断，火焰图的「样本 N / 栈种类」只统计了前 8 条栈，跟 events 对不上（515 样本显示成 64）。
+-- 要出图且用户没显式 --limit 时不截；显式给了就照给。纯文本摘要仍走 opt.limit。
+local function topn(arr)
+  local n = opt.limit
+  if (opt.flame or opt.heat or opt.rank) and not opt.limit_set then n = #arr end
+  local t = {}
+  for i = 1, math.min(#arr, n) do t[#t+1] = arr[i] end
+  return t
 end
 
 local function fail(msg)
@@ -1232,8 +1243,7 @@ local function run_oncpu()
   local arr = {}
   for k, v in pairs(acc) do arr[#arr+1] = { stack = k, count = v } end
   table.sort(arr, function(a, b) return a.count > b.count end)
-  local top = {}
-  for i = 1, math.min(#arr, opt.limit) do top[#top+1] = arr[i] end
+  local top = topn(arr)
   local cl = {}
   for k, v in pairs(comms) do cl[#cl+1] = { comm = k, count = v } end
   table.sort(cl, function(a, b) return a.count > b.count end)
@@ -1393,8 +1403,7 @@ local function run_offcpu()
     for b, c in pairs(h.b) do allh.b[b] = (allh.b[b] or 0) + c end
   end
   table.sort(arr, function(a, b) return a.total_ms > b.total_ms end)
-  local top = {}
-  for i = 1, math.min(#arr, opt.limit) do top[#top+1] = arr[i] end
+  local top = topn(arr)
   result.events, result.matched = total, matched
   result.blocked, result.preempted, result.unmatched = blocked, preempted, unmatched
   result.seeded = seeded
@@ -1442,8 +1451,7 @@ local function run_folded()
   local arr = {}
   for k, v in pairs(acc) do arr[#arr+1] = { stack = k, count = v } end
   table.sort(arr, function(a, b) return a.count > b.count end)
-  local top = {}
-  for i = 1, math.min(#arr, opt.limit) do top[#top+1] = arr[i] end
+  local top = topn(arr)
   result.events, result.folded = total, top
   result.stacks = #arr
   result.frame_dir = "leaf-first"

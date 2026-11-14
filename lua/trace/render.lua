@@ -487,16 +487,29 @@ local function draw_flame(j, out_svg, title)
   else div, dg, divs = 1, 0, "1" end
 
   local nfunc = (#nodes > 1) and (#nodes - 1) or 0
+  -- 栈种类 = 叶子数（=不同栈），以前这里写的是 #nodes-1，那是「帧种类」。
+  -- 只有前 8 条栈时两者差得不多（46 框 vs 8 栈还看不出来），全量后 658 框 vs 231 栈一眼假。
+  local nstack = 0
+  do
+    local haskid = {}
+    for i = 2, #nodes do
+      local p = nodes[i].p
+      if type(p) == "number" and p > 0 then haskid[p] = true end
+    end
+    for i = 2, #nodes do
+      if not haskid[i] then nstack = nstack + 1 end
+    end
+  end
   local sub
   if unit_ms then
     -- div=1000 时数字已经是秒，标签必须跟着变（之前硬写 ms，141s 显示成 "141.5ms"）
     local shown = (div > 1) and fmt("%.1fs", total / div) or fmt("%.1fms", total)
     sub = fmt("阻塞 %s · 栈种类 %d · 最深 %d 层 · 权重=阻塞时长",
-              shown, nfunc, depth)
+              shown, nstack, depth)
   else
     local fr = j.freq
     sub = fmt("样本 %d · 栈种类 %d · 最深 %d 层 · %s",
-              total, nfunc, depth, fr and (fmt("%d", fr) .. "Hz") or "-")
+              total, nstack, depth, fr and (fmt("%d", fr) .. "Hz") or "-")
   end
   local bits = {}
   if (stat.collapsed or 0) > 0 then bits[#bits + 1] = fmt("%d 条栈的连续重复帧已折叠", stat.collapsed) end
