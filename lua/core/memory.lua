@@ -736,8 +736,15 @@ local USAGE_FIELDS = {
     -- 前缀 reset 按原因分账：fold（摘要压缩）与 hard_window（丢弃兜底）代价不同，
     -- 混算的话命中率抖动无法归因。
     "reset_fold", "reset_hard", "reset_window", "reset_other",
+    -- 每请求 miss 二分归因：紧跟 reset 的那条 vs 其余。均值差 =
+    -- "trim 一次平均白付多少 token"，与"新增内容本来不可缓存"分开看。
+    "miss_after_reset", "req_after_reset", "miss_clean", "req_clean",
     -- 没拿到真 usage（estimated 兜底）的请求数，不计入 cache_hit/cache_miss。
     "usage_unknown",
+    -- reset 计数的起点（那一刻的 requests）。reset_* 是后加的字段，老快照里没有；
+    -- 不记起点就会拿"整会话的 requests"当分母，把 trim 率算小一半以上
+    -- （实测 3293/10872=30%，同口径其实是 3293/4045=81%）。
+    "reset_epoch_requests",
 }
 
 function M:save_usage(session_id, usage)
@@ -751,6 +758,27 @@ function M:save_usage(session_id, usage)
     out.last_prompt = math.floor(tonumber(last.prompt) or 0)
     out.last_reuse = tonumber(last.reuse)
     out.last_reset = type(usage.last_reset) == "table" and usage.last_reset or nil
+    -- 逐请求明细（环形）单独拷一份，别把 session 里的表引用塞进 KV：
+    -- 那份还会被 add_usage 继续改，落盘的就该是快照。字段名压到一个字母，
+    -- 24 条也就几百字节。
+    local ring = type(usage.miss_ring) == "table" and usage.miss_ring or nil
+    if ring and #ring > 0 then
+        local copy, from = {}, 0
+        local cap = 24
+        if #ring > cap then from = #ring - cap end
+        for i = from + 1, #ring do
+            local e = ring[i]
+            if type(e) == "table" then
+                copy[#copy + 1] = {
+                    p = math.floor(tonumber(e.p) or 0),
+                    m = e.m and math.floor(tonumber(e.m) or 0) or nil,
+                    u = e.u or nil,
+                    r = e.r or nil,
+                }
+            end
+        end
+        if #copy > 0 then out.miss_ring = copy end
+    end
     out.ts = os.time()
     return self:put("/agent/session", sid .. "/usage", out, TTL.permanent)
 end

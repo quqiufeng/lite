@@ -12,6 +12,15 @@ if not ok_prof then prof = nil end
 local M = {}
 M.__index = M
 
+-- [诊断] 逐请求 usage 落盘开关：touch /tmp/lite-usage-trace 打开。
+-- 常态关（轮末落盘就够），归因 miss_ring 时开。
+local function usage_trace_enabled()
+    if (os.getenv("LITE_USAGE_TRACE") or "") ~= "" then return true end
+    local f = io.open("/tmp/lite-usage-trace", "r")
+    if f then f:close(); return true end
+    return false
+end
+
 function M.new(ctx, provider, tools, session, memory)
     local self = setmetatable({
         ctx = ctx,
@@ -22,6 +31,7 @@ function M.new(ctx, provider, tools, session, memory)
         prompt = Prompt,
         async = false,
         _failures = {},
+        _usage_trace = usage_trace_enabled(),
     }, M)
     self.approval = Approval.new({
         mode = ctx.settings.approval,
@@ -36,6 +46,11 @@ function M.new(ctx, provider, tools, session, memory)
         settings.on_usage = function(u, ...)
             inner(u, ...)
             self:track_usage_day(u)
+            -- [诊断] 常态只在轮末落盘（见 save_usage 头注释），可 miss_ring 是
+            -- 逐请求明细：轮末落盘意味着"正在跑的这一轮"的样本永远看不见，而
+            -- 归因恰恰要在轮内做（round 里几十次请求）。所以留一个文件门控：
+            -- touch /tmp/lite-usage-trace 就逐请求落一次，删掉即恢复常态。
+            if self._usage_trace then self:save_usage() end
         end
     end
     return self
@@ -936,6 +951,11 @@ function M:_loop(text, stream)
                 local trimmed
                 retry_msgs, trimmed = self:hard_window(self:view_messages(),
                     math.floor(c.budget * 0.7))
+                -- 这条重试同样换了前缀基座，必须记一次 reset：漏了它，retry 之后
+                -- 那条请求就会被算进 miss_clean，把"trim 的白付成本"摊薄。
+                if trimmed then
+                    self.ctx:note_cache_reset("hard_window", { dropped = 0, retry = true })
+                end
                 if not trimmed then retry_msgs = nil end
             end
             if retry_msgs then
