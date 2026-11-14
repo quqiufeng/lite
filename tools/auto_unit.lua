@@ -45,7 +45,9 @@ do
     })
     check(cfg.model == "deepseek-flash-x", "config env override")
     check(cfg.max_turns == 256, "config default max_turns")
-    check(cfg.context_chars == 64000, "config default context chars")
+    -- 120000 是**整条请求**的字符预算（system + digest + 尾巴 + schema），
+    -- 旧值 64000 只算消息，实际请求早就是 ~80k 字符，属于记漏了 fixed 成本。
+    check(cfg.context_chars == 120000, "config default context chars")
     check(cfg.context_window == 64000 and cfg.reserve_tokens == 8192
         and cfg.max_output_tokens == 8192 and cfg.token_budget == 0,
         "config default token controls")

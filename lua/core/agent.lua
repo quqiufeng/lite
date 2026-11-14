@@ -130,21 +130,22 @@ end
 function M:compactor()
     if self._compactor then return self._compactor end
     local s = self.ctx.settings or {}
-    local budget = tonumber(s.context_chars) or 64000
+    local budget = tonumber(s.context_chars) or 120000
 
-    -- 预算下限保护：压缩的可分配预算 = 预算 - 固定前缀（system + 钉住的首条 user）。
-    -- system prompt 本身就有 4~5k 字符，预算设得比它大不了多少时，可分配空间
-    -- 连"折叠区 + 尾巴"的最小值都不够 → 每次压缩都"nothing to fold" → 一路滑到
-    -- 硬上限丢历史。实测 budget 9000 时 prompt 8195 → 1231，代价比不压缩大得多。
-    -- 所以这里把预算抬到固定前缀的 3 倍（够放下摘要 + 尾巴 + 可折叠区）。
+    -- 预算下限保护：压缩的可分配预算 = 预算 - 固定成本。
+    -- system prompt 本身就有 4~5k 字符，工具 schema 又是 8~20k，预算设得比它们
+    -- 大不了多少时，可分给"折叠区 + 尾巴"的空间连最小值都不够 → 每次压缩都是
+    -- "nothing to fold" → 一路滑到硬上限丢历史。实测 budget 9000 时 prompt
+    -- 8195 → 1231，代价比不压缩大得多。所以抬到固定成本（system + schema）的 3 倍。
     local fixed = self:fixed_prefix_chars()
-    local floor = math.floor(fixed * 3)
+    local floor = math.floor(self:overhead_chars() * 3)
     if budget < floor then
         if not self._budget_warned and fixed > 0 then
             self._budget_warned = true
             self.ctx:emit("compact", {
                 ok = false, reason = "budget raised",
                 requested = budget, effective = floor, fixed_prefix = fixed,
+                schema = self:schema_chars(),
             })
         end
         budget = floor
@@ -169,6 +170,37 @@ function M:fixed_prefix_chars()
         n = Compact.msg_chars(msgs[1])
     end
     return n
+end
+
+-- 工具 schema 的字符数（每个请求都要重发一遍）。
+--
+-- 它是**纯固定成本**：既不进 session.messages，也不进召回块，所以早期实现
+-- 里 budget/used/tok_per_char 全都没有它 —— 结果三个数都系统性偏小：报出来的
+-- "上下文用了 38%" 实际是 60%，tok_per_char 因为分母缺 schema 而偏高 ~25%，
+-- 由它换算的 token 窗口触发线也就跟着偏。30 个工具的 schema 实测 20~31k 字符，
+-- 和 system prompt 一个量级，不能不记。
+-- memo：按工具数缓存（helper 增删后才会变），避免每轮把 schema 表 serialize 一遍。
+function M:schema_chars()
+    local tools = self.tools
+    if not tools then return 0 end
+    local n = 0
+    if self._schema_chars_n then return self._schema_chars_n end
+    local ok, list = pcall(function() return tools:schemas() end)
+    if not ok or type(list) ~= "table" then return 0 end
+    local enc = require("cjson").encode
+    for i = 1, #list do
+        local ok2, s = pcall(enc, list[i])
+        if ok2 then n = n + #s end
+    end
+    self._schema_chars_n = n
+    return n
+end
+
+-- 每次请求都躲不掉的固定成本：system prompt + 工具 schema。
+-- budget（context_chars）是**整条请求**的字符预算，所以凡是拿"消息字符数"
+-- 和 budget 比的地方，都要先减掉它，否则尾巴会被固定成本悄悄挤没。
+function M:overhead_chars()
+    return self:fixed_prefix_chars() + self:schema_chars()
 end
 
 local function state_key(session_id)
@@ -340,6 +372,7 @@ function M:view_messages(opts)
     -- 普通会话仍保留完整历史，交给 hard_window/compact 兜底。
     if opts.budget and st and st.block and st.block ~= "" then
         local head = Compact.total(out) + (tonumber(opts.reserve) or 0)
+            + self:schema_chars()
         local budget = math.max(1, (tonumber(opts.budget) or 0) - head)
         local start, used = #all + 1, 0
         for i = #all, from + 1, -1 do
@@ -449,7 +482,10 @@ function M:manual_window(keep)
     self._window_keep = keep
     local msgs = self:view_messages({ budget = c.budget })
     local before = Compact.total(msgs)
-    local kept, _, dropped = self:hard_window(msgs, math.floor(c.budget * keep))
+    -- 和 request_messages 同一套算术：budget*keep 是整条请求的，先扣固定成本。
+    local avail = math.floor(c.budget * keep) - self:overhead_chars()
+    if avail < 4000 then avail = 4000 end
+    local kept, _, dropped = self:hard_window(msgs, avail)
     local after = Compact.total(kept)
     return { keep = keep, before = before, after = after, dropped = dropped,
         budget = c.budget, total = #self.ctx.session.messages }
@@ -461,7 +497,7 @@ function M:maybe_compact(stream, reserve, force)
     local c = self:compactor()
     local st = self:compact_state()
     local view = self:view_messages()
-    local used = Compact.total(view) + (tonumber(reserve) or 0)
+    local used = Compact.total(view) + (tonumber(reserve) or 0) + self:schema_chars()
 
     -- 触发线 + 迟滞线取较大者。压完的基座若本身就贴着触发线，
     -- 不设迟滞就会"下一条消息又触发"，每轮压一次。
@@ -628,7 +664,7 @@ function M:request_messages(text, stream, opts)
     self:maybe_compact(stream, reserve, opts.force_compact)
     local c = self:compactor()
     local msgs = self:view_messages({ budget = c.budget, reserve = reserve })
-    local used = Compact.total(msgs) + reserve
+    local used = Compact.total(msgs) + reserve + self:schema_chars()
     local drop_first = self:drop_first()
     -- 丢弃优先时硬线就设在触发线：不做有损摘要，超了直接从最新往回装。
     local ceiling = drop_first and c:trigger() or math.floor(c.budget * 2)
@@ -639,14 +675,33 @@ function M:request_messages(text, stream, opts)
         if not keep or keep < 0.3 or keep > 0.95 then
             keep = drop_first and 0.6 or 0.8
         end
-        -- /compact 手动窗口：窗口从最新往回只装 budget*keep，且**每个请求都滑动**，
-        -- 老消息不删不摘要，留在 session/记忆里靠 recall 取回。
+        -- 固定成本：system + schema + 召回块 + digest。budget 是**整条请求**的预算，
+        -- 这些先扣掉，剩下的才是能装历史的钱。
+        local st = self:compact_state()
+        local head = self:overhead_chars() + (tonumber(reserve) or 0)
+            + (st and #(st.block or "") or 0)
+        local avail
         if self._window_keep then
+            -- /compact 手动窗口：窗口从最新往回只装 budget*keep 的内容，且**每个请求都滑动**，
+            -- 老消息不删不摘要，留在 session/记忆里靠 recall 取回。
             keep = self._window_keep
             ceiling = math.floor(c.budget * keep)
+            avail = math.floor(c.budget * keep) - head
+        else
+            avail = math.floor((c.budget - head) * keep)
         end
-        msgs, trimmed, dropped = self:hard_window(msgs,
-            math.floor(c.budget * keep))
+        -- 地板：head 再大也要留住这么多原文 —— 否则丢掉的正是"眼前发生的事"，
+        -- 模型连刚跑过的命令都看不见。bump 到 budget 的 10%（夹 4000）。
+        local floor_chars = math.max(4000, math.floor(c.budget * 0.1))
+        if avail < floor_chars then avail = floor_chars end
+        -- 迟滞：丢完必须真的落回触发线以下，否则下一个请求又超线、又丢一次、
+        -- 又是整段前缀 miss（实测旧公式丢完还剩 59.4k > 触发线 54.4k，33% 的
+        -- 请求都在丢历史）。留 budget/8 给下一轮增长。
+        if not self._window_keep then
+            local after_max = math.floor(c:trigger() - head - c.budget / 8)
+            if after_max > floor_chars and avail > after_max then avail = after_max end
+        end
+        msgs, trimmed, dropped = self:hard_window(msgs, avail)
         if trimmed then
             -- 手动窗口（/compact N）每轮都在滑动 → 每次都是整段 miss；它和自动硬上限
             -- 是两回事，分账记，否则看不出命中率是被窗口模式拖的还是被兜底拖的。
@@ -683,7 +738,9 @@ function M:request_messages(text, stream, opts)
         out[#out + 1] = { role = "system", content = rt }
     end
     -- 本次真正发出去的规模，供下一轮用真实 usage 反推 chars→tokens。
-    self._last_request_chars = Compact.total(out)
+    -- 必须计入 schema：API 回来的 prompt_tokens 包含工具定义，分母少了它，
+    -- 比值会偏高 ~25%（30 个工具 ≈ 20k 字符），由它换算出的 token 触发线随之偏低。
+    self._last_request_chars = Compact.total(out) + self:schema_chars()
     return out
 end
 

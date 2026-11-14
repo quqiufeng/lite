@@ -1452,14 +1452,14 @@ end
 
 local schema = {
         name = "lens",
-        description = "代码库索引与检索：建索引/调用图/数据流，按符号、上下文、语义查询。"
-            .. "locate=搜+内联源码窗口（recommended 起点），peek=file:line 读窗口，"
-            .. "grep=作用域 cgrep（拒整仓扫描）。数据在 ~/.local/share/lite/codesearch/<project>，与 lite 记忆隔离。",
+        -- schema 每个请求都重发，描述只留「选哪个 action」，细节看本文件头注释。
+        description = "代码/符号检索：locate=搜+内联源码（默认起手），peek=file:line，"
+            .. "grep=作用域正则，build=建索引。",
         parameters = {
             type = "object",
             properties = {
                 action = { type = "string", enum = { "build", "index", "import", "search", "symbol", "context", "exact", "file", "dataflow", "status", "locate", "peek", "grep" },
-                           description = "省略时按参数推断：pattern→grep，query→locate，path→peek，都没有→status。locate=搜+内联源码（默认起手式）；peek=file:line 读窗口；grep=作用域 cgrep；build=全流程；index=只切块（不刷新 KV，要 import 才可查）；import=analysis 导入 KV；search=语义+关键词；symbol/context/exact=结构化查询；file=按文件列 chunk；dataflow=函数读写了哪些变量 / 变量流过哪些函数；status=看产物" },
+                           description = "省略则按参数推断：pattern→grep，query→locate，path→peek" },
                 query = { type = "string", description = "符号名（可省略表前缀，M.foo 查 foo 也行）、自然语言查询、文件路径，或 exact 的完整 KV key；peek 时=符号名（免给 path）" },
                 pattern = { type = "string", description = "grep 的正则（fixed=true 时按字面串）" },
                 line = { type = "integer", description = "peek 的行号（默认 1，给了 before/lines 就围绕它读）" },

@@ -134,7 +134,12 @@ function M.load(env)
         memory_dir = getv("LITE_MEMORY_DIR") or file.memory_dir,
         memory_mb = tonumber(getv("LITE_MEMORY_MB") or file.memory_mb) or 100,
         memory_flush = tonumber(getv("LITE_MEMORY_FLUSH") or file.memory_flush) or 30,
-        context_chars = tonumber(getv("LITE_CONTEXT_CHARS") or file.context_chars) or 64000,
+        -- 单位是**整条请求的字符数**：system + digest + 尾巴 + 工具 schema 全算在内
+        -- （schema 由 agent:schema_chars() 计入，见 design.md「预算的单位」）。
+        -- 120000 字符 ≈ 38k tokens（实测 chars→tokens ≈ 0.46~0.5，见 tok_per_char），
+        -- 留在 DeepSeek 128k 窗口内；旧默认 64000 只算消息不算 schema，实际请求
+        -- 已经 ~80k 字符，改成显式总预算后总规模不变、留下来的尾巴更大。
+        context_chars = tonumber(getv("LITE_CONTEXT_CHARS") or file.context_chars) or 120000,
         context_turns = tonumber(getv("LITE_CONTEXT_TURNS") or file.context_turns) or 16,
         context_window = tonumber(getv("LITE_CONTEXT_WINDOW") or file.context_window) or 64000,
         reserve_tokens = tonumber(getv("LITE_RESERVE_TOKENS") or file.reserve_tokens) or 8192,

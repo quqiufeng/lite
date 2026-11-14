@@ -155,7 +155,8 @@ export LITE_MEMDB_SPLIT=1                        # 仅在多机 NFS 上用：退
 - 导入只写目标库，**不是**双向同步；`--dry-run` 报 `new/overwrite` 数，出错行进 stderr 不影响其余行。
 - 语义回环稳定：导出 → 导入 → 再导出，内容一致（表内键序可能不同）。
 
-上下文预算默认 `LITE_CONTEXT_CHARS=64000`：跨过触发线（预算 85%）就从最新往回装窗口、
+上下文预算默认 `LITE_CONTEXT_CHARS=120000`（**整条请求**的字符数：system + digest + 尾巴 + 工具 schema 都算在内）：
+跨过触发线（预算 85%）就从最新往回装窗口、
 更老的整条丢，`session.messages` 和记忆一条不删 —— 「压缩」在这里只是缩小发出去的窗口。
 `LITE_COMPACT=1` 恢复三段式摘要（稳定前缀 / 结构化 digest / 近期原文尾巴）。
 `/compact` 手动把窗口滑到 `budget*LITE_KEEP_RATIO`。
@@ -173,7 +174,7 @@ export LITE_MEMDB_SPLIT=1                        # 仅在多机 NFS 上用：退
 | `LITE_TEMPERATURE` | 0 | 采样温度 |
 | `LITE_THINKING` / `LITE_REASONING_EFFORT` | — | thinking 开关 / `high`·`medium`·`low` |
 | `LITE_MAX_RETRIES` | 2 | 429/5xx/网络错误重试次数 |
-| `LITE_CONTEXT_CHARS` | 64000 | prompt 字符预算 |
+| `LITE_CONTEXT_CHARS` | 120000 | 整条请求的字符预算（含 system/digest/schema） |
 | `LITE_CONTEXT_TURNS` | 16 | 摘要尾巴的 user 轮数上限 |
 | `LITE_CONTEXT_WINDOW` | 64000 | 模型窗口 tokens（算触发线与 output limit） |
 | `LITE_RESERVE_TOKENS` | 8192 | 预留输出 tokens |

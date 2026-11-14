@@ -25,8 +25,9 @@ local Text = require("core.text")
 
 local M = {}
 
--- 单位统一用**字符**（lite 的 budget 一直是字符），涉及"每次请求都付费"的
--- 固定段时再换算成 token 做提示。默认 64000 字符 ≈ 16k tokens（提示词预算，不是模型窗口）。
+-- 单位统一用**字符**（lite 的 budget 一直是字符），指的是**整条请求**：
+-- system + digest + 历史尾巴 + 工具 schema。默认 120000 字符 ≈ 38k tokens
+-- （实测 chars→tokens ≈ 0.46~0.5，见 agent:tok_per_char），不是模型窗口。
 local DEFAULTS = {
     -- 触发线：超过 budget 的这个比例才压一次。
     compact_ratio = 0.85,
@@ -192,7 +193,7 @@ end
 
 function M.new(opts)
     opts = opts or {}
-    local budget = tonumber(opts.budget_chars) or 64000
+    local budget = tonumber(opts.budget_chars) or 120000
     if budget < 500 then budget = 500 end
     local self = {}
     for k, v in pairs(DEFAULTS) do self[k] = cfg_get(opts, k) end

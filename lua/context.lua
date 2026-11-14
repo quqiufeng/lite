@@ -50,7 +50,7 @@ function M.new(opts)
             model = opts.model or "deepseek-flash",
             temperature = opts.temperature or 0,
             max_turns = opts.max_turns or 16,
-            context_chars = opts.context_chars or 64000,
+            context_chars = opts.context_chars or 120000,
             context_turns = opts.context_turns or 2,
             context_window = opts.context_window or 64000,
             reserve_tokens = opts.reserve_tokens or 8192,

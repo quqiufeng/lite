@@ -166,17 +166,18 @@ KV，重启可恢复，连接时回放历史，SIGINT/SIGTERM 优雅退出。`--
 分工：本机做小改、文档、纯 Lua 与文本级验证；碰 `src/`、C ABI、`lua/ffi/*` 的硬验证推给
 远程实例。提交权留在人手里——slave 通过后就 commit，master 只 pull，不各写一份历史。
 
-## 3 数字与门槛（默认 `budget` = 64000 字符）
+## 3 数字与门槛（默认 `budget` = 120000 字符，指**整条请求**：system + digest + 尾巴 + 工具 schema）
 
 | 项 | 值 | 出处 |
 |---|---|---|
-| 触发线 | `budget × 0.85` = 54400 | `compact.lua:M.trigger` |
-| 丢弃优先的硬线 | = 触发线；装窗口保留 `budget × 0.6` | `agent.lua:M.request_messages` |
+| 固定成本 `head` | system + schema + 召回块 + digest | `agent.lua:M.overhead_chars` |
+| 触发线 | `budget × 0.85` = 102000 | `compact.lua:M.trigger` |
+| 丢弃优先的硬线 | = 触发线；装窗口保留 `(budget - head) × 0.6`，且丢完必须 ≤ 触发线 − budget/8 | `agent.lua:M.request_messages` |
 | 摘要模式硬上限 | `budget × 2`（物理兜底，只保 system 加 digest） | 同上 |
 | 单条 tool 消息上限 | 触发线/4，地板 2000 | `compact.lua:msg_cap` |
 | 摘要近期尾巴 | `budget × 0.10`，clamp 到 `[min(8000, avail/3), 24000]` | `compact.lua` |
 | 摘要稳定前缀 | `min(budget × 5%, 6000)`，硬性 ≤ budget/8 | `compact.lua` |
-| 预算地板 | 抬到固定前缀 × 3，并发 `budget raised` 事件 | `agent.lua:compactor` |
+| 预算地板 | 抬到固定成本（system + schema）× 3，并发 `budget raised` 事件 | `agent.lua:compactor` |
 | 工具输出 | bash 32KB，其余 30KB（头 2/3 加尾 1/3） | `tools.lua:12,15` |
 | 入库截断 | tool 结果 8192 字符，非 user 原文 200 条 | `session.lua` |
 
