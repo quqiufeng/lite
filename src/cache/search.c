@@ -483,21 +483,32 @@ int cache_search_fuzzy(cache_t* cache, const char* query,
 
 // ====== 标签搜索 ======
 
-// 辅助：在 value 中查找 tag（简单字符串搜索）
+// 辅助：在 value 中查找 tag（子串 + 词边界匹配）
 // 假设 value 是 JSON，查找 "tag" 或 [..., "tag", ...]
-static int value_contains_tag(const char* value, size_t value_len, const char* tag) {
-    size_t tag_len = strlen(tag);
+//
+// 性能：tag 索引只在「显式 tags 字段」上有条目，索引未命中时 fallback 要扫全库
+// 每条 value（mem.bin 里 7k 条 / 3.7MB 是常态）。旧版在每个字节偏移都 memcmp
+// 一次，是 O(value_len × tag_len)，实测单次未命中 ~12ms，recall 的 8 个 term
+// 里大半未命中 → recall 卡在 10ms 级（trace oncpu 火焰图里 libc 的
+// __memcmp_avx2_movbe 占绝对多数）。改成先用 memchr(SIMD) 跳首个字节命中点，
+// 再 memcmp 全文 + 校验边界：语义完全不变（不是「近似匹配」），只是把逐字节
+// 试探降成「跳着找」。CJK tag 首字节集中于 0xE*，仍有 3× 左右跳过量。
+static int value_contains_tag(const char* value, size_t value_len, const char* tag, size_t tag_len) {
     if (tag_len == 0 || value_len < tag_len) return 0;
-    
-    // 简单实现：在 value 中搜索 tag 字符串
-    // 为了更准确，可以搜索引号包围的 tag
-    for (size_t i = 0; i <= value_len - tag_len; i++) {
+
+    const unsigned char first = (unsigned char)tag[0];
+    size_t i = 0;
+    while (i + tag_len <= value_len) {
+        const char* hit = (const char*)memchr(value + i, first, value_len - tag_len + 1 - i);
+        if (!hit) return 0;
+        i = (size_t)(hit - value);
         if (memcmp(value + i, tag, tag_len) == 0) {
             // 检查边界：确保是完整的词匹配
             int left_ok = (i == 0) || !isalnum((unsigned char)value[i-1]);
             int right_ok = (i + tag_len >= value_len) || !isalnum((unsigned char)value[i + tag_len]);
             if (left_ok && right_ok) return 1;
         }
+        i++;
     }
     return 0;
 }
@@ -562,7 +573,7 @@ int cache_search_tag(cache_t* cache, const char* tag,
         size_t value_len;
         const char* value = entry_value(cache, offset, &value_len);
         
-        if (value_contains_tag(value, value_len, tag)) {
+        if (value_contains_tag(value, value_len, tag, tag_len)) {
             if (append_result(&results, &result_count, &result_cap, cache, offset, 1.0) < 0) {
                 free(results);
                 return CACHE_ERR_NOMEM;
@@ -571,6 +582,175 @@ int cache_search_tag(cache_t* cache, const char* tag,
         }
     }
     
+    *out_results = results;
+    *out_count = result_count;
+    return CACHE_OK;
+}
+
+// 多标签搜索：单个 cache_search_tag 的并集，但 entry 表只遍历一遍。
+// 语义与逐个调用一致（索引命中走索引、索引未命中回退 value 子串 + 词边界），
+// 区别只在「遍历次数」：8 个 term 各自未命中索引时，旧路径走 8 遍全库；
+// 这里一遍即可，且每条 value 会在 L1 里连续被剩下的 tag 扫，省掉重复的
+// entry_is_valid / ns_filter / entry_value 和重复的冷内存遍历。
+// 去重用 offset 开地址哈希集：单个 tag 时不需要去重，多个 tag 的并集才需要，
+// 而结果集可能上千条——线性比对就是 O(n²)（实测把 8 tag 的收益全吃掉）。
+// offset 在同一 cache 内唯一标识 entry，用它代替 key 指针比较等价。
+typedef struct {
+    size_t* slots;   // 0 = 空（offset 0 是头块，不当 entry 用）
+    size_t cap;      // 2 的幂
+    size_t count;
+} offset_set_t;
+
+static size_t offset_set_hash(size_t x) {
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 29;
+    return (size_t)x;
+}
+
+static int offset_set_init(offset_set_t* s, size_t hint) {
+    size_t cap = 64;
+    while (cap < hint * 2) cap <<= 1;
+    s->slots = (size_t*)calloc(cap, sizeof(size_t));
+    s->cap = s->slots ? cap : 0;
+    s->count = 0;
+    return s->slots ? 0 : -1;
+}
+
+static void offset_set_free(offset_set_t* s) {
+    free(s->slots);
+    s->slots = NULL;
+    s->cap = 0;
+    s->count = 0;
+}
+
+static int offset_set_insert(offset_set_t* s, size_t x);
+
+// 扩容后重插（保持 0.5 装载上限）
+static int offset_set_grow(offset_set_t* s) {
+    size_t old_cap = s->cap;
+    size_t* old = s->slots;
+    size_t new_cap = old_cap ? old_cap * 2 : 64;
+    size_t* fresh = (size_t*)calloc(new_cap, sizeof(size_t));
+    if (!fresh) return -1;
+    s->slots = fresh;
+    s->cap = new_cap;
+    s->count = 0;
+    for (size_t i = 0; i < old_cap; i++) {
+        if (old[i]) offset_set_insert(s, old[i]);
+    }
+    free(old);
+    return 0;
+}
+
+static int offset_set_insert(offset_set_t* s, size_t x) {
+    if (s->cap == 0 || (s->count + 1) * 2 > s->cap) {
+        if (offset_set_grow(s) < 0) return -1;
+    }
+    size_t mask = s->cap - 1;
+    size_t i = offset_set_hash(x) & mask;
+    for (;;) {
+        if (s->slots[i] == 0) {
+            s->slots[i] = x;
+            s->count++;
+            return 1;          // 新插入
+        }
+        if (s->slots[i] == x) return 0;   // 已存在
+        i = (i + 1) & mask;
+    }
+}
+
+int cache_search_tags(cache_t* cache, const char* const* tags, size_t ntags,
+                      const cache_search_options_t* options,
+                      cache_result_t** out_results, size_t* out_count) {
+    if (!cache || !tags || ntags == 0 || !out_results || !out_count) return CACHE_ERR_INVAL;
+
+    *out_results = NULL;
+    *out_count = 0;
+
+    // 单 tag 直接复用原实现（含它自己的「索引命中即短路」），避免两套代码走偏。
+    if (ntags == 1) return cache_search_tag(cache, tags[0], options, out_results, out_count);
+
+    uint64_t now = cache_now_ms();
+    int max_results = options ? options->max_results : 100;
+    const char* ns_filter = options ? options->ns_filter : NULL;
+
+    cache_result_t* results = NULL;
+    size_t result_count = 0;
+    size_t result_cap = 0;
+
+    size_t* lens = (size_t*)malloc(sizeof(size_t) * ntags);
+    unsigned char* need_scan = (unsigned char*)calloc(ntags, 1);
+    if (!lens || !need_scan) {
+        free(lens); free(need_scan);
+        return CACHE_ERR_NOMEM;
+    }
+
+    offset_set_t seen;
+    if (offset_set_init(&seen, 256) < 0) {
+        free(lens); free(need_scan);
+        return CACHE_ERR_NOMEM;
+    }
+
+    size_t nscan = 0;
+    for (size_t t = 0; t < ntags; t++) {
+        lens[t] = tags[t] ? strlen(tags[t]) : 0;
+        if (lens[t] == 0) continue;
+
+        size_t* indexed_offsets = NULL;
+        size_t indexed_count = 0;
+        int ok = (cache_tag_index_search(cache, tags[t], &indexed_offsets, &indexed_count) == CACHE_OK);
+        if (ok && indexed_count > 0) {
+            for (size_t i = 0; i < indexed_count; i++) {
+                size_t offset = indexed_offsets[i];
+                if (!offset) continue;
+                if (!entry_is_valid(cache, offset, now)) continue;
+                if (!ns_filter_match(cache, offset, ns_filter)) continue;
+                if (offset_set_insert(&seen, offset) == 0) continue;
+                if (append_result(&results, &result_count, &result_cap, cache, offset, 1.0) < 0) {
+                    free(indexed_offsets); free(lens); free(need_scan);
+                    offset_set_free(&seen); free(results);
+                    return CACHE_ERR_NOMEM;
+                }
+                if (max_results > 0 && result_count >= (size_t)max_results) break;
+            }
+            free(indexed_offsets);
+        } else {
+            if (indexed_offsets) free(indexed_offsets);
+            need_scan[t] = 1;
+            nscan++;
+        }
+        if (max_results > 0 && result_count >= (size_t)max_results) break;
+    }
+
+    if (nscan > 0 && !(max_results > 0 && result_count >= (size_t)max_results)) {
+        for (size_t i = 0; i < cache->sorted.count; i++) {
+            size_t offset = cache_sorted_get(cache, i);
+            if (!offset) continue;
+            if (!entry_is_valid(cache, offset, now)) continue;
+            if (!ns_filter_match(cache, offset, ns_filter)) continue;
+
+            size_t value_len;
+            const char* value = entry_value(cache, offset, &value_len);
+            int hit = 0;
+            for (size_t t = 0; t < ntags; t++) {
+                if (!need_scan[t]) continue;
+                if (value_contains_tag(value, value_len, tags[t], lens[t])) { hit = 1; break; }
+            }
+            if (!hit) continue;
+            if (offset_set_insert(&seen, offset) == 0) continue;
+
+            if (append_result(&results, &result_count, &result_cap, cache, offset, 1.0) < 0) {
+                free(lens); free(need_scan); offset_set_free(&seen); free(results);
+                return CACHE_ERR_NOMEM;
+            }
+            if (max_results > 0 && result_count >= (size_t)max_results) break;
+        }
+    }
+
+    free(lens);
+    free(need_scan);
+    offset_set_free(&seen);
     *out_results = results;
     *out_count = result_count;
     return CACHE_OK;

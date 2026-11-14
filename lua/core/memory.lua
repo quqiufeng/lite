@@ -28,6 +28,8 @@ local LOCK_NB = 4
 local LOCK_UN = 8
 -- 重抢节流：锁被占时别让每次 put 都 open+flock（默认 2 秒一次）。
 local RECLAIM_THROTTLE_MS = 2000
+-- include/cache.h:16 的 CACHE_ERR_NOENT，del 用它区分「本来就没有」和真失败。
+local CACHE_ERR_NOENT = -4
 
 local M = {}
 M.__index = M
@@ -286,8 +288,13 @@ function M:del(ns, key)
         return false
     end
     local t0 = prof and prof.now_ms()
-    local dok = cache.del(self.h, join(ns, key)) == 0
-    if prof and t0 then prof.record("memory.del", prof.now_ms() - t0, dok) end
+    local rc = cache.del(self.h, join(ns, key))
+    local dok = rc == 0
+    -- NOENT(-4) 是「本来就没有」而不是错误：旧会话截断会重扫已删的键，
+    -- 混进 err 会把真正的写失败彻底淹掉。单列成 miss 计数，err 只留真失败。
+    local miss = rc == CACHE_ERR_NOENT
+    if miss then self.del_miss = (self.del_miss or 0) + 1 end
+    if prof and t0 then prof.record("memory.del", prof.now_ms() - t0, dok or miss) end
     return dok
 end
 
@@ -1158,10 +1165,17 @@ function M:recall(query, limit, opts)
 
     -- tag 检索：旧版对每个 term 各扫一次（terms 上限 32 → 每轮 30+ 次线性扫描）。
     -- 前 8 个 term 覆盖绝大部分命中，长尾丢掉换扫描次数。
-    for i = 1, math.min(#terms, 8) do
-        scans = scans + 1
-        for _, r in ipairs(cache.search_tag(self.h, terms[i], { max_results = math.floor(cand / 2) })) do
-            add(r)
+    -- 现在走 cache.search_tags：一批 term 一遍遍历（索引命中照旧 O(1)，未命中的
+    -- term 回退 value 子串扫描但全库只走一趟），结果与逐个调用取并集相同。
+    do
+        local slice = {}
+        for i = 1, math.min(#terms, 8) do slice[#slice + 1] = terms[i] end
+        if #slice > 0 then
+            scans = scans + 1
+            for _, r in ipairs(cache.search_tags(self.h, slice,
+                { max_results = math.floor(cand / 2) * #slice })) do
+                add(r)
+            end
         end
     end
 
@@ -1287,6 +1301,7 @@ function M:stats()
         recall_scans = st.scans or 0,
         recall_injected = st.injected or 0,
         recall_dropped = st.dropped or 0,
+        del_miss = self.del_miss or 0,
     }
 end
 

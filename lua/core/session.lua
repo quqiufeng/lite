@@ -295,6 +295,14 @@ function M.new(ctx, opts)
         raw_trimmed = tonumber(opts.raw_trimmed) or 0,
     }, M)
     os.execute("mkdir -p " .. shq(base))
+    -- 没显式给 raw_trimmed 就从 meta 接回：这是跨进程增量的唯一来源，
+    -- 丢了就从 1 起重扫整段历史（见 append 里的截断循环）。
+    if not tonumber(opts.raw_trimmed) and self.memory then
+        local meta = self.memory:session_meta(self.id)
+        if meta and tonumber(meta.raw_trimmed) then
+            self.raw_trimmed = tonumber(meta.raw_trimmed)
+        end
+    end
     return self
 end
 
@@ -332,8 +340,10 @@ function M:append(msg)
                 local key = "/agent/session"
                 local sub = self.id .. "/msg/" .. string.format("%08d", i)
                 local old = self.memory:get(key, sub)
+                -- old == nil：这条早被删过（跨进程 raw_trimmed 丢失时会重扫），
+                -- 再 del 只会拿到 NOENT，白跑一趟还脏了 prof 的 err。
                 -- user 的消息永久保留；只淘汰 tool / 旧 assistant 原文。
-                if not (type(old) == "table" and old.role == "user") then
+                if old ~= nil and not (type(old) == "table" and old.role == "user") then
                     self.memory:del(key, sub)
                 end
             end
@@ -342,6 +352,9 @@ function M:append(msg)
 
         if meta then
             meta.messages = self.seq
+            -- raw_trimmed 必须落盘：否则每个新进程都从 0 起，启动时把整段历史
+            -- 重扫一遍 get+del（会话越老启动越慢，prof 里 memory.del 全是 NOENT）。
+            meta.raw_trimmed = self.raw_trimmed or 0
             meta.updated = os.time()
             self.memory:put("/agent/session", self.id .. "/meta", meta,
                 self.memory.TTL and self.memory.TTL.permanent or 0)

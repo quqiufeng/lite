@@ -41,6 +41,8 @@ int cache_search_fuzzy(cache_t* cache, const char* query,
     const cache_search_options_t* options, cache_result_t** out_results, size_t* out_count);
 int cache_search_tag(cache_t* cache, const char* tag,
     const cache_search_options_t* options, cache_result_t** out_results, size_t* out_count);
+int cache_search_tags(cache_t* cache, const char* const* tags, size_t ntags,
+    const cache_search_options_t* options, cache_result_t** out_results, size_t* out_count);
 void cache_results_free(cache_result_t* results);
 int cache_expire(cache_t* cache, const char* key);
 int cache_touch(cache_t* cache, const char* key);
@@ -161,6 +163,24 @@ function M.search_fuzzy(h, query, o)
 end
 function M.search_tag(h, tag, o)
     return search(lib.cache_search_tag, h, tag, nil, o)
+end
+
+-- 多 tag 并集，只遍历一遍 entry 表（recall 一次查 8 个 term 用这个）。
+-- 单个 tag 时 C 侧内部转调 cache_search_tag，行为与上面完全一致。
+function M.search_tags(h, tags, o)
+    local n = #tags
+    if n == 0 then return {} end
+    if n == 1 then return M.search_tag(h, tags[1], o) end
+    local arr = ffi.new("const char*[?]", n)
+    for i = 1, n do
+        if type(tags[i]) ~= "string" or tags[i] == "" then return {} end
+        arr[i - 1] = tags[i]
+    end
+    local out = ffi.new("cache_result_t*[1]")
+    local cnt = ffi.new("size_t[1]")
+    local rc = lib.cache_search_tags(h, arr, n, options(o), out, cnt)
+    if rc ~= 0 then return {} end
+    return collect(out, cnt)
 end
 
 return M

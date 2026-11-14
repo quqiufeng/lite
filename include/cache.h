@@ -129,6 +129,15 @@ int cache_search_tag(cache_t* cache, const char* tag,
                      const cache_search_options_t* options,
                      cache_result_t** out_results, size_t* out_count);
 
+// 多标签搜索 = 上述单个调用的并集，但只遍历一次 entry 表。
+// 用于 recall 那种「一次查 8 个 term」的场景：逐个调 cache_search_tag 时，
+// 每个未命中索引的 tag 都要重走全库（7k 条时 ~3ms/个），8 个就是 20ms+；
+// 这里 entry_is_valid/ns_filter/entry_value 只做一遍，各 tag 的 value 扫描
+// 落在 L1 热区里。结果按 tag 顺序去重（同一 entry 只出一次）。
+int cache_search_tags(cache_t* cache, const char* const* tags, size_t ntags,
+                      const cache_search_options_t* options,
+                      cache_result_t** out_results, size_t* out_count);
+
 // 释放搜索结果
 void cache_results_free(cache_result_t* results);
 
