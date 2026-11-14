@@ -90,6 +90,66 @@ trace action=prof path=/tmp/pf.json   # 读退出时落的快照（进程已退 
 `agent:session_end` 收口时写；进程内账本为空时 `action=prof` 自动退化读快照。
 空账本不落盘（省得每次 `--once` 都留个空文件）。
 
+## 性能问题闭环：定位 → 修复 → reboot → 复验
+
+问题先分层，选错层会白测：
+
+| 现象 | 用哪层 | 起手命令 |
+|---|---|---|
+| lite 自己哪块慢（工具/API/记忆/prompt/serve） | `action=prof`（进程内，零权限） | `trace action=prof json=true` |
+| CPU 热点在哪 | engine `mode=oncpu` | `trace mode=oncpu duration=3 flame=/tmp/oncpu.png` |
+| 卡在哪个 syscall / 阻塞多久 | engine `mode=latency` / `offcpu` | 见上文六模式表 |
+
+### 五步
+
+1. **定位**：`trace action=prof json=true`。先看 `events` 确认这是哪个窗口（坑 1），
+   再按 `total_ms` 给 `spans` 排序取 top，最后翻 `recent` 找单次长尾——
+   `spans` 是聚合（谁最贵），`recent` 是流水（贵在什么时候）。
+2. **量化基线**：进程外跑，别在 agent 里跑（否则结论会写进你自己的账本）：
+   ```bash
+   ./tools/lite-lua /tmp/ab.lua     # 同参数重复 N 次，报 中位 / p95 / max
+   ```
+   基线必须落成数字（中位 + p95），**不拿单次极值当基线**（坑 3）。
+3. **改代码**：动手前写下这次要动的**是哪个量**——均值？p99？可见样本数？
+   改错口径比改错代码更常见（坑 2），而且错了照样能测出「变好了」。
+4. **reboot**：`trace.prof` 被 8 个 core 模块在加载时 `require` 进 `package.loaded`，
+   纯 Lua 改了**必须 reboot** 才生效；C/C++ 改了先 `./tools/build.sh`
+   （跑安装版用 `./tools/release.sh`）再 reboot。
+5. **复验**：同脚本、同种子重跑，前后对比**同一个指标**；再在进程内
+   `trace action=prof` 看真实轮次是否同向。合成数据变好只是必要条件。
+
+### 四个坑（都真踩过）
+
+| 坑 | 表现 | 怎么避 |
+|---|---|---|
+| **窗口错认** | 读到的是 `<memory_dir>/prof.json` 快照（上一轮或 `test.sh` 写的），却当成当前轮次，得出「没埋点」 | 先看 `events` 计数和 span 名单里有没有当前动作；独立 lua 进程里 `require` 到的是空账本，`action=prof` 会静默退化读快照 |
+| **口径错认** | 以为 `SAMPLE_MAX` 影响均值。实际 `avg/min/max/count` 走 `total/count` 累加，**不经 reservoir，永远精确** | `SAMPLE_MAX` 只喂 `p50/p99`；要改善均值精度是白改，只有尾延迟口径才动它 |
+| **单次判决** | 一次 `max_ms` 差 10 倍就当结论（GC / 调度 / 页缓存抖动） | ≥30 次重复，比中位与 p95；样本数要远大于采样上限才看得到采样误差 |
+| **退化实验** | 用分组交替造样本（`i % 2`），任何子样本都精确恒等 → 误差恒 `0.00%`，看起来像「完美」 | 用随机分布；**看到 0.00% 先怀疑实验设计**，别当成有效证据 |
+
+### 复验三问（答不全就不算有效）
+
+1. 目标指标动了没？（同脚本、同种子、前后对比）
+2. 没瞄准的指标有没有被误伤？
+3. 结论在进程内真实轮次也成立，还是只在合成数据里成立？
+
+### 范例：`memory.del`
+
+- **定位**：`prof` 里 `memory.del` 是 `recent` 常客，`avg_ms` 随记忆库增大而上升 → 疑似 O(n)。
+- **改**：删除下沉到 `src/cache`，`lua/core/memory.lua:M.del` 只剩计时与 `NOENT` 归类。
+- **reboot**：这是 C 侧改动 → `./tools/build.sh` → `reboot`（只改 Lua 就跳过 build）。
+- **复验**（`/tmp/bench_del.lua`，逐个删到底、取中位数）：
+
+  | 规模 | 旧中位 | 新中位 | 倍数 | 旧 p99 | 新 p99 |
+  |---|---|---|---|---|---|
+  | n=1000 | 31.0µs | 2.0µs | **15.5×** | 64µs | 3µs |
+  | n=4000 | 140.0µs | 5.0µs | **28.0×** | 277µs | 10µs |
+  | n=16000 | 658.0µs | 18.0µs | **36.6×** | 1292µs | 36µs |
+
+  旧值随规模近似 4 倍翻番（31→140→658µs）＝ O(n)；新值基本平坦（2→5→18µs，
+  增幅主要来自计时器粒度与删除后的页回收）＝ 常数级，不是「同一个 O(n) 变快了一点」。
+  进程内 `trace action=prof` 同向：`memory.del count=7 avg=0.002ms max=0.006ms`。
+
 ## 渲染契约
 
 `render.lua` 吃 engine `--json` 的 `top[]`（oncpu/offcpu）或 `folded[]`，

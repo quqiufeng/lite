@@ -615,6 +615,8 @@ do
     elseif a == "--event"    then opt.event = val()
     elseif a == "--ring-size" then RING_PAGES = math.max(1, math.min(1024, tonumber(val()) or 8))
     elseif a == "--flame"    then opt.flame = val()
+    elseif a == "--folded-in" then opt.folded_in = val()
+    elseif a == "--collapse" then opt.collapse = true   -- folded-in 也折连续重复帧（内核 folded 用）
     elseif a == "--heat"     then opt.heat = val()
     elseif a == "--heat-top" then opt.heat_top = tonumber(val())
     elseif a == "--rank"     then opt.rank = val()
@@ -626,6 +628,10 @@ do
     i = i + 1
   end
 end
+
+-- --folded-in 来了就把 mode 当 folded（除非用户显式 --mode）：否则 render() 的
+-- modes 白名单把 count 挡掉，给了 --flame 也只会打印「跳过」，白跑一趟。
+if opt.folded_in and opt.mode == "count" then opt.mode = "folded" end
 
 -- 出图（flame/heat/rank）吃的是 result.top/folded 全量栈：以前这里按 opt.limit（默认 8）
 -- 截断，火焰图的「样本 N / 栈种类」只统计了前 8 条栈，跟 events 对不上（515 样本显示成 64）。
@@ -667,7 +673,8 @@ else
     if not p then fail(err) end
   end
 end
-if #probes == 0 and opt.mode ~= "oncpu" then fail("没有探针") end
+-- --folded-in 不吃 perf：读文件出图，不需要任何探针（hook 采样路因此不用 root）
+if #probes == 0 and opt.mode ~= "oncpu" and not opt.folded_in then fail("没有探针") end
 local by_id = {}
 for _, p in ipairs(probes) do by_id[p.id] = p end
 
@@ -1457,10 +1464,53 @@ local function run_folded()
   result.frame_dir = "leaf-first"
 end
 
+-- --folded-in <file>：不吃 perf，直接读**外部** folded 文件出图。
+-- 存在理由：perf 路只看得见 JIT/C 帧，Lua 解释帧要另一条路采（lua/trace/luasamp.lua
+-- 的 debug.sethook）；两条路都吐标准 folded（`root;...;leaf 次数`，一行一栈），
+-- 在这个入口合流，render.lua 只认一种输入。所以 hook 采样**不需要 root**。
+local function run_folded_in()
+  local f, err = io.open(opt.folded_in, "rb")
+  if not f then fail("读不到 folded 文件 "..tostring(opt.folded_in).."："..tostring(err)) end
+  local acc, total, bad = {}, 0, 0
+  for line in f:lines() do
+    if line:match("%S") then
+      local stack, cnt = line:match("^(.-)%s+(%d+)%s*$")
+      if stack and stack ~= "" then
+        acc[stack] = (acc[stack] or 0) + tonumber(cnt)
+        total = total + tonumber(cnt)
+      else
+        bad = bad + 1
+      end
+    end
+  end
+  f:close()
+  if total == 0 then
+    fail(("folded 里没有有效行（%s 行不合法）：期望 `a;b;c 次数`，实际示例 %q")
+      :format(bad, (io.open(opt.folded_in) or {}):read("*l") or ""))
+  end
+  if bad > 0 then
+    io.stderr:write(("[trace_engine] 跳过 %d 行不合法的 folded（要 `栈 次数`）\n"):format(bad))
+  end
+  local arr = {}
+  for k, v in pairs(acc) do arr[#arr+1] = { stack = k, count = v } end
+  table.sort(arr, function(a, b)
+    if a.count ~= b.count then return a.count > b.count end
+    return a.stack < b.stack
+  end)
+  result.events, result.folded = total, topn(arr)
+  result.stacks = #arr
+  result.frame_dir = "root-first"     -- 标准 folded 方向：根在左、叶在末尾
+  -- hook 采样（luasamp）的递归就是同一行号连续重复，折了会把深度压平（fib 14 层→1 层）；
+  -- 内核 folded 才需要折 unwind 噪声，那种自己加 --collapse。
+  result.no_collapse = not opt.collapse
+  result.source = "folded-in:"..opt.folded_in
+end
+
 ------------------------------------------------------------------------
 -- 执行 + 输出
 ------------------------------------------------------------------------
-if opt.mode == "count" then run_count()
+if opt.folded_in then run_folded_in()                -- 外部 folded 优先，绕过 perf
+elseif opt.mode == "count" then run_count()
 elseif opt.mode == "samples" then run_samples()
 elseif opt.mode == "latency" then run_latency()
 elseif opt.mode == "folded" then run_folded()
@@ -1513,6 +1563,10 @@ local function render(kind, out)
   local t = ("%s · %s · %ds %s%s"):format(label,
     os.date("%m-%d %H:%M"), opt.duration, rate,
     opt.pid and (" · pid "..opt.pid) or "")
+  if opt.folded_in then            -- 外部 folded：没有 duration/pid 可言，别印 "2s" 骗人
+    t = ("%s · %s · %s"):format(label, os.date("%m-%d %H:%M"),
+      (opt.folded_in:match("([^/]+)$") or opt.folded_in))
+  end
   -- 渲染脚本只出 SVG；要 PNG 就在进程内用 cairo+librsvg 转（2 倍图，汇报材料直接可用）
   local want_png = out:lower():match("%.png$") ~= nil
   local tmp = want_png and os.tmpname() or nil
@@ -1570,7 +1624,8 @@ else
       print(("  %-24s n=%-7d avg=%7.1fus p99=%-6dus max=%.1fus"):format(t.key, t.count, t.avg_us, t.p99_us, t.max_us))
     end
   elseif opt.mode == "folded" then
-    print(("%s  events=%d stacks=%d%s"):format(pname, result.events, result.stacks, lostnote()))
+    local src = result.source or pname
+    print(("%s  events=%d stacks=%d%s"):format(src ~= "" and src or "(无探针)", result.events, result.stacks, lostnote()))
     for _, f in ipairs(result.folded) do print(("  %6d  %s"):format(f.count, f.stack)) end
   elseif opt.mode == "oncpu" then
     print(("oncpu  %dHz  样本=%d 栈种类=%d%s"):format(result.freq, result.events, result.stacks, lostnote()))

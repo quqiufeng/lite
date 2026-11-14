@@ -160,14 +160,22 @@ end
 
 local MAXD = tonumber(os.getenv("MAXD") or "") or 32
 
+-- 源码行帧（`lt_target.lua:8`、`src/x.c:88`、`[C]:-1`）：连续相同就是**真递归**，
+-- 折了就把 fib 的 14 层阶梯压成 1 层，火焰图只剩三个框（踩过：luasamp hook 采样）。
+local function is_src_frame(f)
+  return f:match(":%-?%d+$") ~= nil
+end
+
 -- 折叠连续重复帧：内核 unwind 在不可靠的栈帧上会扫出几十层同一地址，
 -- 真实递归不会连续出现同一个返回地址上百次。保留一帧即可。
-local function collapse(frames)
+-- 但源码行帧例外（见上）；off=true 时整条不折（Lua hook 采样要保真，j.no_collapse）。
+local function collapse(frames, off)
+  if off then return frames end
   local out = {}
   local prev
   for i = 1, #frames do
     local f = frames[i]
-    if i > 1 and f == prev then
+    if i > 1 and f == prev and not is_src_frame(f) then
       -- 折叠
     else
       out[#out + 1] = f
@@ -223,6 +231,7 @@ local function load(j)
   local rows = j.top or j.folded or {}
   local leaf_first = (j.frame_dir or "leaf-first") == "leaf-first"
   local unit_ms = j.unit == "ms"
+  local no_collapse = j.no_collapse == true   -- 外部 folded（Lua hook 采样）：递归保真，一律不折
   local folded, order = {}, {}
 
   for r = 1, #rows do
@@ -243,11 +252,11 @@ local function load(j)
     if unit_ms then w = e.total_ms or 0 else w = e.count or 0 end
 
     local n0 = #frames
-    frames = collapse(frames)
+    frames = collapse(frames, no_collapse)
     if #frames < n0 then stat.collapsed = stat.collapsed + 1 end
     local dropped, trunc, unsym
     frames, dropped, trunc, unsym = scrub(frames)
-    frames = collapse(frames)     -- 归并裸地址后可能相邻，再折一次
+    frames = collapse(frames, no_collapse)   -- 归并裸地址后可能相邻，再折一次
     stat.dropped = stat.dropped + dropped * w
     stat.unsym = stat.unsym + unsym * w
     if trunc > 0 then stat.trunc = stat.trunc + 1 end

@@ -170,7 +170,19 @@ local function num(v) return tonumber(v) end
 
 -- 组装 engine 命令行（不含解释器/前缀）。返回 argv 数组 或 nil, err
 function M.build_argv(args)
-    local mode = tostring(args.mode or "count")
+    -- folded_in = 外部 folded 文件（luasamp hook 路的产物）：不吃 perf、不要 root、不要探针。
+    -- engine 那条分支只在 mode==count 时自动改成 folded，这里显式对齐，免得默认值骗人。
+    local folded_in = args.folded_in
+    if folded_in ~= nil and folded_in ~= "" then
+        if not file_size(folded_in) then
+            error(("trace: 读不到 folded_in %s（先跑 luasamp 采样：" ..
+                "./tools/lite-lua lua/trace/luasamp.lua target.lua --out %s）；参数 folded_in=%s")
+                :format(tostring(folded_in), tostring(folded_in), tostring(folded_in)), 0)
+        end
+    else
+        folded_in = nil
+    end
+    local mode = tostring(args.mode or (folded_in and "folded") or "count")
     if not MODES[mode] then
         error(("trace: 未知 mode %q（可选 %s）；参数 mode=%s"):format(
             mode, "count/samples/latency/folded/oncpu/offcpu", cjson.encode(mode)), 0)
@@ -189,11 +201,31 @@ function M.build_argv(args)
         -- oncpu 是纯 perf 软件时钟采样，engine 一个探针都不注册；offcpu 不给 probe 时
         -- engine 自己补 tracepoint:sched:sched_switch（engine.lua:650 起的 mode 分支）。
         -- 只有 count/samples/folded 必须显式给 probe，别在这里把它们一起拦掉。
-        if #probes == 0 and mode ~= "oncpu" and mode ~= "offcpu" then
+        -- folded_in 那条路读文件出图，一个探针都不注册（engine.lua:676 同款判断）。
+        if #probes == 0 and mode ~= "oncpu" and mode ~= "offcpu" and not folded_in then
             error("trace: " .. mode .. " 模式需要 probe（如 kprobe:do_sys_openat2 / "
-                .. "tracepoint:sched:sched_switch），可给数组；当前 probe 为空", 0)
+                .. "tracepoint:sched:sched_switch），可给数组；当前 probe 为空。"
+                .. "已有 folded 文件就直接给 folded_in=<path>（不要 probe）", 0)
         end
         for _, p in ipairs(probes) do a[#a + 1] = "--probe"; a[#a + 1] = p end
+    end
+    if folded_in then
+        a[#a + 1] = "--folded-in"; a[#a + 1] = tostring(folded_in)
+        -- 读文件出图不采样本，duration 没有意义（engine 标题里也只印文件名），别伪装成采样
+        for _, kind in ipairs({ "flame", "heat", "rank" }) do
+            if args[kind] and args[kind] ~= "" then
+                a[#a + 1] = "--" .. kind; a[#a + 1] = tostring(args[kind])
+            end
+        end
+        for _, k in ipairs({ "heat_top", "rank_top", "rank_by" }) do
+            if args[k] ~= nil and args[k] ~= "" then
+                a[#a + 1] = "--" .. k:gsub("_", "-"); a[#a + 1] = tostring(args[k])
+            end
+        end
+        if args.json then a[#a + 1] = "--json" end
+        -- 默认不折（hook 采样的递归=同一行号连续重复）；只有内核 folded 才要 --collapse
+        if args.collapse then a[#a + 1] = "--collapse" end
+        return a, mode, nil
     end
     local dur = num(args.duration) or 2
     if dur < 0.1 then dur = 0.1 end
@@ -357,20 +389,29 @@ local function do_run(args, env)
         error("trace: 找不到 lua/trace/engine.lua（LITE_ROOT="
             .. tostring(os.getenv("LITE_ROOT")) .. "）；源码树先 ./tools/build.sh，安装版用 release.sh", 0)
     end
-    local prefix = need_root_prefix()
-    if not prefix then
-        error("trace: 需要 root 或 cap_perfmon 才能 perf_event_open；当前 euid≠0 且 `sudo -n` 不可用。"
-            .. " 配 NOPASSWD 或用 root 跑 lite 后重试（action=status 可自检）", 0)
+    -- 先算 argv：folded_in 那条路不吃 perf，也就不该被 root 检查挡住
+    local argv, mode, dur = M.build_argv(args)
+    local readonly_folded = false
+    for _, v in ipairs(argv) do if v == "--folded-in" then readonly_folded = true break end end
+
+    local prefix, bin = "", nil
+    if not readonly_folded then
+        prefix = need_root_prefix()
+        if not prefix then
+            error("trace: 需要 root 或 cap_perfmon 才能 perf_event_open；当前 euid≠0 且 `sudo -n` 不可用。"
+                .. " 配 NOPASSWD 或用 root 跑 lite 后重试（action=status 可自检）。"
+                .. "只有 Lua 侧栈（不 perf、不要 root）就用 folded_in + luasamp", 0)
+        end
     end
-    local bin = lua_bin(root)
+    bin = lua_bin(root)
     if not bin then error("trace: 找不到 luajit（tools/lua.sh 缺失且 PATH 里没有）", 0) end
 
     -- 采自己：先把 JIT ↔ 源码地址表写进 /tmp/perf-<pid>.map，再让 engine 开 --sym。
     -- 否则 JIT 帧在 maps 里是匿名可执行页，火焰图上只有 0x7f.. 或 [anon+0x..]。
-    local pmap = ensure_perfmap(args)
-    if pmap and args.sym == nil then args.sym = true end
-
-    local argv, mode, dur = M.build_argv(args)
+    if not readonly_folded then
+        local pmap = ensure_perfmap(args)
+        if pmap and args.sym == nil then args.sym = true end
+    end
     -- json_out 也要走 --json（engine 一次只出一种格式），落盘后由插件自己给摘要
     local save_json = args.json_out and args.json_out ~= ""
     local want_json = (args.json and true) or save_json or false
@@ -381,12 +422,13 @@ local function do_run(args, env)
     end
     local cmd = prefix .. bin .. " " .. shq(engine) .. " " .. join_argv(argv)
     -- 采样是阻塞的：给它 duration + 收尾余量；渲染大图再宽一点
-    local timeout = math.ceil(dur) + ((args.flame or args.heat or args.rank) and 60 or 30)
+    -- dur 可能是 nil（folded_in 不采样）——别拿 nil 做算术
+    local timeout = math.ceil(dur or 0) + ((args.flame or args.heat or args.rank) and 60 or 30)
     local out, rc = capture(cmd, timeout)
 
     if rc == 124 then
-        error(("trace: 超时 %ds 被 kill（mode=%s duration=%.1f）。缩小 duration/ring_size 后重试；"
-            .. "命令：%s"):format(timeout, mode, dur, cmd), 0)
+        error(("trace: 超时 %ds 被 kill（mode=%s duration=%s）。缩小 duration/ring_size 后重试；"
+            .. "命令：%s"):format(timeout, mode, dur and ("%.1f"):format(dur) or "-", cmd), 0)
     end
     if rc ~= 0 and (out == nil or out == "") then
         error(("trace: engine 退出码 %d 无输出；命令：%s"):format(rc, cmd), 0)
@@ -644,6 +686,16 @@ local schema = {
             json = { type = "boolean", description = "返回原始 JSON（可配合 json_out 落盘供 render 复用）" },
             json_out = { type = "string", description = "把 JSON 结果另存到这个路径" },
             json_in = { type = "string", description = "render：上一次 run 存的 JSON 路径" },
+            folded_in = {
+                type = "string",
+                description = "读外部 folded 文件出图（不要 probe、不要 root）："
+                    .. "luasamp 的 hook 采样产物。给了它 mode 默认 folded，flame/heat/rank 照常在 argv 里",
+            },
+            collapse = {
+                type = "boolean",
+                description = "folded_in 也折叠连续重复帧（默认不折：hook 采样的递归就是同一行号连续重复，"
+                    .. "折了会把深度压平）。只有喂内核 folded（含 unwind 噪声）才需要开",
+            },
             kind = { type = "string", enum = { "flame", "heat", "rank" }, description = "render：出哪种图" },
             out = { type = "string", description = "render：输出路径（.svg/.png）" },
             out_title = { type = "string", description = "render：图标题" },
@@ -661,7 +713,7 @@ function M.run(args, env)
     local action = tostring(args.action or "")
     if action == "" then
         action = (args.kind and args.json_in) and "render"
-            or (args.mode or args.probe or args.entry) and "run" or "status"
+            or (args.mode or args.probe or args.entry or args.folded_in) and "run" or "status"
     end
     if action == "status" then return do_status(lite_root(env)) end
     if action == "run" then return do_run(args, env) end
