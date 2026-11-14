@@ -196,10 +196,17 @@ int cache_sorted_remove(cache_t* cache, const char* key, size_t key_len) {
         } else if (cmp < 0) {
             right = mid;
         } else {
-            // 找到，swap-with-last 删除（O(1)）
-            sorted->offsets[mid] = sorted->offsets[sorted->count - 1];
+            // 找到：有序删除，memmove 填洞。
+            // 旧版用 swap-with-last（O(1)）但把数组打乱并置 dirty，导致下一次
+            // cache_sorted_remove 的 ensure_sorted 对全部 n 个 offset 重新 qsort：
+            // 中小库（count < CACHE_SKIPLIST_THRESHOLD 的 1e6，跳表没建）每次删除
+            // 都付一次 O(n log n) 全量 strcmp。实测 n=3200 单次 del ≈500µs，
+            // 而 put 只要 13µs；raw_keep 每轮淘汰消息就踩这条路径。
+            // 一次 memmove 是 O(n) 但只是搬 8 字节指针（3200 条 ≈25KB，几 µs），
+            // 换来 dirty 保持 0，后续二分免排序。
+            memmove(&sorted->offsets[mid], &sorted->offsets[mid + 1],
+                    (sorted->count - mid - 1) * sizeof(size_t));
             sorted->count--;
-            sorted->dirty = 1;
             
             // 如果跳表已启用，也删除跳表节点
             if (sorted->skiplist) {
