@@ -11,6 +11,7 @@ ssize_t read(int fd, void *buf, size_t n);
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, long offset);
 int close(int fd);
 int munmap(void *addr, size_t length);
+int getpid(void);
 struct timespec { long tv_sec; long tv_nsec; };
 int clock_gettime(int clk_id, struct timespec *tp);
 struct pollfd { int fd; short events; short revents; };
@@ -57,7 +58,23 @@ local function wf(p,s) local f=io.open(p,"w") if not f then return nil end local
 ------------------------------------------------------------------------
 -- 事件源：tracepoint / kprobe / uprobe 统一成 tracefs event id
 ------------------------------------------------------------------------
-local probes, probe_seq, kprobe_added = {}, 0, 0
+local probes, probe_seq = {}, 0
+-- tracefs 的探针名是**全局唯一**的（所有进程共用一套 kprobe_events）。
+-- 老写法 `lite_<seq>` 的 seq 从 0 开始，两个实例同时跑必然撞名：
+-- 后者 write 失败被报成「符号/偏移不存在」，而先退出的那个 cleanup 会按前缀
+-- 把所有 `lite_*` 一并删掉，把还在跑的实例的探针抽走（表现为中途 events 归零）。
+-- 名字里带上本进程 pid，cleanup 只删自己的，跨实例立刻安全。
+local MY_PID = tonumber(ffi.C.getpid()) or 0
+local PROBE_TAG = ("lite_%d_"):format(MY_PID)
+
+local function probe_owner(name)
+  return tonumber(name:match("^lite_(%d+)_%d+$") or "")
+end
+
+local function pid_alive(pid)
+  if not pid or pid <= 0 then return false end
+  return rf(("/proc/%d/comm"):format(pid)) ~= nil
+end
 
 local function parse_format(txt)
   local f = {}
@@ -71,7 +88,10 @@ local function parse_format(txt)
                   off  = tonumber(line:match("offset:(%d+)")),
                   size = tonumber(line:match("size:(%d+)")),
                   dyn  = decl:find("__data_loc") ~= nil,
-                  arr  = decl:find("%[%]") ~= nil,
+                  -- 数组声明是 "char prev_comm[16]" 或 "char[]"：只认 "[]" 会让
+                  -- 定长数组（TASK_COMM_LEN 这类最常见）走成数字分支，
+                  -- 输出 prev_comm=99（'c'）这种"看着像 pid"的垃圾。
+                  arr  = decl:find("%[%d*%]") ~= nil,
                   ptr  = decl:find("%*") ~= nil }
     end
   end
@@ -135,7 +155,7 @@ end
 
 local function reg_dynamic(kind, def, args)
   probe_seq = probe_seq + 1
-  local name = ("lite_%d"):format(probe_seq)
+  local name = PROBE_TAG .. probe_seq
   local file = (kind == "uprobe") and "/uprobe_events" or "/kprobe_events"
   local grp  = (kind == "uprobe") and "uprobes" or "kprobes"
   local line = "p:" .. name .. " " .. def
@@ -198,8 +218,15 @@ local function cleanup()
   for _, spec in ipairs({ {"/kprobe_events", "kprobes"}, {"/uprobe_events", "uprobes"} }) do
     local txt = rf(T .. spec[1]) or ""
     for line in txt:gmatch("[^\n]+") do
-      local name = line:match("^p:" .. spec[2] .. "/(lite_%d+)")
-      if name then wf(T .. spec[1], "-:" .. spec[2] .. "/" .. name .. "\n") end
+      local name = line:match("^p:" .. spec[2] .. "/(lite_%d+_%d+)")
+      if name then
+        local owner = probe_owner(name)
+        -- 只删自己的；顺手收掉「属主进程已经没了」的僵尸探针（崩溃/被 kill 的旧跑法），
+        -- 免得 tracefs 里越堆越多。还活着的别人的探针一律不碰。
+        if owner == MY_PID or not pid_alive(owner) then
+          wf(T .. spec[1], "-:" .. spec[2] .. "/" .. name .. "\n")
+        end
+      end
     end
   end
 end
@@ -271,12 +298,27 @@ end
 local function targets(pid, want_inherit, wakeup)
   local l = {}
   if pid then
+    if want_inherit then
+      -- count 模式要的是「整个进程（含之后 fork 出来的线程）的总数」：
+      -- 一条挂在 tgid 上、开 inherit 的事件就够了 —— 内核把子孙任务计进同一个计数器，
+      -- 我们读父 fd 拿到的就是总和。老写法「先按 tid 展开 + 每个都 inherit」会把
+      -- 同一个线程的计数按「自己 + 每个祖先继承链」重复算，total 虚高数倍。
+      -- 采样模式（ring）不能开 inherit（内核拒绝 mmap，见 ring 池注释），走下面的 tid 展开。
+      return { { pid = pid, cpu = -1, inherit = true, wakeup = wakeup, tid = pid } }
+    end
     local tids = task_tids(pid)
     if #tids == 0 then tids = { pid } end
     if #tids > MAX_TIDS then
-      io.stderr:write(("[trace_engine] 警告：pid %d 有 %d 个线程，超过上限 %d，只跟主线程\n")
-        :format(pid, #tids, MAX_TIDS))
-      tids = { pid }
+      -- 老实现超过上限就只跟主线程 —— 而那恰恰是最没有活干的那个线程，
+      -- 结果是「几乎采不到东西」而不是「精度略降」。改成取前 MAX_TIDS 个，
+      -- 并把丢掉的线程数说清楚（主线程 tid 最小，排序后一定在列表里）。
+      local own = #tids
+      local keep = {}
+      for i = 1, MAX_TIDS do keep[i] = tids[i] end
+      tids = keep
+      io.stderr:write(("[trace_engine] 警告：pid %d 有 %d 个线程，超过上限 %d，"
+        .. "只跟 tid 最小的 %d 个，其余 %d 个线程的样本会缺\n")
+        :format(pid, own, MAX_TIDS, MAX_TIDS, own - MAX_TIDS))
     end
     for _, t in ipairs(tids) do
       l[#l+1] = { pid = t, cpu = -1, inherit = want_inherit, wakeup = wakeup, tid = t }
@@ -436,24 +478,46 @@ end
 -- tracepoint 自带的 common_* 是引擎元数据（common_type 就是事件 id），不是负载
 local NOISE = { common_type = true, common_flags = true,
                 common_preempt_count = true, common_pid = true }
-local function decode(p, raw, pid, strfield)
+-- rl = 本条样本 RAW 的字节数（walk 传进来的），用来给变长字段封顶。
+-- 老写法对数组字段用 ffi.string(raw+off) 读到第一个 \0 为止：字段被填满（没有 \0）时
+-- 会越过本条记录继续读 ring 里后面的样本，输出乱码甚至读到 data 区之外。
+local function decode(p, raw, pid, strfield, rl)
   local out = {}
+  -- --str 指向的字段常常是**用户态指针**（sys_enter_openat 的 `const char *filename`），
+  -- 跨进程/跨 namespace 时 process_vm_readv 读不回来。内核同一条记录里通常还带了
+  -- 一份拷贝 `__data_loc char[] __filename_val`，所以读失败就回退到 `__<name>_val`，
+  -- 别直接报 `<0x...>` 让人以为工具坏了。
+  local missp
   for _, f in ipairs(p.fields) do
     local v
     if f.dyn then
       local dv = ffi.cast("uint32_t*", raw+f.off)[0]
       local o, l = bit.band(dv, 0xffff), bit.rshift(dv, 16)
+      if rl and rl > 0 and o + l > rl then l = (rl > o) and (rl - o) or 0 end
       v = (l > 0) and ffi.string(raw+o, l):gsub("%z.*$", "") or ""
     elseif f.arr then
-      v = ffi.string(raw+f.off)
+      local lim = f.size or 0
+      if lim <= 0 then lim = 16 end                     -- 罕见：format 没给 size，给个保守上界
+      if rl and rl > 0 then
+        local avail = rl - f.off
+        if avail < lim then lim = tonumber(avail) end
+      end
+      if lim < 0 then lim = 0 end
+      v = (lim > 0) and ffi.string(raw+f.off, lim):gsub("%z.*$", "") or ""
     elseif f.size == 8 then v = tonumber(ffi.cast("uint64_t*", raw+f.off)[0])
     elseif f.size == 4 then v = ffi.cast("uint32_t*", raw+f.off)[0]
     elseif f.size == 2 then v = ffi.cast("uint16_t*", raw+f.off)[0]
     else v = raw[f.off] end
     if strfield and f.name == strfield and type(v) == "number" then
-      v = read_cstr(pid, v) or ("<0x%x>"):format(v)
+      local s = read_cstr(pid, v)
+      if s and s ~= "" then v = s else missp = v end
     end
     if not NOISE[f.name] then out[f.name] = v end
+  end
+  if missp then
+    local alt = out["__" .. strfield .. "_val"]
+    -- 回退优先；都没有才退回指针字面量（至少还能自己拿 gdb 看是哪个地址）
+    out[strfield] = (type(alt) == "string" and alt ~= "") and alt or ("<0x%x>"):format(missp)
   end
   return out
 end
@@ -613,6 +677,10 @@ end
 ------------------------------------------------------------------------
 -- 直方图（us，log2 桶）
 ------------------------------------------------------------------------
+-- 桶 k 装 [2^k, 2^(k+1)) us（k=0 装 <1us），所以桶里没有单值：
+--   hist[].us = 桶下界（画图用，等比坐标下就是位置）
+--   p50/p99   = 命中桶的**区间中点**（1.5*2^k）
+-- 老实现直接拿下界 2^k 当分位数报，系统性偏小最多一倍 —— 读的人会以为 p99 没超预算。
 local function new_hist() return { n = 0, sum = 0, max = 0, b = {} } end
 local function hist_add(h, ns)
   h.n = h.n + 1
@@ -631,8 +699,9 @@ local function hist_json(h)
   local t50, t99 = math.floor(h.n*0.5+0.5), math.floor(h.n*0.99+0.5)
   for _, k in ipairs(ks) do
     acc = acc + h.b[k]
-    if not p50 and acc >= t50 then p50 = 2^k end
-    if not p99 and acc >= t99 then p99 = 2^k end
+    local mid = 1.5 * 2^k            -- 桶 [2^k, 2^(k+1)) 的中点，别拿下界当分位数
+    if not p50 and acc >= t50 then p50 = mid end
+    if not p99 and acc >= t99 then p99 = mid end
     out[#out+1] = { us = 2^k, count = h.b[k] }
   end
   return { count = h.n, avg_us = h.n > 0 and (h.sum/h.n/1000) or 0,
@@ -685,7 +754,7 @@ local function run_samples()
       walk(r, by_id, function(pr, pid, tid, tm, raw, rl, ccp, nr, cpu)
         total = total + 1
         if #out < opt.limit then
-          local ev = decode(pr, raw, pid, opt.strfield)
+          local ev = decode(pr, raw, pid, opt.strfield, rl)
           ev.pid, ev.tid, ev.time_ns = pid, tid, tm
           ev.cpu = cpu or r.cpu
           ev.probe, ev.comm = pr.name, comm_of(pid)
@@ -730,7 +799,7 @@ local function run_latency()
       walk(r, by_id, function(pr, pid, tid, tm, raw, rl, ccp, nr, c) 
         total = total + 1
         if pr.id == eid then
-          local ev = decode(pr, raw, pid, opt.strfield)
+          local ev = decode(pr, raw, pid, opt.strfield, rl)
           ev.pid, ev.tid, ev.cpu = pid, tid, c or r.cpu
           -- 同一 tid 可能有多条 entry 没等到 exit：排队，别用后一条覆盖前一条
           local q = pend[tid]
@@ -1270,10 +1339,10 @@ local function run_offcpu()
   local function drain()
     local newest = 0
     for _, r in ipairs(P.rings) do
-      walk(r, by_id, function(pr, pid, _tid, tm, raw, _rl, ccp, nr, cpu)
+      walk(r, by_id, function(pr, pid, _tid, tm, raw, rl, ccp, nr, cpu)
         total = total + 1
         if tm > newest then newest = tm end
-        local ev = decode(pr, raw, pid)
+        local ev = decode(pr, raw, pid, nil, rl)
         local ntid, ptid = tonumber(ev.next_pid), tonumber(ev.prev_pid)
         local line
         if ptid and ptid ~= 0 and hit(ptid) then
