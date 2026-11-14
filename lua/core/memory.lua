@@ -1044,6 +1044,9 @@ function M:recall(query, limit, opts)
     for _, w in ipairs(terms) do tstat[w] = { df = 0, w = 1 } end
 
     local seen, out, turns_kept = {}, {}, 0
+    -- 被原始字节预筛剪掉、连 JSON 都没解的条目数。它只用于把 IDF 的 n 还原成
+    -- 「不做预筛时的候选池大小」，保证打分结果与优化前逐位一致。
+    local pruned = 0
     local working_prefix = "/agent/working/"
     local KNOW = "/agent/knowledge/"
     local SESS = "/agent/session/"
@@ -1105,6 +1108,35 @@ function M:recall(query, limit, opts)
         end
         if seen[r.key] then return end
         seen[r.key] = true
+        -- 解码前按原始字节预筛。候选要得分，某个 term 必须出现在它的文本或 tags 里，
+        -- 而这两者（正文 + data.tags）都原样躺在 value 的 JSON 里。JSON 转义会让字面
+        -- 匹配失效（"\u4f18" 里没有「优」的字节），所以只在 value 不含反斜杠时才敢剪：
+        -- 没有转义 = 字节即文本，此时「一个 term 都不出现」与打分阶段的 hits>0 淘汰
+        -- 完全等价——它们命中数恒为 0，本来就进不了 kept，剪掉的只是 cjson 解码开销。
+        -- 实测真实查询能剪掉候选池的 5%~40%（长尾窄查询剪得最狠）。
+        -- 与打分口径严格对齐，否则就是误剪（真实回归：含大写 "LITE-42" 的条目
+        -- 在预筛阶段被剪掉，recall 直接返回 0）。打分比的是 hay=(text.." "..key):lower()，
+        -- 所以这里必须 ①大小写归一 ②把 key 也算进来（term 可能只命中 key 里的
+        -- 路径片段如 "turn/"），缺一不可。JSON 里 text 与 tags 都是原样字节，
+        -- 故「JSON 里一个 term 都没有」⟹「text 里没有」，剪掉的必然 hits==0。
+        if #terms > 0 and not r.value:find("\\", 1, true) then
+            local hit = false
+            for j = 1, #terms do
+                if r.value:find(terms[j], 1, true) then hit = true; break end
+            end
+            if not hit then
+                -- 原始字节没中才付小写拷贝（:lower 只动 ASCII，CJK 字节原样）。
+                local lowv = r.value:lower()
+                local lowk = r.key:lower()
+                for j = 1, #terms do
+                    local w = terms[j]
+                    if lowv:find(w, 1, true) or lowk:find(w, 1, true) then
+                        hit = true; break
+                    end
+                end
+            end
+            if not hit then pruned = pruned + 1; return end
+        end
         local ok, data = pcall(cjson.decode, r.value)
         -- 解码失败的条目不是「文本」，是坏数据（写一半、加密残留、二进制尾巴）。
         -- 早先回退成 { c = r.value } 会把这些字节原样拼进 prompt。
@@ -1209,17 +1241,34 @@ function M:recall(query, limit, opts)
 
     -- 统一打分：IDF（候选里到处出现 = 不值钱）+ 长度归一（长文命中更廉价）
     -- + 年龄衰减（30 天减半）。空/无命中直接淘汰，不再「人人 0.5」。
-    local n = #out
-    for _, it in ipairs(out) do
-        for _, w in ipairs(terms) do
-            if it.hay:find(w, 1, true) or it.tags_low:find(w, 1, true) then
+    -- n 是「不预筛时的候选池大小」：pruned 那些条目一个 term 都没命中，对 df 没有
+    -- 贡献，但旧版它们也计入 n，IDF 基数就用它，补回去打分结果才与旧版逐位相同。
+    local n = #out + pruned
+    -- 命中位图：第 j 个 term 命中本条目时置 bit(j-1)。上面 drain 一遍，下面打分
+    -- 直接查位，不再对 hay/tags_low 做第二趟子串查找（旧版两趟各 candidates×terms 次）。
+    -- terms 上限 32（build_terms 截断），正好一个 32 位掩码装得下。
+    local hbits, tbits = {}, {}
+    for i = 1, #out do
+        local it = out[i]
+        local hb, tb = 0, 0
+        for j = 1, #terms do
+            local w = terms[j]
+            if it.hay:find(w, 1, true) then
                 tstat[w].df = tstat[w].df + 1
+                hb = bit.bor(hb, bit.lshift(1, j - 1))
+            elseif it.tags_low:find(w, 1, true) then
+                tstat[w].df = tstat[w].df + 1
+                tb = bit.bor(tb, bit.lshift(1, j - 1))
             end
         end
+        hbits[i], tbits[i] = hb, tb
     end
     for _, w in ipairs(terms) do
         tstat[w].w = math.log(1 + (n + 1) / (tstat[w].df + 1))
     end
+    -- tot 是「所有 term 权重之和」，与候选条目无关，从逐条循环里提出来算一次。
+    local totw = 0
+    for _, w in ipairs(terms) do totw = totw + tstat[w].w end
     local now = os.time()
     -- 衰减半径按 kind 分开。原先一律 30 天减半，等于把刚做的「turn 永久化」在
     -- 打分阶段又抵消掉：存了 90 天的 turn decay≈0.25，同分必被新 turn 挤掉，
@@ -1229,15 +1278,16 @@ function M:recall(query, limit, opts)
     st.candidates = st.candidates + #out
     st.scans = (st.scans or 0) + scans
     local kept = {}
-    for _, it in ipairs(out) do
-        local hits, tot = 0, 0
-        for _, w in ipairs(terms) do
-            local tw = tstat[w].w
-            tot = tot + tw
-            if it.hay:find(w, 1, true) then
-                hits = hits + tw
-            elseif it.tags_low:find(w, 1, true) then
-                hits = hits + tw * 0.5
+    for i = 1, #out do
+        local it = out[i]
+        local hb, tb = hbits[i], tbits[i]
+        local hits = 0
+        for j = 1, #terms do
+            local b = bit.lshift(1, j - 1)
+            if bit.band(hb, b) ~= 0 then
+                hits = hits + tstat[terms[j]].w
+            elseif bit.band(tb, b) ~= 0 then
+                hits = hits + tstat[terms[j]].w * 0.5
             end
         end
         if hits > 0 then
@@ -1246,7 +1296,7 @@ function M:recall(query, limit, opts)
             local lenpen = it.kind == "epoch" and 1 or (1 / (1 + math.log(1 + #it.text / 600)))
             local age = it.ts and math.max(0, now - it.ts) or 0
             local decay = 1 / (1 + age / ((DECAY_DAYS[it.kind] or 30) * 86400))
-            it.score = (hits / math.max(tot, 1e-9)) * lenpen * decay * (WEIGHT[it.kind] or 1.0)
+            it.score = (hits / math.max(totw, 1e-9)) * lenpen * decay * (WEIGHT[it.kind] or 1.0)
             kept[#kept + 1] = it
         end
     end
