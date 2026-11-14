@@ -26,7 +26,11 @@ export LITE_ROOT="$ROOT"
 #
 # LUA_PATH / LUA_CPATH：项目路径在前，`;;` 展开默认路径，外部传入的追加在最后
 # （tools/lua.sh 就是靠这一点把 workspace 条目挂上来的）。
-export LUA_PATH="$ROOT/lua/?.lua;$ROOT/lua/?/init.lua;$ROOT/helper/?.lua;;${LUA_PATH:-}"
+# $ROOT/third_party/luajit/src/?.lua 提供 jit.* 的 Lua 侧模块（vmdef/v/dump/p），
+# 必须排在最前：`;;` 会展开到系统 /usr/local/share/luajit-2.1，那份 share 目录
+# 与随包二进制版本不一致时，`-jv`/require("jit.vmdef") 直接报
+# "LuaJIT core/library version mismatch"。
+export LUA_PATH="$ROOT/third_party/luajit/src/?.lua;$ROOT/lua/?.lua;$ROOT/lua/?/init.lua;$ROOT/helper/?.lua;;${LUA_PATH:-}"
 export LUA_CPATH="$ROOT/third_party/cjson/lua/5.1/?.so;$ROOT/build/?.so;$ROOT/lib/?.so;$ROOT/helper/?.so;;${LUA_CPATH:-}"
 
 # 预加载只做「把调用方给的绝对路径列表 dlopen 成 RTLD_GLOBAL」，

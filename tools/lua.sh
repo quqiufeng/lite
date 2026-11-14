@@ -88,7 +88,11 @@ else
 fi
 
 # workspace 条目排在最后：项目自带的模块和 .so 优先，插件不覆盖框架。
+# $ROOT/third_party/luajit/src/?.lua 排最前：jit.* 的 Lua 模块（vmdef/v/dump/p）
+# 必须与随包二进制同版本，否则 `;;` 展开到的系统 share 目录会报
+# "LuaJIT core/library version mismatch"。
 export LUA_PATH="\
+$ROOT/third_party/luajit/src/?.lua;\
 ./?.lua;./lua/?.lua;./?/init.lua;./helper/?.lua;./helper/lib/?.lua;\
 $WS/?.lua;$WS/lua/?.lua;$WS/?/init.lua;$WS/helper/?.lua;$WS/helper/lib/?.lua;;${LUA_PATH:-}"
 export LUA_CPATH="\
