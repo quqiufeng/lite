@@ -49,80 +49,119 @@ local function read_usage(obj)
 end
 
 -- 喂入任意片段，返回事件列表：{type="content", text=...}
+-- 热路径：每个 chunk 几十行、每行都要切行 + 解 JSON，所以这里全部用
+-- string.byte/sub/find 的显式下标版本，不做 gsub/pattern 匹配（它们各自
+-- 会新建一个字符串 + 跑一次 pattern 机，实测占本函数 25% 自身时间）。
+local s_byte, s_sub, s_find = string.byte, string.sub, string.find
+local CR, SP, TAB = 13, 32, 9
+
 function M.feed(p, chunk)
     local events = {}
     -- 用绝对游标切行，只在末尾留未完成的一行；避免每行都 sub 一次导致的
     -- O(lines²) 拷贝（一个 chunk 里塞几十行时非常明显）。
     local data = p.buf .. chunk
+    local total = #data
     local start = 1
+    local content, reasoning = p.content, p.reasoning
+    local nc, nr, ne = #content, #reasoning, 0
 
     while true do
-        local nl = data:find("\n", start, true)
+        local nl = s_find(data, "\n", start, true)
         if not nl then break end
-        local line = data:sub(start, nl - 1)
+        local line = s_sub(data, start, nl - 1)
         start = nl + 1
-        line = line:gsub("\r$", "")
+        local llen = #line
+        if llen > 0 and s_byte(line, llen) == CR then
+            line = s_sub(line, 1, llen - 1)
+            llen = llen - 1
+        end
 
         if line == "data: [DONE]" then
             p.done = true
-            start = #data + 1
+            start = total + 1
             break
         end
 
-        local payload = line:match("^data:%s*(.*)$")
-        if payload and payload ~= "" then
+        -- 只处理 "data:" 开头的行（含 SSE 注释 ": keep-alive" 与空行直接跳过）。
+        local payload
+        if llen > 5 and s_byte(line, 1) == 100 and s_sub(line, 1, 5) == "data:" then
+            local i = 6
+            local b = s_byte(line, i)
+            while b == SP or b == TAB do
+                i = i + 1
+                b = s_byte(line, i)
+            end
+            if i <= llen then payload = s_sub(line, i, llen) end
+        end
+
+        if payload then
             local ok, obj = pcall(cjson.decode, payload)
             if ok and type(obj) == "table" then
-                local usage = read_usage(obj)
-                if usage then
-                    p.usage = usage
-                    events[#events + 1] = { type = "usage", usage = usage }
+                -- usage 只在 include_usage 的最后一个 chunk 出现，先判空挡住
+                -- 每个 chunk 都进 read_usage。
+                if obj.usage ~= nil then
+                    local usage = read_usage(obj)
+                    if usage then
+                        p.usage = usage
+                        ne = ne + 1
+                        events[ne] = { type = "usage", usage = usage }
+                    end
                 end
-            end
-            if ok and type(obj) == "table" and obj.choices and obj.choices[1] then
-                local ch = obj.choices[1]
-                local d = ch.delta or {}
-                if type(d.reasoning_content) == "string" and d.reasoning_content ~= "" then
-                    p.reasoning[#p.reasoning + 1] = d.reasoning_content
-                    events[#events + 1] = { type = "reasoning", text = d.reasoning_content }
-                end
-                -- 思考阶段 content 可能为 JSON null（cjson 解成 lightuserdata）。
-                if type(d.content) == "string" and d.content ~= "" then
-                    p.content[#p.content + 1] = d.content
-                    events[#events + 1] = { type = "content", text = d.content }
-                end
-                if type(d.tool_calls) == "table" then
-                    for _, tc in ipairs(d.tool_calls) do
-                        local idx = (tonumber(tc.index) or p.tool_max) + 1
-                        if idx > p.tool_max then p.tool_max = idx end
-                        local acc = p.tool_calls[idx]
-                        if not acc then
-                            acc = {
-                                id = "",
-                                type = "function",
-                                ["function"] = { name = "", arguments = "" },
-                            }
-                            p.tool_calls[idx] = acc
-                        end
-                        if type(tc.id) == "string" then acc.id = tc.id end
-                        if type(tc.type) == "string" then acc.type = tc.type end
-                        local fn = tc["function"]
-                        if type(fn) == "table" then
-                            if type(fn.name) == "string" then
-                                acc["function"].name = acc["function"].name .. fn.name
+                local choices = obj.choices
+                local ch = type(choices) == "table" and choices[1] or nil
+                if type(ch) == "table" then
+                    -- 思考阶段 content 可能为 JSON null（cjson 解成 lightuserdata），
+                    -- delta 本身也可能缺失，所以一律 type 判。
+                    local d = ch.delta
+                    if type(d) ~= "table" then d = {} end
+                    local rc = d.reasoning_content
+                    if type(rc) == "string" and rc ~= "" then
+                        nr = nr + 1
+                        reasoning[nr] = rc
+                        ne = ne + 1
+                        events[ne] = { type = "reasoning", text = rc }
+                    end
+                    local ct = d.content
+                    if type(ct) == "string" and ct ~= "" then
+                        nc = nc + 1
+                        content[nc] = ct
+                        ne = ne + 1
+                        events[ne] = { type = "content", text = ct }
+                    end
+                    local dtc = d.tool_calls
+                    if type(dtc) == "table" then
+                        for _, tc in ipairs(dtc) do
+                            local idx = (tonumber(tc.index) or p.tool_max) + 1
+                            if idx > p.tool_max then p.tool_max = idx end
+                            local acc = p.tool_calls[idx]
+                            if not acc then
+                                acc = {
+                                    id = "",
+                                    type = "function",
+                                    ["function"] = { name = "", arguments = "" },
+                                }
+                                p.tool_calls[idx] = acc
                             end
-                            if type(fn.arguments) == "string" then
-                                acc["function"].arguments =
-                                    acc["function"].arguments .. fn.arguments
+                            if type(tc.id) == "string" then acc.id = tc.id end
+                            if type(tc.type) == "string" then acc.type = tc.type end
+                            local fn = tc["function"]
+                            if type(fn) == "table" then
+                                local fname, fargs = fn.name, fn.arguments
+                                local afn = acc["function"]
+                                if type(fname) == "string" then afn.name = afn.name .. fname end
+                                if type(fargs) == "string" then
+                                    afn.arguments = afn.arguments .. fargs
+                                end
                             end
                         end
                     end
+                    if ch.finish_reason then p.finish = ch.finish_reason end
                 end
-                if ch.finish_reason then p.finish = ch.finish_reason end
             end
         end
     end
-    p.buf = data:sub(start)
+    -- 没有残留半行时别 new 一个空串（每 chunk 一次，SSE 尾行常被切一半所以要留）。
+    p.buf = start > total and "" or s_sub(data, start, total)
     return events
 end
 
