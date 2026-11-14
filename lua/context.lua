@@ -32,6 +32,11 @@ function M.new(opts)
                 req_after_reset = 0,
                 miss_clean = 0,
                 req_clean = 0,
+                -- 位移账（只记真丢了消息的 trim）：次数的分母有了，才好算
+                -- 「平均位移 / 每次 trim 换回多少 miss」，而不是拿 reset 频次当成本。
+                dropped_msgs = 0,
+                dropped_chars = 0,
+                trim_events = 0,
                 -- 最近 N 条逐请求明细（{p=prompt,m=miss,r=reset种类}），只用于事后
                 -- 复盘抖动，不进 prompt、不影响派发；会被 save_usage 一起落盘。
                 miss_ring = {},
@@ -145,6 +150,13 @@ local function push_miss(s, entry)
     end
     entry.h = s.reset_hard or 0
     entry.q = (s.requests or 0) + 1
+    -- 位移量随条目一起存：事后复盘能直接算 miss/位移，不用再去翻 last_reset
+    -- （它是快照，被后续 reset 覆盖）。dc=丢弃字符，dm=丢弃条数。
+    if entry.r then
+        local lr = s.last_reset
+        entry.dc = tonumber(lr and lr.chars) or 0
+        entry.dm = tonumber(lr and lr.dropped) or 0
+    end
     ring[#ring + 1] = entry
     local over = #ring - M.MISS_RING
     if over > 0 then
@@ -178,7 +190,9 @@ function M:add_usage(u)
     local known = cache_known(u)
     local hit = known and (tonumber(u.cache_hit) or 0) or 0
     -- reset 标记在请求发出前由 note_cache_reset 埋下，这里消费掉：只有紧跟
-    -- reset 的那一条请求吃"整窗 miss"，再往后就重新命中新基座了。
+    -- reset 的那一条请求吃「位移 miss」（新基座第一次预填充），再往后新基座的
+    -- 单元已经落盘，又照常命中。注意位移 miss ≠ 整窗 miss：固定段照样命中，
+    -- 只有位移点之后的旧单元接不上，所以这一栏的均值反映的是**平均位移量**。
     local pending = s._pending_reset
     s._pending_reset = nil
     if not known then
@@ -262,10 +276,14 @@ function M:add_usage(u)
     end
 end
 
--- 前缀被 reset 的原因分两类，代价与频率完全不同，统计时必须分开看：
+-- 前缀被 reset 的原因分三类，代价与频率完全不同，统计时必须分开看：
 --   fold        —— 摘要压缩（LITE_COMPACT=1 的老策略），低频、一次性，压完还能命中新基座；
---   hard_window —— 丢弃优先（默认）下的硬上限兜底，直接把窗口从最新往回装，整窗 miss；
+--   hard_window —— 丢弃优先（默认）下的硬上限兜底，把窗口前沿往后挪一段；
 --   window      —— 手动 /compact N 的窗口滑动，每个请求都在动，命中率必然低。
+-- 三者的缓存代价都**不是**「整窗作废」：官方规则下缓存前缀是互相独立的完整单元，
+-- system+tools+摘要那一段照样命中，被作废的只是位移点之后、按旧偏移落盘的单元。
+-- 代价量级 ≈ 位移量（丢了多少字符），所以这里除了计次还累计 chars ——
+-- 判断「这轮命中率为什么掉」要看 miss/位移 的比值，不是 reset 的频次。
 -- 混成一个数的话，命中率一抖根本看不出是哪种，也就无从判断该调哪个旋钮。
 function M:note_cache_reset(kind, info)
     local s = self.session and self.session.usage
@@ -281,6 +299,14 @@ function M:note_cache_reset(kind, info)
         s.reset_other = (s.reset_other or 0) + 1
     end
     info = type(info) == "table" and info or {}
+    -- 位移账：只累计真正丢了消息的那几次（dropped>0），否则重试之类零位移的 reset
+    -- 会把「平均位移」摊薄。
+    local n_dropped = tonumber(info.dropped) or 0
+    if n_dropped > 0 then
+        s.dropped_msgs = (s.dropped_msgs or 0) + n_dropped
+        s.dropped_chars = (s.dropped_chars or 0) + (tonumber(info.chars) or 0)
+        s.trim_events = (s.trim_events or 0) + 1
+    end
     -- 埋标记给下一次 add_usage：只有紧跟 reset 的那条请求是新基座的第一次预填充。
     -- 连发两次（理论上不该有）留最后一个，种类以便覆盖真实 culprit。
     s._pending_reset = k
@@ -307,6 +333,7 @@ function M:restore_usage(u)
     for _, k in ipairs({ "requests", "prompt", "completion", "cache_hit",
         "cache_miss", "prefix_hit", "prefix_denom",
         "miss_after_reset", "req_after_reset", "miss_clean", "req_clean",
+        "dropped_msgs", "dropped_chars", "trim_events",
         "reset_fold", "reset_hard", "reset_window", "reset_other", "usage_unknown",
         "reset_epoch_requests" }) do
         s[k] = math.floor(tonumber(src[k]) or 0)
@@ -373,12 +400,22 @@ function M:reset_stats()
         ratio = reqs > 0 and (total / reqs) or nil,
         fold = fold, hard_window = hard, window = window, other = other,
         epoch_requests = since,
-        -- 二分归因：紧跟 reset 那条 vs 其余的平均 miss，差值就是 trim 一次的白付。
+        -- 二分归因：紧跟 reset 那条 vs 其余的平均 miss。注意差值的正确读法是
+        -- 「平均位移换来的额外 miss」—— 官方规则下位移 miss 不是整窗 miss，
+        -- 别把这个差当成窗口大小。
         miss_after_reset = (s.req_after_reset or 0) > 0
             and (s.miss_after_reset / s.req_after_reset) or nil,
         miss_clean = (s.req_clean or 0) > 0 and (s.miss_clean / s.req_clean) or nil,
         n_after_reset = s.req_after_reset or 0,
         n_clean = s.req_clean or 0,
+        -- 位移账：一次 trim 平均挪动多少（字符），以及「miss/位移」的比值。
+        -- 比值接近 1 = 代价就是位移本身（正常，无解也不必解）；
+        -- 远大于 1 = 位移之外还有别的东西在破前缀（system 字节变了/tools 顺序变了）。
+        trim_events = s.trim_events or 0,
+        dropped_msgs = s.dropped_msgs or 0,
+        dropped_chars = s.dropped_chars or 0,
+        trim_chars_avg = (s.trim_events or 0) > 0
+            and ((s.dropped_chars or 0) / s.trim_events) or nil,
     }
 end
 

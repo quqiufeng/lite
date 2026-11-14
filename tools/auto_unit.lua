@@ -835,6 +835,29 @@ do
     check(ctx.session.usage.last_reset.kind == "window"
         and ctx.session.usage.last_reset.dropped == 2, "last cache reset is recorded")
 
+    -- 位移账：官方缓存规则下 trim 的代价≈位移量，不是整窗作废。所以只在真丢了
+    -- 消息（dropped>0）时才累计 chars/次数；零位移的 reset（如 400 重试）不能摊薄均值。
+    local u0 = ctx.session.usage
+    local trim0, chars0 = u0.trim_events, u0.dropped_chars
+    ctx:note_cache_reset("other", { dropped = 0, chars = 0, retry = true })
+    check(u0.trim_events == trim0 and u0.dropped_chars == chars0,
+        "zero-displacement reset does not enter the trim ledger")
+    ctx:note_cache_reset("hard_window", { dropped = 4, chars = 9000 })
+    check(u0.trim_events == trim0 + 1 and u0.dropped_chars == chars0 + 9000,
+        "trim ledger accumulates displacement")
+    local rs = ctx:reset_stats()
+    check(rs and rs.trim_events == u0.trim_events and rs.dropped_chars == u0.dropped_chars,
+        "reset_stats exposes the trim ledger")
+    check(rs.trim_chars_avg and math.abs(rs.trim_chars_avg
+        - rs.dropped_chars / rs.trim_events) < 1e-6,
+        "reset_stats averages displacement per trim")
+    -- miss_ring 条目要自带位移量：last_reset 是快照会被后来的 reset 覆盖，
+    -- 复盘「这次 trim 贵在哪」只能靠随条目落盘的 dc/dm。
+    ctx:add_usage({ prompt = 30000, completion = 10, cache_hit = 20000, cache_miss = 10000 })
+    local tail = ctx.session.usage.miss_ring[#ctx.session.usage.miss_ring]
+    check(tail and tail.r == "hard_window" and tail.dc == 9000 and tail.dm == 4,
+        "miss_ring entry carries the displacement that caused it")
+
     -- 落盘再恢复：分账计数要跨进程活下来。
     local Mem = require("core.memory")
     local mdir = os.tmpname()
@@ -843,18 +866,24 @@ do
     local mem = assert(Mem.new({ dir = mdir }))
     ctx.session.usage.reset_fold = 4
     ctx.session.usage.reset_hard = 2
+    local saved_kind = ctx.session.usage.last_reset.kind
     check(mem:save_usage(ctx.session.id, ctx.session.usage), "usage saved")
     local loaded = mem:load_usage(ctx.session.id)
     check(loaded and loaded.reset_fold == 4 and loaded.reset_hard == 2,
         "cache reset counters persist")
+    -- 断言「落盘什么就恢复什么」，别写死种类：上面的位移账用例会改动 last_reset，
+    -- 写死 kind 等于测测试自己的副作用，不是测序列化。
     check(loaded and type(loaded.last_reset) == "table"
-        and loaded.last_reset.kind == "window", "last cache reset persists")
+        and loaded.last_reset.kind == saved_kind, "last cache reset persists")
     local back = Ctx.new({ api_key = "x" })
     check(back:restore_usage(loaded), "usage restored")
     check(back.session.usage.reset_fold == 4 and back.session.usage.reset_window == 1,
         "cache reset counters restored")
-    check(back.session.usage.last_reset and back.session.usage.last_reset.kind == "window",
+    check(back.session.usage.last_reset and back.session.usage.last_reset.kind == saved_kind,
         "last cache reset restored")
+    check(back.session.usage.trim_events == u0.trim_events
+        and back.session.usage.dropped_chars == u0.dropped_chars,
+        "trim ledger persists across processes")
     mem:close()
     os.execute("rm -rf " .. shq(mdir))
 end
@@ -3300,10 +3329,16 @@ do
         view[#view + 1] = { role = "assistant", content = string.rep("a", 800) }
     end
 
-    local out, trimmed, dropped = agent:hard_window(view, 6000)
+    local out, trimmed, dropped, dropped_chars = agent:hard_window(view, 6000)
     check(trimmed == true, "hard ceiling trims")
     check(dropped and dropped > 0, "hard ceiling reports dropped count")
     check(#out < #view, "hard ceiling shrinks prompt")
+    -- 位移量（第 4 个返回值）是 trim 真实缓存代价的量级，必须大于 0 且
+    -- 与丢弃条数量级一致（一条 ~800 字符）；给了 0 归因就退化成「凭感觉」。
+    check(dropped_chars and dropped_chars > 0,
+        "hard ceiling reports dropped chars (displacement)")
+    check(dropped_chars >= dropped * 100,
+        "displacement scales with dropped messages")
 
     local has_sys, has_digest = false, false
     for _, m in ipairs(out) do

@@ -496,6 +496,10 @@ elseif cmd == "state" or cmd == "--state" or cmd == "sessions" or cmd == "--sess
                     hard_window = tonumber(usage.reset_hard) or 0,
                     window = tonumber(usage.reset_window) or 0,
                     other = tonumber(usage.reset_other) or 0,
+                    -- 位移账：trim 的真实代价量级（丢了多少字符 / 平均每次丢多少）。
+                    -- 判前缀健康看 miss 与它的比值，别只看 reset 次数。
+                    trim_events = tonumber(usage.trim_events) or 0,
+                    dropped_chars = tonumber(usage.dropped_chars) or 0,
                 },
                 last_reset = usage.last_reset,
             }
@@ -1055,11 +1059,14 @@ elseif cmd == "--once" then
                 cache_unknown = u.cache_unknown or nil,
                 usage_unknown = total and total.usage_unknown or nil,
                 -- cache reset 分账：fold（摘要压缩）/ hard_window（丢弃兜底）/ window（/compact N）。
+                -- trim_events/dropped_chars 是位移账（真丢了消息的才算），用来算 miss/位移。
                 resets = total and {
                     fold = total.reset_fold or 0,
                     hard_window = total.reset_hard or 0,
                     window = total.reset_window or 0,
                     other = total.reset_other or 0,
+                    trim_events = total.trim_events or 0,
+                    dropped_chars = total.dropped_chars or 0,
                 } or nil,
             })
         end)

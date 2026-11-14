@@ -739,6 +739,9 @@ local USAGE_FIELDS = {
     -- 每请求 miss 二分归因：紧跟 reset 的那条 vs 其余。均值差 =
     -- "trim 一次平均白付多少 token"，与"新增内容本来不可缓存"分开看。
     "miss_after_reset", "req_after_reset", "miss_clean", "req_clean",
+    -- 位移账：官方缓存规则下 trim 的代价≈位移量（不是整窗作废），所以只在
+    -- 真丢了消息时才累计 chars，用来算「平均位移」和 miss/位移 比值。
+    "dropped_msgs", "dropped_chars", "trim_events",
     -- 没拿到真 usage（estimated 兜底）的请求数，不计入 cache_hit/cache_miss。
     "usage_unknown",
     -- reset 计数的起点（那一刻的 requests）。reset_* 是后加的字段，老快照里没有；
@@ -774,6 +777,10 @@ function M:save_usage(session_id, usage)
                     m = e.m and math.floor(tonumber(e.m) or 0) or nil,
                     u = e.u or nil,
                     r = e.r or nil,
+                    -- 位移量必须跟着条目落盘：复盘 miss/位移 全靠它，丢了就只剩
+                    -- 「这次 trim 贵」的结论，说不出贵在哪。
+                    dc = e.dc and math.floor(tonumber(e.dc) or 0) or nil,
+                    dm = e.dm and math.floor(tonumber(e.dm) or 0) or nil,
                 }
             end
         end

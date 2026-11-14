@@ -579,7 +579,7 @@ end
 -- 且连摘要都不剩（实测 prompt 8195 → 1231，模型得从头再来）。那比不压更差。
 --
 -- 返回 (msgs, trimmed, dropped_count)。trimmed=false 表示无可丢弃。
-function M:hard_window(msgs, budget)
+function M:hard_window(msgs, budget, hi_cap)
     local n = #msgs
     -- 前导的固定段：system prompt 与紧随其后的摘要块（view_messages 的布局）。
     -- 这些是压缩的产物，比中间的原始消息便宜得多，必须保留。
@@ -610,8 +610,65 @@ function M:hard_window(msgs, budget)
         start = start - 1
     end
 
+    -- 粘性前沿（sticky）：记住上一轮窗口的第一条，只要它还装得下就**不挪**。
+    --
+    -- 为什么值得（按官方缓存规则）：缓存前缀是**互相独立的完整单元**，落盘时机是
+    -- 「用户输入结束位置 / 模型输出结束位置 / 检测到的公共前缀 / 长输入按固定 token
+    -- 间隔」，命中要求整单元匹配 —— 所以挪动前沿**不会**让整窗作废：
+    -- system+摘要那一段永远是同一个单元，一直在命中。
+    -- 真正的代价是**位移量**：丢弃 k 条，[start..n] 那段原文就到了新的 token 偏移上，
+    -- 旧偏移落的单元接不上；位移越小，剩下来能命中的旧单元越多。
+    -- 实测（miss_ring，同一会话 24 条请求，真实 usage）：
+    --   丢 ~9k tokens → 紧跟那条 miss 12936 / 8798（≈位移量，不是 prompt 大小）
+    --   丢几条        → miss 248 / 267 / 290 / 341（几乎无损）
+    -- 所以「不挪」省的是位移量，不是整窗；而 pin 住前沿同时保住了尾巴的单元边界对齐。
+    -- 代价仍在：窗口目标降到 0.75×avail 才腾得出呼吸空间，平均少留一截原文 ——
+    -- 用它换「少位移」，而不是换「少一次整窗 miss」。
+    --
+    -- hi_cap：呼吸上限，由调用方夹在触发线以下；不让它把请求推过触发线，
+    -- 否则下一个请求又要裁，呼吸反而变成来回抖。
+    -- lo：要挪就挪到位（一次退到 0.7×目标），避免「每轮只挪一条」的连续 miss。
+    local hi = (hi_cap and hi_cap > budget) and hi_cap or budget
+    local lo = math.floor(budget * 0.7)
+    local anchor = self._hw_anchor
+    local function sum_from(s0)
+        local t = 0
+        for i0 = s0, n do t = t + Compact.msg_chars(msgs[i0]) end
+        return t
+    end
+    if anchor and msgs[anchor.i] and Compact.msg_chars(msgs[anchor.i]) == anchor.c
+        and msgs[anchor.i].role == anchor.role
+        and tostring(msgs[anchor.i].content or ""):sub(1, 32) == anchor.head then
+        if sum_from(anchor.i) <= hi then
+            -- 钉住锚点本身，不要 min(自然起点)：锚点比自然起点更靠后时，
+            -- min 会把前沿拉回自然位置，于是下一轮又往前挪一格——白白多一次位移
+            -- （每挪一格，位移点之后的旧缓存单元就换一批偏移，接不上）。
+            start = anchor.i
+        else
+            local s0 = anchor.i
+            while s0 <= n and sum_from(s0) > lo do s0 = s0 + 1 end
+            if s0 <= n then start = math.max(start, s0) end
+        end
+        -- 前沿动过之后守卫要重跑（user 不能被丢、tool 结果不能孤立开头）
+        if last_user and start > last_user then start = last_user end
+        while start > lead + 1 and start <= n and msgs[start].role == "tool" do
+            start = start - 1
+        end
+    end
+    self._hw_anchor = (start <= n) and {
+        i = start, c = Compact.msg_chars(msgs[start]), role = msgs[start].role,
+        head = tostring(msgs[start].content or ""):sub(1, 32),
+    } or nil
+
+    -- dropped_chars：被丢弃那段的字符量 = 前沿位移量，也就是这次 trim 的**真实**
+    -- 缓存代价量级（官方规则：代价≈位移，不是整窗）。调用方把它记进 last_reset，
+    -- 归因时用「miss / 位移」比「reset 率」有意义得多。
     local dropped = start - 1 - lead
-    if dropped < 1 then return msgs, false, 0 end
+    if dropped < 1 then return msgs, false, 0, 0 end
+    local dropped_chars = 0
+    for i = lead + 1, start - 1 do
+        dropped_chars = dropped_chars + Compact.msg_chars(msgs[i])
+    end
 
     local out = {}
     for i = 1, lead do out[#out + 1] = msgs[i] end
@@ -623,7 +680,7 @@ function M:hard_window(msgs, budget)
             .. "</session_context>",
     }
     for i = start, n do out[#out + 1] = msgs[i] end
-    return repair_tool_pairs(out), true, dropped
+    return repair_tool_pairs(out), true, dropped, dropped_chars
 end
 
 -- 组装发出去的完整消息列表：视图 + 召回块。
@@ -696,17 +753,36 @@ function M:request_messages(text, stream, opts)
         if avail < floor_chars then avail = floor_chars end
         -- 迟滞：丢完必须真的落回触发线以下，否则下一个请求又超线、又丢一次、
         -- 又是整段前缀 miss（实测旧公式丢完还剩 59.4k > 触发线 54.4k，33% 的
-        -- 请求都在丢历史）。留 budget/8 给下一轮增长。
+        -- 请求都在丢历史）。
         if not self._window_keep then
-            local after_max = math.floor(c:trigger() - head - c.budget / 8)
-            if after_max > floor_chars and avail > after_max then avail = after_max end
+            -- 固定 budget/8，**不要**改成「按上轮增长自适应」：算一下就知道它绑不上。
+            -- after_max = trigger - head - margin，而 keep 系给出 (budget-head)*0.6 ≈ 56k，
+            -- 自适应要生效必须 margin > trigger - head - 56k ≈ 19.4k，而它的上限是
+            -- 2×单次增长 ≤ 2×8192 = 16.4k（工具结果上限），单次请求增长到不了 9.7k
+            -- → 改了逐字节等价（实测同序列两次 A/B 完全一致，连 miss 数都一样）。
+            -- 真把它压到能绑上（窗口缩到 ~30k），可省 miss 反而翻倍（前沿位移 19→38/75）：
+            -- 窗口越小，新尾内容跨过边界越频繁，而每跨一次就是一次位移
+            -- （丢掉的那段 = 白付；固定段照样命中，所以是「多付位移」不是「整窗作废」）。
+            -- 压 miss 的杠杆在 hard_window 的 sticky 前沿，不在这里。
+            local margin = math.floor(c.budget / 8)
+            local after_max = math.floor(c:trigger() - head - margin)
+            -- 地板优先：after_max 跌破 floor 时**夹到 floor**，不能退回 keep 系的大值 ——
+            -- 否则正是在重工具轮（要收紧的时候）迟滞静默失效，等于没改。
+            if after_max < floor_chars then after_max = floor_chars end
+            if avail > after_max then avail = after_max end
         end
-        msgs, trimmed, dropped = self:hard_window(msgs, avail)
+        -- 目标窗口取 0.75×avail，把省下的 25% 当**呼吸空间**给粘性前沿用：
+        -- 前沿能在这段余量里不动，就不产生位移（miss≈位移量）。手动窗口（/compact N）
+        -- 不呼吸，它按用户指定的固定尺寸滑动。
+        local hw_budget, hw_hi = avail, avail
+        if not self._window_keep then hw_budget = math.floor(avail * 0.75) end
+        local hw_chars
+        msgs, trimmed, dropped, hw_chars = self:hard_window(msgs, hw_budget, hw_hi)
         if trimmed then
-            -- 手动窗口（/compact N）每轮都在滑动 → 每次都是整段 miss；它和自动硬上限
-            -- 是两回事，分账记，否则看不出命中率是被窗口模式拖的还是被兜底拖的。
+            -- 手动窗口（/compact N）每轮都在滑动 → 位移最大；它和自动硬上限是两回事，
+            -- 分账记，否则看不出命中率是被窗口模式拖的还是被兜底拖的。
             local reset = self._window_keep and "window" or "hard_window"
-            self.ctx:note_cache_reset(reset, { dropped = dropped })
+            self.ctx:note_cache_reset(reset, { dropped = dropped, chars = hw_chars })
             self.ctx:emit("compact", {
                 ok = false, reason = "hard ceiling", dropped = dropped,
                 reset = reset,
@@ -740,6 +816,8 @@ function M:request_messages(text, stream, opts)
     -- 本次真正发出去的规模，供下一轮用真实 usage 反推 chars→tokens。
     -- 必须计入 schema：API 回来的 prompt_tokens 包含工具定义，分母少了它，
     -- 比值会偏高 ~25%（30 个工具 ≈ 20k 字符），由它换算出的 token 触发线随之偏低。
+    -- 再留一格上一轮的值：迟滞要按「上一轮长了多少」自适应，而不是拍一个固定数。
+    self._prev_request_chars = self._last_request_chars
     self._last_request_chars = Compact.total(out) + self:schema_chars()
     return out
 end
@@ -1005,13 +1083,17 @@ function M:_loop(text, stream)
                 })
             else
                 local c = self:compactor()
-                local trimmed
-                retry_msgs, trimmed = self:hard_window(self:view_messages(),
+                local trimmed, r_dropped, r_chars
+                retry_msgs, trimmed, r_dropped, r_chars = self:hard_window(self:view_messages(),
                     math.floor(c.budget * 0.7))
                 -- 这条重试同样换了前缀基座，必须记一次 reset：漏了它，retry 之后
                 -- 那条请求就会被算进 miss_clean，把"trim 的白付成本"摊薄。
+                -- 但它**不是**一次 trim：记进 hard_window 会让 reset_hard 虚高
+                -- （老实现传 dropped=0，硬上限次数里混进了零位移的重试）。
+                -- 真丢了消息才进 hard_window，否则进 other。
                 if trimmed then
-                    self.ctx:note_cache_reset("hard_window", { dropped = 0, retry = true })
+                    self.ctx:note_cache_reset(r_dropped > 0 and "hard_window" or "other",
+                        { dropped = r_dropped, chars = r_chars, retry = true })
                 end
                 if not trimmed then retry_msgs = nil end
             end
