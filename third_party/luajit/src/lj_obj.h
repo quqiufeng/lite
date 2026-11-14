@@ -401,6 +401,7 @@ typedef struct GCproto {
 #define PROTO_FFI		0x04	/* Uses BC_KCDATA for FFI datatypes. */
 #define PROTO_NOJIT		0x08	/* JIT disabled for this function. */
 #define PROTO_ILOOP		0x10	/* Patched bytecode with ILOOP etc. */
+#define PROTO_BITOP		0x80	/* Uses bit operator bytecodes. */
 /* Only used during parsing. */
 #define PROTO_HAS_RETURN	0x20	/* Already emitted a return. */
 #define PROTO_FIXUP_RETURN	0x40	/* Need to fixup emitted returns. */
@@ -661,6 +662,7 @@ typedef struct global_State {
   MRef ctype_state;	/* Pointer to C type state. */
   PRNGState prng;	/* Global PRNG state. */
   GCRef gcroot[GCROOT_MAX];  /* GC roots. */
+  MRef saved_jit_base;  /* saved jit_base for lj_err_throw */
 } global_State;
 
 #define mainthread(g)	(&gcref(g->mainthref)->th)
@@ -702,6 +704,12 @@ struct lua_State {
   GCRef env;		/* Thread environment (table of globals). */
   void *cframe;		/* End of C stack frame chain. */
   MSize stacksize;	/* True stack size (incl. LJ_STACK_EXTRA). */
+  void *exdata;	        /* user extra data pointer. added by OpenResty */
+  void *exdata2;	/* the 2nd user extra data pointer. added by OpenResty */
+#if LJ_TARGET_ARM
+  uint32_t unused1;
+  uint32_t unused2;
+#endif
 };
 
 #define G(L)			(mref(L->glref, global_State))
@@ -1034,10 +1042,29 @@ LJ_ASMF LJ_CONSTF int64_t lj_vm_num2int_check(double x);
 ** The uint64_t conversion accepts the union of the unsigned + signed range.
 */
 LJ_ASMF LJ_CONSTF int64_t lj_vm_num2i64(double x);
-LJ_ASMF LJ_CONSTF int64_t lj_vm_num2u64(double x);
+LJ_ASMF LJ_CONSTF uint64_t lj_vm_num2u64(double x);
+
+#if LJ_TARGET_X86
+
+LJ_ASMF LJ_CONSTF int64_t lj_vm_num2i64_sse3(double x);
+LJ_ASMF LJ_CONSTF uint64_t lj_vm_num2u64_sse3(double x);
+LJ_ASMF int64_t (*lj_vm_num2i64_ptr)(double x);
+LJ_ASMF uint64_t (*lj_vm_num2u64_ptr)(double x);
+static LJ_AINLINE int64_t lj_num2i64(double x)
+{
+  return (*lj_vm_num2i64_ptr)(x);
+}
+static LJ_AINLINE uint64_t lj_num2u64(double x)
+{
+  return (*lj_vm_num2u64_ptr)(x);
+}
+
+#else
 
 #define lj_num2i64(x)		(lj_vm_num2i64((x)))
 #define lj_num2u64(x)		(lj_vm_num2u64((x)))
+
+#endif
 
 /* Lua BitOp conversion semantics use the 2^52 + 2^51 trick. */
 LJ_ASMF LJ_CONSTF int32_t lj_vm_tobit(double x);

@@ -21,6 +21,10 @@
 #include "lj_trace.h"
 #include "lj_vm.h"
 
+#if LJ_ARCH_PPC_ELFV2
+#include "lualib.h"
+#endif
+
 /* -- Target-specific handling of callback slots -------------------------- */
 
 #define CALLBACK_MCODE_SIZE	(LJ_PAGESIZE * LJ_NUM_CBPAGE)
@@ -72,7 +76,23 @@ static MSize CALLBACK_OFS2SLOT(MSize ofs)
 
 #elif LJ_TARGET_PPC
 
+#if LJ_ARCH_PPC_OPD
+
+#define CALLBACK_SLOT2OFS(slot)		(24*(slot))
+#define CALLBACK_OFS2SLOT(ofs)		((ofs)/24)
+#define CALLBACK_MAX_SLOT		(CALLBACK_OFS2SLOT(CALLBACK_MCODE_SIZE))
+
+#elif LJ_ARCH_PPC_ELFV2
+
+#define CALLBACK_SLOT2OFS(slot)		(4*(slot))
+#define CALLBACK_OFS2SLOT(ofs)		((ofs)/4)
+#define CALLBACK_MAX_SLOT		(CALLBACK_MCODE_SIZE/4 - 10)
+
+#else
+
 #define CALLBACK_MCODE_HEAD		24
+
+#endif
 
 #elif LJ_TARGET_MIPS32
 
@@ -103,13 +123,13 @@ static MSize CALLBACK_OFS2SLOT(MSize ofs)
 /* Convert callback slot number to callback function pointer. */
 static void *callback_slot2ptr(CTState *cts, MSize slot)
 {
-  return (uint8_t *)cts->cb.mcode + CALLBACK_SLOT2OFS(slot);
+  return lj_ptr_sign((void *)((uint8_t *)cts->cb.mcode + CALLBACK_SLOT2OFS(slot)), 0);
 }
 
 /* Convert callback function pointer to slot number. */
 MSize lj_ccallback_ptr2slot(CTState *cts, void *p)
 {
-  uintptr_t ofs = (uintptr_t)((uint8_t *)p -(uint8_t *)cts->cb.mcode);
+  uintptr_t ofs = (uintptr_t)((uint8_t *)lj_ptr_strip(p) - (uint8_t *)cts->cb.mcode);
   if (ofs < CALLBACK_MCODE_SIZE) {
     MSize slot = CALLBACK_OFS2SLOT((MSize)ofs);
     if (CALLBACK_SLOT2OFS(slot) == (MSize)ofs)
@@ -210,24 +230,59 @@ static void *callback_mcode_init(global_State *g, uint32_t *page)
   return p;
 }
 #elif LJ_TARGET_PPC
+#if LJ_ARCH_PPC_OPD
+register void *vm_toc __asm__("r2");
+static void *callback_mcode_init(global_State *g, uint64_t *page)
+{
+  uint64_t *p = page;
+  void *target = (void *)lj_vm_ffi_callback;
+  MSize slot;
+  for (slot = 0; slot < CALLBACK_MAX_SLOT; slot++) {
+    *p++ = (uint64_t)target;
+    *p++ = (uint64_t)vm_toc;
+    *p++ = (uint64_t)g | ((uint64_t)slot << 47);
+  }
+  return p;
+}
+#else
 static void *callback_mcode_init(global_State *g, uint32_t *page)
 {
   uint32_t *p = page;
   void *target = (void *)lj_vm_ffi_callback;
   MSize slot;
+#if LJ_ARCH_PPC_ELFV2
+  // Needs to be in sync with lj_vm_ffi_callback.
+  lua_assert(CALLBACK_MCODE_SIZE == 4096);
+  for (slot = 0; slot < CALLBACK_MAX_SLOT; slot++) {
+    *p = PPCI_B | (((page+CALLBACK_MAX_SLOT-p) & 0x00ffffffu) << 2);
+    p++;
+  }
+  *p++ = PPCI_LI | PPCF_T(RID_SYS1) | ((((intptr_t)target) >> 32) & 0xffff);
+  *p++ = PPCI_LI | PPCF_T(RID_R11) | ((((intptr_t)g) >> 32) & 0xffff);
+  *p++ = PPCI_RLDICR | PPCF_T(RID_SYS1) | PPCF_A(RID_SYS1) | PPCF_SH(32) | PPCF_M6(63-32);  /* sldi */
+  *p++ = PPCI_RLDICR | PPCF_T(RID_R11) | PPCF_A(RID_R11) | PPCF_SH(32) | PPCF_M6(63-32);  /* sldi */
+  *p++ = PPCI_ORIS | PPCF_A(RID_SYS1) | PPCF_T(RID_SYS1) | ((((intptr_t)target) >> 16) & 0xffff);
+  *p++ = PPCI_ORIS | PPCF_A(RID_R11) | PPCF_T(RID_R11) | ((((intptr_t)g) >> 16) & 0xffff);
+  *p++ = PPCI_ORI | PPCF_A(RID_SYS1) | PPCF_T(RID_SYS1) | (((intptr_t)target) & 0xffff);
+  *p++ = PPCI_ORI | PPCF_A(RID_R11) | PPCF_T(RID_R11) | (((intptr_t)g) & 0xffff);
+  *p++ = PPCI_MTCTR | PPCF_T(RID_SYS1);
+  *p++ = PPCI_BCTR;
+#else
   *p++ = PPCI_LIS | PPCF_T(RID_TMP) | (u32ptr(target) >> 16);
-  *p++ = PPCI_LIS | PPCF_T(RID_R12) | (u32ptr(g) >> 16);
+  *p++ = PPCI_LIS | PPCF_T(RID_R11) | (u32ptr(g) >> 16);
   *p++ = PPCI_ORI | PPCF_A(RID_TMP)|PPCF_T(RID_TMP) | (u32ptr(target) & 0xffff);
-  *p++ = PPCI_ORI | PPCF_A(RID_R12)|PPCF_T(RID_R12) | (u32ptr(g) & 0xffff);
+  *p++ = PPCI_ORI | PPCF_A(RID_R11)|PPCF_T(RID_R11) | (u32ptr(g) & 0xffff);
   *p++ = PPCI_MTCTR | PPCF_T(RID_TMP);
   *p++ = PPCI_BCTR;
   for (slot = 0; slot < CALLBACK_MAX_SLOT; slot++) {
-    *p++ = PPCI_LI | PPCF_T(RID_R11) | slot;
+    *p++ = PPCI_LI | PPCF_T(RID_R12) | slot;
     *p = PPCI_B | (((page-p) & 0x00ffffffu) << 2);
     p++;
   }
+#endif
   return p;
 }
+#endif
 #elif LJ_TARGET_MIPS
 static void *callback_mcode_init(global_State *g, uint32_t *page)
 {
@@ -553,6 +608,15 @@ void lj_ccallback_mcode_free(CTState *cts)
   if (ctype_isfp(ctr->info) && ctr->size == sizeof(float)) \
     ((float *)dp)[1] = *(float *)dp;
 
+#elif LJ_TARGET_S390X
+
+#define CALLBACK_HANDLE_REGARG \
+  if (isfp) { \
+    if (nfpr < CCALL_NARG_FPR) { sp = &cts->cb.fpr[nfpr++]; goto done; } \
+  } else { \
+    if (ngpr < maxgpr) { sp = &cts->cb.gpr[ngpr++]; goto done; } \
+  }
+
 #else
 #error "Missing calling convention definitions for this architecture"
 #endif
@@ -699,11 +763,24 @@ static void callback_conv_result(CTState *cts, lua_State *L, TValue *o)
 	*(int32_t *)dp = ctr->size == 1 ? (int32_t)*(int8_t *)dp :
 					  (int32_t)*(int16_t *)dp;
     }
+#if LJ_TARGET_PPC && LJ_ARCH_BITS == 64
+    if (ctr->size <= 4 &&
+       (ctype_isinteger_or_bool(ctr->info) || ctype_isenum(ctr->info))) {
+      if (ctr->info & CTF_UNSIGNED)
+        *(uint64_t *)dp = (uint64_t)*(uint32_t *)dp;
+      else
+        *(int64_t *)dp = (int64_t)*(int32_t *)dp;
+    }
+#endif
 #if LJ_TARGET_MIPS64 || (LJ_TARGET_ARM64 && LJ_BE)
     /* Always sign-extend results to 64 bits. Even a soft-fp 'float'. */
     if (ctr->size <= 4 &&
 	(LJ_ABI_SOFTFP || ctype_isinteger_or_bool(ctr->info)))
       *(int64_t *)dp = (int64_t)*(int32_t *)dp;
+#elif LJ_TARGET_X64
+    /* Always zero-extend results to 64 bits. */
+    if (ctr->size <= 4 && ctype_isinteger_or_bool(ctr->info))
+      *(uint64_t *)dp = (uint64_t)*(uint32_t *)dp;
 #endif
 #if LJ_TARGET_X86
     if (ctype_isfp(ctr->info))
@@ -718,12 +795,14 @@ lua_State * LJ_FASTCALL lj_ccallback_enter(CTState *cts, void *cf)
   lua_State *L = cts->L;
   global_State *g = cts->g;
   lj_assertG(L != NULL, "uninitialized cts->L in callback");
+  lj_assertG(!isdead(g, obj2gco(L)), "dead cts->L in callback");
   if (tvref(g->jit_base)) {
     setstrV(L, L->top++, lj_err_str(L, LJ_ERR_FFI_BADCBACK));
     if (g->panic) g->panic(L);
     exit(EXIT_FAILURE);
   }
   lj_trace_abort(g);  /* Never record across callback. */
+  setgcref(g->cur_L, obj2gco(L));
   /* Setup C frame. */
   cframe_prev(cf) = L->cframe;
   setcframe_L(cf, L);

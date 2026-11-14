@@ -57,6 +57,7 @@ LJ_FUNC GCtab *lj_tab_new_ah(lua_State *L, uint32_t a, uint32_t h);
 #if LJ_HASJIT
 LJ_FUNC GCtab * LJ_FASTCALL lj_tab_new1(lua_State *L, uint32_t ahsize);
 #endif
+LJ_FUNCA GCtab * lj_tab_dup_helper(lua_State *L, const GCtab *kt, int is_tab_clone);
 LJ_FUNCA GCtab * LJ_FASTCALL lj_tab_dup(lua_State *L, const GCtab *kt);
 LJ_FUNC void LJ_FASTCALL lj_tab_clear(GCtab *t);
 LJ_FUNC void LJ_FASTCALL lj_tab_free(global_State *g, GCtab *t);
@@ -89,5 +90,10 @@ LJ_FUNCA MSize LJ_FASTCALL lj_tab_len(GCtab *t);
 #if LJ_HASJIT
 LJ_FUNC MSize LJ_FASTCALL lj_tab_len_hint(GCtab *t, size_t hint);
 #endif
+
+LJ_FUNCA GCtab * LJ_FASTCALL lj_tab_clone(lua_State *L, const GCtab *src);
+LJ_FUNCA int LJ_FASTCALL lj_tab_isarray(const GCtab *src);
+LJ_FUNCA MSize LJ_FASTCALL lj_tab_nkeys(const GCtab *src);
+LJ_FUNCA int LJ_FASTCALL lj_tab_isempty(const GCtab *t);
 
 #endif

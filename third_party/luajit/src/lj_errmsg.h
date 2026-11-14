@@ -110,6 +110,8 @@ ERRDEF(NOJIT,	"no JIT compiler for this architecture (yet)")
 ERRDEF(NOJIT,	"JIT compiler permanently disabled by build option")
 #endif
 ERRDEF(JITOPT,	"unknown or malformed optimization flag " LUA_QS)
+ERRDEF(PRNGSTATE,     "PRNG state must be an array with up to 8 integers "
+                  "or an integer")
 
 /* Lexer/parser errors. */
 ERRDEF(XMODE,	"attempt to load chunk with wrong mode")
@@ -140,9 +142,14 @@ ERRDEF(XDOTS,	"cannot use " LUA_QL("...") " outside a vararg function")
 ERRDEF(XSYNTAX,	"syntax error")
 ERRDEF(XFOR,	LUA_QL("=") " or " LUA_QL("in") " expected")
 ERRDEF(XBREAK,	"no loop to break")
+ERRDEF(XCONT,	"no loop to continue")
 ERRDEF(XLUNDEF,	"undefined label " LUA_QS)
 ERRDEF(XLDUP,	"duplicate label " LUA_QS)
 ERRDEF(XGSCOPE,	"<goto %s> jumps into the scope of local " LUA_QS)
+ERRDEF(XCSCOPE,	"<continue> jumps into the scope of local " LUA_QS)
+ERRDEF(XCONSTA,	"attempt to assign to const variable " LUA_QS)
+ERRDEF(XCONSTR,	"attempt to re-declare const variable " LUA_QS)
+ERRDEF(XLINEDIR,	"malformed line number directive")
 
 /* Bytecode reader errors. */
 ERRDEF(BCFMT,	"cannot load incompatible bytecode")
@@ -179,6 +186,7 @@ ERRDEF(FFI_CBACKOV,	"too many callbacks")
 #endif
 ERRDEF(FFI_NYIPACKBIT,	"NYI: packed bit fields")
 ERRDEF(FFI_NYICALL,	"NYI: cannot call this C function (yet)")
+ERRDEF(FFI_NOTLOAD,	"ffi module not loaded (yet)")
 #endif
 
 #if LJ_HASBUFFER

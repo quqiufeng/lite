@@ -76,7 +76,7 @@ LJLIB_CF(os_rename)
 
 LJLIB_CF(os_tmpname)
 {
-#if LJ_TARGET_PS3 || LJ_TARGET_PS4 || LJ_TARGET_PS5 || LJ_TARGET_PSVITA || LJ_TARGET_NX
+#if LJ_TARGET_PS3 || LJ_TARGET_PS4 || LJ_TARGET_PS5 || LJ_TARGET_PSVITA || LJ_TARGET_NX || LJ_TARGET_IOS
   lj_err_caller(L, LJ_ERR_OSUNIQF);
   return 0;
 #else
@@ -186,6 +186,7 @@ LJLIB_CF(os_date)
 #endif
   } else {
 #if LJ_TARGET_POSIX
+    tzset();
     stm = localtime_r(&t, &rtm);
 #else
     stm = localtime(&t);
@@ -230,6 +231,7 @@ LJLIB_CF(os_date)
 LJLIB_CF(os_time)
 {
   time_t t;
+  errno = 0;
   if (lua_isnoneornil(L, 1)) {  /* called without args? */
     t = time(NULL);  /* get current time */
   } else {
@@ -245,7 +247,7 @@ LJLIB_CF(os_time)
     ts.tm_isdst = getboolfield(L, "isdst");
     t = mktime(&ts);
   }
-  if (t == (time_t)(-1))
+  if (t == (time_t)(-1) && errno != 0)
     lua_pushnil(L);
   else
     lua_pushnumber(L, (lua_Number)t);

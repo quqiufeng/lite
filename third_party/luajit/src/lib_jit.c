@@ -148,6 +148,66 @@ LJLIB_CF(jit_attach)
   return 0;
 }
 
+LJLIB_CF(jit_prngstate)
+{
+  GCtab *cur = lj_tab_new(L, 8, 0);
+
+#if LJ_HASJIT
+  int i;
+  jit_State *J = L2J(L);
+
+  /* The old state. */
+  for (i = 1; i <= 4; i++) {
+    setintV(lj_tab_setint(L, cur, i*2-1), J->prng.u[i-1] & 0xffffffff);
+    setintV(lj_tab_setint(L, cur, i*2), J->prng.u[i-1] >> 32);
+  }
+
+  /* We need to set new state using the input array. */
+  if (L->base < L->top && !tvisnil(L->base)) {
+    PRNGState prng;
+    if (tvisnumber(L->base)) {
+      TValue *o = L->base;
+
+      if (!tvisint(o) && ((double)(uint32_t)numV(o) != numV(o)))
+        lj_err_arg(L, 1, LJ_ERR_PRNGSTATE);
+
+      prng.u[0] = numberVint(o);
+      for (i = 1; i < 4; i++)
+        prng.u[i] = 0;
+    } else {
+      GCtab *t = lj_lib_checktab(L, 1);
+      int i = 1, len = lj_tab_len(t);
+
+      /* The input array must have at most 8 elements. */
+      if (len > 8)
+        lj_err_arg(L, 1, LJ_ERR_PRNGSTATE);
+
+      for (i = 1; i <= len; i++) {
+        cTValue *v = lj_tab_getint(t, i);
+
+        if (!tvisint(v) && (!tvisnum(v) || (double)(uint32_t)numV(v) != numV(v)))
+          lj_err_arg(L, 1, LJ_ERR_PRNGSTATE);
+
+        if (i & 1)
+          prng.u[(i-1)/2] = numberVint(v);
+        else
+          prng.u[(i-1)/2] = prng.u[(i-1)/2] | ((uint64_t)numberVint(v) << 32);
+      }
+      for (i /= 2; i < 4; i++)
+        prng.u[i] = 0;
+    }
+
+    /* Re-initialize the JIT prng. */
+    J->prng = prng;
+  }
+#else
+  for (int i = 1; i <= 8; i++)
+    setintV(lj_tab_setint(L, cur, i), 0);
+#endif
+  settabV(L, L->top++, cur);
+  return 1;
+}
+
 LJLIB_PUSH(top-5) LJLIB_SET(os)
 LJLIB_PUSH(top-4) LJLIB_SET(arch)
 LJLIB_PUSH(top-3) LJLIB_SET(version_num)
@@ -213,6 +273,7 @@ LJLIB_CF(jit_util_funcbc)
 {
   GCproto *pt = lj_lib_checkLproto(L, 1, 0);
   BCPos pc = (BCPos)lj_lib_checkint(L, 2);
+  int lineinfo = lj_lib_optint(L, 3, 0);
   if (pc < pt->sizebc) {
     BCIns ins = proto_bc(pt)[pc];
     BCOp op = bc_op(ins);
@@ -220,6 +281,11 @@ LJLIB_CF(jit_util_funcbc)
     setintV(L->top, ins);
     setintV(L->top+1, lj_bc_mode[op]);
     L->top += 2;
+    if (lineinfo) {
+      setintV(L->top, lj_debug_line(pt, pc));
+      L->top += 1;
+      return 3;
+    }
     return 2;
   }
   return 0;
@@ -340,11 +406,12 @@ LJLIB_CF(jit_util_tracek)
   return 0;
 }
 
-/* local snap = jit.util.tracesnap(tr, sn) */
+/* local snap = jit.util.tracesnap(tr, sn[, getpos]) */
 LJLIB_CF(jit_util_tracesnap)
 {
   GCtrace *T = jit_checktrace(L);
   SnapNo sn = (SnapNo)lj_lib_checkint(L, 2);
+  int getpos = (L->base+2 < L->top && tvistruecond(L->base+2));
   if (T && sn < T->nsnap) {
     SnapShot *snap = &T->snap[sn];
     SnapEntry *map = &T->snapmap[snap->mapofs];
@@ -357,6 +424,12 @@ LJLIB_CF(jit_util_tracesnap)
     for (n = 0; n < nent; n++)
       setintV(lj_tab_setint(L, t, (int32_t)(n+2)), (int32_t)map[n]);
     setintV(lj_tab_setint(L, t, (int32_t)(nent+2)), (int32_t)SNAP(255, 0, 0));
+    if (getpos) {
+      const BCIns *pc = snap_pc(&map[nent]), *startpc = pc;
+      while (bc_op(*startpc) < BC_FUNCF) startpc--;
+      setintV(L->top++, (int)(pc - startpc));
+      return 2;
+    }
     return 1;
   }
   return 0;
@@ -650,6 +723,12 @@ static uint32_t jit_cpudetect(void)
   uint32_t features[4];
   if (lj_vm_cpuid(0, vendor) && lj_vm_cpuid(1, features)) {
     flags |= ((features[2] >> 0)&1) * JIT_F_SSE3;
+#if LJ_TARGET_X86
+    if (flags) {
+      lj_vm_num2i64_ptr = lj_vm_num2i64_sse3;
+      lj_vm_num2u64_ptr = lj_vm_num2u64_sse3;
+    }
+#endif
     flags |= ((features[2] >> 19)&1) * JIT_F_SSE4_1;
     if (vendor[0] >= 7) {
       uint32_t xfeatures[4];
@@ -710,7 +789,8 @@ static uint32_t jit_cpudetect(void)
     if (x) flags |= JIT_F_MIPSXXR2;  /* Either 0x80000000 (R2) or 0 (R1). */
   }
 #endif
-
+#elif LJ_TARGET_S390X
+  /* No optional CPU features to detect (for now). */
 #else
 #error "Missing CPU detection for this architecture"
 #endif
