@@ -57,6 +57,9 @@ fi
 if [ -f "$ROOT/build/liblite_capture.so" ]; then
     cp "$ROOT/build/liblite_capture.so" "$DIST/lib/"
 fi
+if [ -f "$ROOT/build/liblite_tui.so" ]; then
+    cp "$ROOT/build/liblite_tui.so" "$DIST/lib/"
+fi
 
 # 随包的 ocr 库：只收「仓库内实体文件」。
 # 任何指向仓库外的软链（典型：CUDA provider 329MB 接的是系统

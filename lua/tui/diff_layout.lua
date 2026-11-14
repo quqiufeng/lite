@@ -1,6 +1,7 @@
 -- diff 视图布局：unified / split + wrap 高度 + 前缀和虚拟化。
 local utf8 = require("tui.utf8")
 local Diff = require("tui.diff")
+local TUI = require("ffi.tui")
 
 local M = {}
 M.__index = M
@@ -13,7 +14,9 @@ local function expand_tabs(s)
     return (tostring(s or ""):gsub("\t", string.rep(" ", TAB_WIDTH)))
 end
 
-local function wrap_segments(segs, width)
+-- 折行两条路径必须等价：C（lite_tui_wrap_segs，一次 FFI 调用走完整行）优先，
+-- 缺库时回退下面这份纯 Lua 实现。对拍在 tools/auto_unit.lua。
+local function wrap_segments_lua(segs, width)
     if width < 1 then width = 1 end
     local lines = { {} }
     local line = lines[1]
@@ -46,6 +49,17 @@ local function wrap_segments(segs, width)
     return lines
 end
 
+-- 返回「行 → 样式 run 列表」：同一段连续字符合成一个 run，比逐字符 cell
+-- 少一到两个数量级的 put 调用（大 diff 一帧省 ~150us）。
+local function wrap_segments(segs, width)
+    local lines = TUI.wrap_segs(segs, width)
+    if lines then return lines end
+    return wrap_segments_lua(segs, width)
+end
+
+-- 测试缝：tools/auto_unit.lua 拿它对拍 C 路径，生产代码别调。
+M._wrap_lua = wrap_segments_lua
+
 local function styled(segs, base, hl)
     local out = {}
     for _, s in ipairs(segs) do
@@ -61,8 +75,12 @@ local function one(text, style)
     return { { text = expand_tabs(text), style = style } }
 end
 
+-- 只要行数：走 C 的纯计数（不生成 run），比 wrap 便宜一个量级。
+-- 每条 diff 行构建时都要调一次，大 diff 这里占大头。
 local function count_lines(segs, width)
-    return #wrap_segments(segs, width)
+    local n = TUI.count_lines(segs, width)
+    if n then return n end
+    return #wrap_segments_lua(segs, width)
 end
 
 local function render_cells(screen, x, y, cells)

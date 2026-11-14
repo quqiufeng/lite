@@ -1,5 +1,6 @@
 -- unified diff 解析 / split 配对 / 行内词级 diff。
 local utf8 = require("tui.utf8")
+local TUI = require("ffi.tui")
 
 local M = {}
 
@@ -180,6 +181,58 @@ local function finish(list)
     return merged
 end
 
+-- 增量合并：C 给的是**正向**操作流，边遍历边并相邻同类段，
+-- 省掉「先攒反向列表、再整体反转、再合并」的两趟。
+local function push_seg(out, text, changed)
+    local last = out[#out]
+    if last and last.changed == changed then
+        last.text = last.text .. text
+    else
+        out[#out + 1] = { text = text, changed = changed }
+    end
+end
+
+-- token 字符串 → 小整数，C 侧只比整数（不碰字符串、不做哈希）。
+-- 编号状态 st = {map, n} 必须**跨 a/b 共用**：各自 intern 会让同一 token
+-- 拿到不同 ID、新 token 又从头编号撞上旧号，C 侧就会把不相等当相等。
+local function intern(list, st)
+    local ids, map, n = {}, st.map, st.n
+    for i = 1, #list do
+        local t = list[i]
+        local id = map[t]
+        if not id then
+            n = n + 1
+            id = n
+            map[t] = id
+        end
+        ids[i] = id
+    end
+    st.n = n
+    return ids
+end
+
+-- ops: 0=双方 1=只在左（删） 2=只在右（增），正向顺序
+local function assemble(a, b, ops, nops)
+    local left, right = {}, {}
+    local ia, ib = 1, 1
+    for k = 0, nops - 1 do
+        local op = ops[k]
+        if op == 0 then
+            push_seg(left, a[ia], false)
+            push_seg(right, b[ib], false)
+            ia = ia + 1
+            ib = ib + 1
+        elseif op == 1 then
+            push_seg(left, a[ia], true)
+            ia = ia + 1
+        else
+            push_seg(right, b[ib], true)
+            ib = ib + 1
+        end
+    end
+    return left, right
+end
+
 local function fallback(a, b)
     local n = math.min(#a, #b)
     local p = 0
@@ -221,6 +274,17 @@ function M.intraline(old, new)
     if #a == 0 and #b == 0 then return { left = {}, right = {} } end
     if #a > MAX_TOKENS or #b > MAX_TOKENS or #a * #b > MAX_AREA then
         local l, r = fallback(a, b)
+        return { left = l, right = r }
+    end
+
+    -- C 路径：LCS + 回溯在 C 里做（一次 FFI 调用），Lua 只按操作流并段。
+    -- 缺库或面积超限（DP 缓冲装不下）返回 nil，落到下面的纯 Lua DP。
+    local st = { map = {}, n = 0 }
+    local ai = intern(a, st)
+    local bi = intern(b, st)
+    local ops, nops = TUI.intraline(ai, #a, bi, #b)
+    if ops then
+        local l, r = assemble(a, b, ops, nops)
         return { left = l, right = r }
     end
 

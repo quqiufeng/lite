@@ -3747,6 +3747,16 @@ do
     check(rtxt == "local b = 3", "diff intraline right")
     check(lchg and rchg, "diff intraline changed")
 
+    -- 回归：两侧 token 必须共用一套编号。各自从头编号时，"x" 会和 "abc" 撞号
+    -- 被当成相等，整行渲染成全未变（行内 diff 静默失效，只看截图看不出来）。
+    -- 注意 "abc"/"xabc" 各自是一个 word token，撞号用例得用空格隔开。
+    local ins = D.intraline("abc", "x abc")
+    local l2, r2, l2chg = "", {}, false
+    for _, s in ipairs(ins.left) do l2 = l2 .. s.text; if s.changed then l2chg = true end end
+    for _, s in ipairs(ins.right) do r2[#r2 + 1] = (s.changed and "+" or "=") .. s.text end
+    check(l2 == "abc" and not l2chg, "diff intraline 左侧未变不误报")
+    check(table.concat(r2, "|") == "+x |=abc", "diff intraline 只标出新增的 x")
+
     local added = D.parse("diff --git a/new.txt b/new.txt\nnew file mode 100644\n"
         .. "--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,1 @@\n+hi\n")
     check(added[1].status == "added" and added[1].additions == 1, "diff parse added")
@@ -3754,6 +3764,95 @@ do
     local renamed = D.parse("diff --git a/old.lua b/new.lua\nsimilarity index 90%\n"
         .. "rename from old.lua\nrename to new.lua\n")
     check(renamed[1].status == "renamed" and renamed[1].path == "new.lua", "diff parse rename")
+end
+
+-- tui 文本内核：liblite_tui.so 的折行/行数/宽度必须与纯 Lua 参考实现逐位等价。
+-- C 路径是快路径，回退路径才是经常被单独跑到的那份；不 here 对拍就只能等线上看出错行。
+do
+    local TUI = require("ffi.tui")
+    local L = require("tui.diff_layout")
+    local utf8 = require("tui.utf8")
+    if not (TUI.available() and L._wrap_lua) then
+        print("SKIP tui text kernel：缺 liblite_tui.so（C 路径没编）")
+    else
+        -- 比较粒度是「每行的逐字符 (字符, 样式)」：run 边界允许不同
+        -- （C 会把同色相邻字符合并成一个 run，视觉一致、边界不该算差异）
+        local function render(lines)
+            local out = {}
+            for i = 1, #lines do
+                local chars = {}
+                for _, run in ipairs(lines[i]) do
+                    local t = tostring(run.text)
+                    local j = 1
+                    while j <= #t do
+                        local ch, nj = utf8.decode(t, j)
+                        if not ch then ch, nj = t:sub(j, j), j + 1 end
+                        chars[#chars + 1] = tostring(run.style) .. "\1" .. ch
+                        j = nj
+                    end
+                end
+                out[i] = table.concat(chars, "\2")
+            end
+            return (table.concat(out, "\3"):gsub("\1", "|"):gsub("\2", "/"):gsub("\3", "#"))
+        end
+        local function segstr(segs)
+            local p = {}
+            for _, x in ipairs(segs) do
+                p[#p + 1] = tostring(x.style) .. ":" .. (x.text or ""):gsub("\t", "\\t")
+            end
+            return table.concat(p, " ")
+        end
+
+        -- 注意：真实调用点先 expand_tabs，含 \t 的段是测试专供的边界
+        local pieces = { "a", "中", "🎉", "ｱ", " ", "ab", "e\u{301}", "x_1", "->", "\t" }
+        local styles = { "red", "green", nil }
+        math.randomseed(20261114)
+
+        local bad_wrap, bad_count, cases = 0, 0, 0
+        for _ = 1, 400 do
+            local segs = {}
+            for s = 1, math.random(0, 5) do
+                segs[s] = {
+                    text = pieces[math.random(#pieces)]:rep(math.random(0, 4)),
+                    style = styles[math.random(#styles)],
+                }
+            end
+            local width = math.random(1, 14)
+            local c_lines, c_n = TUI.wrap_segs(segs, width)
+            local l_lines = L._wrap_lua(segs, width)
+            cases = cases + 1
+            if render(c_lines) ~= render(l_lines) then
+                bad_wrap = bad_wrap + 1
+                if bad_wrap == 1 then
+                    print("FAIL wrap segs=[" .. segstr(segs) .. "] width=" .. width)
+                    print("  C: " .. render(c_lines))
+                    print("  L: " .. render(l_lines))
+                end
+            end
+            if c_n ~= #l_lines then bad_count = bad_count + 1 end
+            if TUI.count_lines(segs, width) ~= #l_lines then bad_count = bad_count + 1 end
+        end
+        check(bad_wrap == 0, "tui wrap_segs 折行与纯 Lua 一致（" .. cases .. " 例）")
+        check(bad_count == 0, "tui count_lines 行数与纯 Lua 一致")
+
+        -- width / cells：宽度对得上，且 cell 三元组要正好切分字符串
+        local bad_w, bad_c = 0, 0
+        for _ = 1, 200 do
+            local s = pieces[math.random(#pieces)]:rep(math.random(1, 6))
+            if TUI.width(s) ~= utf8.width_str(s) then bad_w = bad_w + 1 end
+            local buf, n = TUI.cells(s)
+            local pos, sum = 0, 0
+            for k = 0, (n or 0) - 1 do
+                local b, len, w = buf[k * 3], buf[k * 3 + 1], buf[k * 3 + 2]
+                if b ~= pos then bad_c = bad_c + 1; break end
+                pos = pos + len
+                sum = sum + w
+            end
+            if pos ~= #s or sum ~= utf8.width_str(s) then bad_c = bad_c + 1 end
+        end
+        check(bad_w == 0, "tui width 与 utf8.width_str 一致")
+        check(bad_c == 0, "tui cells 切分/宽度与 utf8 一致")
+    end
 end
 
 -- diff layout / virtualization

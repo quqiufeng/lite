@@ -47,6 +47,16 @@ set_target_properties(lite_image PROPERTIES
     BUILD_RPATH "$ORIGIN"
     INSTALL_RPATH "$ORIGIN")
 
+# TUI 文本内核（宽度/折行/cell/行内 diff）：纯 C，无外部依赖。
+# 对应 lua/ffi/tui.lua；找不到时 Lua 侧自动回退纯 Lua 实现。
+add_library(lite_tui SHARED src/tui/text.c)
+target_compile_options(lite_tui PRIVATE -O2 -Wall -Wextra)
+set_target_properties(lite_tui PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+    OUTPUT_NAME lite_tui
+    BUILD_RPATH "$ORIGIN"
+    INSTALL_RPATH "$ORIGIN")
+
 add_library(lite_capture SHARED src/x11/capture.c)
 target_include_directories(lite_capture PRIVATE ${X11_INCLUDE_DIR} ${PNG_INCLUDE_DIRS})
 target_link_libraries(lite_capture PRIVATE ${X11_LIBRARIES} ${PNG_LIBRARIES} m)
