@@ -207,6 +207,8 @@ size_t cache_hash_lookup(cache_t* cache, const char* key, size_t key_len);
 // 排序数组操作
 int cache_sorted_init(cache_t* cache);
 int cache_sorted_insert(cache_t* cache, size_t entry_offset);
+// 批量场景（全量加载/compact 重建）：追加 + dirty，一次 qsort 收尾。
+int cache_sorted_append(cache_t* cache, size_t entry_offset);
 int cache_sorted_remove(cache_t* cache, const char* key, size_t key_len);
 size_t cache_sorted_find_lower_bound(cache_t* cache, const char* key, size_t key_len);
 size_t cache_sorted_find_upper_bound(cache_t* cache, const char* key, size_t key_len);

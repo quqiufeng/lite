@@ -99,23 +99,70 @@ int cache_sorted_init(cache_t* cache) {
     return 0;
 }
 
-// O(1) 插入：直接追加到末尾，标记 dirty
-int cache_sorted_insert(cache_t* cache, size_t entry_offset) {
+// O(1) 追加：末尾塞一个 offset 并置 dirty，排序留给下一次 ensure_sorted。
+// 只给批量场景用（全量加载/compact 重建/批量窗口）：那里 N 次插入只该付一次 qsort。
+int cache_sorted_append(cache_t* cache, size_t entry_offset) {
     if (!cache) return -1;
-    
+
     cache_sorted_array_t* sorted = &cache->sorted;
-    
+
     if (ensure_capacity(sorted, sorted->count + 1) < 0) return -1;
-    
+
     sorted->offsets[sorted->count] = entry_offset;
     sorted->count++;
-    sorted->dirty = 1;  // 标记需要重新排序
-    
-    // 如果跳表已启用，也插入到跳表
+    sorted->dirty = 1;
+
     if (sorted->skiplist) {
         cache_entry_header_t* h = (cache_entry_header_t*)CACHE_PTR(cache, entry_offset);
         const char* key = (const char*)CACHE_PTR(cache, entry_offset + sizeof(cache_entry_header_t));
         cache_skiplist_insert(cache, sorted->skiplist, entry_offset, key, h->key_len);
+    }
+
+    return 0;
+}
+
+// 稳态插入：数组本来有序就按序插（二分 + memmove，O(n) 搬指针），dirty 保持 0。
+// 老版无论何时都「末尾追加 + dirty=1」，于是稳态 put 之后的第一次 del/范围查询又付
+// 一次全量 qsort：实测 put 0.7µs → put+del 195µs(n=3200)/690µs(n=10000)，而 memory
+// 的 raw_keep 每轮都是「先 put 再 del」，正好把这条路径踩满。
+// 反着改回「永远追加」会让稳态写变慢几十倍；反过来「永远二分插入」会让批量加载退化
+// 成 O(n²)，所以两条路都留着，由 dirty/defer 分流。
+int cache_sorted_insert(cache_t* cache, size_t entry_offset) {
+    if (!cache) return -1;
+
+    cache_sorted_array_t* sorted = &cache->sorted;
+
+    // 批量窗口、或数组已经脏（正在批量灌）：追加最省，排序统一交 ensure_sorted。
+    if (cache->sorted_defer || sorted->dirty) {
+        return cache_sorted_append(cache, entry_offset);
+    }
+
+    if (ensure_capacity(sorted, sorted->count + 1) < 0) return -1;
+
+    cache_entry_header_t* h = (cache_entry_header_t*)CACHE_PTR(cache, entry_offset);
+    const char* key = (const char*)CACHE_PTR(cache, entry_offset + sizeof(cache_entry_header_t));
+    size_t key_len = h->key_len;
+
+    // upper_bound：等 key 的旧 entry 之后插入（删除按 key 二分时能命中任意一条）
+    size_t left = 0, right = sorted->count;
+    while (left < right) {
+        size_t mid = left + (right - left) / 2;
+        if (compare_key_with_entry(key, key_len, cache, sorted->offsets[mid]) < 0) {
+            right = mid;
+        } else {
+            left = mid + 1;
+        }
+    }
+    if (left < sorted->count) {
+        memmove(&sorted->offsets[left + 1], &sorted->offsets[left],
+                (sorted->count - left) * sizeof(size_t));
+    }
+    sorted->offsets[left] = entry_offset;
+    sorted->count++;
+
+    // 如果跳表已启用，也插入到跳表
+    if (sorted->skiplist) {
+        cache_skiplist_insert(cache, sorted->skiplist, entry_offset, key, key_len);
     }
     
     return 0;

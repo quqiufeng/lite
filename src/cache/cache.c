@@ -443,7 +443,9 @@ cache_t* cache_open_ex(const char* db_dir, size_t max_memory, unsigned flags) {
                 if (!(header->flags & CACHE_ENTRY_DELETED)) {
                     char* key = (char*)CACHE_PTR(cache, offset + sizeof(cache_entry_header_t));
                     cache_hash_insert(cache, offset, key, header->key_len);
-                    cache_sorted_insert(cache, offset);
+                    // 全量扫描是批量场景：O(1) 追加，排序留给一次 ensure_sorted。
+                    // 走 cache_sorted_insert 会变成 N 次二分插入 = O(n²)。
+                    cache_sorted_append(cache, offset);
                     cache_ns_add(cache, key, offset);
                     // 跳过 tag 索引重建（电子书内容不需要 tag 搜索）
                     // cache_tag_index_add(cache, offset, value, header->value_len);
@@ -1207,7 +1209,8 @@ size_t cache_compact(cache_t* cache) {
         h = (cache_entry_header_t*)CACHE_PTR(cache, off);
         const char* key = (const char*)CACHE_PTR(cache, off + sizeof(cache_entry_header_t));
         const char* value = key + h->key_len + 1;
-        cache_sorted_insert(cache, off);
+        // compact 重建同属批量场景：追加 + 最后统一排序。
+        cache_sorted_append(cache, off);
         cache_ns_add(cache, key, off);
         cache_tag_index_add(cache, off, value, h->value_len);
         off += total;
