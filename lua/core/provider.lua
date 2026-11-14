@@ -54,6 +54,8 @@ end
 -- 会新建一个字符串 + 跑一次 pattern 机，实测占本函数 25% 自身时间）。
 local s_byte, s_sub, s_find = string.byte, string.sub, string.find
 local CR, SP, TAB = 13, 32, 9
+-- 缺 delta 的 chunk（usage-only / 空 choices）共用一个空表：别在热循环里 new。
+local EMPTY = {}
 
 function M.feed(p, chunk)
     local events = {}
@@ -113,7 +115,7 @@ function M.feed(p, chunk)
                     -- 思考阶段 content 可能为 JSON null（cjson 解成 lightuserdata），
                     -- delta 本身也可能缺失，所以一律 type 判。
                     local d = ch.delta
-                    if type(d) ~= "table" then d = {} end
+                    if type(d) ~= "table" then d = EMPTY end
                     local rc = d.reasoning_content
                     if type(rc) == "string" and rc ~= "" then
                         nr = nr + 1
@@ -150,7 +152,11 @@ function M.feed(p, chunk)
                                 local afn = acc["function"]
                                 if type(fname) == "string" then afn.name = afn.name .. fname end
                                 if type(fargs) == "string" then
-                                    afn.arguments = afn.arguments .. fargs
+                                    -- 参数是流式分片来的，可能几十 KB / 上百片：
+                                    -- 直接 `..` 是 O(n²) 拷贝（§5.7），先塞表，M.finish 一次拼。
+                                    local ab = acc._abuf
+                                    if not ab then ab = {}; acc._abuf = ab end
+                                    ab[#ab + 1] = fargs
                                 end
                             end
                         end
@@ -170,7 +176,17 @@ function M.finish(p)
     if p.tool_max > 0 then
         local tcs = {}
         for i = 1, p.tool_max do
-            if p.tool_calls[i] then tcs[#tcs + 1] = p.tool_calls[i] end
+            local tc = p.tool_calls[i]
+            if tc then
+                -- 流式期间参数在 _abuf 里（见 M.feed），这里一次性拼好并清掉缓冲，
+                -- 保证发出去的结构里只有 OpenAI 的字段。
+                local ab = tc._abuf
+                if ab then
+                    tc["function"].arguments = table.concat(ab)
+                    tc._abuf = nil
+                end
+                tcs[#tcs + 1] = tc
+            end
         end
         if #tcs > 0 then msg.tool_calls = tcs end
     end

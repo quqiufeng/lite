@@ -22,12 +22,8 @@ local function wrap_segments_lua(segs, width)
     local line = lines[1]
     local col = 0
 
-    local function newline()
-        lines[#lines + 1] = {}
-        line = lines[#lines]
-        col = 0
-    end
-
+    -- 不建 `newline` 闭包：它在这里一建就是 FNEW + 结尾 UCLO，整条 trace 作废
+    -- （luajit.md §5.1）。只有两个调用点，直接内联。
     for _, seg in ipairs(segs) do
         local text = seg.text or ""
         local style = seg.style
@@ -36,10 +32,16 @@ local function wrap_segments_lua(segs, width)
             local ch, ni, cp = utf8.decode(text, i)
             if not ch then ch, ni, cp = text:sub(i, i), i + 1, text:byte(i) end
             if ch == "\n" then
-                newline()
+                lines[#lines + 1] = {}
+                line = lines[#lines]
+                col = 0
             else
                 local cw = utf8.width(ch, cp)
-                if col + cw > width and col > 0 then newline() end
+                if col + cw > width and col > 0 then
+                    lines[#lines + 1] = {}
+                    line = lines[#lines]
+                    col = 0
+                end
                 line[#line + 1] = { text = ch, style = style }
                 col = col + cw
             end
@@ -81,6 +83,23 @@ local function count_lines(segs, width)
     local n = TUI.count_lines(segs, width)
     if n then return n end
     return #wrap_segments_lua(segs, width)
+end
+
+-- 每行都要用，但闭包不能建在 `_add_*_row` 里：那是「每 diff 行一次 FNEW」，
+-- 大 diff 直接把 trace 打散（luajit.md §5.1）。改成收 self 的模块局部函数。
+local function num_prefix(self, n, sign, base)
+    return { text = sign .. self:_num(n) .. " ", style = base }
+end
+
+local function split_side(self, row, num, base, hl, segs)
+    if not row then
+        return { { text = string.rep(" ", self.lnw) .. " ", style = "diff_num" } }
+    end
+    local cells = { { text = self:_num(num) .. " ", style = "diff_num" } }
+    for _, c in ipairs(styled(segs or one(row.text, base), base, hl)) do
+        cells[#cells + 1] = c
+    end
+    return cells
 end
 
 local function render_cells(screen, x, y, cells)
@@ -167,37 +186,33 @@ function M:_num(n)
 end
 
 function M:_add_unified_row(p)
-    local function prefix(n, sign, base)
-        return { text = sign .. self:_num(n) .. " ", style = base }
-    end
-
     if p.kind == "ctx" then
-        local cells = { prefix(p.left.new, " ", "diff_ctx") }
+        local cells = { num_prefix(self, p.left.new, " ", "diff_ctx") }
         cells[#cells + 1] = { text = expand_tabs(p.left.text), style = "diff_ctx" }
         self:_add_row({ kind = "ctx", cells = cells, height = count_lines(cells, self.width) })
     elseif p.kind == "del" then
         local base = "diff_del"
-        local cells = { prefix(p.left.old, "-", base) }
+        local cells = { num_prefix(self, p.left.old, "-", base) }
         for _, c in ipairs(styled(p.left_segs or one(p.left.text, base), base, "diff_del_hl")) do
             cells[#cells + 1] = c
         end
         self:_add_row({ kind = "del", cells = cells, height = count_lines(cells, self.width) })
     elseif p.kind == "add" then
         local base = "diff_add"
-        local cells = { prefix(p.right.new, "+", base) }
+        local cells = { num_prefix(self, p.right.new, "+", base) }
         for _, c in ipairs(styled(p.right_segs or one(p.right.text, base), base, "diff_add_hl")) do
             cells[#cells + 1] = c
         end
         self:_add_row({ kind = "add", cells = cells, height = count_lines(cells, self.width) })
     elseif p.kind == "change" then
         local lbase, abase = "diff_del", "diff_add"
-        local lc = { prefix(p.left.old, "-", lbase) }
+        local lc = { num_prefix(self, p.left.old, "-", lbase) }
         for _, c in ipairs(styled(p.left_segs or one(p.left.text, lbase), lbase, "diff_del_hl")) do
             lc[#lc + 1] = c
         end
         self:_add_row({ kind = "del", cells = lc, height = count_lines(lc, self.width) })
 
-        local ac = { prefix(p.right.new, "+", abase) }
+        local ac = { num_prefix(self, p.right.new, "+", abase) }
         for _, c in ipairs(styled(p.right_segs or one(p.right.text, abase), abase, "diff_add_hl")) do
             ac[#ac + 1] = c
         end
@@ -206,30 +221,19 @@ function M:_add_unified_row(p)
 end
 
 function M:_add_split_row(p)
-    local function side(row, num, base, hl, segs)
-        if not row then
-            return { { text = string.rep(" ", self.lnw) .. " ", style = "diff_num" } }
-        end
-        local cells = { { text = self:_num(num) .. " ", style = "diff_num" } }
-        for _, c in ipairs(styled(segs or one(row.text, base), base, hl)) do
-            cells[#cells + 1] = c
-        end
-        return cells
-    end
-
     local left_cells, right_cells
     if p.kind == "ctx" then
-        left_cells = side(p.left, p.left.old, "diff_ctx", "diff_ctx")
-        right_cells = side(p.right, p.right.new, "diff_ctx", "diff_ctx")
+        left_cells = split_side(self, p.left, p.left.old, "diff_ctx", "diff_ctx")
+        right_cells = split_side(self, p.right, p.right.new, "diff_ctx", "diff_ctx")
     elseif p.kind == "del" then
-        left_cells = side(p.left, p.left.old, "diff_del", "diff_del_hl", p.left_segs)
-        right_cells = side(nil)
+        left_cells = split_side(self, p.left, p.left.old, "diff_del", "diff_del_hl", p.left_segs)
+        right_cells = split_side(self, nil)
     elseif p.kind == "add" then
-        left_cells = side(nil)
-        right_cells = side(p.right, p.right.new, "diff_add", "diff_add_hl", p.right_segs)
+        left_cells = split_side(self, nil)
+        right_cells = split_side(self, p.right, p.right.new, "diff_add", "diff_add_hl", p.right_segs)
     else
-        left_cells = side(p.left, p.left.old, "diff_del", "diff_del_hl", p.left_segs)
-        right_cells = side(p.right, p.right.new, "diff_add", "diff_add_hl", p.right_segs)
+        left_cells = split_side(self, p.left, p.left.old, "diff_del", "diff_del_hl", p.left_segs)
+        right_cells = split_side(self, p.right, p.right.new, "diff_add", "diff_add_hl", p.right_segs)
     end
 
     self:_add_row({

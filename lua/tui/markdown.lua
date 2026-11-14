@@ -12,25 +12,21 @@ local function inline(text, base)
     local segs = {}
     local i = 1
     while i <= #text do
+        -- 不许在这里建闭包：循环内 FNEW + 出口 UCLO 会让 inline 整条 trace abort
+        -- （-jv: NYI: bytecode FNEW at markdown.lua:21 / UCLO at :47）
         local bs, be, bstyle, btext, burl
 
-        local function consider(s, e, style, txt, url)
-            if s and (not bs or s < bs) then
-                bs, be, bstyle, btext, burl = s, e, style, txt, url
-            end
-        end
-
         local s, e, v = text:find("`([^`]*)`", i)
-        consider(s, e, "code", v)
+        if s and (bs == nil or s < bs) then bs, be, bstyle, btext, burl = s, e, "code", v end
 
         s, e, v = text:find("%*%*([^%*]+)%*%*", i)
-        consider(s, e, "bold", v)
+        if s and (bs == nil or s < bs) then bs, be, bstyle, btext, burl = s, e, "bold", v end
 
         s, e, v = text:find("%*([^%*]+)%*", i)
-        consider(s, e, "italic", v)
+        if s and (bs == nil or s < bs) then bs, be, bstyle, btext, burl = s, e, "italic", v end
 
         local ls, le, lt, lu = text:find("%[([^%]]+)%]%(([^%)]+)%)", i)
-        consider(ls, le, "link", lt, lu)
+        if ls and (bs == nil or ls < bs) then bs, be, bstyle, btext, burl = ls, le, "link", lt, lu end
 
         if not bs then
             push(segs, text:sub(i), base)
@@ -101,12 +97,8 @@ function M.wrap(line, width)
     width = math.max(1, width)
     local out = { {} }
     local cur, col = out[1], 0
-
-    local function newline()
-        out[#out + 1] = {}
-        cur = out[#out]
-        col = 0
-    end
+    -- 内联 newline，不建闭包：带 upvalue 的 local function 在函数出口触发
+    -- UCLO abort（-jv: NYI: bytecode UCLO at markdown.lua:128），整条 wrap 录不住
 
     for _, seg in ipairs(line.segs or {}) do
         local text = seg.text or ""
@@ -115,10 +107,12 @@ function M.wrap(line, width)
             local ch, ni, cp = utf8.decode(text, i)
             if not ch then ch, ni, cp = text:sub(i, i), i + 1, text:byte(i) end
             if ch == "\n" then
-                newline()
+                out[#out + 1] = {}; cur = out[#out]; col = 0
             else
                 local w = utf8.width(ch, cp)
-                if col + w > width and col > 0 then newline() end
+                if col + w > width and col > 0 then
+                    out[#out + 1] = {}; cur = out[#out]; col = 0
+                end
                 cur[#cur + 1] = { text = ch, style = seg.style }
                 col = col + w
             end

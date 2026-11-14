@@ -167,15 +167,17 @@ function M:build_lines(w)
             if #lines > 0 then lines[#lines + 1] = { text = "", style = "default" } end
 
             if b.kind == "assistant" then
-                local key = w .. "|" .. text
-                if b._md_key ~= key then
+                -- 缓存键直接用字符串本身：Lua 字符串内部化，`==` 是 O(1) 指针比较；
+                -- 而 `w .. "|" .. text` 每帧都为整段文本拷一份（§5.7）。
+                if b._md_key ~= text or b._md_w ~= w then
                     local wrapped = {}
                     for _, mline in ipairs(Markdown.render(text)) do
                         for _, cells in ipairs(Markdown.wrap(mline, w)) do
                             wrapped[#wrapped + 1] = cells
                         end
                     end
-                    b._md_key = key
+                    b._md_key = text
+                    b._md_w = w
                     b._md_cells = wrapped
                 end
                 for _, cells in ipairs(b._md_cells or {}) do

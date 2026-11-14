@@ -185,7 +185,7 @@ function M:schema_chars()
     if not tools then return 0 end
     local n = 0
     if self._schema_chars_n then return self._schema_chars_n end
-    local ok, list = pcall(function() return tools:schemas() end)
+    local ok, list = pcall(tools.schemas, tools)
     if not ok or type(list) ~= "table" then return 0 end
     local enc = require("cjson").encode
     for i = 1, #list do

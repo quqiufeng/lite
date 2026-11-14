@@ -999,8 +999,7 @@ function M:session_messages(session_id, limit)
     return msgs, math.max(max_n, tonumber(meta and meta.turns) or 0)
 end
 
-function M:prune_session_messages(session_id, keep)
-    local id = tostring(session_id)
+function M:prune_session_messages(session_id, keep)    local id = tostring(session_id)
     local meta = self:session_meta(id)
     local count = tonumber(meta and meta.messages) or 0
     keep = tonumber(keep) or 200
@@ -1015,6 +1014,33 @@ function M:prune_session_messages(session_id, keep)
         end
     end
     return removed
+end
+
+-- 白名单判定：每个候选条目都要过一遍，所以放在模块层收参数调用——
+-- 建在 recall 里就是每次 FNEW，外层扫描循环整条 trace 作废（luajit.md §5.1）。
+-- 只放「长期事实」和「会话内可复用的轮次/工作笔记」：原始 transcript
+-- （/<sid>/msg/<seq>）和 <sid>/meta 一律不注入——msg 是逐条原始 JSON，一条就能
+-- 吃掉整个字符预算，还会把最近几轮的原文反复塞给模型。
+local KNOW_PREFIX = "/agent/knowledge/"
+local SESS_PREFIX = "/agent/session/"
+
+local function allowed_kind(key, allow_transcript)
+    if key:sub(1, #KNOW_PREFIX) == KNOW_PREFIX then return "fact" end
+    if key:sub(1, #SESS_PREFIX) == SESS_PREFIX then
+        local rest = key:sub(#SESS_PREFIX + 1)
+        local kind = rest:match("^[^/]+/([^/]+)/")
+        if kind == "turn" then return "turn" end
+        -- epoch：每 N 轮折叠出的跨轮结论。它的存在就是为了「一次 recall 就能
+        -- 拿到阶段性答案」，所以直连白名单，权重也高于单轮 turn。
+        if kind == "epoch" then return "epoch" end
+        if kind == "working" then return "working" end
+        -- 原始 transcript：自动注入只放 user 原文（用户自己的话不过期）；
+        -- 显式 recall 时额外放 assistant/tool（kind="trunc"，低权重、有截断），
+        -- 否则 hard_window 丢掉的 tool 结果就是黑洞——文案让模型 recall，
+        -- 却什么也捞不回来。
+        if kind == "msg" then return allow_transcript and "trunc" or "user" end
+    end
+    return nil
 end
 
 function M:recall(query, limit, opts)
@@ -1055,8 +1081,6 @@ function M:recall(query, limit, opts)
     -- 「不做预筛时的候选池大小」，保证打分结果与优化前逐位一致。
     local pruned = 0
     local working_prefix = "/agent/working/"
-    local KNOW = "/agent/knowledge/"
-    local SESS = "/agent/session/"
 
     -- 显式 recall（opts.transcript=true）才允许翻 assistant/tool 原文：
     -- 自动注入永远只要 user 原话，中间产物一条都不进每轮 prompt。
@@ -1066,28 +1090,7 @@ function M:recall(query, limit, opts)
     -- 头 1200 字足够定位，要看全文再 recall 一次更窄的词或直接重跑命令。
     local transcript_max = tonumber(opts.transcript_max) or 1200
 
-    -- 白名单：只放「长期事实」和「会话内可复用的轮次/工作笔记」进来。
-    -- 原始 transcript（/<sid>/msg/<seq>）和 <sid>/meta 一律不注入：msg 是逐条原始
-    -- JSON，一条就能吃掉整个字符预算，还会把最近几轮的原文反复塞给模型。
-    local function allowed(key)
-        if key:sub(1, #KNOW) == KNOW then return "fact" end
-        if key:sub(1, #SESS) == SESS then
-            local rest = key:sub(#SESS + 1)
-            local kind = rest:match("^[^/]+/([^/]+)/")
-            if kind == "turn" then return "turn" end
-            -- epoch：每 N 轮折叠出的跨轮结论。它的存在就是为了「一次 recall 就能
-            -- 拿到阶段性答案」，所以直连白名单，权重也高于单轮 turn。
-            if kind == "epoch" then return "epoch" end
-            if kind == "working" then return "working" end
-            -- 原始 transcript：自动注入只放 user 原文（用户自己的话不过期）；
-            -- 显式 recall 时额外放 assistant/tool（kind="trunc"，低权重、有截断），
-            -- 否则 hard_window 丢掉的 tool 结果就是黑洞——文案让模型 recall，
-            -- 却什么也捞不回来。
-            if kind == "msg" then return allow_transcript and "trunc" or "user" end
-        end
-        return nil
-    end
-
+    -- 白名单判定见模块层 allowed_kind（每次 recall 按条目调用，不能在热循环里建闭包）。
     -- epoch 排在 fact 与 working 之间：它比单轮 turn 更值钱（跨轮结论），
     -- 但仍不该盖过人工 remember 下来的长期事实。
     -- kinds：显式收窄到某一层。recall(query, kind="fact") 这种指令不该被
@@ -1105,7 +1108,7 @@ function M:recall(query, limit, opts)
         -- 目录级 /agent/working（wake 调度状态、todos 兜底）属于运行态：
         -- 既不该跨会话注入，也不该被 tag 检索带进来。
         if r.key:sub(1, #working_prefix) == working_prefix then return end
-        local kind = allowed(r.key)
+        local kind = allowed_kind(r.key, allow_transcript)
         if not kind then return end
         -- kind 过滤放在 add()：白名单外的类别根本不进候选池。这样 df/IDF 也只在
         -- 同一层里估，不会被另一层的词频带偏（fact 里的「文件」不该压低 turn 里

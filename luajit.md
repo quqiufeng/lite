@@ -347,6 +347,30 @@ for i = 1, n do if not t[i] then b = b + 1 end end
 `hotloop` 默认 56，短循环（`n < 56`）根本录不到。**优化前后都要保证 n 足够大**，
 否则测到的是「没热」，不是「没收益」。
 
+### 5.15 全仓过一遍的结论（2026-11-14，253 个 .lua）
+
+方法三件套：`./tools/lite-lua -jv lua/main.lua --tui --snapshot`（看 abort）、`-jp`（看时间去哪）、
+静态扫描（只报**循环体内**的 FNEW/CONCAT/pattern/PATH/建表）。结论：**热路径基本已经合规**，
+`-jv` 跑真实 TUI 渲染**零 NYI abort**；剩下能改的都是「一次性动作」，按 §5.11/§5.14 不改。
+
+| 区域 | 频率 | 判定 | 处置 |
+|---|---|---|---|
+| `core/provider.lua:feed` | 每 SSE chunk | 纯 `find`/下标、无 pattern | 工具参数分片累积原本 `..` 是 O(n²) → 改 `_abuf` 表 + `finish` 一次拼：合成 40KB/200 片 **2.08×**，产出逐字节一致；缺 delta 的 chunk 共用 `EMPTY` 空表 |
+| `core/text.lua:sanitize` | 每请求全量历史 | 零分配 `utf8_ok` 快速路径 | 不动 |
+| `core/memory.lua` 打分 | 每轮 | `hbits/tbits` 位掩码、`totw` 已提到循环外 | 不动 |
+| `tui/screen.lua:put` | 逐格逐帧 | `utf8.decode` 一次 + 无 FNEW | 不动 |
+| `tui/diff_layout.lua` | 每 diff 行 | `prefix`/`side` 每行 FNEW；`wrap_segments_lua` 的 `newline` 闭包 | 都提到模块层/内联：大 diff **1.01×**（耗时在 C 的 `count_lines`），真收益在 abort——`-jv` 跑单测 `diff_layout.lua:49 UCLO×32 + :29 FNEW×25` → **0** |
+| `core/memory.lua:recall` | 每轮、每条候选 | `allowed(key)` 闭包建在扫描循环外但每次 recall 一次（§5.1） | 提成模块层 `allowed_kind(key, allow_transcript)`；`-jv` 的 `memory.lua:1089 FNEW×5` → **0** |
+| `core/agent.lua:schema_chars` | 每次 rebuild 一次 | `pcall(function() return tools:schemas() end)`（§5.2） | `pcall(tools.schemas, tools)`：零闭包 |
+| `tui/transcript.lua:build_lines` | 每帧缓存未命中 | 键 `w.."\|"..text` 每次重建拷整段 | 直接比字符串（内部化 = O(1)）；帧内命中原缓存，**不改倍率** |
+| `core/tools.lua`、`compact.lua`、`session.lua`、`agent.lua` | 每轮/每工具一次 | 有 `..`/`format`/`pairs`，但都 ≤32KB 单次 | 不动（§5.14） |
+| `helper/*.lua`、`lua/charts/*`、`lua/trace/*` | 一次性动作/生成 | `pcall(function…)` 在 3 次重试里、路径拼接 | 不动 |
+
+**教训**：先在**真实工作负载**上取 `-jv`/`-jp`，别对静态命中列表动手——静态扫描 4454 行命中里，
+真热且真违规的只有 provider 的工具参数累积一处；纯 Lua 侧改 FNEW 的倍率通常 <1.1×，
+大头在 C（字符计数、wrap、cjson）。`helper/` 的 `pcall(function…)` 看着像 §5.2 反例，
+但它在 3 次重试循环里、每次动作只跑一次，改它只有折旧风险。
+
 ---
 
 ## 6 测量规范（血泪四条）
