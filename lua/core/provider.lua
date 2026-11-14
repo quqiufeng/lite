@@ -3,6 +3,10 @@ local cjson = require("cjson")
 local http = require("core.http")
 local Text = require("core.text")
 
+-- 进程内追踪账本（trace.prof）：模型 API 的 TTFB / 总时长 / 重试次数。
+local ok_prof, prof = pcall(require, "trace.prof")
+if not ok_prof then prof = nil end
+
 local M = {}
 
 function M.new_parser()
@@ -438,20 +442,33 @@ end
 -- 阻塞请求（--once / 单测）；429/5xx/网络错误重试。
 function M.stream(messages, tools, opts, on_delta, on_reasoning)
     local max_retries = tonumber(opts.max_retries) or 2
+    local p_t0 = prof and prof.now_ms()
+    local p_ttfb
+    local function p_first()
+        if p_t0 and not p_ttfb then p_ttfb = prof.now_ms() end
+    end
+    local function p_done(ok)
+        if not p_t0 then return end
+        prof.record("api.stream", prof.now_ms() - p_t0, ok)
+        if p_ttfb then prof.hist("api.ttfb_ms", p_ttfb - p_t0) end
+    end
     local emitted = false
     local function d(t)
         emitted = true
+        p_first()
         if on_delta then on_delta(t) end
     end
     local function r(t)
         emitted = true
+        p_first()
         if on_reasoning then on_reasoning(t) end
     end
 
     local last_err
     for attempt = 0, max_retries do
+        if prof and attempt > 0 then prof.count("api.retry") end
         local url, headers, payload, err = build_request(messages, tools, opts)
-        if not url then return nil, err end
+        if not url then p_done(false); return nil, err end
 
         local parser = M.new_parser()
         -- [埋点] 流式：真 usage 与兜底估值都从这一个上报口出去（且只出去一次）。
@@ -482,6 +499,7 @@ function M.stream(messages, tools, opts, on_delta, on_reasoning)
                 if opts.debug then opts.debug:log("usage_estimated", M.estimate_usage(payload, res)) end
                 u(M.estimate_usage(payload, res))
             end
+            p_done(true)
             return res
         end
         if rc ~= 0 then
@@ -491,10 +509,12 @@ function M.stream(messages, tools, opts, on_delta, on_reasoning)
         end
 
         if emitted or attempt >= max_retries or not M.retryable(last_err) then
+            p_done(false)
             return nil, last_err
         end
         os.execute("sleep " .. tostring(0.5 * (attempt + 1)))
     end
+    p_done(false)
     return nil, last_err
 end
 
@@ -550,27 +570,42 @@ end
 -- 协程入口：yield {kind="http", req=...}；可重试时重新发起请求。
 function M.stream_async(messages, tools, opts, on_delta, on_reasoning)
     local max_retries = tonumber(opts.max_retries) or 2
+    local p_t0 = prof and prof.now_ms()
+    local p_ttfb
+    local function p_first()
+        if p_t0 and not p_ttfb then p_ttfb = prof.now_ms() end
+    end
+    local function p_done(ok)
+        if not p_t0 then return end
+        prof.record("api.stream", prof.now_ms() - p_t0, ok)
+        if p_ttfb then prof.hist("api.ttfb_ms", p_ttfb - p_t0) end
+    end
     local emitted = false
     local function d(t)
         emitted = true
+        p_first()
         if on_delta then on_delta(t) end
     end
     local function r(t)
         emitted = true
+        p_first()
         if on_reasoning then on_reasoning(t) end
     end
 
     local last_err
     for attempt = 0, max_retries do
+        if prof and attempt > 0 then prof.count("api.retry") end
         local req, err = M.start(opts.multi, messages, tools, opts, d, r)
-        if not req then return nil, err end
+        if not req then p_done(false); return nil, err end
         local assistant, err2 = coroutine.yield({ kind = "http", req = req })
-        if assistant then return assistant end
+        if assistant then p_done(true); return assistant end
         last_err = err2
         if emitted or attempt >= max_retries or not M.retryable(err2) then
+            p_done(false)
             return nil, err2
         end
     end
+    p_done(false)
     return nil, last_err
 end
 

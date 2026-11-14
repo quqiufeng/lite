@@ -1,6 +1,9 @@
 -- 会话持久化：JSONL，一条消息一行。
 local cjson = require("cjson")
 
+local ok_prof, prof = pcall(require, "trace.prof")
+if not ok_prof then prof = nil end
+
 local M = {}
 M.__index = M
 
@@ -351,15 +354,18 @@ function M:append(msg)
 end
 
 function M:save()
+    local t0 = prof and prof.now_ms()
     local tmp = self.path .. ".tmp"
     local f = io.open(tmp, "w")
     if not f then return false end
+    local bytes = 0
     for _, msg in ipairs(self.ctx.session.messages) do
         local ok, line = pcall(cjson.encode, msg)
-        if ok then f:write(line, "\n") end
+        if ok then f:write(line, "\n"); bytes = bytes + #line + 1 end
     end
     f:close()
     os.rename(tmp, self.path)
+    if prof and t0 then prof.record("session.save", prof.now_ms() - t0, true, bytes) end
     return true
 end
 

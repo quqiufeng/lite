@@ -5,6 +5,10 @@ local Text = require("core.text")
 local Approval = require("core.approval")
 local Compact = require("core.compact")
 
+-- 进程内追踪账本（trace.prof）：压缩（fold）单独记一笔。
+local ok_prof, prof = pcall(require, "trace.prof")
+if not ok_prof then prof = nil end
+
 local M = {}
 M.__index = M
 
@@ -470,9 +474,16 @@ function M:maybe_compact(stream, reserve, force)
     local summarize = function(text, prompt)
         return self:summarize(text, prompt, stream)
     end
+    -- fold 是重活（要调模型做摘要），单独记一笔：压缩卡顿和「模型慢」要能分开看。
+    local p_t0 = prof and prof.now_ms()
     local res = c:fold(self.ctx.session.messages, summarize, {
         previous_digest = st and st.digest or nil,
     })
+    if prof and p_t0 then
+        prof.record("compact.fold", prof.now_ms() - p_t0, res.ok,
+            res.stats and res.stats.region_chars or nil)
+        if res.ok then prof.count("compact.ok") else prof.count("compact.skip") end
+    end
     if not res.ok then
         self.ctx:emit("compact", { ok = false, reason = res.reason,
             used = used, line = line, plan = res.plan })
@@ -845,6 +856,13 @@ function M:session_end()
         self.tools:on_session_end({
             id = s.id, turn = s.turn, busy = s.busy,
         })
+    end
+    -- 追踪账本落盘：进程一退，进程内聚合就没了。写一份快照到记忆目录
+    -- （默认可写 cwd），这样 `--once` 跑完还能查「刚才那轮慢在哪」。
+    if prof and prof.enabled() then
+        local dir = (self.memory and self.memory.dir) or os.getenv("PWD") or "."
+        -- 落盘失败不算错（只读目录/无 cjson），追踪不能反过来打断收口。
+        prof.dump(dir .. "/prof.json")
     end
 end
 

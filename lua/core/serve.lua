@@ -16,6 +16,10 @@ local Signal = require("core.signal")
 local Text = require("core.text")
 local Http = require("core.serve_http")
 
+-- 进程内追踪账本（trace.prof）：serve 每请求时延（含排队等待）。
+local ok_prof, prof = pcall(require, "trace.prof")
+if not ok_prof then prof = nil end
+
 local M = {}
 
 -- reboot/shutdown 工具只往 ctx.settings 里置标记，TUI 由 lua/tui/loop.lua 在空闲处收尾；
@@ -513,6 +517,8 @@ function M.run(opts)
         if not prompt then
             return http_close(fd, Http.error(400, perr or "bad request", "bad_request"))
         end
+        if prof then c.p_t0 = prof.now_ms() end
+        c.prompt_len = #prompt
         -- 进同一条队列，轮到自己跑一轮，跑完 finish_http 回 {"ok":true,"text":...}。
         c.waiting = true
         submit(prompt, { http = true, fd = fd })
@@ -549,6 +555,9 @@ function M.run(opts)
         c.waiting = nil
         local text = type(answer) == "string" and answer or ""
         local aerr = type(err) == "string" and err or b.error
+        if prof and c.p_t0 then
+            prof.record("serve.request", prof.now_ms() - c.p_t0, aerr == nil or aerr == "", c.prompt_len)
+        end
         if aerr and aerr ~= "" and text == "" then
             return http_close(b.fd, Http.error(500, aerr, "agent_error"))
         end

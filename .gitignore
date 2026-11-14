@@ -53,6 +53,8 @@ cluster-out/
 mem.bin
 mem.idx
 mem.lock
+# 追踪账本快照（trace.prof 退出时落盘，运行态产物，不是真相）
+prof.json
 
 # codesearch: tokenizers-cpp 静态库随仓库自带（构建 liblite_codesearch.so 需要）
 !third_party/codesearch/lib/tokenizers-cpp/*.a

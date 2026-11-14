@@ -186,7 +186,10 @@ function M.build_argv(args)
         a[#a + 1] = "--entry"; a[#a + 1] = tostring(args.entry)
         a[#a + 1] = "--exit";  a[#a + 1] = tostring(args.exit)
     else
-        if #probes == 0 then
+        -- oncpu 是纯 perf 软件时钟采样，engine 一个探针都不注册；offcpu 不给 probe 时
+        -- engine 自己补 tracepoint:sched:sched_switch（engine.lua:650 起的 mode 分支）。
+        -- 只有 count/samples/folded 必须显式给 probe，别在这里把它们一起拦掉。
+        if #probes == 0 and mode ~= "oncpu" and mode ~= "offcpu" then
             error("trace: " .. mode .. " 模式需要 probe（如 kprobe:do_sys_openat2 / "
                 .. "tracepoint:sched:sched_switch），可给数组；当前 probe 为空", 0)
         end
@@ -493,6 +496,99 @@ local function do_render(args, env)
         (out_txt or ""):gsub("%s+$", "") ~= "" and ("\n" .. out_txt:gsub("%s+$", "")) or "")
 end
 
+-- ── action=prof：读进程内追踪账本（工具/API/记忆/serve/hook 的耗时与成败）──
+-- 两个来源：进程内优先（helper 与 agent 同进程，直接 require），
+-- 退回到 main.lua 退出时落的 prof.json 快照（进程已退、或 --once 跑完）。
+local function prof_mod()
+    local ok, mod = pcall(require, "trace.prof")
+    if ok and mod then return mod end
+    return nil
+end
+
+local function prof_dump_path(args, env)
+    if args.path and args.path ~= "" then return args.path end
+    if os.getenv("LITE_PROF_FILE") then return os.getenv("LITE_PROF_FILE") end
+    local cwd = (env and env.cwd) or os.getenv("PWD") or "."
+    return (cwd:gsub("/+$", "")) .. "/prof.json"
+end
+
+local function fmt_prof_table(snap)
+    local L = {}
+    local spans = snap.spans or {}
+    table.sort(spans, function(a, b) return (a.total_ms or 0) > (b.total_ms or 0) end)
+    local total, calls, errs = 0, 0, 0
+    for _, s in ipairs(spans) do
+        total = total + (s.total_ms or 0)
+        calls = calls + (s.count or 0)
+        errs = errs + (s.err or 0)
+    end
+    L[#L + 1] = ("prof: %d 类 / %d 次 / %d 错 / 合计 %dms%s"):format(
+        #spans, calls, errs, math.floor(total + 0.5),
+        snap.ts and ("  （快照 %s）"):format(os.date("%H:%M:%S", snap.ts)) or "")
+    L[#L + 1] = ("%-24s %7s %5s %9s %9s %9s %9s"):format(
+        "name", "count", "err", "total", "avg", "p99", "max")
+    local function ms(v) return ("%.0f"):format((v or 0) + 0.5) end
+    for _, s in ipairs(spans) do
+        L[#L + 1] = ("%-24s %7d %5d %9s %9s %9s %9s"):format(
+            s.name, s.count or 0, s.err or 0, ms(s.total_ms), ms(s.avg_ms),
+            ms(s.p99_ms), ms(s.max_ms))
+    end
+    local cn = {}
+    for k in pairs(snap.counters or {}) do cn[#cn + 1] = k end
+    if #cn > 0 then
+        table.sort(cn)
+        L[#L + 1] = "counters:"
+        for _, k in ipairs(cn) do
+            L[#L + 1] = ("  %-22s %d"):format(k, snap.counters[k])
+        end
+    end
+    local hn = {}
+    for k in pairs(snap.histograms or {}) do hn[#hn + 1] = k end
+    if #hn > 0 then
+        table.sort(hn)
+        L[#L + 1] = "histograms:"
+        for _, k in ipairs(hn) do
+            local h = snap.histograms[k]
+            L[#L + 1] = ("  %-22s n=%d p50=%.0f p99=%.0f max=%.0f"):format(
+                k, h.n or 0, h.p50 or 0, h.p99 or 0, h.max or 0)
+        end
+    end
+    return table.concat(L, "\n")
+end
+
+local function do_prof(args, env)
+    local mod = prof_mod()
+    local path = prof_dump_path(args, env)
+    -- 进程内有账（agent 同进程）就优先；空账本时退化读快照 ——
+    -- 独立 lua 进程里 require 得到的是个空账本，直接报 0 会让人误以为没数据。
+    if mod and mod.enabled() then
+        if args.reset then mod.reset() end
+        local live = mod.report_json()
+        if (live.events or 0) > 0 then
+            if args.json then return cjson.encode(live) end
+            return mod.report()
+        end
+        local snap = mod.load(path)
+        if snap then
+            if args.json then return cjson.encode(snap) end
+            return fmt_prof_table(snap) .. "\n（进程内账本为空，读的是快照 " .. path .. "）"
+        end
+        if args.json then return cjson.encode(live) end
+        return mod.report()
+    end
+    -- 进程内拿不到（LITE_PROF=0 或没这个模块）：只读快照。
+    local f = io.open(path, "r")
+    if not f then
+        return ("prof: 找不到 lua/trace/prof.lua，也没有快照 %s（跑一次 lite 会写出来）"):format(path)
+    end
+    local body = f:read("*a")
+    f:close()
+    local d, snap = pcall(cjson.decode, body)
+    if not d then return "prof: 快照不是合法 JSON：" .. path end
+    if args.json then return body end
+    return fmt_prof_table(snap)
+end
+
 local schema = {
     name = "trace",
     description = "动态追踪（Linux 内核，纯 LuaJIT）：perf_event_open + tracefs 探针采样，"
@@ -507,9 +603,10 @@ local schema = {
         properties = {
             action = {
                 type = "string",
-                enum = { "status", "run", "render", "perfmap" },
+                enum = { "status", "run", "render", "perfmap", "prof" },
                 description = "status=环境自检（权限/tracefs/渲染依赖）；run=采样（默认）；"
-                    .. "render=从 json_in 重出图；perfmap=开（默认）/关本进程 JIT 地址表",
+                    .. "render=从 json_in 重出图；perfmap=开（默认）/关本进程 JIT 地址表；"
+                    .. "prof=读进程内追踪账本（工具/API/记忆/serve/hook 的耗时与成败）",
             },
             off = { type = "boolean", description = "perfmap：true=关掉并删除 /tmp/perf-<pid>.map" },
             mode = {
@@ -519,7 +616,9 @@ local schema = {
             },
             probe = {
                 type = "array", items = { type = "string" },
-                description = "探针，可多个：tracepoint:sched:sched_switch / kprobe:do_sys_openat2 / uprobe:/path:func",
+                description = "探针，可多个：tracepoint:sched:sched_switch / kprobe:do_sys_openat2 / uprobe:/path:func。"
+                    .. "oncpu 可省略（纯 perf 采样），offcpu 省略时自动挂 sched_switch，count/samples/folded 必填；"
+                    .. "latency 用 entry/exit 代替",
             },
             arg = {
                 type = "array", items = { type = "string" },
@@ -548,6 +647,8 @@ local schema = {
             kind = { type = "string", enum = { "flame", "heat", "rank" }, description = "render：出哪种图" },
             out = { type = "string", description = "render：输出路径（.svg/.png）" },
             out_title = { type = "string", description = "render：图标题" },
+            path = { type = "string", description = "prof：指定 prof.json 快照路径（默认 <cwd>/prof.json）" },
+            reset = { type = "boolean", description = "prof：读之前先清零账本" },
         },
     },
 }
@@ -566,7 +667,8 @@ function M.run(args, env)
     if action == "run" then return do_run(args, env) end
     if action == "render" then return do_render(args, env) end
     if action == "perfmap" then return do_perfmap(args) end
-    error("trace: 未知 action " .. action .. "（status/run/render/perfmap）", 0)
+    if action == "prof" then return do_prof(args, env) end
+    error("trace: 未知 action " .. action .. "（status/run/render/perfmap/prof）", 0)
 end
 
 return M

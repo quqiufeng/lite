@@ -10,6 +10,7 @@
 | `render.lua` | 折叠栈 → SVG（flame/heat/rank），`tools/{flame,heat,rank}.py` 的等价移植，逐字节对齐 |
 | `svgpng.lua` | SVG → PNG（cairo + librsvg，LuaJIT FFI），自包含单文件，可整份拷走 |
 | `summary.lua` | engine `--json` → 人读摘要（纯函数，单测直接测） |
+| `prof.lua` | 进程内追踪账本（O(1) 聚合：工具/API/记忆/serve/hook 的耗时·成败·字节），`helper/trace.lua action=prof` 读它 |
 
 `helper/trace.lua` 只做参数归一 + 子进程调度（sudo/luajit/超时/落盘/摘要），
 采样逻辑一律不进插件——插件层别塞内核细节。
@@ -63,6 +64,32 @@ trace action=render json_in=/tmp/t.json kind=flame out=/tmp/f.png   # 从 JSON �
 - `svgpng.lua` 里 `ffi.cdef` 了 cairo/GError，一个进程只能加载一次：
   插件用 `MODCACHE` 缓存 `dofile` 结果，别改成每次重载（会 `attempt to redefine '_GError'`）。
 
+## 进程内账本（`action=prof`，与内核侧分工）
+
+`engine` 看的是「CPU/系统在干什么」，要权限；`prof` 看的是「lite 自己的哪块慢」，
+不需要任何权限、不需要子进程。埋点是 O(1) 记账，异常一律静默：
+
+| 埋点名 | 来源 |
+|---|---|
+| `tool:<name>` | 每次工具调用（含 `bash`/`web`/插件），带输出字节 |
+| `hook:<kind>` | 插件 hook 调用（`before_tool`/`after_tool`/`on_user_*`/`on_compact`/`on_session_end`） |
+| `api.stream` / `api.ttfb_ms` / `api.retry` | 模型 API 总时长、首字节、重试次数 |
+| `http.get` / `http.post_stream` / `http.stream` | libcurl 各通道耗时（分清「模型慢」还是「网慢」） |
+| `memory.recall` / `memory.put` / `memory.del` | 记忆召回与落盘 |
+| `prompt.build` / `session.save` / `compact.fold` | 组 prompt、存会话、压缩摘要 |
+| `serve.request` | serve 的 HTTP/JSONL 请求（含排队时间） |
+
+```text
+trace action=prof                     # 进程内账本（agent 同进程，实时）
+trace action=prof json=true           # 原始 JSON，便于别的工具吃
+trace action=prof reset=true          # 读之前清零
+trace action=prof path=/tmp/pf.json   # 读退出时落的快照（进程已退 / 独立 lua 进程）
+```
+
+`LITE_PROF=0` 整层关掉。快照路径 `<memory_dir>/prof.json`（默认 cwd），
+`agent:session_end` 收口时写；进程内账本为空时 `action=prof` 自动退化读快照。
+空账本不落盘（省得每次 `--once` 都留个空文件）。
+
 ## 渲染契约
 
 `render.lua` 吃 engine `--json` 的 `top[]`（oncpu/offcpu）或 `folded[]`，
@@ -73,5 +100,7 @@ trace action=render json_in=/tmp/t.json kind=flame out=/tmp/f.png   # 从 JSON �
 ## 测试
 
 `./tools/test.sh` 里的 `trace *` 用例覆盖：探针参数归一、summary 各模式输出、
-SVG 生成与尺寸、PNG 转换（缺库时跳过）、engine 的 JSON 字段契约。
+SVG 生成与尺寸、PNG 转换（缺库时跳过）、engine 的 JSON 字段契约；
 内核侧真采样不进单测（要 root，机器相关），靠 `action=status` + `count` 现场验。
+`prof` 的记账/聚合/落盘读回/关闭语义与 `action=prof`（含空账本退化读快照）在
+`tools/auto_unit.lua` 的 `trace.prof` 段。

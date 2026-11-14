@@ -7,6 +7,12 @@ local Text = require("core.text")
 local http = require("core.http")
 local Memdb = require("core.memdb")
 
+-- 进程内追踪账本（trace.prof）：每个工具调用记一笔耗时/成败/字节。
+-- 放在 execute 这一层而不是每个工具里 —— 内置/插件/native 全部走这里，
+-- 新增功能天然被追踪，不用记得去埋点。失败静默，不拖慢功能。
+local ok_prof, prof = pcall(require, "trace.prof")
+if not ok_prof then prof = nil end
+
 -- 路径操作用 libc 直达：realpath/test -d 原先每次都 fork 两个 shell，
 -- agent 探索期一次几十次 resolve，代价明显。FFI 不可用时退回 popen。
 local ffi_ok, ffi = pcall(require, "ffi")
@@ -1516,6 +1522,17 @@ function M:_hook_error(p, kind, err)
         tostring(p.name) .. "." .. kind .. ": " .. tostring(err)
 end
 
+-- 钩子也进追踪账本：插件 hook 慢/抛错是「某个功能莫名变慢」的常见暗坑，
+-- 而且它和工具在同一个 execute 里，不单独记就会被算到 tool 头上。
+function M:_hook_invoke(p, kind, fn, ...)
+    if not prof then return pcall(fn, ...) end
+    local t0 = prof.now_ms()
+    local ok, res = pcall(fn, ...)
+    prof.record("hook:" .. kind, prof.now_ms() - t0, ok)
+    if not ok then prof.count("hook.errors") end
+    return ok, res
+end
+
 function M:has_hooks(kind)
     self:_helper_schemas()
     local kinds = self._hook_kinds
@@ -1529,7 +1546,7 @@ function M:before_tool(name, args, env)
     for _, p in ipairs(self._helper_plugins) do
         local fn = p.mod.hooks.before_tool
         if type(fn) == "function" then
-            local ok, res = pcall(fn, name, args, env or self:_helper_env(p))
+            local ok, res = self:_hook_invoke(p, "before_tool", fn, name, args, env or self:_helper_env(p))
             if not ok then
                 self:_hook_error(p, "before_tool", res)
             elseif type(res) == "string" and res ~= "" then
@@ -1547,7 +1564,7 @@ function M:after_tool(name, args, result, env)
     for _, p in ipairs(self._helper_plugins) do
         local fn = p.mod.hooks.after_tool
         if type(fn) == "function" then
-            local ok, res = pcall(fn, name, args, result, env or self:_helper_env(p))
+            local ok, res = self:_hook_invoke(p, "after_tool", fn, name, args, result, env or self:_helper_env(p))
             if not ok then
                 self:_hook_error(p, "after_tool", res)
             elseif type(res) == "string" then
@@ -1563,7 +1580,7 @@ function M:on_user_turn(text, env)
     for _, p in ipairs(self._helper_plugins) do
         local fn = p.mod.hooks.on_user_turn
         if type(fn) == "function" then
-            local ok, res = pcall(fn, text, env or self:_helper_env(p))
+            local ok, res = self:_hook_invoke(p, "on_user_turn", fn, text, env or self:_helper_env(p))
             if not ok then
                 self:_hook_error(p, "on_user_turn", res)
             elseif type(res) == "string" and res ~= "" then
@@ -1579,7 +1596,7 @@ function M:on_compact(info, env)
     for _, p in ipairs(self._helper_plugins) do
         local fn = p.mod.hooks.on_compact
         if type(fn) == "function" then
-            local ok, err = pcall(fn, info or {}, env or self:_helper_env(p))
+            local ok, err = self:_hook_invoke(p, "on_compact", fn, info or {}, env or self:_helper_env(p))
             if not ok then self:_hook_error(p, "on_compact", err) end
         end
     end
@@ -1590,7 +1607,7 @@ function M:on_session_end(env)
     for _, p in ipairs(self._helper_plugins) do
         local fn = p.mod.hooks.on_session_end
         if type(fn) == "function" then
-            local ok, err = pcall(fn, env or self:_helper_env(p))
+            local ok, err = self:_hook_invoke(p, "on_session_end", fn, env or self:_helper_env(p))
             if not ok then self:_hook_error(p, "on_session_end", err) end
         end
     end
@@ -1856,6 +1873,7 @@ end
 
 function M:execute(name, args)
     args = args or {}
+    local p_t0 = prof and prof.now_ms()
     local ok, out = pcall(function()
         if name == "bash" then
             return self:bash(args.command or "")
@@ -1968,6 +1986,10 @@ function M:execute(name, args)
         if helper_out ~= nil then return helper_out end
         return "error: unknown tool " .. tostring(name)
     end)
+    if p_t0 then
+        local nb = (ok and type(out) == "string") and #out or nil
+        prof.record("tool:" .. tostring(name), prof.now_ms() - p_t0, ok, nb)
+    end
     if not ok then return self:error_hint(name, args, "error: " .. tostring(out)) end
     return truncate(self:error_hint(name, args, out))
 end

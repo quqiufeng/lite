@@ -2,6 +2,9 @@
 -- 参考 Pi system-prompt sections 与 Reasonix prefix/recall 的稳定前缀思路。
 local M = {}
 
+local ok_prof, prof = pcall(require, "trace.prof")
+if not ok_prof then prof = nil end
+
 -- 注意：时钟/轮次预算这类每轮都变的内容不能进 system（会让 prefix cache 每轮失效），
 -- 走 M.runtime_block 追加到本轮末尾。
 local ORDER = { "preamble", "tools", "capabilities", "native", "rules", "memory", "project_context", "cwd" }
@@ -138,7 +141,15 @@ function M.render(sections)
 end
 
 function M.system_prompt(ctx, opts)
-    return M.render(M.sections(ctx, opts))
+    if not prof then return M.render(M.sections(ctx, opts)) end
+    -- 组 prompt 要读文件（AGENTS.md/项目上下文）、扫工具清单，慢的时候是次/秒级；
+    -- 字节数顺便记下来，prompt 变大是 prefix cache 失效的先兆。
+    local t0 = prof.now_ms()
+    local ok, out = pcall(M.render, M.sections(ctx, opts))
+    prof.record("prompt.build", prof.now_ms() - t0, ok,
+        type(out) == "string" and #out or nil)
+    if not ok then error(out, 0) end
+    return out
 end
 
 -- 每轮易变上下文：本地时钟 + 循环预算。作为本轮最后一条 system 消息追加，

@@ -44,6 +44,11 @@ const char *curl_multi_strerror(int);
 
 local M = {}
 
+-- 进程内追踪账本（trace.prof）：HTTP 是唯一能吃到网络延迟的一层，
+-- 工具/API 的耗时里混着它。单独记一笔，才分得清「模型慢」还是「网慢」。
+local ok_prof, prof = pcall(require, "trace.prof")
+if not ok_prof then prof = nil end
+
 local CURLOPT_URL = 10002
 local CURLOPT_POST = 47
 local CURLOPT_POSTFIELDS = 10015
@@ -103,7 +108,7 @@ local function setup_easy(h, url, headers, payload, cb, writedata)
 end
 
 -- 返回 rc, status, body_or_error；on_data 收到流式片段。
-function M.post_stream(url, headers, payload, on_data)
+local function post_stream_inner(url, headers, payload, on_data)
     global_init()
     local h = curl.curl_easy_init()
     if h == nil then return -1, 0, "curl_easy_init failed" end
@@ -133,8 +138,17 @@ function M.post_stream(url, headers, payload, on_data)
     return 0, tonumber(code[0]), body
 end
 
+function M.post_stream(url, headers, payload, on_data)
+    if not prof then return post_stream_inner(url, headers, payload, on_data) end
+    local t0 = prof.now_ms()
+    local rc, code, body = post_stream_inner(url, headers, payload, on_data)
+    prof.record("http.post_stream", prof.now_ms() - t0, rc == 0,
+        type(body) == "string" and #body or nil)
+    return rc, code, body
+end
+
 -- 阻塞 GET（web 工具）；max_bytes 防大页面吃内存。
-function M.get(url, headers, max_bytes, timeout_sec)
+local function get_inner(url, headers, max_bytes, timeout_sec)
     global_init()
     max_bytes = tonumber(max_bytes) or (1024 * 1024)
     local h = curl.curl_easy_init()
@@ -182,6 +196,15 @@ function M.get(url, headers, max_bytes, timeout_sec)
     return 0, tonumber(code[0]), table.concat(chunks)
 end
 
+function M.get(url, headers, max_bytes, timeout_sec)
+    if not prof then return get_inner(url, headers, max_bytes, timeout_sec) end
+    local t0 = prof.now_ms()
+    local rc, code, body = get_inner(url, headers, max_bytes, timeout_sec)
+    prof.record("http.get", prof.now_ms() - t0, rc == 0,
+        type(body) == "string" and #body or nil)
+    return rc, code, body
+end
+
 -- 非阻塞请求组。当前 agent 一次只有一个请求，但接口支持多个。
 function M.multi_new()
     global_init()
@@ -213,6 +236,7 @@ function M.request(m, url, headers, payload, on_data)
         chunks = {},
         on_data = on_data,
         done = false,
+        t0 = prof and prof.now_ms() or nil,
     }
 
     req.list = setup_easy(h, url, headers, payload, nil, stream)
@@ -242,6 +266,9 @@ local function finish_req(m, req)
     req.done = true
     req.body = table.concat(req.chunks)
     req.chunks = {}
+    if prof and req.t0 then
+        prof.record("http.stream", prof.now_ms() - req.t0, true, #req.body)
+    end
     if req.stream then
         curl.fclose(req.stream)
         req.stream = nil

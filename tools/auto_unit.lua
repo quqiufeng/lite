@@ -5638,6 +5638,57 @@ do
     end
 end
 
+-- trace.prof：进程内追踪账本（聚合/直方图/计数/落盘/读回）
+do
+    local prof = require("trace.prof")
+    prof.reset()
+    prof.record("t.a", 10, true, 100)
+    prof.record("t.a", 30, false, 50)
+    prof.record("t.b", 5, true)
+    prof.count("t.c", 2)
+    prof.hist("t.h", 7)
+    local rep = prof.report()
+    check(rep:find("t%.a") ~= nil and rep:find("t%.c") ~= nil, "prof report lists spans+counters")
+    local snap = prof.report_json()
+    check(#snap.spans == 2 and snap.counters["t.c"] == 2, "prof report_json aggregates")
+    check(snap.events == 3, "prof report_json counts events")
+    local okd, n = prof.dump("/tmp/lite-prof-unit.json")
+    check(okd == true and type(n) == "number" and n > 0, "prof dump writes snapshot")
+    local back, lerr = prof.load("/tmp/lite-prof-unit.json")
+    check(back ~= nil and #back.spans == 2 and back.counters["t.c"] == 2, "prof load reads snapshot")
+    check(prof.load("/tmp/lite-prof-unit-missing.json") == nil, "prof load missing file -> nil,err")
+    check(type(lerr) == "string" or lerr == nil, "prof load returns reason")
+    check(prof.summary_line():find("top=") ~= nil, "prof summary_line")
+    -- 空账本不该写文件（省得每次 --once 都留个空 prof.json）
+    prof.reset()
+    local ok2 = prof.dump("/tmp/lite-prof-empty.json")
+    check(ok2 == false, "prof dump skips empty ledger")
+    -- 关闭后：记账静默丢弃，report 明确说 disabled，dump 不落盘
+    prof.enable(false)
+    prof.record("t.off", 99, true)
+    check(prof.report():find("disabled") ~= nil, "prof disabled report")
+    check(prof.dump("/tmp/lite-prof-off.json") == false, "prof disabled dump refuses")
+    prof.enable(true)
+    prof.reset()
+    os.remove("/tmp/lite-prof-unit.json")
+end
+
+-- trace 插件 action=prof（走同进程账本，不走内核）
+do
+    local mod = dofile(root .. "/helper/trace.lua")
+    local prof = require("trace.prof")
+    prof.reset()
+    prof.record("t.plugin", 4, true)
+    local out = mod.run({ action = "prof" }, { cwd = "/tmp" })
+    check(type(out) == "string" and out:find("t%.plugin") ~= nil, "trace prof action reads ledger")
+    local jout = mod.run({ action = "prof", json = true }, { cwd = "/tmp" })
+    local cjson = require("cjson")
+    local dj, dec = pcall(cjson.decode, jout)
+    check(dj and dec.spans and #dec.spans >= 1, "trace prof action json")
+    mod.run({ action = "prof", reset = true }, { cwd = "/tmp" })
+    check(prof.report_json().events == 0, "trace prof action reset clears ledger")
+end
+
 -- entry
 check(loadfile(root .. "/lua/main.lua") ~= nil, "load lua/main.lua")
 

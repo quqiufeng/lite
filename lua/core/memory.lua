@@ -6,6 +6,10 @@ local cache = require("ffi.cache")
 local Prompt = require("core.prompt")
 local net = require("core.net")
 
+-- 进程内追踪账本（trace.prof）：召回耗时单独记一笔。
+local ok_prof, prof = pcall(require, "trace.prof")
+if not ok_prof then prof = nil end
+
 pcall(ffi.cdef, [[
 int open(const char *pathname, int flags, unsigned int mode);
 int flock(int fd, int operation);
@@ -261,7 +265,12 @@ function M:put(ns, key, value, ttl)
     local full = join(ns, key)
     local ok, s = pcall(cjson.encode, value)
     if not ok then return false, s end
-    return cache.set(self.h, full, s, ttl or 0) == 0
+    -- 落盘写是 mmap KV，通常几十 µs，但锁竞争/页换出时会突然变慢，
+    -- 记一笔才能分清「记忆慢」还是「模型慢」。
+    local t0 = prof and prof.now_ms()
+    local wok = cache.set(self.h, full, s, ttl or 0) == 0
+    if prof and t0 then prof.record("memory.put", prof.now_ms() - t0, wok, #s) end
+    return wok
 end
 
 function M:get(ns, key)
@@ -276,7 +285,10 @@ function M:del(ns, key)
         self.write_failures = (self.write_failures or 0) + 1
         return false
     end
-    return cache.del(self.h, join(ns, key)) == 0
+    local t0 = prof and prof.now_ms()
+    local dok = cache.del(self.h, join(ns, key)) == 0
+    if prof and t0 then prof.record("memory.del", prof.now_ms() - t0, dok) end
+    return dok
 end
 
 function M:search_prefix(prefix, opts)
@@ -964,6 +976,7 @@ function M:prune_session_messages(session_id, keep)
 end
 
 function M:recall(query, limit, opts)
+    local p_t0 = prof and prof.now_ms()
     limit = limit or 6
     opts = opts or {}
     query = tostring(query or "")
@@ -1239,6 +1252,10 @@ function M:recall(query, limit, opts)
     end
     st.injected = st.injected + #keep
     st.dropped = st.dropped + math.max(0, #out - #keep)
+    if p_t0 then
+        prof.record("memory.recall", prof.now_ms() - p_t0, true, #keep)
+        prof.hist("memory.recall_items", #keep)
+    end
     return keep
 end
 
