@@ -87,7 +87,15 @@ end
 
 actions.play = function(M, args, env)
     local src = args.source or args.path
-    if not src or src == "" then error("music play 需要 source（文件/目录/URL/曲名关键词） — required: source") end
+    if not src or src == "" then
+        -- 不给 source → 默认曲库 WEBDAV_MUSIC（写在 ~/.env），整库随机流播
+        local wd = wdlib(env)
+        src = wd.env("WEBDAV_MUSIC")
+        if not src or src == "" then
+            error("music play 需要 source（文件/目录/URL/曲名关键词），" ..
+                "或把 WEBDAV_MUSIC 写进 ~/.env 当作默认曲库 — required: source")
+        end
+    end
     src = expand(src)
     local files, label
     local is_url = src:match("^%a[%w+.-]*://") ~= nil
@@ -124,7 +132,9 @@ actions.play = function(M, args, env)
                 error("dav:// 只给了主机，没给路径，环境里也没有 WEBDAV_MUSIC — " ..
                     "写成 dav://host:port/目录，或把 WEBDAV_MUSIC 写进 ~/.env")
             end
-            src = src:gsub("/+$", "") .. "/" .. music_dir:gsub("^/+", ""):gsub("/+$", "")
+            -- WEBDAV_MUSIC 可能是纯路径，也可能是完整 dav://host/路径 → 只取路径段
+            local mpath = wd.http(music_dir):gsub("^%a[%w+.-]*://[^/]*", "")
+            src = src:gsub("/+$", "") .. "/" .. mpath:gsub("^/+", ""):gsub("/+$", "")
         end
         local entries, lerr = wd.list_at(src)
         if not entries then error(tostring(lerr)) end
@@ -305,7 +315,7 @@ end
 return {
     schema = {
         name = "music",
-        description = "放歌：后台常驻 VLC，支持播放文件/目录/网络流/WebDAV 无损曲库、暂停继续、上一首下一首、音量、跳转、队列、状态。action 默认 status；没有本地文件时给曲名关键词即可，先 search 看命中再 play 加 index。WebDAV 走 dav://host:port/目录（边播边取不下载）或直接关键词（检索后按需下载到缓存），凭据只从环境变量 WEBDAV_URL/WEBDAV_USER/WEBDAV_PASS 读。",
+        description = "放歌：后台常驻 VLC，支持播放文件/目录/网络流/WebDAV 无损曲库、暂停继续、上一首下一首、音量、跳转、队列、状态。action 默认 status；没有本地文件时给曲名关键词即可，先 search 看命中再 play 加 index。WebDAV 走 dav://host:port/目录（边播边取不下载）或直接关键词（检索后按需下载到缓存），曲库要四个变量：WEBDAV_URL（也可写 dav://host:port/目录）、WEBDAV_USER、WEBDAV_PASS、WEBDAV_MUSIC（曲库目录，必填，无内置兜底）；进程环境优先，缺失回退 .env（cwd 向上 → LITE_ENV_FILE → ~/.config/lite/.env → ~/.env），都不在就报「缺 WebDAV 配置：…」。凭据只走 CURLOPT_USERPWD（不进 URL/argv/m3u），检索结果按需下载到 LITE_MUSIC_CACHE（默认 /tmp/lite-music-cache）。",
         parameters = {
             type = "object",
             properties = {
@@ -314,7 +324,7 @@ return {
                     enum = { "play", "pause", "resume", "toggle", "next", "prev", "stop", "status", "volume", "seek", "playlist", "quit", "devices", "search" },
                     description = "play=播放(本地路径/URL/dav:// 或曲名关键词); pause/resume/toggle; next/prev=切歌; stop=停止; status=状态; volume=音量; seek=跳转; playlist=队列; search=搜 WebDAV 曲库(关键词); quit=关播放器; devices=列输出设备",
                 },
-                source = { type = "string", description = "play: 本地文件路径 / 目录（递归找音频）/ http(s) URL 或广播流 / dav://host:port/目录（WebDAV 直接流播，只写 dav://host:port 则回退 WEBDAV_MUSIC 整库随机）/ 曲名关键词（→ WebDAV 曲库检索，命中多首要加 index）；search: 关键词（搜 WebDAV 曲库）" },
+                source = { type = "string", description = "play: 本地文件路径 / 目录（递归找音频）/ http(s) URL 或广播流 / dav://host:port/目录（WebDAV 直接流播，只写 dav://host:port 则回退 WEBDAV_MUSIC 整库随机）/ 曲名关键词（→ WebDAV 曲库检索，命中多首要加 index）省略 source 或给空串 = 用 ~/.env 的 WEBDAV_MUSIC 整库随机流播；search: 关键词（搜 WebDAV 曲库）" },
                 index = { type = "integer", description = "play: 关键词命中多首时选第几首（先不带 index 看列表）" },
                 append = { type = "boolean", description = "play: true=追加到现有队列（默认替换）" },
                 shuffle = { type = "boolean", description = "play: 目录/多文件时是否打乱（dav:// 目录默认 true）" },
