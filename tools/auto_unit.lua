@@ -89,6 +89,16 @@ do
     check(cfg.api_key == "sk-test", "config dotenv key")
     check(cfg.model == "m1", "config dotenv quote")
 
+    -- config.env：插件/helper 侧的单键查询（进程环境优先，缺失回退合并后的 .env）。
+    -- 它是「key 不进 environ」的唯一出口：别用 setenv 冒充，`ps e` 能看到。
+    local cfgmod = require("core.config")
+    local fix = { HOME = "/tmp", PWD = dir, LITE_ENV_FILE = envf }
+    check(cfgmod.env("DEEPSEEK_API_KEY", fix) == "sk-test", "config.env dotenv fallback")
+    check(cfgmod.env("DEEPSEEK_MODEL", fix) == "m1", "config.env dotenv unquote")
+    check(cfgmod.env("LITE_NO_SUCH_KEY_XYZ", fix) == nil, "config.env missing -> nil")
+    fix.DEEPSEEK_MODEL = "envwin"
+    check(cfgmod.env("DEEPSEEK_MODEL", fix) == "envwin", "config.env env over dotenv")
+
     local cfg2 = require("core.config").load({
         HOME = "/tmp", PWD = dir, LITE_ENV_FILE = envf, DEEPSEEK_MODEL = "override",
     })
@@ -4754,7 +4764,10 @@ do
             return r[1], r[2], r[3]
         end,
     }
-    local env2 = { helper_dir = hdir, cwd = root }
+    -- env.getenv 是插件桥的权威读取器（生产= core.config.env，进程环境→.env 合并）。
+    -- 夹具必须给，否则 lib 会回落到真 .env，把「没有 key」这条断言冲掉。
+    local function fake_getenv(k) return fake_env[k] end
+    local env2 = { helper_dir = hdir, cwd = root, getenv = fake_getenv }
     local Search2 = dofile(hdir .. "/search.lua")
     local Fetch2 = dofile(hdir .. "/fetch.lua")
 

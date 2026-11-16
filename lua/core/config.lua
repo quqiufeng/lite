@@ -102,6 +102,23 @@ local function load_dotenv_merged(get, cwd)
     return merged
 end
 
+-- 给插件/工具用的单键查询：进程环境优先，缺失回退到合并后的 .env。
+-- **故意不 setenv**：key 灌进 environ 后 `ps e` / `/proc/<pid>/environ` 都能读到，
+-- 而 .env 是 0600 文件；插件的 os.getenv 拿不到 .env 值这个坑就靠这里补。
+-- env 表可选（测试夹具用它完全接管读取；生产传 nil = os.getenv）。
+function M.env(key, env)
+    local function get(k)
+        if env then return env[k] end
+        return os.getenv(k)
+    end
+    local v = get(key)
+    if v ~= nil and v ~= "" then return v end
+    local d = load_dotenv_merged(get, current_dir(get))
+    local dv = d[key]
+    if dv == nil or dv == "" then return nil end
+    return dv
+end
+
 -- 优先级：注入 env / 进程环境 > .env > ~/.config/lite/config.lua > 默认值。
 -- 传了 env 表 = 由它**完全接管**环境读取（不再回落到 os.getenv）：否则调用方
 -- 无法表达「这个键就是没有」，宿主 shell 里的 DEEPSEEK_API_KEY 会把夹具里的

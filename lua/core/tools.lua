@@ -1622,6 +1622,13 @@ function M:_helper_env(p)
         scope = p.scope,
         -- [埋点] usage 读侧入口：插件（如 helper/tokens.lua）经 env.memory 读每日账本。
         memory = self.memory,   -- 插件读会话/每日账本用（只读用 get/usage_day）
+        -- 读配置里的密钥/环境量：进程环境优先，缺失回退 .env（不 setenv，key 不进
+        -- environ）。插件想读 DEEPSEEK_API_KEY 之类一律用 env.getenv，别直接 os.getenv。
+        getenv = function(k)
+            local ok, cfgmod = pcall(require, "core.config")
+            if ok and cfgmod and cfgmod.env then return cfgmod.env(k) end
+            return os.getenv(k)
+        end,
         ffi = ffi,
         load = function(n)
             local so, serr = self:_helper_so_abs(n)

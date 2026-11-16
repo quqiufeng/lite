@@ -2,12 +2,18 @@
 local shared
 
 local function lib(env)
-    if shared then return shared end
-    local dir = (env and env.helper_dir) or "helper"
-    local path = dir:gsub("/+$", "") .. "/lib/deepseek.lua"
-    local chunk, err = loadfile(path)
-    if not chunk then error("cannot load " .. path .. ": " .. tostring(err)) end
-    shared = chunk()
+    if not shared then
+        local dir = (env and env.helper_dir) or "helper"
+        local path = dir:gsub("/+$", "") .. "/lib/deepseek.lua"
+        local chunk, err = loadfile(path)
+        if not chunk then error("cannot load " .. path .. ": " .. tostring(err)) end
+        shared = chunk()
+    end
+    -- 插件桥的 env.getenv 是权威读取器（进程环境 → .env 合并）；每次调用都装一次，
+    -- 免得缓存下来的 getter 串到下一个 env（测试夹具换 env 就靠这个复位）。
+    if shared.set_getenv then
+        shared.set_getenv(env and type(env.getenv) == "function" and env.getenv or nil)
+    end
     return shared
 end
 

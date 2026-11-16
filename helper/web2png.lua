@@ -15,7 +15,7 @@
 --      h <= 0 = 自动测高（src/html/render.cpp 先布局拿 content_h 再定高度），卡片不裁剪不留白。
 -- 坑：
 --   - helper_dir 跟着插件走（cwd/helper 或 $LITE_ROOT/helper），共享库一律 dofile(dir.."/lib/x.lua")。
---   - 密钥只读环境变量（+ ~/.env 回退走 webdav.M.env），不打印、不内置。
+--   - 密钥只读环境变量 / .env（经 core.config.env 合并，不 setenv），不打印、不内置。
 --   - 工具返回值必须是字符串，返回 table 会被 tostring 成 "table: 0x..."。
 local ffi = require("ffi")
 
@@ -77,9 +77,12 @@ end
 -- 取正文：返回 title, markdown 正文, 来源标签（fetch | curl）
 local function grab(url, dir)
   local key = os.getenv("DEEPSEEK_API_KEY") or os.getenv("LITE_DEEPSEEK_API_KEY")
-  if not key then
-    local ok, wd = pcall(dofile, dir .. "/lib/webdav.lua")
-    if ok and wd and wd.env then key = wd.env("DEEPSEEK_API_KEY") end
+  if not key or key == "" then
+    -- .env 里的 key 不在进程环境里（lite 不 setenv），走 core.config.env 合并读
+    local ok, cfg = pcall(require, "core.config")
+    if ok and cfg and cfg.env then
+      key = cfg.env("DEEPSEEK_API_KEY") or cfg.env("LITE_DEEPSEEK_API_KEY")
+    end
   end
   if key and key ~= "" then
     local ok, body = pcall(function()

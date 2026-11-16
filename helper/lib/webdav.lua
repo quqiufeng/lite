@@ -66,29 +66,14 @@ local function shell(cmd)
     return out
 end
 
--- 进程环境缺变量时回退读 dotenv（进程环境优先，与 tools/lua.sh 顺序一致）
-local dotenv
--- 环境变量优先，缺失时回退 ~/.env → ~/.config/lite/.env（插件进程未必带全 env）
+-- 环境变量优先，缺失时回退 .env（交给 core.config.env：cwd 向上 → LITE_ENV_FILE →
+-- ~/.config/lite/.env → ~/.env，且不 setenv）。别在这儿再手写一遍文件扫描。
 local function env(key)
     local v = os.getenv(key)
     if v and v ~= "" then return v end
-    if dotenv == nil then
-        dotenv = {}
-        local home = os.getenv("HOME") or ""
-        for _, p in ipairs({ home .. "/.env", home .. "/.config/lite/.env" }) do
-            local f = io.open(p, "r")
-            if f then
-                for line in f:lines() do
-                    local k, val = line:match("^%s*([%w_]+)%s*=%s*(.-)%s*$")
-                    if k and dotenv[k] == nil then
-                        dotenv[k] = val:gsub("^['\"]", ""):gsub("['\"]$", "")
-                    end
-                end
-                f:close()
-            end
-        end
-    end
-    return dotenv[key]
+    local ok, cfg = pcall(require, "core.config")
+    if ok and cfg and cfg.env then return cfg.env(key) end
+    return v
 end
 
 -- dav://host:port/path → http://host:port + /path（davs:// → https）

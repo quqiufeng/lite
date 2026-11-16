@@ -15,15 +15,32 @@ local function sleep_ms(ms)
     if ms > 0 then pcall(function() ffi.C.usleep(ms * 1000) end) end
 end
 
+-- key 只在环境变量或 .env 里，不能进仓库/命令行。os.getenv 看不到 .env（lite 不 setenv，
+-- key 进了 environ 就等于 `ps e` 可见），所以缺失时回退 core.config.env（按 cwd 向上 +
+-- LITE_ENV_FILE + ~/.config/lite/.env 合并）。
+-- getter 是插件桥（env.getenv）注入的权威读取器：只要装了它，就完全走它——测试夹具
+-- 靠这个能表达「这个键就是没有」，否则真 .env 里的 key 会把夹具盖掉。
+local getter
+function M.set_getenv(fn) getter = fn end
+
+local function getenv(k)
+    if getter then return getter(k) end
+    local v = os.getenv(k)
+    if v and v ~= "" then return v end
+    local ok, cfg = pcall(require, "core.config")
+    if ok and cfg and cfg.env then return cfg.env(k) end
+    return v
+end
+
 function M.base()
-    local b = os.getenv("LITE_DEEPSEEK_BASE")
+    local b = getenv("LITE_DEEPSEEK_BASE")
     if b and b ~= "" then return (b:gsub("/+$", "")) end
     return "https://api.deepseek.com"
 end
 
 function M.key()
-    local key = os.getenv("DEEPSEEK_API_KEY")
-    if not key or key == "" then key = os.getenv("LITE_DEEPSEEK_API_KEY") end
+    local key = getenv("DEEPSEEK_API_KEY")
+    if not key or key == "" then key = getenv("LITE_DEEPSEEK_API_KEY") end
     if not key or key == "" then
         return nil, "error: DeepSeek Search/Fetch need DEEPSEEK_API_KEY "
             .. "(put DEEPSEEK_API_KEY=sk-... in ~/.config/lite/.env or the "
