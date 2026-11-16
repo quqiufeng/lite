@@ -58,7 +58,7 @@ local function wf(p,s) local f=io.open(p,"w") if not f then return nil end local
 ------------------------------------------------------------------------
 -- 事件源：tracepoint / kprobe / uprobe 统一成 tracefs event id
 ------------------------------------------------------------------------
-local probes, probe_seq = {}, 0
+local probes, probe_seq, kprobe_added = {}, 0, 0
 -- tracefs 的探针名是**全局唯一**的（所有进程共用一套 kprobe_events）。
 -- 老写法 `lite_<seq>` 的 seq 从 0 开始，两个实例同时跑必然撞名：
 -- 后者 write 失败被报成「符号/偏移不存在」，而先退出的那个 cleanup 会按前缀
@@ -153,6 +153,23 @@ local function elf_sym_offset(path, sym)
   return vaddr + extra
 end
 
+-- tracefs 里的探针条数（`p:` 行 = 已注册），顺带数出本机制占多少 lite_*。
+-- 注册失败只有 errno 时看不出是「写错了」还是「名额被占满/撞内核上限」，
+-- 把这个数写进报错才可自修（跑一次 trace 的 cleanup 会顺手收掉僵尸探针）。
+local function count_live_probes()
+  local total, mine = 0, 0
+  for _, f in ipairs({ "/kprobe_events", "/uprobe_events" }) do
+    local txt = rf(T .. f) or ""
+    for line in txt:gmatch("[^\n]+") do
+      if line:match("^p:") then
+        total = total + 1
+        if line:match("^p:[%w_]+/lite_%d+_%d+") then mine = mine + 1 end
+      end
+    end
+  end
+  return total, mine
+end
+
 local function reg_dynamic(kind, def, args)
   probe_seq = probe_seq + 1
   local name = PROBE_TAG .. probe_seq
@@ -160,13 +177,18 @@ local function reg_dynamic(kind, def, args)
   local grp  = (kind == "uprobe") and "uprobes" or "kprobes"
   local line = "p:" .. name .. " " .. def
   if args and args ~= "" then line = line .. " " .. args end
+  -- 名额统计必须在 write **之前**取样：注册失败的 write 会让 tracefs 的列表读回空
+  -- （实测：先注册好 lite_a1，再写一条坏行，再读 kprobe_events 得到 0 行），
+  -- 事后再数永远是 0，等于没数。
+  local live, mine = count_live_probes()
   local ok, err = wf(T .. file, line .. "\n")
   -- 内核在 write 时只报 errno，io.write 仍可能返回成功；以事件目录是否出现为准
   local idtxt = rf(("%s/events/%s/%s/id"):format(T, grp, name))
   local fmt   = rf(("%s/events/%s/%s/format"):format(T, grp, name))
   if not idtxt or not fmt then
-    return nil, ("%s 注册失败（%s；符号/偏移是否存在？errno=%s）"):format(
-      kind, file:sub(2) .. ":" .. line, tostring(err))
+    return nil, ("%s 注册失败（%s；符号/偏移是否存在？errno=%s；" ..
+      "写前 tracefs 有探针 %d 个，其中 lite_* %d 个，本次已注册 %d 个）"):format(
+      kind, file:sub(2) .. ":" .. line, tostring(err), live, mine, kprobe_added)
   end
   kprobe_added = kprobe_added + 1
   return tonumber(idtxt:match("%d+")), parse_format(fmt), name, grp
