@@ -7,6 +7,7 @@
 #include <litehtml/document_container.h>
 
 #include <cairo/cairo.h>
+#include <cairo/cairo-pdf.h>
 #include <fontconfig/fontconfig.h>
 #include <cstdio>
 #include <cstring>
@@ -947,6 +948,95 @@ public:
 
 cairo_t* cairo_container::g_cr = nullptr;
 
+// ── 图版（PNG）与 PDF 版共用的两段：布局、绘制 ───────────────────────────────
+// 两条出口的差别只有 surface 类型，布局/测量/绘制必须完全一致，否则同一份 HTML
+// 在 PNG 和 PDF 里会有细微错位（字重、折行位置、clip 深度都从同一份代码来）。
+
+// 进程级挂载 helper/assets 的项目字体（cairo toy font 只认族名，靠 fontconfig 兜底）。
+// LITE_HTML_FONT_DIR 可覆盖目录。重复调用无副作用。
+void ensure_fonts()
+{
+    static bool loaded = false;
+    if (loaded) return;
+    loaded = true;
+    const char* fdir = getenv("LITE_HTML_FONT_DIR");
+    if (!fdir || !*fdir) fdir = "helper/assets";
+    FcConfig* cfg = FcConfigGetCurrent();
+    const char* fnames[] = { "DroidSansFallbackFull.ttf", "DejaVuSansMono.ttf" };
+    for (const char* fn : fnames) {
+        std::string fp = std::string(fdir) + "/" + fn;
+        if (FcConfigAppFontAddFile(cfg, (const FcChar8*)fp.c_str()))
+            FcConfigBuildFonts(cfg);
+    }
+}
+
+// 布局一页并返回内容高度（CSS px）。失败返回 null，*err_rc 给 lite_html_render 的退出码。
+document::ptr layout_page(const char* html, cairo_container& container, int w, int h_view,
+                          pixel_t* content_h, int* err_rc)
+{
+    container.m_width  = w;
+    // 自动测高时给一个足够大的视口：m_height = 0 会让 litehtml 按 0 高视口算，
+    // content_h 偏小、最后几行被裁掉。
+    container.m_height = h_view;
+
+    // litehtml 不认 opacity / box-shadow / transform:translate：先改写成它认识的形式
+    // （见 src/html/prepass.cpp）。aliasing 只在这里做一次，渲染期只认哨兵色。
+    std::string pre_html = prepass::rewrite(html, container.m_shadows);
+    document::ptr doc;
+    try {
+        doc = document::createFromString(pre_html.c_str(), &container, master_css, "");
+    } catch (const std::exception& e) {
+        g_error = std::string("createFromString: ") + e.what();
+        *err_rc = 3;
+        return nullptr;
+    } catch (...) {
+        g_error = "createFromString failed";
+        *err_rc = 3;
+        return nullptr;
+    }
+    if (!doc) { g_error = "createFromString returned null"; *err_rc = 3; return nullptr; }
+
+    // 注意：document::render() 的返回值不是内容高度，真实高度在 doc->height()。
+    try {
+        doc->render(w);
+        *content_h = doc->height();
+    } catch (...) {
+        g_error = "layout failed";
+        *err_rc = 4;
+        return nullptr;
+    }
+    if (content_h->value() <= 0)
+        *content_h = pixel_t(static_cast<float>(h_view > 0 ? h_view : 800));
+    return doc;
+}
+
+// 把已布局的 doc 画到 cr（cr 的 CTM 已按目标缩放设好）。0 成功 / -1 失败（g_error 已设）。
+int draw_page(cairo_t* cr, document::ptr doc, cairo_container& container, int w, int h)
+{
+    cairo_save(cr);                    // 与下面 clip 的 restore 配对，出错也不漏
+    cairo_set_source_rgb(cr, 1, 1, 1);
+    cairo_paint(cr);
+
+    cairo_container::g_cr = cr;
+    position clip(0, 0, w, h);
+    try {
+        doc->draw(reinterpret_cast<uint_ptr>(cr), 0, 0, &clip);
+        container.flush_text();                            // 最后一行落笔
+        while (container.m_clip_depth > 0) { cairo_restore(cr); --container.m_clip_depth; }
+        container.m_clip_right.clear();
+    } catch (...) {
+        cairo_container::g_cr = nullptr;
+        while (container.m_clip_depth > 0) { cairo_restore(cr); --container.m_clip_depth; }
+        container.m_clip_right.clear();
+        cairo_restore(cr);
+        g_error = "draw failed";
+        return -1;
+    }
+    cairo_container::g_cr = nullptr;
+    cairo_restore(cr);
+    return 0;
+}
+
 } // namespace
 
 extern "C" {
@@ -963,82 +1053,31 @@ int lite_html_render(const char* html, const char* out_png, int w, int h, double
     if (scale <= 0) scale = 1.0;
 
     // 项目自带字体（helper/assets）：cairo toy font 只认族名，靠 fontconfig 兜底。
-    // 进程级注册一次即可；LITE_HTML_FONT_DIR 可覆盖目录。
-    static bool fc_fonts_loaded = false;
-    if (!fc_fonts_loaded) {
-        fc_fonts_loaded = true;
-        const char* fdir = getenv("LITE_HTML_FONT_DIR");
-        if (!fdir || !*fdir) fdir = "helper/assets";
-        FcConfig* cfg = FcConfigGetCurrent();
-        const char* fnames[] = { "DroidSansFallbackFull.ttf", "DejaVuSansMono.ttf" };
-        for (const char* fn : fnames) {
-            std::string fp = std::string(fdir) + "/" + fn;
-            if (FcConfigAppFontAddFile(cfg, (const FcChar8*)fp.c_str()))
-                FcConfigBuildFonts(cfg);
-        }
-    }
+    ensure_fonts();
 
     cairo_container container;
-    container.m_width  = w;
-    // 自动测高时先用一个足够大的视口布局：m_height 是媒体/DOM 视口高度，
-    // 给 0 会让 litehtml 按 0 高视口算，content_h 偏小、最后几行被裁掉。
-    container.m_height = (h > 0) ? h : 100000;
-
-    document::ptr doc;
-    // litehtml 本身不认 opacity / box-shadow / transform:translate：先改写成它认识的形式
-    // （见 src/html/prepass.cpp）。aliasing 只在这里做一次，渲染期只认哨兵色。
-    std::string pre_html = prepass::rewrite(html, container.m_shadows);
-    try {
-        doc = document::createFromString(pre_html.c_str(), &container, master_css, "");
-    } catch (const std::exception& e) {
-        g_error = std::string("createFromString: ") + e.what();
-        return 3;
-    } catch (...) {
-        g_error = "createFromString failed";
-        return 3;
-    }
-    if (!doc) { g_error = "createFromString returned null"; return 3; }
-
-    // 注意：document::render() 的返回值不是内容高度（render_item 的返回值），
-    // 文档真实高度在 m_size 里，要靠 doc->height() 取 —— 否则自动测高恒等于视口高。
+    int err_rc = 5;
     pixel_t content_h = 0;
-    try {
-        doc->render(w);
-        content_h = doc->height();
-    } catch (...) {
-        g_error = "layout failed";
-        return 4;
-    }
+    document::ptr doc = layout_page(html, container, w, (h > 0) ? h : 100000, &content_h, &err_rc);
+    if (!doc) return err_rc;
+
     if (h <= 0) {
         int auto_h = static_cast<int>(std::ceil(content_h.value()));
         h = auto_h > 0 ? auto_h : 800;
     }
     container.m_height = h;   // 出图按最终高度，clip/draw 都对齐
-    if (content_h.value() <= 0) content_h = pixel_t(static_cast<float>(h));
 
     cairo_surface_t* surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32,
                                                           static_cast<int>(w * scale),
                                                           static_cast<int>(h * scale));
     cairo_t* cr = cairo_create(surface);
     cairo_scale(cr, scale, scale);
-    cairo_set_source_rgb(cr, 1, 1, 1);
-    cairo_paint(cr);
 
-    cairo_container::g_cr = cr;
-    position clip(0, 0, w, h);
-    try {
-        doc->draw(reinterpret_cast<uint_ptr>(cr), 0, 0, &clip);
-        container.flush_text();                            // 最后一行落笔
-        while (container.m_clip_depth > 0) { cairo_restore(cr); --container.m_clip_depth; }
-        container.m_clip_right.clear();
-    } catch (...) {
-        cairo_container::g_cr = nullptr;
+    if (draw_page(cr, doc, container, w, h) != 0) {
         cairo_destroy(cr);
         cairo_surface_destroy(surface);
-        g_error = "draw failed";
         return 5;
     }
-    cairo_container::g_cr = nullptr;
 
     cairo_status_t st = cairo_surface_write_to_png(surface, out_png);
     cairo_destroy(cr);
@@ -1048,6 +1087,85 @@ int lite_html_render(const char* html, const char* out_png, int w, int h, double
         return 6;
     }
     return 0;
+}
+
+// 矢量 PDF：与 lite_html_render 同一套布局/绘制，只把 surface 换成 cairo_pdf_surface。
+// htmls 是页数组（每页一段完整 HTML，须自带 <style>；CSS 不跨页继承）。
+// 页面宽度 = 内容 CSS px × pt_per_px（0.75 → 96dpi 屏 px 对 72pt/inch，
+// 与「每页出 PNG 再合成」的图版 PDF 几何完全一致，只是文字变成**可选中/可搜索**）。
+// h <= 0 = 每页按自身内容高度定页（长卡片不分页，出来是一整页长纸）。
+// page_h_out / content_h_out 可传 nullptr；否则须是长度 ≥ n 的 int 数组，回填每页
+// **最终页高**和**内容实际高度**（都是 CSS px）—— 调用方靠后者判溢出，不必再渲探针图。
+// 返回 0 成功；非 0 失败（错误串见 lite_html_error）。
+int lite_html_render_pdf(const char* const* htmls, int n, const char* out_pdf,
+                         int w, int h, double pt_per_px,
+                         int* page_h_out, int* content_h_out)
+{
+    g_error.clear();
+    if (!htmls || n <= 0 || !out_pdf) { g_error = "invalid args (htmls/out_pdf)"; return 1; }
+    if (w <= 0 || h < 0) { g_error = "invalid size"; return 2; }
+    if (!(pt_per_px > 0)) pt_per_px = 0.75;
+
+    ensure_fonts();
+
+    const double page_w = w * pt_per_px;
+    // 首页先按名义高度开 surface；h<=0 时每页在 show_page 前用 set_size 改成实测高度。
+    cairo_surface_t* surface = cairo_pdf_surface_create(out_pdf, page_w,
+                                                        (h > 0 ? h : w) * pt_per_px);
+    cairo_status_t st = cairo_surface_status(surface);
+    if (st != CAIRO_STATUS_SUCCESS) {
+        g_error = std::string("pdf surface: ") + cairo_status_to_string(st);
+        cairo_surface_destroy(surface);
+        return 6;
+    }
+    cairo_t* cr = cairo_create(surface);
+
+    for (int i = 0; i < n; ++i) {
+        if (!htmls[i]) { g_error = "null page html"; goto fail; }
+
+        cairo_container container;
+        int err_rc = 5;
+        pixel_t content_h = 0;
+        document::ptr doc = layout_page(htmls[i], container, w,
+                                        (h > 0) ? h : 100000, &content_h, &err_rc);
+        if (!doc) goto fail;
+
+        int page_h = h;
+        if (h <= 0) {
+            page_h = static_cast<int>(std::ceil(content_h.value()));
+            if (page_h <= 0) page_h = 800;
+        }
+        container.m_height = page_h;
+        if (page_h_out)    page_h_out[i]    = page_h;
+        if (content_h_out) content_h_out[i] = static_cast<int>(std::ceil(content_h.value()));
+
+        // 每页先把页面尺寸钉死（自动测高时这一步才知道这页多长），再画。
+        cairo_pdf_surface_set_size(surface, page_w, (page_h > 0 ? page_h : 1) * pt_per_px);
+
+        cairo_save(cr);                       // scale 会累积：每页自己包一层
+        cairo_scale(cr, pt_per_px, pt_per_px);
+        int dr = draw_page(cr, doc, container, w, page_h);
+        cairo_restore(cr);
+        if (dr != 0) goto fail;
+        cairo_show_page(cr);
+    }
+
+    cairo_destroy(cr);
+    cairo_surface_finish(surface);
+    st = cairo_surface_status(surface);
+    cairo_surface_destroy(surface);
+    if (st != CAIRO_STATUS_SUCCESS) {
+        g_error = std::string("pdf finish: ") + cairo_status_to_string(st);
+        return 7;
+    }
+    return 0;
+
+fail:
+    cairo_container::g_cr = nullptr;
+    cairo_destroy(cr);
+    cairo_surface_finish(surface);
+    cairo_surface_destroy(surface);
+    return 5;
 }
 
 } // extern "C"

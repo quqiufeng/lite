@@ -227,17 +227,11 @@ local function render_png(html, out, width, height, scale, env)
   end
 end
 
-function M.run(args, env)
+-- 只产 HTML（不出图）：pdf 的 template="trending" 走这条，保证两边是**同一份模板**。
+-- 返回 html, 条数, 源 url。
+function M.build(args, env)
   args = args or {}
-  local home = os.getenv("HOME") or "/tmp"
-  local out   = args.out or (home .. "/trending.png")
-  if not out:match("%.png$") then error("out 必须以 .png 结尾: " .. out) end
-  local width  = tonumber(args.width)  or 820
-  local height = tonumber(args.height) or 0 -- 0 = 自动测高
-  local scale  = tonumber(args.scale)  or 2
-  local limit  = tonumber(args.limit)  or 9
-  if width < 780 then error("width 太小（" .. width .. "），19px 仓库名会折行；required: width >= 780") end
-
+  local limit = tonumber(args.limit) or 9
   local url = "https://github.com/trending"
   local qs = {}
   if args.since and args.since ~= "" then qs[#qs + 1] = "since=" .. args.since end
@@ -249,6 +243,20 @@ function M.run(args, env)
   while #items > limit do items[#items] = nil end
 
   local html = build_html(items, expand_vars(apply_theme(load_css(env), args.theme)))
+  return html, #items, url
+end
+
+function M.run(args, env)
+  args = args or {}
+  local home = os.getenv("HOME") or "/tmp"
+  local out   = args.out or (home .. "/trending.png")
+  if not out:match("%.png$") then error("out 必须以 .png 结尾: " .. out) end
+  local width  = tonumber(args.width)  or 820
+  local height = tonumber(args.height) or 0 -- 0 = 自动测高
+  local scale  = tonumber(args.scale)  or 2
+  if width < 780 then error("width 太小（" .. width .. "），19px 仓库名会折行；required: width >= 780") end
+
+  local html, nitems = M.build(args, env)
   local html_path = out:gsub("%.png$", ".html")
   local wf = assert(io.open(html_path, "w")); wf:write(html); wf:close()
 
@@ -270,7 +278,7 @@ function M.run(args, env)
   end)()
 
   return ("%d 条 · %dx%d @%dx · litehtml\nPNG: %s (%d KB)\nHTML: %s"):format(
-    #items, pw, ph, scale, out, math.floor(sz / 1024), html_path)
+    nitems, pw, ph, scale, out, math.floor(sz / 1024), html_path)
 end
 
 return M

@@ -76,21 +76,32 @@ local BLOCK = { DOC=0, QUOTE=1, UL=2, OL=3, LI=4, HR=5, H=6, CODE=7, HTML=8, P=9
 local SPAN = { EM=0, STRONG=1, A=2, IMG=3, CODE=4, DEL=5, LATEXMATH=6, LATEXMATH_DISPLAY=7,
                WIKILINK=8, U=9 }
 
+-- 坑：MD_PARSER 是**共享**声明（helper/lib/md4c.lua 也 cdef 它），所以别拿
+-- 「MD_PARSER 已存在」当「本文件都声明过了」—— 先加载 md4c 时本文件的 lite_html_*
+-- 就会被跳过，调用时才炸 missing declaration。两个 cdef 各自用私有 marker 判定。
 local function cdef()
-  if pcall(ffi.typeof, "MD_PARSER") then return end
+  if not pcall(ffi.typeof, "MD_PARSER") then
+    ffi.cdef[[
+      typedef struct MD_PARSER {
+        unsigned abi_version; int flags;
+        int (*enter_block)(int, void*, void*);
+        int (*leave_block)(int, void*, void*);
+        int (*enter_span)(int, void*, void*);
+        int (*leave_span)(int, void*, void*);
+        int (*text)(int, const char*, unsigned, void*);
+        void (*debug_log)(const char*, void*);
+        void (*syntax)(void*);
+      } MD_PARSER;
+      int md_parse(const char*, unsigned, const MD_PARSER*, void*);
+    ]]
+  end
+  if pcall(ffi.typeof, "lite_html_render_declared_t") then return end
   ffi.cdef[[
-    typedef struct MD_PARSER {
-      unsigned abi_version; int flags;
-      int (*enter_block)(int, void*, void*);
-      int (*leave_block)(int, void*, void*);
-      int (*enter_span)(int, void*, void*);
-      int (*leave_span)(int, void*, void*);
-      int (*text)(int, const char*, unsigned, void*);
-      void (*debug_log)(const char*, void*);
-      void (*syntax)(void*);
-    } MD_PARSER;
-    int md_parse(const char*, unsigned, const MD_PARSER*, void*);
     int lite_html_render(const char*, const char*, int, int, double);
+    int lite_html_render_pdf(const char* const*, int, const char*, int, int, double,
+                             int*, int*);
+    const char* lite_html_error(void);
+    typedef int lite_html_render_declared_t;
   ]]
 end
 
@@ -179,26 +190,59 @@ local function md_to_html(src)
   return table.concat(out), rc
 end
 
-local function render_png(html, out, w, h, scale, env)
+-- dlopen liblite_html（图版和 PDF 版共用同一个 .so，加载失败信息也只写一份）
+local function load_html_lib(env)
+  cdef()   -- 只走 PDF 分支时 md_to_html 不会被调用，这里补一次（cdef 自己幂等）
   local cands = { "build/liblite_html.so",
                   ((env and env.helper_dir) or "helper") .. "/../build/liblite_html.so" }
-  local lib
   for _, p in ipairs(cands) do
     local ok, l = pcall(ffi.load, p)
-    if ok then lib = l break end
+    if ok then return l end
   end
-  if not lib then
-    -- 安装版：$LITE_ROOT/build/ 里除了 liblite_html.so 还必须躺着它的私有依赖
-    -- liblitehtml.so.0 + libgumbo.so.0（同一目录 $ORIGIN 自解析，由 tools/package.sh 带入）。
-    -- 只缺后两者时 dlopen 报的是 "libgumbo.so.0: cannot open shared object"，别误判成没编译。
-    error("缺 " .. cands[1] .. " / " .. cands[2] .. "\n"
-      .. "  源码树：./tools/build.sh\n"
-      .. "  安装版：./tools/release.sh（打包会带上 liblitehtml.so.0 + libgumbo.so.0）\n"
-      .. "  自检：./tools/check_deps.sh | grep lite_html")
-  end
+  -- 安装版：$LITE_ROOT/build/ 里除了 liblite_html.so 还必须躺着它的私有依赖
+  -- liblitehtml.so.0 + libgumbo.so.0（同一目录 $ORIGIN 自解析，由 tools/package.sh 带入）。
+  -- 只缺后两者时 dlopen 报的是 "libgumbo.so.0: cannot open shared object"，别误判成没编译。
+  error("缺 " .. cands[1] .. " / " .. cands[2] .. "\n"
+    .. "  源码树：./tools/build.sh\n"
+    .. "  安装版：./tools/release.sh（打包会带上 liblitehtml.so.0 + libgumbo.so.0）\n"
+    .. "  自检：./tools/check_deps.sh | grep lite_html")
+end
+
+local function render_png(html, out, w, h, scale, env)
+  local lib = load_html_lib(env)
   if lib.lite_html_render(html, out, w, h, scale) ~= 0 then
-    error("lite_html_render 失败（检查 PNG 路径可写、字体目录 helper/assets 存在）")
+    error("lite_html_render 失败（检查 PNG 路径可写、字体目录 helper/assets 存在）: "
+      .. tostring(ffi.string(lib.lite_html_error())))
   end
+end
+
+-- 矢量 PDF：同一套布局/绘制，surface 换成 cairo_pdf_surface（文字可选中/可搜索）。
+-- htmls 是页数组，每页一段**完整** HTML（自带 <style>，CSS 不跨页继承）。
+-- h = 0 → 每页按内容高度定页（长卡片出一整页长纸）；h > 0 → 固定页高，超出裁掉。
+-- pt_per_px 默认 0.75（96dpi 屏 px → 72pt/inch，与图版 PDF 几何一致）。
+-- 返回 page_hs（每页最终页高，CSS px）、content_hs（每页内容高度，CSS px；>page_h 即溢出）。
+local function render_pdf(htmls, out_pdf, w, h, pt_per_px, env)
+  if type(htmls) == "string" then htmls = { htmls } end
+  if type(htmls) ~= "table" or #htmls == 0 then error("render_pdf: htmls 需要非空数组") end
+  local lib = load_html_lib(env)
+  local n = #htmls
+  local arr = ffi.new("const char*[?]", n)
+  local keep = {}                       -- 防止 GC 提前回收页面字符串
+  for i = 1, n do
+    local s = tostring(htmls[i])
+    keep[i] = ffi.new("char[?]", #s + 1, s)
+    arr[i - 1] = keep[i]
+  end
+  local ph = ffi.new("int[?]", n)
+  local ch = ffi.new("int[?]", n)
+  local rc = lib.lite_html_render_pdf(arr, n, out_pdf, w, h, tonumber(pt_per_px) or 0.75, ph, ch)
+  if rc ~= 0 then
+    error(("lite_html_render_pdf 失败 rc=%d（检查 PDF 路径可写、字体目录 helper/assets 存在）: %s")
+      :format(rc, tostring(ffi.string(lib.lite_html_error()))))
+  end
+  local page_hs, content_hs = {}, {}
+  for i = 1, n do page_hs[i] = ph[i - 1]; content_hs[i] = ch[i - 1] end
+  return page_hs, content_hs
 end
 
 -- 读 PNG IHDR 拿真实像素尺寸（h=0 自动测高时才知道最终高度）
@@ -238,5 +282,14 @@ function M.run(args, env)
   return string.format("PNG %dx%d (%d 字节) → %s\nHTML → %s",
     pw, ph, size, out, hp)
 end
+
+-- 供其它插件复用（helper/pdf.lua 按页出图就是这么用的）：
+-- 这三件事各自都不小（md4c 回调拼 HTML / dlopen liblite_html / 读 PNG IHDR），
+-- 复制一份就是两份漂移源。**改这里就是改所有调用方**。
+M.md_to_html = md_to_html      -- (src) -> html_body, rc
+M.render_png = render_png      -- (html, out_png, w, h, scale, env)
+M.render_pdf = render_pdf      -- (htmls[], out_pdf, w, h, pt_per_px, env) 矢量 PDF，文字可选中
+M.png_size   = png_size        -- (path) -> px_w, px_h（h=0 自动测高后靠它知道真实高度）
+M.theme_css  = theme_css       -- (body_css, theme_name) -> <style> 内容（含 var() 展开）
 
 return M
