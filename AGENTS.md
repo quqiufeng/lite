@@ -158,28 +158,17 @@ MUST NOT：`python`/`sed -i` 改仓库文件（用 `edit`/`write`）；Chrome/We
 
 ## 7 现有插件
 
-细节看文件头注释；共享逻辑放 `helper/lib/`（`app_<class>_map.lua` 勿手改）。
+**不在这里维护清单**——插件增删是会话里随时发生的，抄一份进来第二天就漂。要知道有什么：
+`./tools/run.sh plugins [--json]`（带加载错误）；单个插件的参数与坑看 `helper/<name>.lua`
+开头几行注释，用到再读。**模型侧更该靠 `tools` 清单和 `helper/` 目录现查，别背这张表。**
 
-只列**作用 + 在哪**；参数和坑看各文件头注释（`helper/<name>.lua` 开头几行），用到再读。
+只留不随增删漂移的结构事实：
 
-| 插件 | 作用 | 实现在哪 |
-|---|---|---|
-| `adb` | Android：screenshot/tap/swipe/text/open/shell/push | `helper/adb.lua` + `helper/lib/adb.lua` |
-| `wechat` | 搜联系人/群 → 进会话 → 发消息/文件 | `helper/wechat.lua` |
-| `uimap` | 视觉定位按钮：discover/learn/click/save | `helper/uimap.lua`，映射落 `helper/lib/app_<class>_map.lua` |
-| `usb` | 麦/音箱/摄像头：record/play/photo/video/volume | `helper/usb.lua` |
-| `music` | 常驻 VLC 播放器（本地/URL/WebDAV） | `helper/music.lua` + `helper/lib/webdav.lua` |
-| `search`/`fetch` | DeepSeek 搜索 / URL→Markdown | `helper/{search,fetch}.lua` + `helper/lib/deepseek.lua` |
-| `tokens` | 每日 token 账本（源 `/agent/usage`） | `helper/tokens.lua` |
-| `cgrep` | 正则/字面串扫目录 → `path:line: text` | `helper/cgrep.c` + `helper/cgrep.lua` |
-| `lens` | 代码库检索：`locate`/`peek`/`grep`/`dataflow` | `helper/lens.lua` → `lua/ffi/codesearch.lua` → `src/codesearch/` |
-| `pdftext` | PDF 抽文本 | `helper/pdftext.lua`（纯 FFI） |
-| `md2png`/`web2png`/`trending`/`pdf` | MD/网页→PNG；PDF 两条路（`mode=image` 分页图版 / `mode=html` 矢量可选中，含 `template=trending` 直出） | `helper/{md2png,web2png,trending,pdf}.lua` + `helper/lib/{md4c,htmlmd}.lua` + `src/html/`（`lite_html_render_pdf`） |
-| `charts` | 手绘风 SVG 图表卡（54 种）→ PNG | `helper/charts.lua` → `lua/charts/` |
-| `trace` | perf 探针采样 → 火焰图/热力/排行 | `helper/trace.lua` → `lua/trace/` |
-
-`lens` **只索引 cwd 之外的项目**（lite 自身不建索引），细节见 `src/codesearch/README.md`
-与 `code_search_best_practices.md`。
+- **共享逻辑放 `helper/lib/`**（不是插件，不按名可调）；`helper/lib/app_<class>_map.lua` 是 `uimap`
+  生成的映射，**勿手改**（要改跑 `uimap learn` 或 `save`）。
+- **重活下沉到 `src/`**：常见形状 `helper/<x>.lua` → `lua/ffi/<x>.lua` → `src/<x>/`，
+  改 C 就必须重编（§6 尾部），只改 Lua 立刻生效。`helper/*.c` 走 `native build`。
+- `lens` **只索引 cwd 之外的项目**（lite 自身不建索引），见 `src/codesearch/README.md`。
 
 ## 8 serve
 
