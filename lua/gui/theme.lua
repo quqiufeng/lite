@@ -159,8 +159,14 @@ end
 
 -- 色系 + 排版一次吐成 CSS :root 块（litehtml 不解析 var，调用方还要 expand_vars）。
 -- 变量名与 helper/assets/kami.css 对齐；额外给 --fs-* 字号阶，让卡片跟 Kami 同源。
+--
+-- 默认值只有一条：name 为空/未知 → M.CARD_DEFAULT（moon）。与 apply/page_css/series
+-- 一致，也与 GUI 的 palette() 一致（palette 里同一套回落）。
+-- **别再传 M.KAMI 当兜底**：那会让 css(nil) 出 light、而 apply(nil) 出 moon，
+-- 同一个「没给主题」两条路两个色。要 Kami 原色就显式 M.css(M.KAMI)，那条链
+-- 是给 kami.css 逐值对账用的，不承担默认职责。
 function M.css(name)
-  local pal, key = M.palette(name or M.KAMI)
+  local pal, key = M.palette(name or M.CARD_DEFAULT)
   local t = M.THEMES[key]
   local T = M.TYPO
   return string.format([[:root{
@@ -197,7 +203,7 @@ end
 
 -- 换色系：把 css 里第一个 :root 整块换成该主题的令牌，排版规则一个字不动。
 -- name 为空/未知 → 用 M.CARD_DEFAULT 换掉第一块 :root（卡片默认月白）；
--- 未知主题在 M.palette 里回落 light，不会报错。
+-- 未知名字由 M.palette 回落 M.DEFAULT（同为 moon），不报错。
 -- 用法：M.expand(M.apply(css, args.theme))
 function M.apply(css, name)
   name = (name ~= nil and name ~= "") and name or M.CARD_DEFAULT
