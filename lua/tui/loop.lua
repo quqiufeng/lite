@@ -621,6 +621,31 @@ function M.run(ctx, agent, memory, opts)
         diff_auto = auto
     end
 
+    -- plan 模式开关就是一个 cwd/.plan 文件：谁都能 `touch/rm`，插件 helper/plan.lua
+    -- 用 before_tool 钩子读它拦写操作，进程外也能验（不用重启 TUI）。
+    local function plan_file()
+        return (ctx.session.cwd or ".") .. "/.plan"
+    end
+    local function plan_on()
+        local f = io.open(plan_file(), "r")
+        if f then f:close() return true end
+        return false
+    end
+    local function toggle_plan()
+        local on = not plan_on()
+        if on then
+            local f = io.open(plan_file(), "w")
+            if not f then transcript:add("info", "plan 开关失败: 无法写 " .. plan_file()) return end
+            f:write("plan mode\n")
+            f:close()
+            transcript:add("system", "plan 模式开启（只读）：只能看不能改，方案想清楚再按 Tab 退出")
+        else
+            os.remove(plan_file())
+            transcript:add("system", "plan 模式关闭（可执行）")
+        end
+        if draw then draw() end
+    end
+
     local function complete_path()
         local line = composer.lines[composer.cy] or ""
         local token, start = Complete.token(line, composer.cx)
@@ -774,7 +799,8 @@ function M.run(ctx, agent, memory, opts)
         elseif k == "newline" then
             composer:insert("\n")
         elseif k == "tab" then
-            complete_path()
+            -- 输入框空着 = 切 plan 模式（Tab 再按一次退出）；正在打路径 = 仍然是补全。
+            if composer:is_empty() then toggle_plan() else complete_path() end
         elseif k == "backspace" then
             composer:backspace()
         elseif k == "delete" then
@@ -836,6 +862,7 @@ function M.run(ctx, agent, memory, opts)
                 -- 记忆降级只读时状态栏必须显眼：否则整轮对话都不落盘，
                 -- 用户还以为在正常记。快照那种"故意只读"不算，别造假警报。
                 readonly = memory and memory.readonly and not memory.snapshot_only or false,
+                plan = plan_on(),
                 cache = ctx.cache_ratio and ctx:cache_ratio() or nil,
                 reuse = ctx.prefix_ratio and ctx:prefix_ratio() or nil,
                 ctxeng = agent and agent._compact_probe or nil,

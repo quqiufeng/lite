@@ -100,6 +100,8 @@ MUST NOT：`python`/`sed -i` 改仓库文件（用 `edit`/`write`）；Chrome/We
 - **TUI 两个 `#` 开关**（`submit()` 先拦，不进模型）：`#语音模式`；`#监工模式`/`#终止监工` 每
   `LITE_WATCHDOG_SEC`（180s）在**空闲+队列空+输入框空**时补发 `LITE_WATCHDOG_TEXT`（默认「继续」），
   状态落 `/agent/session/<sid>/watchdog`，reboot 自动接上。
+- **Tab 切 plan 模式**（`loop.lua`）：输入框**空**时 Tab 写 `cwd/.plan`（再按一次 Tab 删掉=退出），状态栏显
+  `PLAN`；框里有字时仍是路径补全。开关就是一个文件，`helper/plan.lua` 的 `before_tool` 读它拦写，进程外可验。
 - **HTML→PNG 三件套**走 `build/liblite_html.so`，与 `liblitehtml.so.0`/`libgumbo.so.0` 同目录靠 `$ORIGIN`：
   源码树要 `/opt/litehtml` 才能**编**，安装版不必也能**跑**；缺库别误读成「liblite_html 没编译」。
 - 工具输出 ≤32KB；`read` 文本限 workspace，图片可读 `$TMPDIR:/tmp:/var/tmp`，多文件用 `paths` 批量读；

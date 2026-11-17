@@ -5,7 +5,7 @@ M.__index = M
 local ITEMS = {
     { "Enter", "send message" },
     { "Ctrl+J", "insert newline" },
-    { "Tab", "complete file path" },
+    { "Tab", "complete file path / empty input: toggle plan mode" },
     { "Wheel/PgUp/PgDn", "scroll transcript" },
     { "Drag (left)", "select text · copy on release" },
     { "Ctrl+O", "expand/collapse last tool" },

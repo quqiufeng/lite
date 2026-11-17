@@ -23,6 +23,8 @@ function M.render(screen, y, w, ctx, info)
 
     local left = string.format(" lite · %s · turn %d · %s ", model, turn, cwd)
     local mem = string.format(" mem:%d", info.mem or 0)
+    -- plan 模式：只读。不显眼 = 模型被拦了用户还纳闷，所以大写放最前。
+    if info.plan then mem = " PLAN" .. mem end
     -- 只读实例：所有写都被丢掉，不给红字就等于骗人（旧版这里有且仅有一行 stderr）。
     if info.readonly then mem = mem .. " RO!" end
     -- 不再显示 hit:N：每轮召回都刷数字，只增噪声（要看召回明细开 LITE_TUI_MEM_NOTICE=1）。

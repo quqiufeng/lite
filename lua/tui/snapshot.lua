@@ -77,6 +77,12 @@ function M.render(ctx, opts)
         mem = opts.mem or 0,
         hits = 0,
         todos = ctx.session.todos or {},
+        -- 跟 loop.lua 同一个判据（cwd/.plan，helper/plan.lua 也读它），否则快照验收看不到 plan 状态。
+        plan = (function()
+            local f = io.open((ctx.session.cwd or ".") .. "/.plan", "r")
+            if f then f:close() return true end
+            return false
+        end)(),
     })
     screen.cursor.x = cx
     screen.cursor.y = cy
