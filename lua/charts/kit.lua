@@ -4,8 +4,9 @@ local P = require('charts.pen')
 local M = {}
 
 -- 取一行的数值：给了 key 就用 key，否则 value（也兼容纯数字行）
+-- 一律过一遍 pen.fin：坏值（"oops"/nil/nan/±inf）落成 0，下游不必再防
 local function vof(r, key)
-  if type(r) == 'number' then return r end
+  if type(r) == 'number' then return P.fin(r) or 0 end
   if type(r) ~= 'table' then return 0 end
   local v = key and (r[key] or r.value) or r.value
   -- 一行可能是一串样本（蜂群/雨云/山脊的 values = {...}）：取其中最大那个，
@@ -13,13 +14,12 @@ local function vof(r, key)
   if type(v) == 'table' then
     local mx = -math.huge
     for _, x in ipairs(v) do
-      x = tonumber(x)
+      x = P.fin(x)
       if x and x > mx then mx = x end
     end
     return mx == -math.huge and 0 or mx
   end
-  if type(v) ~= 'number' then v = tonumber(v) or 0 end
-  return v
+  return P.fin(v) or 0
 end
 M.vof = vof
 
@@ -29,6 +29,7 @@ function M.box(o)
 end
 
 function M.scale(v, a, b, c, d)
+  v, a, b, c, d = P.fin(v) or 0, P.fin(a) or 0, P.fin(b) or 0, P.fin(c) or 0, P.fin(d) or 0
   if b == a then b = a + 1e-9 end
   return c + (d - c) * (v - a) / (b - a)
 end
@@ -55,7 +56,14 @@ end
 
 function M.sum(rows, key)
   local s = 0
-  for _, r in ipairs(rows) do s = s + vof(r, key) end
+  for _, r in ipairs(rows or {}) do s = s + vof(r, key) end
+  return P.fin(s) or 0
+end
+
+-- 占比用的分母：和为 0（全 0 数据）时给 1，别让卡片自己写 /0
+function M.total(rows, key)
+  local s = M.sum(rows, key)
+  if s == 0 then return 1 end
   return s
 end
 
@@ -67,7 +75,7 @@ local function trim0(s)
 end
 
 function M.vfmt(v)
-  v = tonumber(v) or 0
+  v = P.fin(v) or 0
   local a = math.abs(v)
   if a >= 1e6 then return trim0(string.format('%.1f', v / 1e6)) .. 'M' end
   if a >= 1000 then return trim0(string.format('%.1f', v / 1000)) .. 'k' end
@@ -75,10 +83,11 @@ function M.vfmt(v)
   return trim0(string.format('%.2f', v))
 end
 
-function M.int(v) return string.format('%d', math.floor((tonumber(v) or 0) + .5)) end
+function M.int(v) return string.format('%d', math.floor((P.fin(v) or 0) + .5)) end
 
 -- 一律按 0 起算的比例尺上界（bar/line 通用），留 8% 余量
 function M.top(v)
+  v = P.fin(v) or 0
   if v <= 0 then return 1 end
   local mag = 10 ^ math.floor(math.log(v, 10))
   local n = v / mag
@@ -109,6 +118,7 @@ end
 -- 轴上的刻度数字与淡网格
 -- 好读的刻度步长：1 / 2 / 2.5 / 5 / 10 × 10^k
 function M.step(v)
+  v = P.fin(v) or 0
   if v <= 0 then return 1 end
   local mag = 10 ^ math.floor(math.log(v, 10))
   local n = v / mag
@@ -118,10 +128,13 @@ end
 
 function M.ticksY(b, top, n)
   n = n or 4
+  top = P.fin(top) or 0
+  if top <= 0 then return end
   local st = M.step(top / n)
   if st * math.floor(top / st + 1e-9) < top * .55 then st = st / 2 end
   local k = 0
-  while true do
+  -- 上限 512 条：st 被算成 0/极小值时 while 会原地转圈，刻度也不该有几百条
+  while k <= 512 do
     local v = k * st
     if v > top * 1.0001 then break end
     local y = M.scale(v, 0, top, b.y1, b.y0)
@@ -132,8 +145,12 @@ function M.ticksY(b, top, n)
 end
 
 function M.ticksX(b, rows, n)
+  rows = rows or {}
+  if #rows == 0 then return end
   n = n or #rows
+  if n < 1 then n = 1 end
   local step = math.ceil(#rows / n)
+  if step < 1 then step = 1 end
   for i = 1, #rows, step do
     local x = M.scale(i - .5, 0, #rows, b.x0, b.x1)
     P.text(tostring(rows[i].label or ''), x, b.y1 + 16, { size = 11, anchor = 'middle', col = P.INK })

@@ -7,6 +7,7 @@
 --   C.render('pie', spec, '/tmp/a.png')  -- 出 PNG（cairo+librsvg）
 --   C.render('pie')                   -- 不给 spec 就用卡自带的 demo
 local P = require('charts.pen')
+local S = require('charts.spec')
 
 local M = { PEN = P }
 
@@ -63,8 +64,12 @@ function M.spec(id, spec)
   return s, d
 end
 
+-- 唯一的出图入口：spec 先过守卫（数值规整/空数据标记），再交给卡片画。
+-- 卡片因此可以假设「rows 里每行的 value 是有限数」，坏数据在图上变成一句注脚。
 function M.svg(id, spec)
   local s, d = M.spec(id, spec)
+  s = S.guard(s)
+  if s._empty then return P.card(s, function() S.draw_empty() end) end
   return P.card(s, function(sp) d.draw(sp) end)
 end
 

@@ -12,6 +12,15 @@ echo "== deps =="
 echo "== unit =="
 "$ROOT/tools/lite-lua" "$ROOT/tools/auto_unit.lua"
 
+echo "== charts =="
+# 54 卡 × 坏数据矩阵（空/全 0/单行/负数/1e12/字符串/nan）：崩、出 nan、点数爆炸都算失败。
+# 外面套 timeout 是因为坏数据曾把 resample/spline 的循环放大到十亿次（进程挂住），
+# 挂住要变成一条 FAIL，而不是把整个回归拖死。
+if ! timeout 180 "$ROOT/tools/lite-lua" "$ROOT/tools/charts_check.lua"; then
+    echo "FAIL charts.boundary" >&2; exit 1
+fi
+echo "OK charts"
+
 echo "== live =="
 "$ROOT/tools/live_smoke.sh"
 

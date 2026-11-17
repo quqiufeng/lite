@@ -240,7 +240,10 @@ M.raincloud = {
     local bb = { y0 = 78, y1 = 226 }
     for i, r in ipairs(rs) do
       local cx = 90 + slot * (i - .5)
-      local vals = r.values or {}
+      -- 只给 value 的一行也当成「一个样本」：空 vals 会让密度处处为 0，
+      -- 云就退化成一条零宽的竖线（看着像 bug，其实是没数据）
+      local vals = r.values
+      if not vals or #vals == 0 then vals = { K.vof(r, 'value') } end
       local poly = shape(cx, min(slot * .34, 34), vals, top, bb)
       P.shape(poly, P.mix(K.col(i), '#fdf9f1', .3), { w = 1.2 })
       for k, v in ipairs(vals) do
@@ -250,7 +253,9 @@ M.raincloud = {
       -- 下面的横条＝横向箱线：须是 min..max，粗条是中间一半
       -- 用本组自己的 min..max 做比例尺（套 0..top 的话四分位差只有几像素，缩成一个点）
       local half = min(slot * .34, 34)
-      local lo, hi = vals[1], vals[1]
+      -- 没有 values（只给了 value 的行）时用这一行的 value 起头，别让 lo/hi 是 nil
+      local lo = vals[1] or K.vof(r, 'value')
+      local hi = lo
       for _, v in ipairs(vals) do
         if v < lo then lo = v end
         if v > hi then hi = v end

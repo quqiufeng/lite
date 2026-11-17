@@ -139,19 +139,21 @@ function M.polar(cx, cy, r, a) return cx + r * cos(a), cy + r * sin(a) end
 -- 高斯核密度（violin / ridge 用）
 function M.density(vals, lo, hi, n)
   n = n or 40
+  -- nv 兜 0：空样本时下面 d/(nv*bw*…) 会算成 0/0=nan，整条曲线变成 d="Mnan nan"
+  local nv = math.max(1, #vals)
   local mean, sd = 0, 0
   for _, v in ipairs(vals) do mean = mean + v end
-  mean = mean / math.max(1, #vals)
+  mean = mean / nv
   for _, v in ipairs(vals) do sd = sd + (v - mean) ^ 2 end
-  sd = sqrt(sd / math.max(1, #vals))
+  sd = sqrt(sd / nv)
   if sd <= 0 then sd = (hi - lo) / 6 > 0 and (hi - lo) / 6 or 1 end
-  local bw = sd * 1.06 * math.max(1, #vals) ^ (-0.2)
+  local bw = sd * 1.06 * nv ^ (-0.2)
   local o = {}
   for i = 0, n do
     local v = lo + (hi - lo) * i / n
     local d = 0
     for _, x in ipairs(vals) do d = d + math.exp(-0.5 * ((v - x) / bw) ^ 2) end
-    o[#o + 1] = { v = v, d = d / (#vals * bw * 2.5066) }
+    o[#o + 1] = { v = v, d = d / (nv * bw * 2.5066) }
   end
   return o
 end

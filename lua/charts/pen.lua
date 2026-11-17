@@ -31,8 +31,36 @@ M.out = {}
 M.rnd = nil
 M.W, M.H = 520, 420
 
+-- 单条路径的点数上限。坏数据（坐标算到 1e12）会把 resample/spline 的循环次数
+-- 从「几十」放大到「十亿」——那不是画错，是进程挂住。宁可画糙，不能挂。
+M.MAXPTS = 4096
+-- 坐标夹到画布的两倍多：真跑飞的坐标只画到画外，不会把 cairo 拖死
+M.CLAMPD = 2
+
+-- 有限数：nan / ±inf 一律算坏值（它们进 SVG 就是 d="M98 96Lnan nan"）
+function M.fin(v)
+  v = tonumber(v)
+  if not v or v ~= v then return nil end
+  if v == math.huge or v == -math.huge then return nil end
+  return v
+end
+
+-- 丢掉非有限点；下游别再自己判空
+function M.clean(pts)
+  local o = {}
+  for i = 1, #(pts or {}) do
+    local p = pts[i]
+    if type(p) == 'table' then
+      local x, y = M.fin(p[1]), M.fin(p[2])
+      if x and y then o[#o + 1] = { x, y } end
+    end
+  end
+  return o
+end
+
 function M.n1(v)
-  local s = fmt('%.1f', tonumber(v) or 0)
+  v = M.fin(v) or 0
+  local s = fmt('%.1f', v)
   if s == '-0.0' then s = '0.0' end
   return (s:gsub('%.0$', ''))
 end
@@ -86,11 +114,15 @@ function M.lerp(a, b, t) return a + (b - a) * t end
 -- ---------------------------------------------------------------------------
 function M.resample(pts, step)
   step = step or 8
-  local o = {}
+  pts = M.clean(pts)
+  if #pts < 2 then return pts end
+  local o, cap = {}, M.MAXPTS
   for i = 1, #pts - 1 do
     local a, b = pts[i], pts[i + 1]
     local d = sqrt((b[1] - a[1]) ^ 2 + (b[2] - a[2]) ^ 2)
-    local n = max(1, floor(d / step + .5))
+    local n = max(1, floor((M.fin(d) or 0) / step + .5))
+    -- 预算用完 / 这一段长到离谱：不再细分，直接连直线（点少一点，形状还在）
+    if n > 1 and #o + n > cap then n = 1 end
     for k = 0, n - 1 do o[#o + 1] = { a[1] + (b[1] - a[1]) * k / n, a[2] + (b[2] - a[2]) * k / n } end
   end
   o[#o + 1] = { pts[#pts][1], pts[#pts][2] }
@@ -105,6 +137,7 @@ end
 
 function M.hand(pts, amp, over)
   amp = amp or .5
+  pts = M.clean(pts)
   if #pts < 2 then return pts end
   if over and over > 0 then
     local a, b, y, z = pts[1], pts[2], pts[#pts], pts[#pts - 1]
@@ -134,9 +167,26 @@ function M.hand(pts, amp, over)
   return o
 end
 
+-- 出路径前最后一道闸：非有限点跳过，坐标夹进画布附近。
+-- 卡片把坐标算错了 → 图会歪/出框，但不会写出 nan，也不会把 cairo 拖死。
+local function clampc(v, lim)
+  v = M.fin(v) or 0
+  if v > lim then return lim elseif v < -lim then return -lim end
+  return v
+end
+M.clampc = clampc
+
 function M.pathOf(pts, closed)
-  local t = { 'M', M.n1(pts[1][1]), ' ', M.n1(pts[1][2]) }
-  for i = 2, #pts do t[#t + 1] = 'L' .. M.n1(pts[i][1]) .. ' ' .. M.n1(pts[i][2]) end
+  local lw, lh = M.W * M.CLAMPD, M.H * M.CLAMPD
+  local t = {}
+  for i = 1, #(pts or {}) do
+    local p = pts[i]
+    if type(p) == 'table' then
+      local x, y = clampc(p[1], lw), clampc(p[2], lh)
+      t[#t + 1] = (t[1] and 'L' or 'M') .. M.n1(x) .. ' ' .. M.n1(y)
+    end
+  end
+  if not t[1] then return 'M0 0' end
   if closed then t[#t + 1] = 'Z' end
   return table.concat(t)
 end
@@ -144,7 +194,11 @@ end
 -- Catmull-Rom 采样：平滑曲线（云、饼边、山脊）
 function M.spline(c, closed, step)
   step = step or 1.4
+  c = M.clean(c)
   local n = #c
+  if n == 0 then return {} end
+  -- 单点没法平滑（也画不出曲线），原样返回，别让 at() 在空表上取下标
+  if n == 1 then return { { c[1][1], c[1][2] } } end
   local function at(i)
     if closed then return c[(i - 1) % n + 1] end
     return c[max(1, min(n, i))]
@@ -156,7 +210,8 @@ function M.spline(c, closed, step)
     local m0 = { (p1[1] - at(i - 1)[1]) / 2, (p1[2] - at(i - 1)[2]) / 2 }
     local m1 = { (at(i + 2)[1] - p0[1]) / 2, (at(i + 2)[2] - p0[2]) / 2 }
     local d = sqrt((p1[1] - p0[1]) ^ 2 + (p1[2] - p0[2]) ^ 2)
-    local k = max(1, floor(d / step + .999))
+    local k = max(1, floor((M.fin(d) or 0) / step + .999))
+    if k > 1 and #o + k > M.MAXPTS then k = 1 end
     for j = 0, k - 1 do
       local t = j / k
       local t2, t3 = t * t, t * t * t
@@ -212,6 +267,7 @@ function M.fill(pts, col, o)
   o = o or {}
   local dx, dy, amp = o.dx or 1.1, o.dy or .8, o.amp or .5
   local j = M.hand(pts, amp)
+  if #j < 2 then return end
   local a = {}
   for i, p in ipairs(j) do a[i] = { p[1] + dx, p[2] + dy } end
   emit(fmt('<path fill="%s" d="%s"/>', col or M.PAL.cream, M.pathOf(a, true)))
@@ -225,17 +281,20 @@ function M.line(pts, o)
   local w, col, amp = o.w or 1.4, o.col or M.INK, o.amp
   if amp == nil then amp = .55 end
   local j = M.hand(pts, amp, o.over or 1.6)
+  if #j < 2 then return end
   emit(fmt('<path d="%s" fill="none" stroke="%s" stroke-width="%s" stroke-linecap="round" stroke-linejoin="round" opacity="%s"%s/>',
     M.pathOf(j), col, M.n1(w), M.n1(o.op or 1),
     o.dash and (' stroke-dasharray="' .. o.dash .. '"') or ''))
 end
 
 function M.rim(pts, w, col, op)
+  if #(pts or {}) < 2 then return end
   emit(fmt('<path d="%s" fill="none" stroke="%s" stroke-width="%s" opacity="%s"/>', M.pathOf(pts, true), col or M.INK, M.n1(w or 1), M.n1(op or 1)))
 end
 
 function M.inkLoop(pts, o)
   o = o or {}
+  if #(pts or {}) < 2 then return end
   local c = {}
   for i, p in ipairs(pts) do c[i] = p end
   c[#c + 1] = pts[1]
