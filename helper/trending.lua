@@ -24,10 +24,13 @@
 -- ═══════════════════════════════════════════════════════════════════════════
 --
 -- ① 插件依赖（本文件自身的运行时）
---    · curl            抓 https://github.com/trending（走 io.popen，零 FFI）
+--    · core.http       抓 https://github.com/trending（libcurl FFI，不 fork、不拼 shell）
 --    · 解析器是本文件内的 parse()（纯 Lua gmatch，无外部库；页面结构一变就
 --      返回空表，由调用方报错）
---    无 key、无网络代理配置；GitHub 挂了就直接报 curl 错误。
+--    无 key、无网络代理配置；GitHub 挂了就直接报 http.get 的 rc/HTTP 状态。
+--    别退回 io.popen("curl …")：core.http 顺手做了 ACCEPT_ENCODING(自动解 gzip)、
+--    重定向、NOSIGNAL、SSL 校验，并把耗时记进 trace.prof 的 http.get —— popen 这些全没有，
+--    且卡住只能靠 -m 等满 30s，取消不掉。
 --
 -- ② 编译依赖（出图后端 liblite_html.so，不进 helper/）
 --    src/html/render.cpp → build/liblite_html.so，由 ./tools/build.sh 产出：
@@ -132,12 +135,17 @@ local function esc(s)
   end))
 end
 
--- 抓 HTML；curl 失败或空串直接抛，避免出空白图
+-- 抓 HTML；rc≠0 / 非 200 / 过短都直接抛，避免出空白图。
+-- 4MB 上限：trending 页面带内联 SVG 与整段 CSS，实测 ~300KB，留足余量（默认 1MB 会截断）。
 local function fetch(url)
-  local f = io.popen(('curl -sS -m 30 -A "Mozilla/5.0" %q 2>/dev/null'):format(url))
-  if not f then error("无法启动 curl（检查是否安装）") end
-  local h = f:read("*a"); f:close()
-  if not h or #h < 2000 then error("抓取失败或返回过短: " .. url .. " (" .. tostring(h and #h) .. " bytes)") end
+  local http = require("core.http")
+  local rc, status, body = http.get(url, { "User-Agent: Mozilla/5.0" }, 4 * 1024 * 1024, 30)
+  if rc ~= 0 then
+    error(("抓取失败: curl rc=%s（%s）；url=%s"):format(tostring(rc), tostring(body), url))
+  end
+  if status ~= 200 then error(("抓取失败: HTTP %s；url=%s"):format(tostring(status), url)) end
+  local h = body or ""
+  if #h < 2000 then error("抓取失败或返回过短: " .. url .. " (" .. #h .. " bytes)") end
   return h
 end
 
