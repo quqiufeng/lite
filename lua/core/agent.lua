@@ -833,6 +833,28 @@ end
 -- 手写循环在 128 轮里烧掉几十万 token 是常态，越早熔断越好。
 M.REPEAT_LIMIT = 4
 M.RESULT_REPEAT_LIMIT = 3
+-- 被策略/审批拦住比「结果重复」更早熔断：重试同一调用永远同样被拦，
+-- 只有人能解除（`rm .plan`、改审批策略、给权限），模型的正确动作是转人工。
+M.BLOCK_LIMIT = 2
+
+-- 「这不是没数据，是做不了」：hook 拦截、审批拒绝、策略拒绝。
+-- 这类结果必须和「同一结果重复」分开算 —— 后者是模型在原地打转，
+-- 前者是模型再试一百次也不会变，收尾时该让模型交代要人做什么，
+-- 而不是让它对着原问题硬答一个它根本没拿到的结论。
+local BLOCK_PATTERNS = {
+    "^error: blocked by hook",
+    "^error: tool call denied by policy",
+    "^error: tool call rejected by user",
+    "^error: approval required",
+}
+
+local function is_blocked(result)
+    if type(result) ~= "string" then return false end
+    for _, pat in ipairs(BLOCK_PATTERNS) do
+        if result:find(pat) then return true end
+    end
+    return false
+end
 
 -- 不同命令可能产生同一结果（反复 git log/ls）。只比较调用参数抓不到；
 -- 用「工具名 + 结果哈希」做无进展检测。
@@ -854,6 +876,20 @@ local STOP_NOTE = table.concat({
     "1) 结论；",
     "2) 只列必要的一两条证据；",
     "3) 仅当确实需要时再给下一步。",
+    "</session_context>",
+}, "\n")
+
+-- 被策略挡住时的收尾：不能说「用已有结果回答原问题」——模型手上根本没有
+-- 需要用户动手才能拿到的数据。要说的是「谁拦的、用户该做什么」。
+local BLOCK_NOTE = table.concat({
+    "<session_context>",
+    "工具循环已停止：%s。",
+    "这不是「查不到数据」，而是「这件事现在做不了」：刚才的调用被权限/策略拦住了，",
+    "原样重试会得到完全一样的拦截，所以别再请求工具调用，也别说已经做完了。",
+    "当前没有可用工具。直接对用户说清三件事，不要复述历史：",
+    "1) 是什么拦住了：工具名 + 拦截原因（一句话）；",
+    "2) 用户需要做什么才能继续：给出可以直接复制执行的具体命令或操作；",
+    "3) 解除之后我接着做什么（一句话）。",
     "</session_context>",
 }, "\n")
 
@@ -901,15 +937,18 @@ end
 -- 用户只看到一句报错，得自己翻会话才知道跑到哪了。收尾请求不带 tools
 -- （模型没有工具可调，只能说话），把结论落地成一条普通 assistant 消息。
 -- 这额外一次请求是全新前缀，但只发生一次，值得。
-function M:_finalize(stream, why)
+function M:_finalize(stream, why, kind)
     local ctx = self.ctx
     local msgs = self:view_messages()
     -- 用 user 而不是在末尾插 system：有些网关对"system 必须在最前面"较真，
     -- 这个请求要是 400 了，前面几十轮的结果就彻底丢了。
     local question = tostring(self._text or ""):sub(1, 500)
-    msgs[#msgs + 1] = { role = "user", content = string.format(STOP_NOTE, why, question) }
+    -- kind=blocked：调用被策略/hook 拦死，不是"没数据"，收尾要求换一套说法。
+    local note = (kind == "blocked") and BLOCK_NOTE or STOP_NOTE
+    msgs[#msgs + 1] = { role = "user", content = string.format(note, why, question) }
 
-    ctx:emit("turn_limit", { reason = why, turns = ctx.settings.max_turns })
+    ctx:emit("turn_limit", { reason = why, kind = kind or "repeat",
+        turns = ctx.settings.max_turns })
     -- 工具轮结束时没有 end_turn（busy 还挂着），别再叠一个 turn_start。
     if not ctx.session.busy then ctx:begin_turn() end
     ctx:set_status("thinking")
@@ -1033,7 +1072,11 @@ function M:_loop(text, stream)
 
     local tool_notes = {}
     local last_sig, repeat_n = nil, 0
-    local result_counts, repeated_result = {}, 0
+    -- 结果重复必须**连续**才算卡住：整轮里「同一条结果第 3 次出现」不等于原地打转，
+    -- 中间夹着别的进展（读文件、跑测试）时，同一个 `git status` 输出重复很正常。
+    local prev_rs, result_streak = nil, 0
+    -- 同一工具连续被拦：这是"做不了"而不是"没进展"，单独计数、单独收尾。
+    local blocked_tool, blocked_n = nil, 0
     local overflow_retried = false
     local max_turns = ctx.settings.max_turns
     local token_budget = tonumber(ctx.settings.token_budget) or 0
@@ -1217,10 +1260,23 @@ function M:_loop(text, stream)
             local fnote = self:_failure_note(name, fn.arguments, result)
             if fnote ~= "" then result = tostring(result) .. fnote end
             ctx:emit("tool_result", name, result)
+            -- 连续重复计数（不连续的重复不算卡住，见上面的 prev_rs）。
             local rs = result_sig(name, result)
-            local rn = (result_counts[rs] or 0) + 1
-            result_counts[rs] = rn
-            if rn > repeated_result then repeated_result = rn end
+            if rs == prev_rs then
+                result_streak = result_streak + 1
+            else
+                prev_rs, result_streak = rs, 1
+            end
+            -- 拦截单独记账：同一工具连续被挡住，再发一百次结果也一样。
+            if is_blocked(result) then
+                if blocked_tool == name then
+                    blocked_n = blocked_n + 1
+                else
+                    blocked_tool, blocked_n = name, 1
+                end
+            else
+                blocked_tool, blocked_n = nil, 0
+            end
             tool_notes[#tool_notes + 1] = {
                 name = name,
                 args = fn.arguments or "",
@@ -1262,12 +1318,20 @@ function M:_loop(text, stream)
         else
             last_sig, repeat_n = cur, 1
         end
+        if blocked_n >= M.BLOCK_LIMIT then
+            -- 转人工：原因要能直接抄给用户，别只说"重复了 N 次"。
+            local why = string.format(
+                "`%s` 连续 %d 次被拦（不是数据缺失，是需要用户动手才能继续）",
+                tostring(blocked_tool), blocked_n)
+            return self:_finalize(stream, why, "blocked")
+        end
         if repeat_n >= M.REPEAT_LIMIT then
             local why = string.format("the same tool calls repeated %d times in a row", repeat_n)
             return self:_finalize(stream, why)
         end
-        if repeated_result >= M.RESULT_REPEAT_LIMIT then
-            local why = string.format("the same tool result repeated %d times", repeated_result)
+        if result_streak >= M.RESULT_REPEAT_LIMIT then
+            local why = string.format(
+                "the same tool result repeated %d times in a row", result_streak)
             return self:_finalize(stream, why)
         end
     end

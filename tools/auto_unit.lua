@@ -1018,6 +1018,113 @@ do
     check(calls == 2, "agent loop count")
 end
 
+-- 卡住检测的两种误判（都实际踩过）：
+--   1) 「同一结果重复」曾按整轮累计计数，中间夹着别的进展也会熔断；
+--   2) 「被 hook/策略拦住」被当成「没进展」，收尾时逼模型对着原问题硬答。
+do
+    local Context = require("context")
+    local Agent = require("core.agent")
+
+    local function agent_for(steps, tools, opts)
+        local ctx = Context.new({ cwd = "/tmp", max_turns = (opts and opts.max_turns) or 10 })
+        local i, finalized, finalized_n = 0, nil, -1
+        local provider = {
+            -- ts == nil 才是收尾请求（_finalize 不带 tools），别用轮数判断：
+            -- 熔断后仍然会调一次 stream，按轮数走会又发一条 tool_call。
+            stream = function(msgs, ts)
+                if ts == nil then
+                    finalized = msgs[#msgs] and msgs[#msgs].content or ""
+                    finalized_n = 0
+                    return { role = "assistant", content = "wrap" }
+                end
+                i = i + 1
+                if i <= #steps then
+                    return { role = "assistant", content = "",
+                        tool_calls = { { id = "c" .. i, type = "function",
+                            ["function"] = { name = steps[i].name,
+                                arguments = steps[i].args } } } }
+                end
+                return { role = "assistant", content = "done" }
+            end,
+        }
+        local base = {
+            schemas = function() return {} end,
+            execute = function(_, name, args) return tostring(steps[(args and args.i) or 0]) end,
+        }
+        for k, v in pairs(tools or {}) do base[k] = v end
+        local agent = Agent.new(ctx, provider, base,
+            { append = function() end, save = function() end })
+        local kinds = {}
+        ctx:on("turn_limit", function(info) kinds[#kinds + 1] = info.kind or "?" end)
+        return agent, function() return finalized, finalized_n, kinds end
+    end
+
+    -- 1) 同一结果第 3 次出现，但中间有别的进展 → 不许熔断
+    do
+        local steps = {
+            { name = "bash", args = '{"i":1}' },
+            { name = "bash", args = '{"i":2}' },
+            { name = "bash", args = '{"i":1}' },
+            { name = "bash", args = '{"i":2}' },
+            { name = "bash", args = '{"i":1}' },
+        }
+        local executed = 0
+        local agent, state = agent_for(steps, {
+            execute = function(_, name, args)
+                executed = executed + 1
+                return (args.i == 1) and "clean-tree" or "other-noise"
+            end,
+        })
+        local text, err = agent:run("hi")
+        local _, _, kinds = state()
+        -- 跑完 5 步后模型自己收尾（"done"），不是熔断后的 "wrap"
+        check(err == nil and text == "done", "non-consecutive repeats keep running")
+        check(executed == 5, "non-consecutive repeats executed all calls (" .. executed .. ")")
+        check(#kinds == 0, "non-consecutive repeats never trip the breaker")
+    end
+
+    -- 2) 真·连续同一结果 → 仍然熔断（旧行为不能丢）
+    do
+        local steps = {}
+        for i = 1, 5 do
+            steps[i] = { name = "bash", args = '{"i":' .. i .. '}' }
+        end
+        local agent, state = agent_for(steps, {
+            execute = function() return "clean-tree" end,
+        })
+        local text = agent:run("hi")
+        local _, _, kinds = state()
+        check(text == "wrap", "consecutive identical results still end the loop")
+        check(kinds[1] == "repeat", "consecutive identical results report reason=repeat")
+    end
+
+    -- 3) 被 hook 拦住：连续 2 次就转人工，收尾文案不能是「用已有结果回答原问题」
+    do
+        local steps = {}
+        for i = 1, 6 do
+            steps[i] = { name = "write", args = '{"i":' .. i .. '}' }
+        end
+        local executed = 0
+        local agent, state = agent_for(steps, {
+            has_hooks = function(_, kind) return kind == "before_tool" end,
+            before_tool = function()
+                return "blocked by hook plan: plan 模式只读，需要用户 rm .plan 退出"
+            end,
+            execute = function() executed = executed + 1; return "ok" end,
+        })
+        local text = agent:run("hi")
+        local finalized, finalized_n, kinds = state()
+        check(text == "wrap", "blocked calls hand control back to the user")
+        check(executed == 0, "blocked calls never reach execute")
+        check(kinds[1] == "blocked", "blocked calls report reason=blocked (" .. tostring(kinds[1]) .. ")")
+        check(finalized_n == 0, "blocked wrap-up request carries no tools")
+        check(finalized:find("这件事现在做不了", 1, true) ~= nil,
+            "blocked wrap-up asks for the human action, not the original answer")
+        check(finalized:find("用户原问题", 1, true) == nil,
+            "blocked wrap-up drops the answer-the-original-question template")
+    end
+end
+
 -- 旧会话 system prompt 必须刷新；统一 loop 不按问题文本切工具
 do
     local Context = require("context")

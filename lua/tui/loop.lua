@@ -392,10 +392,12 @@ function M.run(ctx, agent, memory, opts)
     end)
     ctx:on("turn_limit", function(info)
         if not info then return end
+        -- blocked：调用被策略/hook 拦死，收尾是转人工而不是总结，别写"wrap up"。
+        local tail = (info.kind == "blocked")
+            and "handing back to the user (this needs human action, not another retry)"
+            or "Asking the model to wrap up with a summary (no tools this time)"
         transcript:add("info", string.format(
-            "tool loop stopped: %s. Asking the model to wrap up with a summary"
-                .. " (no tools this time).",
-            tostring(info.reason or "")))
+            "tool loop stopped: %s. %s.", tostring(info.reason or ""), tail))
         if draw then draw() end
     end)
     ctx:on("todos", function(items)
