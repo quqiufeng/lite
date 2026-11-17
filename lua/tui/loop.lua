@@ -638,7 +638,7 @@ function M.run(ctx, agent, memory, opts)
             if not f then transcript:add("info", "plan 开关失败: 无法写 " .. plan_file()) return end
             f:write("plan mode\n")
             f:close()
-            transcript:add("system", "plan 模式开启（只读）：只能看不能改，方案想清楚再按 Tab 退出")
+            transcript:add("system", "plan 模式开启（只读）：只放行只读工具（read/recall/remember/todo/ocr/web/fetch/search/cgrep/pdftext/tokens + lens 查询），bash 与写盘一律拦；方案想清楚再按 Tab 退出")
         else
             os.remove(plan_file())
             transcript:add("system", "plan 模式关闭（可执行）")
