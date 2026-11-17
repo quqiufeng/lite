@@ -174,7 +174,7 @@ MUST NOT：`python`/`sed -i` 改仓库文件（用 `edit`/`write`）；Chrome/We
 | `cgrep` | 正则/字面串扫目录 → `path:line: text` | `helper/cgrep.c` + `helper/cgrep.lua` |
 | `lens` | 代码库检索：`locate`/`peek`/`grep`/`dataflow` | `helper/lens.lua` → `lua/ffi/codesearch.lua` → `src/codesearch/` |
 | `pdftext` | PDF 抽文本 | `helper/pdftext.lua`（纯 FFI） |
-| `md2png`/`web2png`/`trending` | MD / 网页 / Trending → 长图 PNG | `helper/{md2png,web2png,trending}.lua` + `helper/lib/{md4c,htmlmd}.lua` + `src/html/` |
+| `md2png`/`web2png`/`trending`/`pdf` | MD/网页→PNG；PDF 两条路（`mode=image` 分页图版 / `mode=html` 矢量可选中，含 `template=trending` 直出） | `helper/{md2png,web2png,trending,pdf}.lua` + `helper/lib/{md4c,htmlmd}.lua` + `src/html/`（`lite_html_render_pdf`） |
 | `charts` | 手绘风 SVG 图表卡（54 种）→ PNG | `helper/charts.lua` → `lua/charts/` |
 | `trace` | perf 探针采样 → 火焰图/热力/排行 | `helper/trace.lua` → `lua/trace/` |
 
