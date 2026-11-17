@@ -29,32 +29,45 @@ local M = { schema = {
     width = { type = "number",  description = "卡片宽度，默认 760" },
     scale = { type = "number",  description = "device scale factor，默认 2" },
     max_chars = { type = "number", description = "正文最多保留多少字，默认 6000（超出按段落截断）" },
+    theme = { type = "string",  description = "色系：moon(默认)/light/bamboo/china/indigo/cinnabar/dark；版式不变" },
   }, required = { "url" } },
 } }
 
+-- 颜色全部 var(--token)，由 lua/gui/theme.lua 的 :root 提供并在出图前展开。
+-- 换色系（args.theme）不动版式；新增颜色先在 theme.lua:M.css 里加令牌，别在这儿写死 hex。
 local CARD_CSS = [[
-body{margin:0;background:#ecebe4;color:#2b2a26;font-family:"Noto Sans CJK SC";font-size:16px;line-height:1.7}
-.card{margin:24px;background:#fbfaf5;border:1px solid #ddd8ca;padding:40px 46px 30px 46px}
-.kicker{font-size:12.5px;letter-spacing:2px;color:#a8672b;margin-bottom:14px}
-h1{font-size:30px;line-height:1.32;color:#1B365D;margin:0 0 16px 0}
-.meta{font-size:13px;color:#8a8578;margin-bottom:22px}
-.rule{border-top:1px solid #ddd8ca;margin:0 0 22px 0}
+body{margin:0;background:var(--parchment);color:var(--ink);font-family:"Noto Sans CJK SC";font-size:16px;line-height:1.7}
+.card{margin:24px;background:var(--ivory);border:1px solid var(--hairline);padding:40px 46px 30px 46px}
+.kicker{font-size:12.5px;letter-spacing:2px;color:var(--brand);margin-bottom:14px}
+h1{font-size:30px;line-height:1.32;color:var(--brand);margin:0 0 16px 0}
+.meta{font-size:13px;color:var(--muted);margin-bottom:22px}
+.rule{border-top:1px solid var(--hairline);margin:0 0 22px 0}
 .body p{margin:.8em 0}
-h2{font-size:21px;color:#1B365D;margin:1.3em 0 .5em 0;line-height:1.35}
-h3{font-size:18px;color:#1B365D;margin:1.2em 0 .4em 0}
-strong{color:#1B365D}
-a{color:#1B365D;text-decoration:none}
+h2{font-size:21px;color:var(--brand);margin:1.3em 0 .5em 0;line-height:1.35}
+h3{font-size:18px;color:var(--brand);margin:1.2em 0 .4em 0}
+strong{color:var(--brand)}
+a{color:var(--brand);text-decoration:none}
 ul,ol{margin:.7em 0;padding-left:1.5em}li{margin:.3em 0}
-blockquote{margin:1em 0;padding:.2em 1em;border-left:3px solid #a8672b;color:#6b665c;background:#f3f0e6}
-code{font-family:"DejaVu Sans Mono";font-size:13.5px;background:#f1efe6;padding:1px 5px;border-radius:3px}
-pre{background:#f1efe6;border:1px solid #e4dfd3;border-radius:5px;padding:12px 14px;overflow:hidden}
+blockquote{margin:1em 0;padding:.2em 1em;border-left:3px solid var(--brand);color:var(--muted);background:var(--tint)}
+code{font-family:"DejaVu Sans Mono";font-size:13.5px;background:var(--tint);padding:1px 5px;border-radius:3px}
+pre{background:var(--tint);border:1px solid var(--hairline);border-radius:5px;padding:12px 14px;overflow:hidden}
 pre code{background:none;padding:0;font-size:13px;line-height:1.5}
 table{border-collapse:collapse;margin:1em 0;width:100%}
-th,td{border:1px solid #e4dfd3;padding:6px 10px;text-align:left;font-size:14px}
-th{background:#f1efe6;color:#1B365D}
-hr{border:0;border-top:1px solid #ddd8ca;margin:1.4em 0}
-.tfoot{border-top:1px solid #ddd8ca;margin-top:26px;padding-top:12px;font-size:12px;color:#a39d8e}
+th,td{border:1px solid var(--hairline);padding:6px 10px;text-align:left;font-size:14px}
+th{background:var(--tint);color:var(--brand)}
+hr{border:0;border-top:1px solid var(--hairline);margin:1.4em 0}
+.tfoot{border-top:1px solid var(--hairline);margin-top:26px;padding-top:12px;font-size:12px;color:var(--stone)}
 ]]
+
+-- 返回 css, err：err 非空 = 缺色系真源，调用方必须中断。CARD_CSS 里颜色全是 var()，
+-- litehtml 不认未展开的 var —— 静默降级会出白底白字，看着像"渲染坏了"。
+local function theme_css(body_css, name)
+  local ok, th = pcall(require, "gui.theme")
+  if not ok or type(th.page_css) ~= "function" then
+    return nil, "web2png 读不到 lua/gui/theme.lua（色系真源），确认 package.path 含仓库 lua/"
+  end
+  return th.page_css(body_css, name)
+end
 
 local function dir_of(env)
   return (env and env.helper_dir) or "helper"
@@ -171,8 +184,10 @@ function M.run(args, env)
   local home = os.getenv("HOME") or "/tmp"
   local out = args.out or (home .. "/card-" .. host:gsub("[^%w%.%-]", "_") .. ".png")
   local now = os.date("%Y-%m-%d %H:%M")
+  local css, cerr = theme_css(CARD_CSS, args.theme)
+  if not css then return "error: " .. cerr end
   local html = table.concat({
-    "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><style>", CARD_CSS, "</style></head><body>",
+    "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><style>", css, "</style></head><body>",
     "<div class=\"card\">",
     "<div class=\"kicker\">资料卡片 · ", mdlib.esc(host:upper()), "</div>",
     "<h1>", mdlib.esc(title), "</h1>",

@@ -1,8 +1,10 @@
 -- helper/trending.lua —— GitHub Trending → Kami 排版 → 长图 PNG
 --
 -- 用法：
---   trending({})                                 默认 9 条，出 ~/trending.png（820x1420@2x）
+--   trending({})                                 默认 9 条、月白色系，出 ~/trending.png（820 宽@2x）
 --   trending({out="/tmp/t.png", width=820, height=1420, scale=2, limit=9, since="daily", lang="python"})
+--   trending({theme="cinnabar"})                 换色系（默认 moon）：排版仍是 Kami，色值走 lua/gui/theme.lua
+--                                                 （light/moon/bamboo/china/sepia/amber/mist/ochre/lotus/indigo/cinnabar/dark）
 --
 -- 坑（都踩过）：
 --   1. HTML 必须一次成型，不要往旧文件追加 <style>；残留的 .page{max-width} 会让内容
@@ -13,6 +15,9 @@
 --   5. 底部不要再加 <hr>：最后一条 li 自带 border-bottom，加了就是两条线。
 --   6. 字号 = kami 原字号 ×1.2（h1 34→41, repo 16→19, desc 13.5→16, lede 17→20, 小字 12→14.5）。
 --   7. os.date 里写 "%%m" 会输出字面量 "%m"，日期要用 "%Y-%m-%d"。
+--   8. 描述文本要先剥标签再解实体（&amp; → &）：build_html 的 esc() 会再转义一次，
+--      不解就把 "&amp;amp;" 印在图上；解码顺序 &amp; 必须放最后，否则 &amp;lt; 会被解两次。
+--   9. 换主题只换 :root 一块（apply_theme），排版规则一律不动 —— 两条正交轴，别混改。
 --
 -- ═══════════════════════════════════════════════════════════════════════════
 -- 依赖全景（四层，缺哪层报哪层，不降级；不用 Chrome/WebView/Node）
@@ -72,6 +77,7 @@ local M = { schema = {
     limit  = { type = "number",  description = "取前 N 条，默认 9" },
     since  = { type = "string",  description = "daily | weekly | monthly，默认 daily" },
     lang   = { type = "string",  description = "语言过滤，如 python / rust / go" },
+    theme  = { type = "string",  description = "色系（light/moon/bamboo/china/sepia/amber/mist/ochre/lotus/indigo/cinnabar/dark），默认 moon 月白（theme.lua:M.CARD_DEFAULT）；排版不变，只换色系令牌" },
   } },
 } }
 
@@ -83,6 +89,23 @@ local CSS_FALLBACK = [[
   --serif:"TsangerJinKai02";--mono:"Maple Mono NF CN"}
 body{background:var(--parchment);color:var(--ink);font-family:var(--serif)}
 ]]
+
+-- 色系令牌的唯一真源是 lua/gui/theme.lua（light 与上面 kami.css 的 :root 逐值相同）。
+-- 给 theme 就把 :root 整块换掉，其余排版规则（字号/字距/细线）一个字不动 ——
+-- 这样"排版 = Kami"和"色系 = 传统色"是两条独立轴，可以任意组合。
+-- expand_vars 只认第一个 :root，所以必须替换而不是追加第二段 <style>。
+-- 实现在 lua/gui/theme.lua:M.apply，md2png/web2png 用同一份 —— 别在这儿再写一遍。
+local function theme_mod()
+  local ok, th = pcall(require, "gui.theme")
+  if ok and th.apply and th.expand then return th end
+  return nil
+end
+
+local function apply_theme(css, name)
+  local th = theme_mod()
+  if not th then return css end
+  return th.apply(css, name)
+end
 
 -- kami.css 是排版底，缺了就用兜底最小样式（仍能出图，只是不像 Kami）
 local function load_css(env)
@@ -96,18 +119,11 @@ local function load_css(env)
   return CSS_FALLBACK
 end
 
--- 展开 CSS 里的 var(--x)：litehtml 不解析 CSS 变量。取 :root 块里的定义。
+-- 展开 CSS 里的 var(--x)：litehtml 不解析 CSS 变量。实现同在 lua/gui/theme.lua:M.expand。
 local function expand_vars(css)
-  local defs = {}
-  local root = css:match(":root%s*{([^}]*)}")
-  if root then
-    for k, v in root:gmatch("%-%-([%w%-_]+)%s*:%s*([^;]+);") do
-      defs[k] = v:gsub("^%s+", ""):gsub("%s+$", "")
-    end
-  end
-  return (css:gsub("var%(%s*%-%-([%w%-_]+)%s*%)", function(k)
-    return defs[k] or "inherit"
-  end))
+  local th = theme_mod()
+  if not th then return css end
+  return th.expand(css)
 end
 
 local function esc(s)
@@ -134,7 +150,13 @@ local function parse(html)
     local lang = art:match('<span itemprop="programmingLanguage">([^<]+)</span>')
     local star = art:match("([%d,]+)[^%d]-stars today")
     if repo then
-      if desc then desc = desc:gsub("<[^>]->", ""):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "") end
+      -- 先剥标签再解实体：esc() 出图时会再转义一次，这里不解就成 &amp;amp; → 图上印 "&amp;"
+      if desc then
+        desc = desc:gsub("<[^>]->", "")
+          :gsub("&nbsp;", " "):gsub("&lt;", "<"):gsub("&gt;", ">")
+          :gsub("&quot;", '"'):gsub("&#39;", "'"):gsub("&amp;", "&")
+          :gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+      end
       items[#items + 1] = { repo = repo, desc = desc or "", lang = lang or "—", star = star or "0" }
     end
   end
@@ -218,7 +240,7 @@ function M.run(args, env)
   if #items == 0 then error("解析到 0 条，GitHub 页面结构可能变了: " .. url) end
   while #items > limit do items[#items] = nil end
 
-  local html = build_html(items, expand_vars(load_css(env)))
+  local html = build_html(items, expand_vars(apply_theme(load_css(env), args.theme)))
   local html_path = out:gsub("%.png$", ".html")
   local wf = assert(io.open(html_path, "w")); wf:write(html); wf:close()
 

@@ -3,6 +3,7 @@
 -- 用法：
 --   md2png({path="README.md"})                          默认出 ~/<name>.png，宽 820，scale 2
 --   md2png({path="a.md", out="/tmp/a.png", width=820, scale=2, gfm=true})
+--   md2png({path="a.md", theme="cinnabar"})             换色系（light/moon/bamboo/china/dark…）
 --
 -- 依赖（四层，缺哪层报哪层）：
 --   ① 解析：libmd4c.so.0（系统已装 /lib/x86_64-linux-gnu/libmd4c.so.0，MIT，GFM 全支持）
@@ -27,32 +28,46 @@ local M = { schema = {
     height= { type = "number",  description = "图像高度，默认 0 = 自动测高（按内容撑满）；给正数则固定高度、超出裁掉" },
     scale = { type = "number",  description = "device scale factor，默认 2" },
     gfm   = { type = "boolean", description = "GitHub 方言（表格/任务列表/删除线），默认 true" },
+    theme = { type = "string",  description = "色系：moon(默认)/light/bamboo/china/indigo/cinnabar/dark；版式不变" },
   }, required = { "path" } },
 } }
 
+-- 颜色一律走 var(--token)，由 lua/gui/theme.lua 提供 :root 并展开（litehtml 不认 CSS 变量）。
+-- 版式（字号/行高/字距/内边距）留在这里，色系（--parchment/--ink/--brand…）由 args.theme 决定，
+-- 两条轴分开：换色不动版式，改版式不动色。新增颜色别写死 hex，先在 theme.lua 的 M.css 里加令牌。
 local MD_CSS = [[
-body{margin:0;background:#f5f4ed;color:#2b2a26;font-family:"Noto Sans CJK SC";font-size:16px;line-height:1.65}
+body{margin:0;background:var(--parchment);color:var(--ink);font-family:"Noto Sans CJK SC";font-size:16px;line-height:1.65}
 .page{width:auto;padding:44px 52px}
-h1,h2,h3,h4{font-family:"Noto Sans CJK SC";color:#1B365D;line-height:1.3;margin:1.4em 0 .6em}
-h1{font-size:33px;border-bottom:1px solid #e4dfd3;padding-bottom:.3em;margin-top:0}
+h1,h2,h3,h4{font-family:"Noto Sans CJK SC";color:var(--brand);line-height:1.3;margin:1.4em 0 .6em}
+h1{font-size:33px;border-bottom:1px solid var(--hairline);padding-bottom:.3em;margin-top:0}
 h2{font-size:25px}h3{font-size:20px}h4{font-size:17px}
-p{margin:.75em 0}strong{color:#1B365D}
-a{color:#1B365D;text-decoration:none}
-code{font-family:"DejaVu Sans Mono";font-size:14px;background:#f1efe6;padding:1px 5px;border-radius:3px}
-pre{background:#f1efe6;border:1px solid #e4dfd3;border-radius:5px;padding:14px 16px;overflow:hidden}
+p{margin:.75em 0}strong{color:var(--brand)}
+a{color:var(--brand);text-decoration:none}
+code{font-family:"DejaVu Sans Mono";font-size:14px;background:var(--tint);padding:1px 5px;border-radius:3px}
+pre{background:var(--tint);border:1px solid var(--hairline);border-radius:5px;padding:14px 16px;overflow:hidden}
 pre code{background:none;padding:0;font-size:13.5px;line-height:1.5}
-blockquote{margin:.9em 0;padding:.2em 1em;border-left:3px solid #1B365D;color:#6b665c;background:#f1efe6}
+blockquote{margin:.9em 0;padding:.2em 1em;border-left:3px solid var(--brand);color:var(--muted);background:var(--tint)}
 ul,ol{margin:.7em 0;padding-left:1.6em}li{margin:.28em 0}
-hr{border:0;border-top:1px solid #e4dfd3;margin:1.5em 0}
+hr{border:0;border-top:1px solid var(--hairline);margin:1.5em 0}
 table{border-collapse:collapse;margin:1em 0;width:100%}
-th,td{border:1px solid #e4dfd3;padding:7px 11px;text-align:left;font-size:14.5px}
-th{background:#f1efe6;color:#1B365D}
+th,td{border:1px solid var(--hairline);padding:7px 11px;text-align:left;font-size:14.5px}
+th{background:var(--tint);color:var(--brand)}
 img{max-width:100%}
 ]]
 
 local function esc(s)
   s = s:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
   return s
+end
+
+-- 色系唯一真源在 lua/gui/theme.lua：M.page_css 吐 <主题 :root> + 上面 MD_CSS 并把 var() 展开。
+-- 拿不到主题模块就直接报错 —— MD_CSS 里的颜色全是 var()，静默降级会出白底白字。
+local function theme_css(body_css, name)
+  local ok, th = pcall(require, "gui.theme")
+  if not ok then
+    error("md2png: 读不到 lua/gui/theme.lua（色系真源），确认 package.path 含仓库 lua/")
+  end
+  return th.page_css(body_css, name)
 end
 
 -- md4c 常量（md4c.h）
@@ -210,7 +225,8 @@ function M.run(args, env)
   local home = os.getenv("HOME") or "/tmp"
   local name = args.path:match("([^/]+)%.md$") or "md"
   local out = args.out or (home .. "/" .. name .. ".png")
-  local html = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><style>" .. MD_CSS ..
+  local css = theme_css(MD_CSS, args.theme)
+  local html = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><style>" .. css ..
                "</style></head><body><div class=\"page\">" .. body .. "</div></body></html>"
   local hp = out:gsub("%.png$", "") .. ".html"
   local hf = io.open(hp, "wb") if hf then hf:write(html) hf:close() end

@@ -869,7 +869,9 @@ elseif cmd == "--tui" or cmd == "--gui" then
     end
 
     if cmd == "--gui" then
-        local gok, gerr = require("gui.transcript").run(ctx, { agent = agent })
+        -- LITE_THEME 覆盖起手色系；空值/未知名交给 gui.theme.palette 回落 M.DEFAULT
+        local gok, gerr = require("gui.transcript").run(ctx, {
+            agent = agent, theme = os.getenv("LITE_THEME") })
         memory:close()
         http.multi_free(multi)
         if logger then logger:close() end
