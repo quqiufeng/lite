@@ -170,6 +170,19 @@ local function load_sibling(name, env)
   error("找不到 helper/" .. name .. ".lua（pdf 复用它出图）")
 end
 
+-- 相对图片路径基准（md/html 里的 ![](sub/a.png)、url(a.png)）：
+-- 用**源文件所在目录**，不是 agent 的 cwd —— 否则同一份文档在不同 cwd 下丢图。
+-- 裸 HTML 字符串 / pages 数组没有源文件，回落到 cwd（可用 args.base_dir 显式覆盖）。
+local function base_of(args)
+  if args.base_dir then return tostring(args.base_dir) end
+  local p = args.path
+  if not p and args.html and not tostring(args.html):match("^%s*<") then p = tostring(args.html) end
+  if not p then return "" end
+  p = tostring(p)
+  if p:match("^%s*<") then return "" end
+  return p:match("^(.*)/") or ""
+end
+
 -- ── 分页：默认只认独占一行的 `---`（marp/slidev 习惯）；也可 <!-- page --> ──────
 local function split_pages(src, pat)
   local pages, cur = {}, {}
@@ -294,11 +307,13 @@ local M = { schema = {
     keep_png = { type = "boolean", description = "image 模式默认 true（逐页留 PNG）；html 模式默认 false，"
                   .. "置 true 额外出首页预览 PNG" },
     check_overflow = { type = "boolean", description = "报溢出页，默认 true（定高页多渲一张探针图量真实内容高）" },
+    base_dir = { type = "string", description = "相对图片路径基准目录，默认取 path/html 文件所在目录（md/html 里 ![](sub/a.png) 按它解析）" },
   } },
 } }
 
 local function run_image(args, env)
   local md2png = load_sibling("md2png", env)
+  md2png.set_base_dir(base_of(args))      -- 图版同样按 md 目录找图
 
   -- 1 取页
   local raw
@@ -406,6 +421,7 @@ end
 -- 不做分页（litehtml 不认 page-break），h 默认 0 让每页按内容定高。
 local function run_html(args, env)
   local md2png = load_sibling("md2png", env)
+  md2png.set_base_dir(base_of(args))      -- 矢量版同理：md/html 里的相对图按源目录找
 
   -- 0 页面几何先定（md 分支要用它算 CSS；px，C 侧 ×0.75 转 pt）
   local sz = SIZES[args.size or ""] or {}

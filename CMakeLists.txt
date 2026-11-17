@@ -67,9 +67,11 @@ set_target_properties(lite_capture PROPERTIES
     BUILD_RPATH "$ORIGIN"
     INSTALL_RPATH "$ORIGIN")
 
-add_library(lite_html SHARED src/html/render.cpp src/html/prepass.cpp)
-target_include_directories(lite_html PRIVATE /opt/litehtml/include)
-target_link_libraries(lite_html PRIVATE /opt/litehtml/build-pic/liblitehtml.so cairo fontconfig)
+add_library(lite_html SHARED src/html/render.cpp src/html/prepass.cpp src/html/imgcache.cpp)
+target_include_directories(lite_html PRIVATE /opt/litehtml/include
+    ${PNG_INCLUDE_DIRS} ${JPEG_INCLUDE_DIRS} ${WEBP_INCLUDE_DIRS})
+target_link_libraries(lite_html PRIVATE /opt/litehtml/build-pic/liblitehtml.so cairo fontconfig
+    ${PNG_LIBRARIES} ${JPEG_LIBRARIES} ${WEBP_LIBRARIES})
 # libgumbo 升成 liblite_html.so 的直接 NEEDED。原因：liblitehtml.so.0 自己声明的
 # RUNPATH 是绝对值 /opt/litehtml/build-pic/src/gumbo，目标机没这目录时 dlopen 链会在
 # 它的依赖上断掉（liblitehtml 找到、libgumbo 找不到），随包的 .so 于是不自洽。

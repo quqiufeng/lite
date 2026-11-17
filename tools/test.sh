@@ -21,6 +21,13 @@ if ! timeout 180 "$ROOT/tools/lite-lua" "$ROOT/tools/charts_check.lua"; then
 fi
 echo "OK charts"
 
+echo "== html_img =="
+# Markdown 图片链路：md_to_html 必须吐 <img>，相对路径按 base_dir（md 所在目录）解析。
+# 曾经两条都断（SPAN.IMG 没接 + base_dir 声明顺序踩到全局 nil），用户侧表现就是「pdf 不能插图」。
+if ! "$ROOT/tools/lite-lua" "$ROOT/tools/html_img_check.lua"; then
+    echo "FAIL html_img" >&2; exit 1
+fi
+
 echo "== live =="
 "$ROOT/tools/live_smoke.sh"
 

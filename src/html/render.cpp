@@ -20,6 +20,7 @@
 #include <memory>
 
 #include "prepass.h"
+#include "imgcache.h"
 
 using namespace litehtml;
 
@@ -611,10 +612,107 @@ public:
         cairo_restore(cr);
     }
 
-    void load_image(const char* /*src*/, const char* /*base*/, bool /*redraw*/) override {}
-    void get_image_size(const char* /*src*/, const char* /*base*/, size& sz) override { sz.width = 0; sz.height = 0; }
-    void draw_image(uint_ptr /*hdc*/, const background_layer& /*layer*/, const std::string& /*url*/,
-                    const std::string& /*base*/) override {}
+    // ── 图片（src/html/imgcache.cpp）────────────────────────────────────────
+    // litehtml 只把 src 字符串交给我们，路径解析/解码/缓存都在 imgcache：
+    //   load_image     —— 预热（预解码，失败只是记一笔，不影响布局）
+    //   get_image_size —— 布局期要固有尺寸（<img> 不给 width/height 时的 auto 尺寸）
+    //   draw_image     —— 按 background_layer 贴图：origin_box 是贴图位置（background-size /
+    //                     position 已由 litehtml 算好），clip_box ∩ 圆角 border_box 是裁剪区，
+    //                     repeat 决定平铺方向。
+    void load_image(const char* src, const char* base, bool /*redraw*/) override
+    {
+        if (!src || !*src) return;
+        imgcache::get(imgcache::resolve(src, base ? base : ""));
+    }
+
+    void get_image_size(const char* src, const char* base, size& sz) override
+    {
+        sz.width = 0;
+        sz.height = 0;
+        if (!src || !*src) return;
+        int w = 0, h = 0;
+        if (!imgcache::size(imgcache::resolve(src, base ? base : ""), &w, &h)) return;
+        sz.width  = static_cast<pixel_t>(w);
+        sz.height = static_cast<pixel_t>(h);
+    }
+
+    void draw_image(uint_ptr hdc, const background_layer& layer, const std::string& url,
+                    const std::string& base) override
+    {
+        flush_text();                                      // 保持绘制顺序（文本先落笔）
+        auto* cr = cr_of(hdc);
+        if (!cr) return;
+        cairo_save(cr);
+        layer_clip(cr, layer);                             // clip_box ∩ 圆角 border_box
+
+        const position& ob = layer.origin_box;
+        const double dw = ob.width.value(), dh = ob.height.value();
+        const imgcache::image* img = imgcache::get(imgcache::resolve(url, base));
+        if (!img || dw <= 0 || dh <= 0) {
+            // 缺图/零尺寸：画一个虚线占位框，别让「图没出来」和「图是白的」混为一谈。
+            draw_broken_image(cr, layer);
+            cairo_restore(cr);
+            return;
+        }
+
+        cairo_pattern_t* pat = cairo_pattern_create_for_surface(img->surf);
+        cairo_pattern_set_filter(pat, CAIRO_FILTER_GOOD);  // 缩小走 mipmap，不糊
+        // pattern 矩阵是 user→pattern：把图片 (0,0)-(w,h) 映射到 origin_box
+        const double sx = dw / img->w, sy = dh / img->h;
+        cairo_matrix_t m;
+        cairo_matrix_init(&m, 1.0 / sx, 0, 0, 1.0 / sy,
+                          -ob.x.value() / sx, -ob.y.value() / sy);
+        cairo_pattern_set_matrix(pat, &m);
+
+        switch (layer.repeat) {
+        case background_repeat_no_repeat:
+            cairo_pattern_set_extend(pat, CAIRO_EXTEND_NONE);
+            break;
+        case background_repeat_repeat_x:
+            // 只横向平铺：竖向裁到 origin_box 那一行，否则图案会往上下一路铺满
+            cairo_pattern_set_extend(pat, CAIRO_EXTEND_REPEAT);
+            cairo_rectangle(cr, layer.clip_box.x, ob.y, layer.clip_box.width, ob.height);
+            cairo_clip(cr);
+            break;
+        case background_repeat_repeat_y:
+            cairo_pattern_set_extend(pat, CAIRO_EXTEND_REPEAT);
+            cairo_rectangle(cr, ob.x, layer.clip_box.y, ob.width, layer.clip_box.height);
+            cairo_clip(cr);
+            break;
+        case background_repeat_repeat:
+        default:
+            cairo_pattern_set_extend(pat, CAIRO_EXTEND_REPEAT);
+            break;
+        }
+
+        cairo_set_source(cr, pat);
+        cairo_rectangle(cr, layer.clip_box.x, layer.clip_box.y,
+                        layer.clip_box.width, layer.clip_box.height);
+        cairo_fill(cr);
+        cairo_pattern_destroy(pat);
+        cairo_restore(cr);
+    }
+
+    // 缺图占位：灰虚线外框 + 对角叉（尺寸取 origin_box，跟真图一样参与布局）
+    static void draw_broken_image(cairo_t* cr, const background_layer& layer)
+    {
+        const position& b = layer.origin_box;
+        const double w = b.width.value(), h = b.height.value();
+        if (w <= 0 || h <= 0) return;
+        cairo_save(cr);
+        const double dashes[] = { 4.0, 3.0 };
+        cairo_set_dash(cr, dashes, 2, 0);
+        cairo_set_line_width(cr, 1.0);
+        cairo_set_source_rgba(cr, 0.62, 0.62, 0.62, 0.9);
+        cairo_rectangle(cr, b.x.value() + 0.5, b.y.value() + 0.5, w - 1, h - 1);
+        cairo_stroke(cr);
+        cairo_move_to(cr, b.x.value() + 0.5, b.y.value() + 0.5);
+        cairo_line_to(cr, b.x.value() + w - 0.5, b.y.value() + h - 0.5);
+        cairo_move_to(cr, b.x.value() + w - 0.5, b.y.value() + 0.5);
+        cairo_line_to(cr, b.x.value() + 0.5, b.y.value() + h - 0.5);
+        cairo_stroke(cr);
+        cairo_restore(cr);
+    }
 
     void draw_solid_fill(uint_ptr hdc, const background_layer& layer, const web_color& color) override
     {
@@ -1042,6 +1140,13 @@ int draw_page(cairo_t* cr, document::ptr doc, cairo_container& container, int w,
 extern "C" {
 
 const char* lite_html_error(void) { return g_error.c_str(); }
+
+// 渲染期图片相对路径的基准目录（空串 = cwd）。每条约带渲染前调一次，
+// 让 md 里的 ![](img/a.png) 按 md 所在目录解析，而不是按进程 cwd。
+void lite_html_set_base_dir(const char* dir)
+{
+    imgcache::set_base_dir(dir ? dir : "");
+}
 
 // 返回 0 成功；非 0 失败（错误串见 lite_html_error）
 int lite_html_render(const char* html, const char* out_png, int w, int h, double scale)

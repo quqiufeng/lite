@@ -29,6 +29,8 @@ local M = { schema = {
     scale = { type = "number",  description = "device scale factor，默认 2" },
     gfm   = { type = "boolean", description = "GitHub 方言（表格/任务列表/删除线），默认 true" },
     theme = { type = "string",  description = "色系：moon(默认)/light/bamboo/china/indigo/cinnabar/dark；版式不变" },
+    base_dir = { type = "string", description = "相对图片路径基准目录，默认 md 所在目录（md 里 ![](sub/a.png) 就按它解析）；"
+                  .. "给了 md 就不必给" },
   }, required = { "path" } },
 } }
 
@@ -101,12 +103,69 @@ local function cdef()
     int lite_html_render_pdf(const char* const*, int, const char*, int, int, double,
                              int*, int*);
     const char* lite_html_error(void);
+    void lite_html_set_base_dir(const char*);
     typedef int lite_html_render_declared_t;
   ]]
 end
 
+-- md4c 的 MD_ATTRIBUTE：`![](src "title")` 的 src 只藏在这里，指针**只在 enter_span
+-- 回调期间有效**，必须当场读出来。布局（md4c.h）：text,size,substr_count,substr_types,
+-- substr_offsets —— substr_count=0 表示整串就是值；>0 时要按 substr 段拼（段类型里可能是
+-- ENTITY/NULLCHAR，属性值才不是字面量）。
+local function cdef_attr()
+  if pcall(ffi.typeof, "MD_ATTR_PIECES") then return end
+  ffi.cdef[[
+    /* 字段名可以随便写（FFI 按声明顺序算偏移），叫 end 会撞 Lua 关键字 */
+    typedef struct MD_OFFSET_PIECE { unsigned first; unsigned last; } MD_OFFSET_PIECE;
+    typedef struct MD_ATTR_PIECES {
+      const char* text;
+      unsigned size;
+      unsigned substr_count;
+      const int* substr_types;
+      const MD_OFFSET_PIECE* substr_offsets;
+    } MD_ATTR_PIECES;
+  ]]
+end
+
+local ENTITIES = { amp = "&", lt = "<", gt = ">", quot = '"', apos = "'", nbsp = " " }
+
+local function decode_entity(piece)
+  local body = piece:match("^&(.-);$") or piece:match("^&?(.-);?$") or piece
+  local named = ENTITIES[body]
+  if named then return named end
+  local dec = body:match("^#(%d+)$")
+  if dec then return utf8.char(tonumber(dec)) end
+  local hex = body:match("^#[xX](%x+)$")
+  if hex then return utf8.char(tonumber(hex, 16)) end
+  return body
+end
+
+-- MD_ATTRIBUTE*（detail 的首字段）→ Lua 字符串；非法/空返回 ""
+local function attr_string(p)
+  if p == nil then return "" end
+  local a = ffi.cast("MD_ATTR_PIECES*", p)
+  if a.text == nil or a.size == 0 then return "" end
+  if a.substr_count == 0 or a.substr_types == nil or a.substr_offsets == nil then
+    return ffi.string(a.text, a.size)
+  end
+  local acc = {}
+  for i = 0, a.substr_count - 1 do
+    local t = a.substr_types[i]
+    local beg, fin = a.substr_offsets[i].first, a.substr_offsets[i].last
+    if fin > beg then
+      local s = ffi.string(a.text + beg, fin - beg)
+      if t == 1 then                        -- MD_TEXT_NULLCHAR（U+0000）：丢掉
+        s = nil
+      elseif t == 5 then acc[#acc + 1] = decode_entity(s)   -- MD_TEXT_ENTITY
+      else acc[#acc + 1] = s end
+    end
+  end
+  return table.concat(acc)
+end
+
 local function md_to_html(src)
   cdef()
+  cdef_attr()
   local md
   for _, so in ipairs({ "libmd4c.so.0", "libmd4c.so", "md4c" }) do
     local ok, l = pcall(ffi.load, so)
@@ -160,19 +219,36 @@ local function md_to_html(src)
     return 0
   end)
 
-  local cb_enter_span = ffi.cast("int (*)(int,void*,void*)", function(t)
+  -- 图片：md4c 把 src 放进 enter_span 的 detail（只在回调期间有效），alt 是随后的
+  -- text 回调 → 先攒着，leave_span 时一次性吐 <img>。不认 {{width=…}} 这类扩展。
+  local img_depth, img_src, img_alt = 0, "", nil
+  local cb_enter_span = ffi.cast("int (*)(int,void*,void*)", function(t, d)
     if t == SPAN.EM then emit("<em>") elseif t == SPAN.STRONG then emit("<strong>")
-    elseif t == SPAN.DEL then emit("<del>") elseif t == SPAN.CODE then emit("<code>") end
+    elseif t == SPAN.DEL then emit("<del>") elseif t == SPAN.CODE then emit("<code>")
+    elseif t == SPAN.IMG then
+      img_depth = img_depth + 1
+      img_src = attr_string(d)          -- detail 首字段就是 MD_ATTRIBUTE src
+      img_alt = {}
+    end
     return 0
   end)
   local cb_leave_span = ffi.cast("int (*)(int,void*,void*)", function(t)
     if t == SPAN.EM then emit("</em>") elseif t == SPAN.STRONG then emit("</strong>")
-    elseif t == SPAN.DEL then emit("</del>") elseif t == SPAN.CODE then emit("</code>") end
+    elseif t == SPAN.DEL then emit("</del>") elseif t == SPAN.CODE then emit("</code>")
+    elseif t == SPAN.IMG then
+      img_depth = img_depth - 1
+      local alt = img_alt and table.concat(img_alt) or ""
+      if img_src ~= "" then
+        emit('<img src="' .. esc(img_src):gsub('"', "&quot;") .. '" alt="' .. esc(alt) .. '">')
+      elseif alt ~= "" then emit(esc(alt)) end   -- 空 src 时至少留下替代文字
+      img_src, img_alt = "", nil
+    end
     return 0
   end)
   -- MD_TEXTTYPE: 0=NORMAL 1=NULLCHAR 2=BR 3=SOFTBR 4=HTML 5=ENTITY 6=CODE
   local cb_text = ffi.cast("int (*)(int,const char*,unsigned,void*)", function(tt, p, n)
     local s = ffi.string(p, n)
+    if img_depth > 0 and img_alt then img_alt[#img_alt + 1] = s return 0 end
     if tt == 4 or tt == 6 then emit(s) elseif tt == 2 then emit("<br>")
     elseif tt == 3 then emit(" ") else emit(esc(s)) end
     return 0
@@ -208,8 +284,13 @@ local function load_html_lib(env)
     .. "  自检：./tools/check_deps.sh | grep lite_html")
 end
 
+local base_dir = ""  -- 相对图片路径基准；空 = 进程 cwd。必须声明在 render_png 之前：
+-- 声明在后面的话函数里读到的是同名**全局** nil，set_base_dir 白设（踩过）。
 local function render_png(html, out, w, h, scale, env)
   local lib = load_html_lib(env)
+  -- 相对 <img src>/url() 的基准目录（md 所在目录）。不设就落到进程 cwd，
+  -- 于是 helper/md2png.lua 里写 ![](img/a.png) 的文档会因为 agent 的 cwd 不同而丢图。
+  lib.lite_html_set_base_dir(base_dir)
   if lib.lite_html_render(html, out, w, h, scale) ~= 0 then
     error("lite_html_render 失败（检查 PNG 路径可写、字体目录 helper/assets 存在）: "
       .. tostring(ffi.string(lib.lite_html_error())))
@@ -225,6 +306,7 @@ local function render_pdf(htmls, out_pdf, w, h, pt_per_px, env)
   if type(htmls) == "string" then htmls = { htmls } end
   if type(htmls) ~= "table" or #htmls == 0 then error("render_pdf: htmls 需要非空数组") end
   local lib = load_html_lib(env)
+  lib.lite_html_set_base_dir(base_dir)
   local n = #htmls
   local arr = ffi.new("const char*[?]", n)
   local keep = {}                       -- 防止 GC 提前回收页面字符串
@@ -260,6 +342,7 @@ function M.run(args, env)
   if not args.path then error("md2png: required: path (string)") end
   local f = assert(io.open(args.path, "rb"), "读不到 " .. args.path)
   local src = f:read("*a") f:close()
+  base_dir = args.base_dir or args.path:match("^(.*)/") or ""   -- md 里 ![](sub/a.png) 以 md 目录为准
   local width  = tonumber(args.width)  or 820
   local height = tonumber(args.height) or 0 -- 0 = 自动测高
   local scale  = tonumber(args.scale)  or 2
@@ -291,5 +374,8 @@ M.render_png = render_png      -- (html, out_png, w, h, scale, env)
 M.render_pdf = render_pdf      -- (htmls[], out_pdf, w, h, pt_per_px, env) 矢量 PDF，文字可选中
 M.png_size   = png_size        -- (path) -> px_w, px_h（h=0 自动测高后靠它知道真实高度）
 M.theme_css  = theme_css       -- (body_css, theme_name) -> <style> 内容（含 var() 展开）
+-- 相对图片路径基准：md2png/pdf 的 run 会按 md 所在目录自动设；pages/inline HTML 场景由调用方设。
+M.set_base_dir = function(dir) base_dir = dir or "" end
+M.get_base_dir = function() return base_dir end
 
 return M
