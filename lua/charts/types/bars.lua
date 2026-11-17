@@ -72,7 +72,7 @@ M.waterfall = {
   label = '瀑布图',
   demo = {
     title = '雨水桶，一个星期', note = '从 200 升开始。每级是进来的或出去的水。',
-    start = 200,
+    start = 200, unit = ' 升', startLabel = '起', endLabel = '末', spanLabel = '七天',
     rows = { { label = '一', value = 40 }, { label = '二', value = -25 }, { label = '三', value = 35 },
              { label = '四', value = -60 }, { label = '五', value = 15 }, { label = '六', value = -10 },
              { label = '日', value = 30 } },
@@ -110,10 +110,12 @@ M.waterfall = {
       local y0 = K.scale(a, lo, hi, b.y1, b.y0)
       local y1 = K.scale(z, lo, hi, b.y1, b.y0)
       L.vbar(cx - bw / 2, cx + bw / 2, y0, y1, col)
-      P.text(tostring(label or ''), cx, b.y1 + 17, { size = 10, anchor = 'middle' })
+      if label and label ~= '' then                       -- 空标签=调用方不想标（bizdeck 清空演示口径时会传 "")
+        P.text(tostring(label), cx, b.y1 + 17, { size = 10, anchor = 'middle' })
+      end
       return cx
     end
-    local sx = block(1, lo, start, P.PAL.sky, '起')
+    local sx = block(1, lo, start, P.PAL.sky, spec.startLabel or '起')
     P.line({ { sx + bw / 2, K.scale(start, lo, hi, b.y1, b.y0) }, { sx + bw / 2 + slot - bw, K.scale(start, lo, hi, b.y1, b.y0) } },
       { w = .9, col = P.LEAD, amp = .2, over = 0, dash = '3 3' })
     for i, w in ipairs(walk) do
@@ -124,9 +126,26 @@ M.waterfall = {
         P.line({ { cx + bw / 2, yl }, { cx + bw / 2 + slot - bw, yl } }, { w = .9, col = P.LEAD, amp = .2, over = 0, dash = '3 3' })
       end
     end
-    local cx = block(#rs + 2, lo, cur, P.PAL.gold, '末')
-    K.callout(cx, K.scale(cur, lo, hi, b.y1, b.y0), 470, 84, '剩 ' .. K.vfmt(cur) .. ' 升',
-      '七天净变化 ' .. (cur - start >= 0 and '+' or '') .. K.vfmt(cur - start), 'end')
+    local cx = block(#rs + 2, lo, cur, P.PAL.gold, spec.endLabel or '末')
+    -- 注释语：单位/「几天」都由 spec 给，默认才用演示那套水桶说法；
+    -- callout=false 整条不画（图很高时它会压住末尾的柱子）
+    if spec.callout ~= false then
+      local u = spec.unit == nil and ' 升' or tostring(spec.unit)
+      local span = spec.spanLabel
+      -- 字块放末柱的**对侧**顶部：柱子常是「右边最高」的爬升形，右对齐的
+      -- 引线文字会正压在最末那根柱子上（实测叠字），所以末柱在右半就把字放左边。
+      local title = '剩 ' .. K.vfmt(cur) .. u
+      local note = (span and (span .. '净变化 ') or '净变化 ')
+        .. (cur - start >= 0 and '+' or '') .. K.vfmt(cur - start)
+      local ty = b.y0 - 12
+      if cx > (b.x0 + b.x1) / 2 then
+        -- 末柱在右半（爬升形的常态）：字块放左上角且**不画引线**——
+        -- 目标在右、字在左，肘线会横穿整张图压在其它柱子顶上（实测很难看）。
+        P.label(b.x0 + 6, ty, title, note, nil, { side = 'start', size = 17 })
+      else
+        K.callout(cx, K.scale(cur, lo, hi, b.y1, b.y0), b.x1, ty, title, note, 'end')
+      end
+    end
   end,
 }
 

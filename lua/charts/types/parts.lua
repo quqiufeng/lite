@@ -86,8 +86,13 @@ M.pie = {
     local px, py = cx + math.cos(a) * (r + 4), cy + math.sin(a) * (r + 4)
     -- 标签放在饼右上方空白处，引线从角平分线外沿折回来
     local side = math.cos(a) >= 0
-    K.callout(px, py, side and 500 or 40, 92, tostring(row.label),
-      K.vfmt(v) .. ' h · ' .. pct(v, total), side and 'end' or 'start')
+    -- 单位默认 'h'（卡自带 demo 是「一天怎么花掉的」，按小时）；spec.unit 可换，
+    -- 传 '' 就只打占比 —— 商业汇报里没有「68 h」，硬套会把演示单位带进正文。
+    local u = spec.unit == nil and ' h' or tostring(spec.unit)
+    local sub = (u == '') and pct(v, total)
+      or (K.vfmt(v) .. u .. ' · ' .. pct(v, total))
+    K.callout(px, py, side and 500 or 40, 92, tostring(row.label), sub,
+      side and 'end' or 'start')
     local labs, cols = {}, {}
     for i, r2 in ipairs(rs) do labs[i], cols[i] = tostring(r2.label), r2.col or K.col(i) end
     K.legend(labs, cols, 60, 344)
