@@ -724,10 +724,17 @@ function M:fold(msgs, summarize, opts)
     digest = tostring(digest):gsub("%s+$", "")
     -- 检查点验收：摘要比折叠区小不了多少的话，这次折叠是净亏损。
     -- 拒绝比留下一个"看起来压过了"的假结果好 —— 后者会一直占着 prompt。
-    if #digest > cap * 2 then
+    -- 阈值要跟折叠区一起放大，不能只用 cap*2：cap 是按 budget 算的绝对上限，
+    -- 折叠区大十倍时（305KB → 摘要 12KB）cap*2 会误杀本该省 95% 的摘要。
+    -- 代价不对称：误杀的下一轮会拿同样大的区域**再花一次摘要调用**，且上下文
+    -- 一点没缩、直奔 hard_window。真正的经济性判据在下面 base_after 那道检查。
+    -- 这里只挡「摘要离谱到接近折叠区本身」的情况。
+    local digest_limit = math.max(cap * 2, math.floor(plan.total_chars * 0.10))
+    if #digest > digest_limit then
         return {
             ok = false, plan = plan, rejected = true,
-            reason = string.format("digest too large (%d chars > %d cap)", #digest, cap),
+            reason = string.format("digest too large (%d chars > %d limit, region %d)",
+                #digest, digest_limit, plan.total_chars),
         }
     end
 
