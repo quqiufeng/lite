@@ -37,18 +37,22 @@ function M.project_context(cwd)
     end
 
     local cap = tonumber(os.getenv("LITE_INSTRUCTIONS_CHARS")) or DEFAULT_PROJECT_CHARS
+    -- 缓存键不能只是"读过没有"：AGENTS.md 改了而这里还吐旧字节，模型就整晚
+    -- 按过期规则办事，且没人看得出来（早期版本正是这样，一次进程活到底）。
+    -- 改成每次重读 + 字节比对：内容没变就复用同一张表 —— system prompt 仍然
+    -- 逐字节稳定，prefix cache 照旧命中；真改了才换，换一次付一次前缀 miss，
+    -- 这比"永不更新"便宜得多。读的是 ≤cap 的本地文件，一次/轮，成本可忽略。
     for _, path in ipairs(candidates) do
-        if context_cache[path] ~= nil then
-            if context_cache[path] then return context_cache[path] end
-        else
-            local text = read_capped(path, cap)
-            if text then
-                local ctx = { path = path, content = text }
-                context_cache[path] = ctx
-                return ctx
-            end
-            context_cache[path] = false
+        local text = read_capped(path, cap)
+        if text then
+            local cached = context_cache[path]
+            if cached and cached.content == text then return cached end
+            local ctx = { path = path, content = text }
+            context_cache[path] = ctx
+            return ctx
         end
+        -- 文件没了/空了：清掉缓存，否则删了 AGENTS.md 还会被旧内容顶住。
+        context_cache[path] = nil
     end
     return nil
 end

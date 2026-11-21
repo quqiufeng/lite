@@ -184,7 +184,17 @@ function M:schema_chars()
     local tools = self.tools
     if not tools then return 0 end
     local n = 0
-    if self._schema_chars_n then return self._schema_chars_n end
+    -- 失效键：helper 名单条数。只记"算过没有"是不够的——插件是会话里随时增删的
+    -- （native wrap / 删 helper / /reload），第一次算完钉死就等于永远按旧名单记账。
+    -- _helper_schemas 自身有 memo，这里多看一眼条数是常数级开销。
+    local n_tools = 0
+    if type(tools._helper_schemas) == "function" then
+        local okh, hs = pcall(tools._helper_schemas, tools)
+        if okh and type(hs) == "table" then n_tools = #hs end
+    end
+    if self._schema_chars_n and self._schema_chars_of == n_tools then
+        return self._schema_chars_n
+    end
     local ok, list = pcall(tools.schemas, tools)
     if not ok or type(list) ~= "table" then return 0 end
     local enc = require("cjson").encode
@@ -193,7 +203,16 @@ function M:schema_chars()
         if ok2 then n = n + #s end
     end
     self._schema_chars_n = n
+    self._schema_chars_of = n_tools
     return n
+end
+
+-- 插件增删后手动作废工具清单与 schema 记账（/reload 走这里）。
+-- 顺带清 _helper_cache：不清的话条数不变，上面的失效键就检测不到"换了个同名插件"。
+function M:reset_tool_memo()
+    self._schema_chars_n = nil
+    self._schema_chars_of = nil
+    if self.tools then self.tools._helper_cache = nil end
 end
 
 -- 每次请求都躲不掉的固定成本：system prompt + 工具 schema。

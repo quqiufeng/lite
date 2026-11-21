@@ -999,7 +999,12 @@ function M:session_messages(session_id, limit)
     return msgs, math.max(max_n, tonumber(meta and meta.turns) or 0)
 end
 
-function M:prune_session_messages(session_id, keep)    local id = tostring(session_id)
+-- 整段重扫式裁剪：**不是生产路径**。生产裁剪在 session.lua:336（每条 append 增量淘汰
+-- 到 raw_keep，并把进度记在 meta.raw_trimmed，新进程不用从头重扫）。这里保留只为了
+-- 一次性/诊断用途（tools/auto_unit.lua 的 "session prune messages" 用例按它断言）。
+-- 从 1 扫到 drop 是全量开销，别把它接进 append 热路径。
+function M:prune_session_messages(session_id, keep)
+    local id = tostring(session_id)
     local meta = self:session_meta(id)
     local count = tonumber(meta and meta.messages) or 0
     keep = tonumber(keep) or 200
@@ -1009,9 +1014,15 @@ function M:prune_session_messages(session_id, keep)    local id = tostring(sessi
     for i = 1, drop do
         local sub = id .. "/msg/" .. string.format("%08d", i)
         local old = self:get("/agent/session", sub)
+        -- user 原话永久保留，只淘汰 tool / 旧 assistant 原文（与 session.lua 同口径）。
         if not (type(old) == "table" and old.role == "user") then
             if self:del("/agent/session", sub) then removed = removed + 1 end
         end
+    end
+    -- 水位只进不退：不写回的话，下次 append 还要把这 drop 条重扫一遍 get（多半 NOENT）。
+    if meta and drop > (tonumber(meta.raw_trimmed) or 0) then
+        meta.raw_trimmed = drop
+        self:put("/agent/session", id .. "/meta", meta, TTL.permanent)
     end
     return removed
 end
