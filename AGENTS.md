@@ -2,8 +2,10 @@
 
 **lite = 会改自己的 agent 外壳**：`lua/` 提供循环/工具/记忆/TUI/serve，机器提供 shell/编译器/`.so`/X11。
 本文件只写「每次都要遵守的规则和入口」，**不是教程**：原理见 `design.md`（D1–D10），用法见 `README.md`，
-细节看代码头注释。**≤16000 字节**——超了会被 `prompt.project_context` 截断（`DEFAULT_PROJECT_CHARS`）；
-要加内容先问「能不能挪进 README/design.md/头注释」。
+细节看代码头注释。**体量要求 ≤16000 字节，这是我们自己的约定，不是代码限制**：`prompt.lua:read_capped` 只按
+`LITE_INSTRUCTIONS_CHARS`（默认 16000）在尾部静默截尾——超了不报错、不拦你，只是尾巴悄悄消失。
+约定这么定是因为它**每轮都进 prompt**，字节成本由所有请求分摊。加内容前先问「能不能挪进
+README/design.md/头注释」。
 
 **能力 = `bash`/`web` + 编译器 + FFI + `native`**，内置工具只是常用快捷键，不是上限。缺能力先造，别降级。
 **代码是唯一真相**，注解落后顺手修。上下文有界（旧内容靠 `recall`），同目录只允许一个写实例（`mem.lock`）。
