@@ -3480,6 +3480,29 @@ do
     -- 丢掉 digest 等于白压一次，还让模型失去全部历史
     check(has_digest, "hard ceiling keeps existing digest")
     check(out[#out].role ~= "tool", "hard ceiling tail alignment")
+
+    -- shrink_hard：撞天花板时的唯一补救动作。回归过一次真崩：
+    -- hard_window 返回 (msgs, trimmed, dropped, dropped_chars)，第一个是消息表，
+    -- 误解包成 `trimmed, dropped, chars` 就会在救场路径上抛
+    -- "attempt to compare number with boolean"，整轮直接崩。
+    for i = 1, 20 do
+        ctx.session.messages[#ctx.session.messages + 1] = {
+            role = (i % 2 == 1) and "user" or "assistant",
+            content = "m" .. i .. string.rep("y", 800),
+        }
+    end
+    local shrunk = agent:shrink_hard(0.7)
+    check(type(shrunk) == "table", "shrink_hard returns messages, not boolean")
+    check(#shrunk > 0 and shrunk[1].role == "system", "shrink_hard keeps system")
+    check(type(shrunk[1].content) == "string", "shrink_hard messages carry content")
+    -- 预算给到装得下全部时不裁（返回 nil，调用方好判断"压不动了"）。用**新** agent：
+    -- 上一个已经立了 sticky 前沿，它有意不再往前扩，不是"没裁"。
+    local ctx2 = Context.new({ cwd = "/tmp", context_chars = 9000, max_turns = 1 })
+    local agent2 = Agent.new(ctx2, { stream = function() end },
+        { schemas = function() return {} end }, { append = function() end })
+    agent2:ensure_system()
+    local roomy = agent2:shrink_hard(50)
+    check(roomy == nil, "shrink_hard returns nil when nothing to drop")
 end
 
 -- chars→tokens 校准：用真实 usage 反推，不能纯靠经验值

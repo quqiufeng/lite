@@ -428,10 +428,21 @@ function M:summarize(text, prompt, stream)
         { role = "system", content = tostring(prompt or Compact.DIGEST_PROMPT) },
         { role = "user", content = text },
     }
+    -- input_tokens 必须换成**这次摘要请求**的估算：从 settings 抄过来的是主对话
+    -- 那条请求的，正常时偏大、撞墙时偏得最凶 —— 于是 output_limit 凭一个不属于
+    -- 本次请求的数字算出 room≈0，max_tokens 不写，回来 content="" finish=length，
+    -- 压缩路径上一句 "empty summary" 把真正原因（空间不够）吞掉了。
+    opts.input_tokens = self:estimate_tokens(Compact.total(msgs))
     local assistant, err = stream(msgs, {}, opts, nil, nil)
     if not assistant then return nil, err end
     local out = tostring(assistant.content or "")
-    if out == "" then return nil, "empty summary" end
+    if out == "" then
+        -- 带上 finish/reasoning 长度：空摘要与"输出被截断"是两回事，报错得能分清。
+        return nil, string.format("empty summary (finish=%s, reasoning %d chars, input≈%d tok)",
+            tostring(assistant.finish or "?"),
+            #tostring(assistant.reasoning or ""),
+            opts.input_tokens or 0)
+    end
     return out, nil
 end
 
@@ -681,6 +692,25 @@ function M:hard_window(msgs, budget, hi_cap)
     }
     for i = start, n do out[#out + 1] = msgs[i] end
     return repair_tool_pairs(out), true, dropped, dropped_chars
+end
+
+-- 硬裁到 budget 的 ratio 倍，并把这次位移记进 cache reset 账本。返回新的消息表
+-- （裁不动返回 nil）。这就是「撞到天花板」的唯一补救动作，单独成方法是因为它
+-- 踩过一次很难复现的坑：hard_window 返回 (msgs, trimmed, dropped, dropped_chars)，
+-- 第一个是**消息表**不是布尔，误当 `trimmed, dropped, chars` 解包就会在这条救场
+-- 路径上抛 "attempt to compare number with boolean" —— 本该救场的压缩变成整轮崩。
+function M:shrink_hard(ratio)
+    local c = self:compactor()
+    ratio = tonumber(ratio) or 0.7
+    local kept, trimmed, dropped, chars =
+        self:hard_window(self:view_messages(), math.floor(c.budget * ratio))
+    if not trimmed then return nil end
+    -- 重试换了前缀基座，必须记一次 reset：漏了它，retry 之后那条请求会被算进
+    -- miss_clean，把"trim 的白付成本"摊薄。但它**不是**一次用户可见的 trim：
+    -- 记进 hard_window 会让 reset_hard 虚高。真丢了消息才进 hard_window。
+    self.ctx:note_cache_reset(dropped > 0 and "hard_window" or "other",
+        { dropped = dropped, chars = chars, retry = true })
+    return kept
 end
 
 -- 组装发出去的完整消息列表：视图 + 召回块。
@@ -1132,16 +1162,7 @@ function M:_loop(text, stream)
         if compacted then
             return self:request_messages(text, stream, { inject_context = inject })
         end
-        local c = self:compactor()
-        local trimmed, r_dropped, r_chars =
-            self:hard_window(self:view_messages(), math.floor(c.budget * ratio))
-        if not trimmed then return nil end
-        -- 重试换了前缀基座，必须记一次 reset：漏了它，retry 之后那条请求会被
-        -- 算进 miss_clean，把"trim 的白付成本"摊薄。但它**不是**一次 trim：
-        -- 记进 hard_window 会让 reset_hard 虚高。真丢了消息才进 hard_window。
-        self.ctx:note_cache_reset(r_dropped > 0 and "hard_window" or "other",
-            { dropped = r_dropped, chars = r_chars, retry = true })
-        return trimmed
+        return self:shrink_hard(ratio)
     end
 
     for iter = 1, max_turns do
