@@ -984,13 +984,21 @@ do
     local Debug = require("core.debug")
     local path = os.tmpname()
     local d = assert(Debug.new(path))
-    d:log("test", { a = 1 })
+    -- 契约：文件名插 pid（多实例不抢写同一文件），所以真实路径 ≠ 传入路径。
+    check(d.path ~= path and d.path:find("-", 1, true) ~= nil, "debug log pid 后缀")
+    d:log("test", { a = 1, big = string.rep("x", 20000) })
     d:close()
-    local f = assert(io.open(path))
+    local f = assert(io.open(d.path))
     local line = f:read("*l")
     f:close()
-    os.remove(path)
+    os.remove(d.path)
     check(line and line:find('"event":"test"', 1, true) ~= nil, "debug log")
+    -- 契约：超长字段截断并留原长标记，日志不会被单个大字段撑爆。
+    check(#line < 9000 and line:find("big_truncated", 1, true) ~= nil, "debug log 截断")
+    check(line:find('"big_bytes":20000', 1, true) ~= nil, "debug log 原长")
+    -- 契约：指纹稳定且区分内容（长且重复的字段靠它比对，不再整段落盘）。
+    check(Debug.hash("abc") == Debug.hash("abc") and Debug.hash("abc") ~= Debug.hash("abd"),
+        "debug hash")
 end
 
 -- agent loop（mock provider/tools/session）

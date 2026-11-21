@@ -62,6 +62,8 @@
 - **单写者**：抢不到 `mem.lock` 时 `--tui/--once/serve` 报「被 pid N (comm) 占着」并以**退出码 3** 拒绝启动；
   明知不落盘就 `--readonly`/`LITE_ALLOW_READONLY=1`（状态栏 `mem:N RO!`），只读实例不持 fd。
 - 截断：tool 结果 `LITE_TOOL_RESULT_CHARS`（8192），非 user 原文留 `LITE_SESSION_RAW_KEEP`（200）条。
+- `--debug` 日志按 pid 分文件（`LITE_DEBUG_NO_PID=1` 关），超 `LITE_DEBUG_MAX_MB`（128）轮转 `.1`，
+  单字段超 `LITE_DEBUG_FIELD_CHARS`（4096）截断并留 `*_bytes`；重复大字段（system prompt）只存 `*_sha`。
 
 **system prompt 必须字节稳定**：时钟/轮次/预算都在消息末尾的 `runtime_block`，工具**名字**也在那里
 （helper 增删会打散清单），schema 以 API `tools` 为准。前缀 reset 按 `fold`/`hard_window`/`window` 记账

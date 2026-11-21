@@ -2,6 +2,7 @@
 local cjson = require("cjson")
 local http = require("core.http")
 local Text = require("core.text")
+local Debug = require("core.debug")
 
 -- 进程内追踪账本（trace.prof）：模型 API 的 TTFB / 总时长 / 重试次数。
 local ok_prof, prof = pcall(require, "trace.prof")
@@ -469,7 +470,9 @@ local function build_request(messages, tools, opts)
         opts.debug:log("request", {
             model = body.model,
             messages = #cleaned,
-            system_prompt = system_prompt,
+            -- system prompt 每轮字节相同（前缀缓存要求它恒定），整段存等于每轮重复
+            -- 19KB：只留指纹 + 长度，要对比两次请求是否同一份提示看 sha 就够。
+            system_prompt_sha = Debug.hash(system_prompt),
             system_prompt_bytes = #system_prompt,
             bytes = #payload,
             images = images,

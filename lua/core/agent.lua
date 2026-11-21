@@ -2,6 +2,7 @@
 local cjson = require("cjson")
 local Prompt = require("core.prompt")
 local Text = require("core.text")
+local Debug = require("core.debug")
 local Approval = require("core.approval")
 local Compact = require("core.compact")
 
@@ -108,7 +109,9 @@ function M:ensure_system(active_tools)
     end
     if changed and self.ctx.settings.debug then
         self.ctx.settings.debug:log("system_prompt", {
-            content = prompt,
+            -- 全文 19KB 存进日志没意义（要看内容看 prompt.lua 构建结果）；
+            -- 留指纹 + 长度，够判定"这轮提示是否变了"。
+            content_sha = Debug.hash(prompt),
             bytes = #prompt,
             tools = active_tools and #active_tools or 0,
         })
