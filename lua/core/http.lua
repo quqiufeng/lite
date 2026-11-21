@@ -15,6 +15,7 @@ typedef struct CURLMsg {
 
 CURL *curl_easy_init(void);
 void curl_easy_cleanup(CURL *);
+void curl_easy_reset(CURL *);
 int curl_easy_perform(CURL *);
 int curl_easy_setopt(CURL *, int, ...);
 int curl_easy_getinfo(CURL *, int, ...);
@@ -61,6 +62,10 @@ local CURLOPT_SSL_VERIFYPEER = 64
 local CURLOPT_CONNECTTIMEOUT = 78
 local CURLOPT_TIMEOUT = 13
 local CURLOPT_ACCEPT_ENCODING = 10102
+-- CURLOPT(CURLOPT_FRESH_CONNECT, CURLOPTTYPE_LONG, 74) 即 0 + 74：
+-- 强制为本次请求新建连接（用于 keep-alive 连接被对端关掉后的重试）。
+-- 别写成 75，75 是 FORBID_REUSE（是"用完就关"，不是"这次别复用"）。
+local CURLOPT_FRESH_CONNECT = 74
 local CURLOPT_HTTPGET = 80
 local CURLOPT_FOLLOWLOCATION = 52
 local CURLOPT_MAXREDIRS = 68
@@ -84,7 +89,7 @@ local write_cb_t = ffi.typeof("size_t (*)(char*, size_t, size_t, void *)")
 -- 避免从 C 回调进入 Lua（LuaJIT JIT 下偶发 bad callback）。
 local active_req = nil
 
-local function setup_easy(h, url, headers, payload, cb, writedata)
+local function setup_easy(h, url, headers, payload, cb, writedata, fresh)
     local list = nil
     for _, v in ipairs(headers) do
         list = curl.curl_slist_append(list, v)
@@ -101,41 +106,69 @@ local function setup_easy(h, url, headers, payload, cb, writedata)
     end
     curl.curl_easy_setopt(h, CURLOPT_NOSIGNAL, ffi.cast("long", 1))
     curl.curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, ffi.cast("long", 1))
+    if fresh then curl.curl_easy_setopt(h, CURLOPT_FRESH_CONNECT, ffi.cast("long", 1)) end
     curl.curl_easy_setopt(h, CURLOPT_ACCEPT_ENCODING, ffi.cast("const char *", ""))
     curl.curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, ffi.cast("long", 20))
     curl.curl_easy_setopt(h, CURLOPT_TIMEOUT, ffi.cast("long", 300))
     return list
 end
 
+-- 阻塞通道专用 easy handle：跨请求复用，省掉每次 ~35ms 的 TLS 握手
+-- （libcurl 的连接池挂在 handle 上；multi 通道的连接池在 multi handle 上，本来就复用，
+--  所以这里只处理阻塞通道）。不 cleanup：进程退出由内核回收，句柄里的连接才有机会留着。
+-- 每次用前 reset，选项全由 setup_easy 重设，不复用上一次的残留配置。
+local cached_easy = nil
+
+local function acquire_easy()
+    global_init()
+    if cached_easy == nil then
+        cached_easy = curl.curl_easy_init()
+    else
+        curl.curl_easy_reset(cached_easy)
+    end
+    return cached_easy
+end
+
+-- 复用的 keep-alive 连接可能已被对端关掉：CURLE_GOT_NOTHING(52) / SEND_ERROR(55) /
+-- RECV_ERROR(56) / PARTIAL_FILE(18) / COULDNT_CONNECT(7)。此时若一个字节都没收到，
+-- 重来一次是安全的（不会重复回调 on_data）；这一轮用 FRESH_CONNECT 逼 curl 新建连接，
+-- 否则它会捡回同一个已死的连接再失败一次。
+local STALE_CONN = { [7] = true, [18] = true, [52] = true, [55] = true, [56] = true }
+
 -- 返回 rc, status, body_or_error；on_data 收到流式片段。
 local function post_stream_inner(url, headers, payload, on_data)
-    global_init()
-    local h = curl.curl_easy_init()
+    local h = acquire_easy()
     if h == nil then return -1, 0, "curl_easy_init failed" end
 
-    local chunks = {}
-    local cb = ffi.cast(write_cb_t, function(ptr, size, nmemb)
-        local n = tonumber(size) * tonumber(nmemb)
-        if n <= 0 then return 0 end
-        local s = ffi.string(ptr, n)
-        chunks[#chunks + 1] = s
-        if on_data then on_data(s) end
-        return n
-    end)
+    for attempt = 0, 1 do
+        local chunks = {}
+        local cb = ffi.cast(write_cb_t, function(ptr, size, nmemb)
+            local n = tonumber(size) * tonumber(nmemb)
+            if n <= 0 then return 0 end
+            local s = ffi.string(ptr, n)
+            chunks[#chunks + 1] = s
+            if on_data then on_data(s) end
+            return n
+        end)
 
-    local list = setup_easy(h, url, headers, payload, cb)
-    local rc = curl.curl_easy_perform(h)
-    local code = ffi.new("long[1]")
-    curl.curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, code)
+        local list = setup_easy(h, url, headers, payload, cb, nil, attempt > 0)
+        local rc = curl.curl_easy_perform(h)
+        local code = ffi.new("long[1]")
+        curl.curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, code)
 
-    if list then curl.curl_slist_free_all(list) end
-    curl.curl_easy_cleanup(h)
+        if list then curl.curl_slist_free_all(list) end
 
-    local body = table.concat(chunks)
-    if rc ~= 0 then
-        return tonumber(rc), 0, ffi.string(curl.curl_easy_strerror(rc))
+        local nrc = tonumber(rc)
+        if nrc == 0 then
+            return 0, tonumber(code[0]), table.concat(chunks)
+        end
+        local err = ffi.string(curl.curl_easy_strerror(rc))
+        if not (attempt == 0 and #chunks == 0 and STALE_CONN[nrc]) then
+            return nrc, 0, err
+        end
+        curl.curl_easy_reset(h)
     end
-    return 0, tonumber(code[0]), body
+    return -1, 0, "unreachable"
 end
 
 function M.post_stream(url, headers, payload, on_data)
