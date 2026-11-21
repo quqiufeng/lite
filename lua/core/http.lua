@@ -62,6 +62,10 @@ local CURLOPT_SSL_VERIFYPEER = 64
 local CURLOPT_CONNECTTIMEOUT = 78
 local CURLOPT_TIMEOUT = 13
 local CURLOPT_ACCEPT_ENCODING = 10102
+-- 无数据超时：CURLOPT_TIMEOUT 只管总时长，挡不住"连接活着但一个字节都不来"。
+-- 服务端半开（TCP 没 FIN，LB 黑洞）时 TIMEOUT 之前全在干等。
+local CURLOPT_LOW_SPEED_LIMIT = 19
+local CURLOPT_LOW_SPEED_TIME = 20
 -- CURLOPT(CURLOPT_FRESH_CONNECT, CURLOPTTYPE_LONG, 74) 即 0 + 74：
 -- 强制为本次请求新建连接（用于 keep-alive 连接被对端关掉后的重试）。
 -- 别写成 75，75 是 FORBID_REUSE（是"用完就关"，不是"这次别复用"）。
@@ -84,6 +88,24 @@ local function global_init()
 end
 
 local write_cb_t = ffi.typeof("size_t (*)(char*, size_t, size_t, void *)")
+
+-- 无数据超时。CURLOPT_TIMEOUT 只管总时长：服务端半开（没发 FIN、LB 黑洞、
+-- 进程被 kill 而 socket 还挂着）时一个字节都不来，也要干等到 300s 才报错，
+-- 而报的还是含糊的 "Timeout was reached"。
+-- LOW_SPEED 的语义正是"连续 N 秒平均速率低于阈值就中止"：阈值取 1 B/s，
+-- 正常流式每几十毫秒就有数据，不可能触发；真卡死则 120s 收场。
+-- 不调更激进：推理模型首 token 等几十秒是正常现象，不是故障。
+-- LITE_HTTP_LOW_SPEED_TIME=0 可关掉（排查"到底是谁在耗时间"时用）。
+-- 实测（桩服务端 accept 后不回数据）：设 T 时约在 T+2s 中止、rc=28，
+-- 这 2s 是 curl 低速判定的检查粒度，别按 T 精确计时。
+local LOW_SPEED_LIMIT = 1
+local function apply_idle_timeout(h, total_sec)
+    local t = tonumber(os.getenv("LITE_HTTP_LOW_SPEED_TIME") or "") or 120
+    if t <= 0 then return end          -- 0 = 交给 CURLOPT_TIMEOUT 兜底
+    if total_sec and total_sec < t then t = total_sec end
+    curl.curl_easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, ffi.cast("long", LOW_SPEED_LIMIT))
+    curl.curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, ffi.cast("long", t))
+end
 
 -- 单活动请求；多路复用期间用 tmpfile 缓冲，poll 后再读增量，
 -- 避免从 C 回调进入 Lua（LuaJIT JIT 下偶发 bad callback）。
@@ -110,6 +132,7 @@ local function setup_easy(h, url, headers, payload, cb, writedata, fresh)
     curl.curl_easy_setopt(h, CURLOPT_ACCEPT_ENCODING, ffi.cast("const char *", ""))
     curl.curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, ffi.cast("long", 20))
     curl.curl_easy_setopt(h, CURLOPT_TIMEOUT, ffi.cast("long", 300))
+    apply_idle_timeout(h, 300)
     return list
 end
 
@@ -218,6 +241,7 @@ local function get_inner(url, headers, max_bytes, timeout_sec)
     local tmo = math.max(1, tonumber(timeout_sec) or 60)
     curl.curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, ffi.cast("long", math.min(20, tmo)))
     curl.curl_easy_setopt(h, CURLOPT_TIMEOUT, ffi.cast("long", tmo))
+    apply_idle_timeout(h, tmo)
 
     local rc = curl.curl_easy_perform(h)
     local code = ffi.new("long[1]")

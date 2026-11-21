@@ -174,6 +174,7 @@ export LITE_MEMDB_SPLIT=1                        # 仅在多机 NFS 上用：退
 | `LITE_TEMPERATURE` | 0 | 采样温度 |
 | `LITE_THINKING` / `LITE_REASONING_EFFORT` | — | thinking 开关 / `high`·`medium`·`low` |
 | `LITE_MAX_RETRIES` | 2 | 429/5xx/网络错误重试次数 |
+| `LITE_HTTP_LOW_SPEED_TIME` | 120 | 无数据超时秒数：连续这么久没有任何字节就断（`CURLOPT_LOW_SPEED_*`，实测触发点约为此值 +2s）。`CURLOPT_TIMEOUT` 管总时长，挡不住服务端半开导致的干等。`0` 关掉 |
 | `LITE_CONTEXT_CHARS` | 120000 | 整条请求的字符预算（含 system/digest/schema） |
 | `LITE_CONTEXT_TURNS` | 16 | 摘要尾巴的 user 轮数上限 |
 | `LITE_CONTEXT_WINDOW` | 64000 | 模型窗口 tokens（算触发线与 output limit） |
