@@ -957,7 +957,18 @@ function M:_finalize(stream, why, kind)
         function(delta) ctx:emit("reasoning", delta) end)
     if not assistant then
         ctx:end_turn()
-        return nil, err
+        -- 收尾请求本身失败时也要有话说：返回 nil 时 TUI/--once 什么都不显示，
+        -- 用户看到的是整轮沉默，比一句"没收口"糟得多。
+        local answer = string.format(
+            "（工具循环已停止：%s；收尾请求也失败了：%s。请说\"继续\"让我接着做。）",
+            why, tostring(err))
+        ctx:emit("assistant", { role = "assistant", content = answer })
+        if self.memory then
+            self.memory:remember_turn(ctx.session.id, ctx.session.turn, self._text or "", answer, {})
+            self.memory:tick()
+        end
+        self:save_usage()
+        return answer
     end
     local answer = assistant.content or ""
     if answer:match("^%s*$") then
@@ -1077,7 +1088,9 @@ function M:_loop(text, stream)
     local prev_rs, result_streak = nil, 0
     -- 同一工具连续被拦：这是"做不了"而不是"没进展"，单独计数、单独收尾。
     local blocked_tool, blocked_n = nil, 0
-    local overflow_retried = false
+    -- 上下文不够时的重试次数（不是布尔）：第一次轻压、第二次狠压。
+    -- 只给 1 次时，压缩本身没把输入降下来就又撞墙，后面直接返回空白。
+    local MAX_OVERFLOW = 2
     local max_turns = ctx.settings.max_turns
     local token_budget = tonumber(ctx.settings.token_budget) or 0
 
@@ -1090,9 +1103,45 @@ function M:_loop(text, stream)
         })
         -- outputLimit：让 provider 知道本轮输入大概占了多少 token。
         ctx.settings.input_tokens = self:estimate_tokens(Compact.total(req))
+        -- 本地就算出"留给输出的空间不够"时**不发请求**。发出去的结果必然是
+        -- max_tokens 被压到地板、finish=length、content 空串；那不是 API 错误，
+        -- context_overflow() 认不出来，压缩也就永远不会触发 —— 用户只看到空白。
+        -- 这里自己合成一条 overflow 错误，让下面统一的压缩重试去处理。
+        if self.provider.room_left then
+            local room = self.provider.room_left(ctx.settings)
+            local min_out = self.provider.MIN_OUT or 1024
+            if room and room < min_out then
+                return nil, string.format(
+                    "context overflow: estimated input %d tokens leaves only %d for output "
+                        .. "(window %d, reserve %d)",
+                    ctx.settings.input_tokens, room,
+                    tonumber(ctx.settings.context_window) or 0,
+                    tonumber(ctx.settings.reserve_tokens) or 0)
+            end
+        end
         return stream(req, request_tools, ctx.settings,
             function(delta) ctx:emit("delta", delta) end,
             function(delta) ctx:emit("reasoning", delta) end)
+    end
+
+    -- 上下文超限的补救：先摘要压缩，压不动就硬裁到 budget 的 ratio 倍。
+    -- 三条触发路径（provider 报 overflow / 本地算出没空间 / 空回复被 length 截断）
+    -- 共用同一份，免得各写一遍、各自漏记 cache reset。
+    local function recover_context(ratio, inject)
+        local compacted = self:maybe_compact(stream, 0, true)
+        if compacted then
+            return self:request_messages(text, stream, { inject_context = inject })
+        end
+        local c = self:compactor()
+        local trimmed, r_dropped, r_chars =
+            self:hard_window(self:view_messages(), math.floor(c.budget * ratio))
+        if not trimmed then return nil end
+        -- 重试换了前缀基座，必须记一次 reset：漏了它，retry 之后那条请求会被
+        -- 算进 miss_clean，把"trim 的白付成本"摊薄。但它**不是**一次 trim：
+        -- 记进 hard_window 会让 reset_hard 虚高。真丢了消息才进 hard_window。
+        self.ctx:note_cache_reset(r_dropped > 0 and "hard_window" or "other",
+            { dropped = r_dropped, chars = r_chars, retry = true })
+        return trimmed
     end
 
     for iter = 1, max_turns do
@@ -1113,38 +1162,44 @@ function M:_loop(text, stream)
         ctx:begin_turn()
         local assistant, err = request_stream(iter == 1, false, iter)
 
-        -- 参考 opencode：provider 明确报上下文过长时，强制压一次再重试。
-        if not assistant and not overflow_retried
-            and self.provider.context_overflow and self.provider.context_overflow(err) then
-            overflow_retried = true
+        -- 上下文不够：provider 明确报过长，或本地算出没空间留输出（自己合成的
+        -- 错误串）。两者都压一次再来；第一次保守（0.7），第二次更狠（0.5）——
+        -- 只压一次时，压缩本身没把输入降到线下就又会撞墙，然后返回空白。
+        local function squeezed()
+            return self.provider.context_overflow and self.provider.context_overflow(err)
+        end
+        local squeezed_n = 0
+        while not assistant and squeezed() and squeezed_n < MAX_OVERFLOW do
+            squeezed_n = squeezed_n + 1
             self:save_usage()
-            local compacted = self:maybe_compact(stream, 0, true)
-            local retry_msgs
-            if compacted then
-                retry_msgs = self:request_messages(text, stream, {
-                    inject_context = (iter == 1),
-                })
-            else
-                local c = self:compactor()
-                local trimmed, r_dropped, r_chars
-                retry_msgs, trimmed, r_dropped, r_chars = self:hard_window(self:view_messages(),
-                    math.floor(c.budget * 0.7))
-                -- 这条重试同样换了前缀基座，必须记一次 reset：漏了它，retry 之后
-                -- 那条请求就会被算进 miss_clean，把"trim 的白付成本"摊薄。
-                -- 但它**不是**一次 trim：记进 hard_window 会让 reset_hard 虚高
-                -- （老实现传 dropped=0，硬上限次数里混进了零位移的重试）。
-                -- 真丢了消息才进 hard_window，否则进 other。
-                if trimmed then
-                    self.ctx:note_cache_reset(r_dropped > 0 and "hard_window" or "other",
-                        { dropped = r_dropped, chars = r_chars, retry = true })
-                end
-                if not trimmed then retry_msgs = nil end
-            end
+            local retry_msgs = recover_context(squeezed_n == 1 and 0.7 or 0.5, iter == 1)
+            if not retry_msgs then break end
+            ctx.settings.input_tokens = self:estimate_tokens(Compact.total(retry_msgs))
+            assistant, err = stream(retry_msgs, self.tools:schemas(), ctx.settings,
+                function(delta) ctx:emit("delta", delta) end,
+                function(delta) ctx:emit("reasoning", delta) end)
+        end
+
+        -- 空回复 + finish=length = 输出额度被砍断（reasoning 吃光了 max_tokens）。
+        -- 这不是"模型没返回内容"，是"空间不够"：压一次给输出腾地方再问。
+        if assistant and squeezed_n < MAX_OVERFLOW
+            and assistant.finish == "length"
+            and (assistant.content or ""):match("^%s*$") then
+            squeezed_n = squeezed_n + 1
+            self:save_usage()
+            local retry_msgs = recover_context(squeezed_n == 1 and 0.7 or 0.5, false)
             if retry_msgs then
                 ctx.settings.input_tokens = self:estimate_tokens(Compact.total(retry_msgs))
-                assistant, err = stream(retry_msgs, self.tools:schemas(), ctx.settings,
+                local again, aerr = stream(retry_msgs, self.tools:schemas(), ctx.settings,
                     function(delta) ctx:emit("delta", delta) end,
                     function(delta) ctx:emit("reasoning", delta) end)
+                if again then
+                    assistant, err = again, nil
+                else
+                    -- 重试比第一次还糟：留住手里这条残片（至少 finish 信息在），
+                    -- 让下面的兜底文案把它说清楚，别整轮丢掉。
+                    err = aerr
+                end
             end
         end
 
@@ -1152,8 +1207,25 @@ function M:_loop(text, stream)
             -- 报错前也要落一次账：这一轮已经发出去的请求（含被计费的 miss）
             -- 不能因为最后一步失败就从统计里消失。
             self:save_usage()
-            ctx:fail(err)
             ctx:end_turn()
+            -- 压缩到极限仍放不下：给一条能照做的收尾，而不是甩一行 API 错误
+            -- 或干脆空白（`_loop` 返回 nil 时 TUI 什么都不显示）。
+            if squeezed() then
+                local answer = string.format(
+                    "（上下文放不下：窗口 %s tokens，估算输入 %s，压了 %d 次仍不够留给输出。"
+                        .. "可以 /compact 压一次、清空本轮，或开新会话继续。）",
+                    tostring(ctx.settings.context_window), tostring(ctx.settings.input_tokens),
+                    squeezed_n)
+                ctx:add_message({ role = "assistant", content = answer })
+                self.session:append({ role = "assistant", content = answer })
+                ctx:emit("assistant", { role = "assistant", content = answer })
+                if self.memory then
+                    self.memory:remember_turn(ctx.session.id, ctx.session.turn, text, answer, tool_notes)
+                    self.memory:tick()
+                end
+                return answer
+            end
+            ctx:fail(err)
             return nil, err
         end
 
@@ -1165,7 +1237,17 @@ function M:_loop(text, stream)
         if not calls or #calls == 0 then
             local answer = assistant.content or ""
             if answer:match("^%s*$") then
-                answer = "（模型没有返回内容。）"
+                -- 压够次数还是空：别只说"没有返回内容"，把真实原因写出来，
+                -- 否则用户以为是模型抽风，其实是额度/上下文不够。
+                if assistant.finish == "length" then
+                    answer = string.format(
+                        "（输出被 max_tokens 砍断，压缩 %d 次后仍没有正文：估算输入 %s / 窗口 %s。"
+                            .. "再试一次，或 /compact、开新会话。）",
+                        squeezed_n, tostring(ctx.settings.input_tokens),
+                        tostring(ctx.settings.context_window))
+                else
+                    answer = "（模型没有返回内容。）"
+                end
                 assistant.content = answer
             end
             if self.memory then

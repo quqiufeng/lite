@@ -800,9 +800,21 @@ do
     local lim = P.output_limit({ context_window = 64000, input_tokens = 16000,
         reserve_tokens = 8192, max_output_tokens = 8192 })
     check(lim == 8192, "provider output limit roomy")
+    -- room = 20000-18000-1000 = 1000：如实返回 1000，**不抬回 1024**。
+    -- 抬回下限 = 明知塞不下还发请求，回来 finish=length + 空 content，
+    -- 既不是 API 错误也触发不了压缩，用户只看到空白。
     local lim2 = P.output_limit({ context_window = 20000, input_tokens = 18000,
         reserve_tokens = 1000, max_output_tokens = 8192 })
-    check(lim2 == 1024, "provider output limit floor")
+    check(lim2 == 1000, "provider output limit honest, not floored")
+    local lim3 = P.output_limit({ context_window = 20000, input_tokens = 19000,
+        reserve_tokens = 1000, max_output_tokens = 8192 })
+    check(lim3 == 0, "provider output limit zero when input eats the window")
+    check(P.room_left({ context_window = 20000, input_tokens = 19000,
+        reserve_tokens = 1000 }) == 0, "provider room_left arithmetic")
+    check(P.room_left({ context_window = 0, input_tokens = 10 }) == nil,
+        "provider room_left nil when window unknown")
+    check(P.context_overflow("context overflow: estimated input 9000 tokens"), 
+        "provider recognizes locally synthesized overflow")
 end
 
 -- usage 累积与命中率

@@ -292,18 +292,31 @@ local function clean_messages(messages)
     return out, fixed
 end
 
--- OpenCode 的 outputLimit 思路：输出不能把剩余窗口吃穿。
-function M.output_limit(opts)
-    local max_out = tonumber(opts.max_output_tokens) or 0
-    if max_out <= 0 then return nil end
+-- 最小可用输出额度：低于它，回复必然是残片（reasoning 模型连一句话都收不了尾）。
+M.MIN_OUT = 1024
+
+-- 窗口减去估算输入和 reserve，剩下的**输出**额度。
+-- 纯本地推算：input 是 agent 用 tok_per_char 估的，不是 provider 报的实数。
+-- 返回 nil = 不知道（没配窗口或还没算过输入），调用方不该据此做决定。
+function M.room_left(opts)
     local window = tonumber(opts.context_window) or 0
     local input = tonumber(opts.input_tokens) or 0
     local reserve = tonumber(opts.reserve_tokens) or 0
-    if window > 0 and input > 0 then
-        local room = window - input - reserve
-        if room < 1024 then room = 1024 end
-        if room < max_out then max_out = room end
-    end
+    if window <= 0 or input <= 0 then return nil end
+    return window - input - reserve
+end
+
+-- OpenCode 的 outputLimit 思路：输出不能把剩余窗口吃穿。
+-- 关键：room 不足时**不许抬回下限**。老实现 `if room < 1024 then room = 1024`，
+-- 等于明知输入已经吃穿窗口还发一次 max_tokens=1024 的请求，结果 finish=length +
+-- content="" —— 那不是 API 报错，context_overflow() 认不出来，压缩永不触发，
+-- 用户只看到空白。现在如实返回（可能 ≤0），由 agent 判"没空间就先压缩"。
+function M.output_limit(opts)
+    local max_out = tonumber(opts.max_output_tokens) or 0
+    if max_out <= 0 then return nil end
+    local room = M.room_left(opts)
+    if room and room < max_out then max_out = room end
+    if max_out <= 0 then return 0 end
     return math.floor(max_out)
 end
 
@@ -315,6 +328,8 @@ function M.context_overflow(err)
         or s:find("too many tokens", 1, true) ~= nil
         or s:find("input is too long", 1, true) ~= nil
         or s:find("request too large", 1, true) ~= nil
+        -- agent 本地判出"没空间留输出"时自己合成的错误串（见 agent.request_stream）
+        or s:find("context overflow", 1, true) ~= nil
         or (s:find("http 400", 1, true) ~= nil and s:find("token", 1, true) ~= nil)
         or (s:find("http 400", 1, true) ~= nil and s:find("context", 1, true) ~= nil)
 end
@@ -422,7 +437,7 @@ local function build_request(messages, tools, opts)
     -- 不带上 include_usage，DeepSeek 不会在流末尾返回 usage，命中率就无从观测。
     body.stream_options = { include_usage = true }
     local max_out = M.output_limit(opts)
-    if max_out then body.max_tokens = max_out end
+    if max_out and max_out > 0 then body.max_tokens = max_out end
     if opts.thinking then body.thinking = { type = "enabled" } end
     if opts.reasoning_effort and opts.reasoning_effort ~= "" then
         body.reasoning_effort = opts.reasoning_effort
