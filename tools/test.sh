@@ -28,6 +28,17 @@ if ! "$ROOT/tools/lite-lua" "$ROOT/tools/html_img_check.lua"; then
     echo "FAIL html_img" >&2; exit 1
 fi
 
+echo "== http =="
+# 无数据超时（LITE_HTTP_LOW_SPEED_TIME）：桩服务端 accept 后一个字节不回（半开，
+# 模拟 LB 黑洞 / 进程被 kill 而 socket 还挂着），此时必须在 ~3s 收场且 rc=28，
+# 而不是干等 CURLOPT_TIMEOUT 的 300s 然后报含糊的 "Timeout was reached"。
+# 同时钉住反面：正常快响应不能被误杀、T=0 时不该提前放弃。
+# 全离线（fork 一个纯 libc 桩服务端），不碰真 API，不需要 key。
+# 外面套 timeout 是因为这条如果回归，「干等 300s」会变成整条回归挂住 —— 要 FAIL 不要 hang。
+if ! timeout 90 "$ROOT/tools/lite-lua" "$ROOT/tools/http_check.lua"; then
+    echo "FAIL http.idle_timeout" >&2; exit 1
+fi
+
 echo "== live =="
 "$ROOT/tools/live_smoke.sh"
 
