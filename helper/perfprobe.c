@@ -208,7 +208,7 @@ static void freeargv(char **argv, int n) { for (int i = 0; i < n; i++) free(argv
 
 /* ------------------------------------------------------------------- elf */
 typedef struct { unsigned long off, vaddr, filesz; } Seg;
-typedef struct { unsigned long long v; char *nm; } Sym;
+typedef struct { unsigned long long v; unsigned sz; char *nm; } Sym;
 typedef struct { unsigned long long b, e; } Fde;      /* .eh_frame 的 pc 范围 */
 typedef struct {
   char path[512];
@@ -397,6 +397,7 @@ static void elf_parse_eh(Elf *e, size_t sec_off, size_t sec_sz, unsigned long lo
 }
 
 static void elf_fde_try(Elf *e, const Elf64_Shdr *sh) {
+  if (e->f) return;                       /* 已解析过 */
   if (sh) elf_parse_eh(e, sh->sh_offset, sh->sh_size, sh->sh_addr);
 }
 
@@ -475,12 +476,17 @@ static void elf_parse(Elf *e) {
     int t = ELF64_ST_TYPE(sy->st_info);
     if (t != STT_FUNC && t != STT_OBJECT && t != STT_NOTYPE && t != STT_GNU_IFUNC) continue;
     arr[n].v = sy->st_value;
+    arr[n].sz = (unsigned)sy->st_size;
     arr[n].nm = (char *)nm;
     n++;
   }
   if (!n) { free(arr); elf_fde_try(e, ehsec); return; }
   qsort(arr, n, sizeof(Sym), symcmp);
   e->s = arr; e->n = n;
+  /* 有符号表也照样解析 .eh_frame：符号之间的裸代码（如 glibc 被 strip 的
+     memcpy/memmove IFUNC 变体）就能拿到稳定的 sub_<pc_begin>，而不是散成
+     几十个 libc.so.6+0x… 碎片。 */
+  elf_fde_try(e, ehsec);
 }
 
 static Elf *elf_get(const char *path) {
@@ -537,7 +543,12 @@ static const char *elf_sym(Elf *e, unsigned long fileoff) {
     int mid = lo + (hi - lo) / 2;
     if (e->s[mid].v <= va) { best = mid; lo = mid + 1; } else hi = mid - 1;
   }
-  return (best < 0) ? NULL : e->s[best].nm;
+  if (best < 0) return NULL;
+  /* 只认「落在符号自身范围内」的地址：glibc 的 memcpy/memset IFUNC 变体被
+     strip 掉后没有符号，若按"前一个符号"归因，整片内存拷贝会全被算到
+     __nss_database_lookup 这类尾部符号上（实测虚高到 37%）。 */
+  if (e->s[best].sz && va >= e->s[best].v + e->s[best].sz) return NULL;
+  return e->s[best].nm;
 }
 
 /* 无符号表时的兜底：命中 FDE 范围就返回 sub_<入口地址> */
