@@ -373,9 +373,14 @@ StaticPy 的产物是「Chez AOT 编出的匿名可执行段 + 独立 ELF」。�
 STATICPY_PERFMAP=1 ./dist/translator app.static.py > ~/iso_gen/app.code.scm
 #    （走 build 脚本也行：翻译在脚本内部跑，env 一样生效）
 bash staticpy/static_build_comfycli.sh ~/iso_gen/app.code.scm app
-# 2. 直接采，不用任何附加动作：产物启动时自己写 /tmp/perf-<pid>.map
+# 2. 用 perfprobe 采（它跑完再统一归因，正好吃得到事后才写出来的 map）
 perfprobe argv=["/opt/StaticPy/dist/app"] freq=199
 ```
+
+**时刻要记牢**：map 是 `(static_main)` 之后才写的 → **进程退出前才出现**（见原理第 5 条）。
+所以它是 **post-mortem 归因**：`perfprobe` 采完、目标退出、再读 map，能对上；
+而 `trace mode=oncpu --sym` 是**边采边符号化**（`engine.lua` 的 `perf_map()` 还带负缓存，
+第一次读不到就锁成"没有"），对这类目标会全程 `[anon]` —— 要命名请用 `perfprobe`。
 
 原理只有五条，不需要任何名字表：
 
@@ -385,6 +390,8 @@ perfprobe argv=["/opt/StaticPy/dist/app"] freq=199
 3. `(object->reference-address p)` 掩掉低 3 位就是 code entry。
 4. 码长用「与下一个入口的间距」估，上限 `#x2000`（没跑过的函数估不准，宁短勿长）。
 5. 写在 `(static_main)` **之后**：函数跑过一轮，对象才稳定指向代码段。
+   ——代价是 map 只在进程结束前才落盘（live 采样看不到，见上）；
+   这是"名字准"与"采样期就有名字"的取舍，当前选了名字准。
 
 覆盖量：translator 从 **399 条 → 2283 条（5.7×）**。构建期门禁只影响这份 IR，
 **不开 `STATICPY_PERFMAP` 时 IR 逐字节不变**（`n5` → 2104828 B，`cmp` 通过）。
