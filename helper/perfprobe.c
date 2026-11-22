@@ -634,7 +634,11 @@ static void jit_load(pid_t pid) {
   g_jit_loaded = 1; g_jit_mt = st.st_mtime; g_jit_sz = st.st_size;
   FILE *f = fopen(p, "re");
   if (!f) return;
+  /* jit_free() 刚把 g_jit 置空：cap 只是上限，缓冲区必须自己先分配，
+     否则下面的 g_jit[g_njit] 就是空指针写（目标一旦真写了 perf map 即崩）。 */
   int cap = 1024;
+  g_jit = malloc((size_t)cap * sizeof(JitE));
+  if (!g_jit) { fclose(f); return; }
   char line[600];
   while (fgets(line, sizeof line, f)) {
     unsigned long a = 0, n = 0; char nm[256];
