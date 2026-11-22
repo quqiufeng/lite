@@ -1,0 +1,1 @@
+{"source":"perfprobe.c","name":"perfprobe","lang":"c","so":"perfprobe-1795305720.so","abi":"char *lite_helper(const char *input); void lite_helper_free(char *out);","built_at":1795305720,"scope":"local"}
