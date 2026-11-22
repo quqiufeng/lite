@@ -53,6 +53,22 @@ local function sleep_seconds(sec)
 end
 
 local function rf(p) local f=io.open(p) if not f then return nil end local s=f:read("*a") f:close() return s end
+
+-- 目标还活着吗：--pid 跟的是别人的进程，随时可能退出。没有这条，短命目标
+-- （translator 跑 n5 ≈ 1.3s）就得把 duration 硬睡满再报几乎空的样本；更糟的是
+-- ring 建立时已 ESRCH（open errno=3），整个采样白跑。见 helper/trace.lua spawn_target。
+-- 注意「僵尸 != 活着」：目标退出了但父进程还没 reap，/proc/<pid>/stat 依然在，
+-- 只看文件存在就会把采样窗口硬拖满 duration，报告里还看不出目标是提前结束的。
+-- stat 第三字段是状态，comm 可能含空格/括号 → 从最后一个 ')' 之后取。
+local function proc_alive(pid)
+  if not pid then return true end
+  local f = io.open("/proc/"..tostring(pid).."/stat", "rb")
+  if not f then return false end
+  local s = f:read("*l") or "" f:close()
+  local st = (s:match("%)%s+(%a)") or "")
+  if st == "Z" or st == "X" or st == "x" then return false end
+  return true
+end
 local function wf(p,s) local f=io.open(p,"w") if not f then return nil end local ok,e=f:write(s) f:close() return ok,e end
 
 ------------------------------------------------------------------------
@@ -1446,7 +1462,8 @@ local function run_oncpu()
   if #P.rings == 0 then fail("ring 建立失败" .. ring_err_note()) end
 
   local acc, comms, total = {}, {}, 0
-  local deadline = now_s() + opt.duration
+  local t0 = now_s()
+  local deadline = t0 + opt.duration
   local function drain()
     for _, r in ipairs(P.rings) do
       walk(r, by_id, function(_, pid, _tid, _tm, _raw, _rl, ccp, nr)
@@ -1459,11 +1476,21 @@ local function run_oncpu()
       end)
     end
   end
-  while wait_ready(P.pfd, P.npfd, deadline) do
+  local exited = false
+  while true do
+    -- 目标先退就收工：per-task ring 死了再等只是白睡。存活检查必须比 wait_ready 更
+    -- 频繁（per-task 事件没了以后 wait_ready 会一直阻塞到 deadline），所以按 100ms 切片。
+    if not proc_alive(opt.pid) then exited = true break end
+    local now = now_s()
+    if now >= deadline then break end
+    if not wait_ready(P.pfd, P.npfd, math.min(deadline, now + 0.1)) and now_s() >= deadline then break end
     drain() P.reap() P.sync()
   end
   drain()
   P.close_all()
+  -- 实际采了多久：目标先退时 < duration，报告里如实说（否则「2s」是骗人的）
+  result.elapsed = now_s() - t0
+  result.target_exited = exited or (opt.pid ~= nil and not proc_alive(opt.pid))
 
   local arr = {}
   for k, v in pairs(acc) do arr[#arr+1] = { stack = k, count = v } end
@@ -1846,7 +1873,15 @@ else
     print(("%s  events=%d stacks=%d%s"):format(src ~= "" and src or "(无探针)", result.events, result.stacks, lostnote()))
     for _, f in ipairs(result.folded) do print(("  %6d  %s"):format(f.count, f.stack)) end
   elseif opt.mode == "oncpu" then
-    print(("oncpu  %dHz  样本=%d 栈种类=%d%s"):format(result.freq, result.events, result.stacks, lostnote()))
+    -- 目标自己先退：实际采样时长 < duration，别让读的人以为采满了
+    local el = result.elapsed
+    local exnote = ""
+    if result.target_exited then
+      exnote = ("（目标提前退出：实际采了 %.2fs / 计划 %gs）"):format(el or 0, opt.duration)
+    elseif el and el < opt.duration * 0.9 then
+      exnote = ("（实际采了 %.2fs）"):format(el)
+    end
+    print(("oncpu  %dHz  样本=%d 栈种类=%d%s%s"):format(result.freq, result.events, result.stacks, lostnote(), exnote))
     for _, f in ipairs(result.top) do
       local pct = result.events > 0 and (f.count * 100 / result.events) or 0
       print(("  %5.1f%% %6d  %s"):format(pct, f.count, f.stack))

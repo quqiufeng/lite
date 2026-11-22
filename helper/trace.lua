@@ -58,6 +58,15 @@ local function capture(cmd, timeout)
     return out, rc or -1
 end
 
+-- 起后台进程专用：**不能**套 timeout（套了 $! 拿到的是 timeout，采它就永远 0 样本）
+local function capture_raw(cmd)
+    local p = io.popen("sh -c " .. shq(cmd) .. " 2>&1")
+    if not p then return nil, -1 end
+    local out = p:read("*a") or ""
+    local ok = p:close()
+    return out, ok and 0 or -1
+end
+
 local function file_size(p)
     local f = io.open(p, "rb")
     if not f then return nil end
@@ -381,8 +390,73 @@ local function do_perfmap(args)
     return table.concat(L, "\n")
 end
 
+-- ── 目标进程：给了 command/argv 就自己起（当前用户/当前 cwd/env）───────────
+-- 为什么不把 fork+exec 放进 engine（engine 跑在 sudo -n 下）：
+--   [1] 目标产物归 o 就变 root（translator 写的 IR、构建产物、日志全跟着变）
+--   [2] sudo 默认 env_reset：LD_LIBRARY_PATH/PATH 全丢；StaticPy 产物还就要 LD_LIBRARY_PATH
+--   [3] 报错更难懂：目标先于 ring 建立就死 = open errno=3(ESRCH)，用户看不出是「跑太快」
+-- 所以：本进程用 sh 后台起（setsid 给独立进程组），拿 $! 当 pid 交给 engine 挂，
+-- 采完连组一起收（目标自己 fork 的子进程也带走）。
+local function proc_alive(pid)
+    local f = io.open("/proc/" .. tostring(pid) .. "/stat", "rb")
+    if f then f:close() return true end
+    return false
+end
+
+local function kill_group(pid)
+    if not pid then return end
+    -- TERM 先给机会收尾（flush/删临时文件），0.2s 还不走就 KILL
+    capture(("kill -s TERM -- -%d 2>/dev/null; sleep 0.2; kill -s KILL -- -%d 2>/dev/null; true")
+        :format(pid, pid), 8)
+end
+
+local function spawn_target(args)
+    local parts = as_list(args.argv)
+    local cmd
+    if #parts > 0 then
+        local q = {}
+        for i, v in ipairs(parts) do q[i] = shq(v) end
+        cmd = table.concat(q, " ")
+    elseif args.command ~= nil and tostring(args.command) ~= "" then
+        cmd = tostring(args.command)
+    else
+        return nil
+    end
+    if args.pid ~= nil and tostring(args.pid) ~= "" then
+        error("trace: pid 和 command/argv 二选一（给了 pid 就是只旁观已有进程，不会替你起）", 0)
+    end
+    local log = (args.target_out ~= nil and tostring(args.target_out) ~= "")
+        and shq(tostring(args.target_out)) or "/dev/null"
+    -- $! = 后台作业的 pid；setsid 让它成为新会话/进程组首进程（组 id == pid）
+    -- capture_raw 而不是 capture：capture 会套 `timeout N`，$! 就成了 timeout 的 pid
+    local out, rc = capture_raw("setsid " .. cmd .. " >" .. log .. " 2>&1 & echo __lite_pid=$!")
+    local pid = tonumber((out or ""):match("__lite_pid=(%d+)"))
+    if not pid or pid <= 1 then
+        error(("trace: 起不来目标 %s（%s）%s"):format(shq(cmd), tostring(out or ""):sub(1, 300),
+            rc == 124 and "；10s 内 shell 没返回（命令里有等待输入？）" or ""), 0)
+    end
+    -- 起来 ≠ 活下来：路径错/缺 .so 时 exec 立刻失败，这里给一句人话而不是 errno=3
+    capture("sleep 0.05", 5)
+    if not proc_alive(pid) then
+        local tail = ""
+        if args.target_out ~= nil and tostring(args.target_out) ~= "" then
+            local f = io.open(tostring(args.target_out), "rb")
+            if f then
+                local n = f:seek("end") or 0
+                f:seek("set", math.max(0, n - 600))
+                tail = (f:read("*a") or ""):gsub("%s+$", "")
+                f:close()
+            end
+        end
+        error(("trace: 目标 %s 在 50ms 内就退出（pid %d 已消失）。多半是路径/依赖/参数问题："
+            .. "先手动跑一遍确认（要做更细的分析用 perfprobe，它自带 fork+exec）。%s")
+            :format(shq(cmd), pid, tail ~= "" and ("\n它最后的输出：\n" .. tail) or ""), 0)
+    end
+    return pid, cmd
+end
+
 -- ── action=run ───────────────────────────────────────────────────────────
-local function do_run(args, env)
+local function do_run_body(args, env)
     local root = lite_root(env)
     local engine = engine_path(root)
     if not engine then
@@ -476,6 +550,42 @@ local function do_run(args, env)
         return head .. (summary and summary.render(mode, j) or body)
     end
     return head .. (body:gsub("%s+$", "") == "" and "(engine 无 stdout 输出)" or body)
+end
+
+-- ── action=run（外层：起目标 → 采 → 收组）───────────────────────
+-- 没有 command/argv 时跟以前完全一样（只吃 pid / 全机采样），不碰子进程。
+local function do_run(args, env)
+    args = args or {}
+    local pid, cmd = spawn_target(args)
+    if pid then args.pid = pid end
+    local ok, res = pcall(do_run_body, args, env)
+    if pid then kill_group(pid) end
+    -- 自己起的目标 + ring 挂不上 = 目标在 perf 挂载前就没了（说人话，别丢 errno=3）
+    local function ring_hint(body)
+        if not pid or not tostring(body):find("ring 建立失败", 1, true) then return body end
+        local tail = ""
+        if args.target_out ~= nil and tostring(args.target_out) ~= "" then
+            local f = io.open(tostring(args.target_out), "rb")
+            if f then
+                local n = f:seek("end") or 0
+                f:seek("set", math.max(0, n - 600))
+                tail = (f:read("*a") or ""):gsub("%s+$", "")
+                f:close()
+            end
+        end
+        return tostring(body) .. ("\n（目标 pid %d 在 perf 挂上之前就没了。常见原因：命令本身跑挂"
+            .. "（比如把 `exec` 当前缀，setsid 会去找名为 exec 的程序）、路径/依赖错、"
+            .. "或者目标比 perf 挂载还快（→ 换更重的输入，短命目标用 perfprobe）；"
+            .. "不想起进程就传 pid 旁观已有进程。%s）")
+            :format(pid, tail ~= "" and ("目标最后的输出：\n" .. tail) or "可给 target_out 看目标自己的输出")
+    end
+    if not ok then error(ring_hint(res), 0) end
+    res = ring_hint(res)
+    if pid then
+        res = ("目标: pid %d（%s，setsid 进程组；采样结束已整组收掉）\n")
+            :format(pid, shq(cmd)) .. res
+    end
+    return res
 end
 
 -- ── action=render：从上次的 JSON 重出图（不采样，毫秒级） ────────────────
@@ -671,6 +781,14 @@ local schema = {
             key = { type = "string", description = "latency/聚合键，默认 comm" },
             str = { type = "string", description = "按字符串解的字段名" },
             pid = { type = "integer", description = "只跟这个进程（覆盖其全部线程 + 之后 fork 的）" },
+            argv = {
+                type = "array", items = { type = "string" },
+                description = "自己起目标（不走 shell）：如 [\"/opt/StaticPy/dist/translator\",\"x.static.py\"]。"
+                    .. "以当前用户/当前 cwd/env 跑，内部 setsid + 取 pid 交给 engine，采完整组收掉；"
+                    .. "跟 pid 二选一。短命目标配合小 duration 用",
+            },
+            command = { type = "string", description = "同 argv，但整串交给 sh -c（要用管道/重定向/环境变量前缀时用）" },
+            target_out = { type = "string", description = "目标 stdout/stderr 落到这个文件（默认 /dev/null）；目标秒退时会把尾部贴进错误" },
             duration = { type = "number", description = "采样秒数，默认 2，夹到 [0.1,120]" },
             limit = { type = "integer", description = "samples/folded 输出条数" },
             freq = { type = "integer", description = "oncpu 采样频率 Hz，默认 99" },
@@ -713,7 +831,8 @@ function M.run(args, env)
     local action = tostring(args.action or "")
     if action == "" then
         action = (args.kind and args.json_in) and "render"
-            or (args.mode or args.probe or args.entry or args.folded_in) and "run" or "status"
+            or (args.mode or args.probe or args.entry or args.folded_in
+                or args.command or (type(args.argv) == "table" and #args.argv > 0)) and "run" or "status"
     end
     if action == "status" then return do_status(lite_root(env)) end
     if action == "run" then return do_run(args, env) end

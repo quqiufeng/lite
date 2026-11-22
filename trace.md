@@ -240,6 +240,12 @@ perf 只能看到 JIT 机器码与 C 帧，纯解释执行的 Lua 帧在 native 
 - **测时延**：`latency` 对任意 entry/exit 探针对，按 `comm`/自定义 key 出 `avg/p50/p99/max`，
   适合 syscall、锁、驱动函数。
 - **找 CPU 热点**：`oncpu --freq 99 --pid N` → 火焰图/热力图；带 `comms` 排行回答「哪个进程在烧 CPU」。
+- **自己起目标（不用先拿到 pid）**：`argv=["dist/translator","x.static.py"]`（不走 shell）或
+  `command="... > out.scm"`（整串交 `sh -c`，要管道/重定向时用）→ 插件以**当前用户/当前 cwd/env**
+  起进程（`setsid` 独立进程组），取 pid 交给 engine，采完整组收掉。短命目标（1.3 s 的 translator）
+  可以直接采；长命目标只采前 `duration` 秒然后收掉，不用等它自己跑完。
+  **但短命目标样本少**：1.3 s × 99 Hz ≈ 110 样本 → 单次 1~2% 是噪声，只能看粗粒度；
+  要比两个版本，靠重复跑 10+ 次累加，别信单次榜。
 - **找卡点**：`offcpu` 回答「睡在哪、阻塞多久」，是 IO/锁/调度问题首选（比 oncpu 更接近用户体感）。
 - **任意事件出栈**：`folded` + 自定义探针，看「谁在调用 `do_sys_openat2`」。
 - **符号化**：`--sym` 把 `0x55b3…` 变成 `libc.so.6+0x…` / `func+0x1a` / `sub_401156`；
@@ -261,6 +267,7 @@ trace action=status                       # 权限/内核五环/render 依赖过
 trace probe=tracepoint:sched:sched_switch mode=count duration=1    # 探针能触发？
 trace mode=offcpu duration=5 rank=/tmp/block.png                   # 卡在哪
 trace mode=oncpu duration=3 flame=/tmp/cpu.png sym=true            # 热点在哪
+trace mode=oncpu argv=["dist/translator","x.static.py"] sym=true   # 目标没在跑：自己起、自己收
 trace action=render json_in=/tmp/t.json kind=flame out=/tmp/f.svg  # 换图不重采
 ```
 
@@ -298,6 +305,15 @@ trace action=render json_in=/tmp/t.json kind=flame out=/tmp/f.svg  # 换图不�
 10. 采自己（未给 `pid` 或等于本进程）时才会自动写 perf-map；采别人要目标进程自己写过。
 11. `event` 参数目前**只解析未使用**（`engine.lua:637` 存进 `opt.event` 后无人读）[static]，
     `oncpu` 固定用 `PERF_COUNT_SW_CPU_CLOCK`；要别的 perf 事件得改 `run_oncpu` 的 `src`。
+12. 起目标**不能**借用 `capture()`：它外面套 `timeout N`，`$!` 拿到的是 timeout 的 pid →
+    采它就永远 0 样本（而且它随目标退出消失，看着像「目标提前退出」）。用 `capture_raw()` 直接
+    `sh -c` 起，`$!` 才是 `setsid` 出来的目标本身。
+13. 判目标「还活着」**不能只看 `/proc/<pid>/stat` 存在**：目标退出后到父进程 reap 之前是**僵尸**，
+    stat 照样在 → 采样会白等到 `duration` 满，报告里看不出是提前结束的。要读 stat 第三字段，
+    `Z`/`X` 算已结束（`comm` 可能含空格/括号，从最后一个 `)` 之后取）。且检查频率必须**高于**
+    `wait_ready`（per-task 事件没了以后它会一直阻塞到 deadline），所以 oncpu 循环按 100 ms 切片。
+14. `command` 里**别写 `exec` 前缀**：`setsid exec …` 会去找名为 `exec` 的程序，目标 50 ms 内就没了；
+    想收尾统一由进程组负责（`kill -s TERM -- -<pid>`），不需要 `exec`。
 
 ---
 
@@ -310,6 +326,7 @@ trace action=render json_in=/tmp/t.json kind=flame out=/tmp/f.svg  # 换图不�
 | 动作 | `action=status/run/render/perfmap/prof`（`run` 是默认推断） |
 | 探针 | `probe[]`、`entry`/`exit`（latency）、`arg[]`（fetchargs） |
 | 采样 | `mode`、`duration`、`freq`、`pid`、`ring_size`、`str`、`key`、`limit` |
+| 自己起目标 | `argv[]` 或 `command`（与 `pid` 二选一）、`target_out`（目标 stdout/stderr 落盘，默认 `/dev/null`） |
 | 符号 | `sym`、`ksym` |
 | 出图 | `flame`/`heat`/`rank`、`heat_top`、`rank_top`、`rank_by=self/incl/count` |
 | 复用 | `json`、`json_out`、`json_in`+`kind`+`out`（render） |
@@ -330,6 +347,7 @@ trace action=render json_in=/tmp/t.json kind=flame out=/tmp/f.svg  # 换图不�
 | `folded[]` / `stacks` / `frame_dir` | folded/oncpu/offcpu | 折叠栈、栈种类、方向 |
 | `freq` / `comms[]` | oncpu | 采样频率、进程排行 |
 | `matched/blocked/preempted/unmatched/seeded/migrated` | offcpu | 配对诊断 |
+| `elapsed` / `target_exited` | oncpu | 实际采样秒数；`true`=目标先于 `duration` 退出（此时 `elapsed < duration`，样本按真实时长算占比） |
 | `sym` / `sym_hits` | 全开 `--sym` | 是否符号化 + 命中次数 |
 | `source` / `no_collapse` | folded-in | 外部文件来源、是否折叠递归帧 |
 
@@ -361,7 +379,7 @@ StaticPy 的产物是「Chez AOT 编出的匿名可执行段 + 独立 ELF」。�
 | 你想知道 | 用什么 | 得到的名字 | 天花板 |
 |---|---|---|---|
 | 哪个**顶层过程**在烧 CPU | perfmap 自报 + `oncpu`/perfprobe | `static_tget`、`string-hash`、`sweep_generation_pass` | 只覆盖顶层过程；lambda/内联代码仍是 `[anon]` |
-| 哪**一行 Python** 在烧 CPU | `STATICPY_PROFILE=source` + `dist/sprof` | `parse_lib.static.py:541` | 要专门重编一次；只归因 py 侧，Scheme 运行时算在 runtime 名下 |
+| 哪**一行 Python** 在烧 CPU | `STATICPY_PROFILE=source` + `dist/sprof` | `t.static.py:541`（**报的是你编译的那个 bundle 文件名**：拼 translator 时是 `t.static.py`，不是 `parse_lib.static.py`；行号是 bundle 内的行） | 要专门重编一次；只归因 py 侧，Scheme 运行时算在 runtime 名下 |
 | 哪个 **C 库/GC** 在烧 CPU | `oncpu` 默认就够（不用额外准备） | `libc.so.6+0x188d80`、`libstaticpyrt.so` 内的 `sweep_generation_pass` | strip 过的库只能到 `sub_<入口>` |
 
 判据：**先跑 §10.2 拿到函数级**（免重编、一次到位），**只有需要精确到行才上 §10.4**。
@@ -381,6 +399,10 @@ perfprobe argv=["/opt/StaticPy/dist/app"] freq=199
 所以它是 **post-mortem 归因**：`perfprobe` 采完、目标退出、再读 map，能对上；
 而 `trace mode=oncpu --sym` 是**边采边符号化**（`engine.lua` 的 `perf_map()` 还带负缓存，
 第一次读不到就锁成"没有"），对这类目标会全程 `[anon]` —— 要命名请用 `perfprobe`。
+
+**这条不因为 `argv` 直采而改变**：`trace argv=[...]` 现在已经能自己起目标，但 perfmap 是
+退出前才落盘、engine 又是边采边符号化 —— 起法解决了"采不到"，没解决"采时没名"。
+**perfmap 目标 → `perfprobe`；只要时间分布 → `trace oncpu`（接受 `[anon]`）**，两者别互相指望。
 
 原理只有五条，不需要任何名字表：
 
