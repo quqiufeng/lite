@@ -934,6 +934,9 @@ static char *run_probe(const char *in) {
 
   int ex = WIFEXITED(st) ? WEXITSTATUS(st) : 0;
   int sig = WIFSIGNALED(st) ? WTERMSIG(st) : 0;
+  /* target 常在 main 收尾时才写 perf map（Chez AOT 的代码入口此刻才稳定），
+     子进程已回收、/proc/<pid>/maps 已消失，但地图文件还在：补最后一次加载。 */
+  if (!g_jit_loaded) jit_load(pid);
   stage = "attribute";
 
   /* ---- attribution ---------------------------------------------------- */
