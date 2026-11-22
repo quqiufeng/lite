@@ -65,6 +65,12 @@ export DEEPSEEK_API_KEY=...   # 或写进 .env / ~/.config/lite/.env
 | `tokens` | 每日 token 账本（prompt/completion/命中率） | 本地 `/agent/usage` |
 | `pdftext` | 抽 PDF 文本 | 纯 FFI 直连 `libpoppler-glib` |
 | `md2png` / `trending` | Markdown/GitHub Trending → 长图 PNG（无 Chrome） | `libmd4c` + 自带 `liblite_html` |
+| `perfprobe` | 采样任意命令：叶帧 IP → maps → ELF 符号热榜 | `perf_event_open` + 自带 `helper/perfprobe.c` |
+
+`perfprobe` 的两个坑写在 `helper/perfprobe.c` 头注释里，都属「看起来成功了其实全错」：
+ET_EXEC 要过 `PT_LOAD` 把文件偏移换成 vaddr（否则整表 `[nosym]`），以及 `ok`/`stage`
+只在失败时出现 —— Lua 里 `not 0` 是假，别用 `if not d.ok`。回归是
+`tools/perfprobe_check.lua`（现场编 PIE / `-no-pie` 两个 fixture，接在 `tools/test.sh`）。
 
 共享逻辑放 `helper/lib/`（子目录不参与发现，不会冒出多余工具）。
 

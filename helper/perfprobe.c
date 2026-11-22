@@ -1,19 +1,41 @@
-/* perfprobe: in-process CPU sampler with attribution.
- * lite_helper(input_json) -> output_json
- * input : {"argv":["prog","arg1"],"freq":99,"seconds":60,"top":20,"show_output":false}
- * output: {"ok":1,"samples":N,"lost":0,"exit":0,"objects":[...],"symbols":[...]}
+/* perfprobe: sample a target with perf_event_open, attribute leaf IPs.
+ *
+ * lite_helper(input_json) -> output_json (UTF-8)
+ *   in : {"argv":["prog","a"] | "command":"prog a", "freq":99, "seconds":60,
+ *          "top":20, "kernel":true, "show_output":false, "max_samples":200000}
+ *   out: {"ok":1,"target","samples","lost","dropped","exit","signal","killed",
+ *         "seconds","timed_out","maps","maps_truncated","freq","cap",
+ *         "anon_pct","jit_pct","kernel_pct","unmapped_pct","kernel_excluded",
+ *         "truncated","hint","objects":[{"name","samples","pct"}],
+ *         "symbols":[{"symbol","object","samples","pct"}]}
+ *   err: {"ok":0,"samples":0,"exit":0,"stage","error"}   -- ok~=1 才是失败
+ *
+ * Why the SIGSTOP handshake: the counter is armed with enable_on_exec=1 so counting
+ * starts exactly at execve. The child stops itself right after fork, letting the parent
+ * finish perf_event_open + mmap before the target runs an instruction -- no usleep
+ * race, and short-lived targets still get sampled.
+ *
+ * Why off2va walks PT_LOAD: the IP arrives as a *file offset*
+ * (ip - map.start + map.off), while symbol tables hold *virtual* addresses. They are
+ * equal only for PIE/DSO (p_vaddr == p_offset); PT_LOAD gives
+ * vaddr = p_vaddr + (file_off - p_offset), valid for ET_EXEC too.
+ *
+ * /tmp/perf-<pid>.map (perfmap) is read and reloaded when it changes so LuaJIT/JVM
+ * frames get real names instead of an anonymous blob.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
-#include <unistd.h>
 #include <errno.h>
+#include <ctype.h>
 #include <fcntl.h>
 #include <poll.h>
-#include <elf.h>
+#include <signal.h>
 #include <time.h>
+#include <elf.h>
+#include <unistd.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -21,375 +43,792 @@
 #include <sys/syscall.h>
 #include <linux/perf_event.h>
 
-/* ---------- growable buffer ---------- */
-typedef struct { char *p; size_t len, cap; } Buf;
-static void binit(Buf *b){ b->cap=8192; b->len=0; b->p=(char*)malloc(b->cap); b->p[0]=0; }
-static void bput(Buf *b, const char *s, size_t n){
-  if (b->len+n+1 > b->cap){ while (b->len+n+1 > b->cap) b->cap*=2; b->p=(char*)realloc(b->p,b->cap); }
-  memcpy(b->p+b->len, s, n); b->len+=n; b->p[b->len]=0;
+#define RING_SZ    (1u << 20)   /* power of two */
+#define MAXHITS    8192
+#define MAXOBJ     256
+#define MAXMAPS    2048
+#define MAXELF     256
+#define MAXJIT     200000
+#define MAXARGV    64
+#define DEFCAP     200000
+#define MAXCAP     1000000
+
+/* ---------------------------------------------------------------- buffer */
+typedef struct { char *p; size_t n, cap; } Buf;
+static void binit(Buf *b) { b->cap = 4096; b->n = 0; b->p = malloc(b->cap); if (b->p) b->p[0] = 0; }
+static void bgrow(Buf *b, size_t need) {
+  if (!b->p || b->n + need + 1 <= b->cap) return;
+  size_t c = b->cap; while (c < b->n + need + 1) c *= 2;
+  char *q = realloc(b->p, c); if (!q) return;
+  b->p = q; b->cap = c;
 }
-static void bputs(Buf *b, const char *s){ bput(b,s,strlen(s)); }
-static void bprintf(Buf *b, const char *fmt, ...){
-  char tmp[4096]; va_list ap; va_start(ap,fmt);
-  int n=vsnprintf(tmp,sizeof tmp,fmt,ap); va_end(ap);
-  if (n>0) bput(b,tmp,(size_t)n<(sizeof tmp)?(size_t)n:sizeof tmp-1);
+static void bput(Buf *b, const char *s, size_t n) { bgrow(b, n); if (!b->p) return; memcpy(b->p + b->n, s, n); b->n += n; b->p[b->n] = 0; }
+static void bputs(Buf *b, const char *s) { bput(b, s, strlen(s)); }
+static void bprintf(Buf *b, const char *fmt, ...) {
+  char t[512]; va_list ap;
+  va_start(ap, fmt); int n = vsnprintf(t, sizeof t, fmt, ap); va_end(ap);
+  if (n < 0) return;
+  if ((size_t)n < sizeof t) { bput(b, t, (size_t)n); return; }
+  char *big = malloc((size_t)n + 1); if (!big) return;
+  va_start(ap, fmt); vsnprintf(big, (size_t)n + 1, fmt, ap); va_end(ap);
+  bput(b, big, (size_t)n); free(big);
 }
-static void bjstr(Buf *b, const char *s){
-  bput(b,"\"",1);
-  for (const unsigned char *q=(const unsigned char*)s; *q; q++){
-    if (*q=='"'||*q=='\\'){ char e[2]={'\\',(char)*q}; bput(b,e,2); }
-    else if (*q=='\n') bput(b,"\\n",2);
-    else if (*q=='\t') bput(b,"\\t",2);
-    else if (*q<0x20) bprintf(b,"\\u%04x",*q);
-    else bput(b,(const char*)q,1);
+static void bjstr(Buf *b, const char *s) {
+  bputs(b, "\"");
+  for (; s && *s; s++) {
+    unsigned char c = (unsigned char)*s;
+    if (c == '"' || c == '\\') { bputs(b, "\\"); bput(b, (const char *)&c, 1); }
+    else if (c == '\n') bputs(b, "\\n");
+    else if (c == '\t') bputs(b, "\\t");
+    else if (c == '\r') bputs(b, "\\r");
+    else if (c < 0x20) bprintf(b, "\\u%04x", c);
+    else bput(b, (const char *)&c, 1);
   }
-  bput(b,"\"",1);
+  bputs(b, "\"");
 }
 
-/* ---------- tiny JSON reader (input is ours) ---------- */
-static const char *jfind(const char *s, const char *key){
-  char pat[128]; snprintf(pat,sizeof pat,"\"%s\"",key);
-  return strstr(s,pat);
-}
-static char *jstr(const char **pp){
-  const char *p=*pp; if (*p!='"') return NULL; p++;
-  size_t cap=256,len=0; char *o=(char*)malloc(cap);
-  while (*p && *p!='"'){
-    char c=*p;
-    if (c=='\\' && p[1]){ p++; c=*p; if(c=='n')c='\n'; else if(c=='t')c='\t'; else if(c=='r')c='\r'; }
-    o[len++]=c; p++;
-    if (len+2>cap){ cap*=2; o=(char*)realloc(o,cap); }
-  }
-  if (*p=='"') p++;
-  o[len]=0; *pp=p; return o;
-}
-static double jnum(const char *s, const char *key, double dflt){
-  const char *p=jfind(s,key); if(!p) return dflt;
-  p=strchr(p,':'); if(!p) return dflt;
-  return strtod(p+1,NULL);
-}
-static long jbool(const char *s, const char *key, long dflt){
-  const char *p=jfind(s,key); if(!p) return dflt;
-  p=strchr(p,':'); if(!p) return dflt; p++;
-  while (*p==' ') p++;
-  return strncmp(p,"true",4)?dflt:1;
-}
+/* ------------------------------------------------------------------ json */
+static const char *jspace(const char *p) { while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++; return p; }
 
-/* ---------- ELF symbol tables (kept mapped: names point into the image) ---------- */
-typedef struct { unsigned long v, sz; unsigned int noff; } Sym;
-typedef struct {
-  char path[512]; Sym *s; int n; char *str; size_t strsz;
-  unsigned char *base; int ok;
-} ElfT;
-static ElfT *g_elf; static int g_nelf, g_capelf;
-
-static int symcmp(const void *a, const void *b){
-  unsigned long x=((const Sym*)a)->v, y=((const Sym*)b)->v;
-  return x<y?-1:(x>y?1:0);
-}
-
-static ElfT *elf_get(const char *path){
-  for (int i=0;i<g_nelf;i++) if (!strcmp(g_elf[i].path,path)) return &g_elf[i];
-  if (g_nelf==g_capelf){ g_capelf = g_capelf? g_capelf*2 : 8;
-    g_elf=(ElfT*)realloc(g_elf,(size_t)g_capelf*sizeof(ElfT)); }
-  ElfT *e=&g_elf[g_nelf++]; memset(e,0,sizeof *e);
-  snprintf(e->path,sizeof e->path,"%s",path);
-  int fd=open(path,O_RDONLY); if(fd<0) return e;
-  struct stat st;
-  if (fstat(fd,&st)<0 || st.st_size<64){ close(fd); return e; }
-  size_t fsz=(size_t)st.st_size;
-  unsigned char *d=(unsigned char*)mmap(NULL,fsz,PROT_READ,MAP_PRIVATE,fd,0); close(fd);
-  if (d==MAP_FAILED) return e;
-  e->base=d;
-  if (!(d[0]==0x7f&&d[1]=='E'&&d[2]=='L'&&d[3]=='F'&&d[4]==2)) return e;
-  Elf64_Ehdr *eh=(Elf64_Ehdr*)d;
-  size_t shneed=(size_t)eh->e_shoff + (size_t)eh->e_shnum*sizeof(Elf64_Shdr);
-  if (!eh->e_shoff || eh->e_shentsize!=sizeof(Elf64_Shdr) || shneed>fsz) return e;
-  Elf64_Shdr *sh=(Elf64_Shdr*)(d+eh->e_shoff);
-  int pick=-1, pickdyn=-1;
-  for (int i=0;i<eh->e_shnum;i++){
-    if (sh[i].sh_type==SHT_SYMTAB && pick<0) pick=i;
-    if (sh[i].sh_type==SHT_DYNSYM && pickdyn<0) pickdyn=i;
-  }
-  if (pick<0) pick=pickdyn;
-  if (pick<0) return e;
-  Elf64_Shdr *ss=&sh[pick];
-  if (ss->sh_entsize!=sizeof(Elf64_Sym) || ss->sh_link>=eh->e_shnum) return e;
-  if (ss->sh_offset+ss->sh_size>fsz) return e;
-  Elf64_Shdr *ts=&sh[ss->sh_link];
-  if (ts->sh_offset+ts->sh_size>fsz) return e;
-  size_t cnt=ss->sh_size/sizeof(Elf64_Sym);
-  Elf64_Sym *sy=(Elf64_Sym*)(d+ss->sh_offset);
-  e->s=(Sym*)malloc((cnt?cnt:1)*sizeof(Sym)); e->n=0;
-  for (size_t i=0;i<cnt;i++){
-    if (ELF64_ST_TYPE(sy[i].st_info)!=STT_FUNC) continue;
-    if (!sy[i].st_value || !sy[i].st_size) continue;
-    e->s[e->n].v=sy[i].st_value; e->s[e->n].sz=sy[i].st_size;
-    e->s[e->n].noff=sy[i].st_name; e->n++;
-  }
-  if (e->n>0) qsort(e->s,(size_t)e->n,sizeof(Sym),symcmp);
-  e->str=(char*)(d+ts->sh_offset); e->strsz=ts->sh_size;
-  e->ok = e->n>0;
-  return e;
-}
-
-static const char *elf_sym(ElfT *e, unsigned long off){
-  if (!e->ok) return NULL;
-  int lo=0, hi=e->n-1, best=-1;
-  while (lo<=hi){ int mid=(lo+hi)/2;
-    if (e->s[mid].v<=off){ best=mid; lo=mid+1; } else hi=mid-1; }
-  if (best<0) return NULL;
-  if (off < e->s[best].v + e->s[best].sz){
-    unsigned int no=e->s[best].noff;
-    if (no < e->strsz) return e->str+no;
+/* Exact-key lookup: pointer just past the ':' of "key":value, or NULL.
+ * Length compared too, so "argv" never matches "argv2" / "xargv". */
+static const char *jkey(const char *s, const char *key) {
+  size_t kl = strlen(key);
+  const char *p = s;
+  while (p && *p) {
+    if (*p != '"') { p++; continue; }
+    const char *q = p + 1; size_t n = 0;
+    while (q[n] && q[n] != '"') { if (q[n] == '\\' && q[n + 1]) n++; n++; }
+    if (!q[n]) return NULL;                        /* unterminated string */
+    if (n == kl && !memcmp(q, key, kl)) {
+      const char *c = jspace(q + n + 1);
+      if (*c == ':') return jspace(c + 1);
+    }
+    p = q + n + 1;
   }
   return NULL;
 }
 
-/* ---------- /proc/pid/maps snapshot (merged, deduped) ---------- */
-typedef struct { unsigned long start,end,off; char perms[8]; char path[512]; } MapR;
-#define MAXMAPS 1024
-static MapR g_map[MAXMAPS]; static int g_nmap;
+/* Decode one JSON string starting at '"'; returns pointer past closing quote.
+ * \uXXXX is decoded; non-ASCII code points are dropped (argv is a file path). */
+static const char *jstr_at(const char *v, char *out, size_t cap) {
+  if (!v || *v != '"') return NULL;
+  size_t o = 0;
+  v++;
+  while (*v && *v != '"') {
+    if (*v == '\\' && v[1]) {
+      v++;
+      switch (*v) {
+        case 'n': if (o + 1 < cap) out[o++] = '\n'; break;
+        case 't': if (o + 1 < cap) out[o++] = '\t'; break;
+        case 'r': if (o + 1 < cap) out[o++] = '\r'; break;
+        case 'b': if (o + 1 < cap) out[o++] = '\b'; break;
+        case 'f': if (o + 1 < cap) out[o++] = '\f'; break;
+        case 'u': {
+          unsigned cp = 0; int k;
+          for (k = 1; k <= 4; k++) {
+            char c = v[k]; int d;
+            if (c >= '0' && c <= '9') d = c - '0';
+            else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+            else break;
+            cp = cp * 16 + (unsigned)d;
+          }
+          v += k - 1;
+          if (cp >= 0x20 && cp < 0x7f && o + 1 < cap) out[o++] = (char)cp;
+          break;
+        }
+        default: if (o + 1 < cap) out[o++] = *v; break;
+      }
+      v++; continue;
+    }
+    if (o + 1 < cap) out[o++] = *v;
+    v++;
+  }
+  if (cap) out[o] = 0;
+  return (*v == '"') ? v + 1 : v;
+}
 
-static void maps_read(pid_t pid){
-  char p[64]; snprintf(p,sizeof p,"/proc/%d/maps",pid);
-  FILE *f=fopen(p,"r"); if(!f) return;
+static int jstr(const char *s, const char *key, char *out, size_t cap) {
+  if (cap) out[0] = 0;
+  const char *v = jkey(s, key);
+  return jstr_at(v, out, cap) != NULL;
+}
+
+static double jnum(const char *s, const char *key, double def) {
+  const char *v = jkey(s, key);
+  if (!v) return def;
+  if (!(isdigit((unsigned char)*v) || *v == '-' || *v == '+' || *v == '.')) return def;
+  char *end = NULL;
+  double d = strtod(v, &end);
+  return (end == v) ? def : d;
+}
+
+static int jbool(const char *s, const char *key, int def) {
+  const char *v = jkey(s, key);
+  if (!v) return def;
+  if (*v == 't') return 1;
+  if (*v == 'f') return 0;
+  if (isdigit((unsigned char)*v)) return strtol(v, NULL, 10) != 0;
+  return def;
+}
+
+/* "argv":["a","b"]  ->  argv[i] (malloc'd), returns count or -1 on malformed JSON */
+static int jargv(const char *s, char **argv, int maxargv) {
+  const char *v = jkey(s, "argv");
+  int n = 0;
+  if (!v) return -1;
+  if (*v != '[') return -1;
+  v = jspace(v + 1);
+  while (*v && *v != ']' && n < maxargv) {
+    char tmp[1024];
+    const char *e = jstr_at(v, tmp, sizeof tmp);
+    if (!e) return -1;
+    argv[n] = strdup(tmp);
+    if (!argv[n]) return -1;
+    n++;
+    v = jspace(e);
+    if (*v == ',') { v = jspace(v + 1); continue; }
+    break;
+  }
+  return n;
+}
+
+static void freeargv(char **argv, int n) { for (int i = 0; i < n; i++) free(argv[i]); }
+
+/* ------------------------------------------------------------------- elf */
+typedef struct { unsigned long off, vaddr, filesz; } Seg;
+typedef struct { unsigned long long v; char *nm; } Sym;
+typedef struct {
+  char path[512];
+  unsigned char *base;
+  size_t fsz;
+  Sym *s;
+  int n;
+  Seg seg[8];
+  int nseg;
+  int tried;      /* 1 = parsed (s may still be NULL) */
+} Elf;
+
+static Elf *g_elf;
+static int g_nelf, g_capelf;
+static long g_elf_full;
+
+static void elf_release_all(void) {
+  for (int i = 0; i < g_nelf; i++) {
+    free(g_elf[i].s);
+    if (g_elf[i].base) munmap(g_elf[i].base, g_elf[i].fsz);   /* base is mmap'ed, not malloc'ed */
+  }
+  free(g_elf); g_elf = NULL; g_nelf = g_capelf = 0; g_elf_full = 0;
+}
+
+static int symcmp(const void *a, const void *b) {
+  unsigned long long x = ((const Sym *)a)->v, y = ((const Sym *)b)->v;
+  return (x < y) ? -1 : (x > y) ? 1 : 0;
+}
+
+/* Fill e->seg[] from PT_LOAD and e->s[] from .symtab (fallback .dynsym). */
+static void elf_parse(Elf *e) {
+  unsigned char *b = e->base;
+  size_t sz = e->fsz;
+  if (sz < sizeof(Elf64_Ehdr)) return;
+  Elf64_Ehdr *eh = (Elf64_Ehdr *)b;
+  if (eh->e_phentsize != sizeof(Elf64_Phdr)) return;
+  for (int i = 0; i < eh->e_phnum && e->nseg < 8; i++) {
+    size_t o = (size_t)eh->e_phoff + (size_t)i * eh->e_phentsize;
+    if (o + sizeof(Elf64_Phdr) > sz) break;
+    Elf64_Phdr *ph = (Elf64_Phdr *)(b + o);
+    if (ph->p_type != PT_LOAD || !ph->p_filesz) continue;
+    e->seg[e->nseg].off = ph->p_offset;
+    e->seg[e->nseg].vaddr = ph->p_vaddr;
+    e->seg[e->nseg].filesz = ph->p_filesz;
+    e->nseg++;
+  }
+  if (eh->e_shentsize != sizeof(Elf64_Shdr)) return;
+  const Elf64_Shdr *use = NULL;
+  size_t nsym = 0;
+  const Elf64_Shdr *dyn = NULL;
+  for (int i = 0; i < eh->e_shnum; i++) {
+    size_t o = (size_t)eh->e_shoff + (size_t)i * eh->e_shentsize;
+    if (o + sizeof(Elf64_Shdr) > sz) break;
+    const Elf64_Shdr *sh = (const Elf64_Shdr *)(b + o);
+    if (sh->sh_type == SHT_SYMTAB && !use) { use = sh; nsym = sh->sh_size / sh->sh_entsize; }
+    else if (sh->sh_type == SHT_DYNSYM && !dyn) dyn = sh;
+  }
+  if (!use && dyn) { use = dyn; nsym = dyn->sh_size / dyn->sh_entsize; }
+  if (!use || !use->sh_entsize) return;
+  size_t so = use->sh_offset;
+  size_t st = use->sh_link < (size_t)eh->e_shnum ? (size_t)eh->e_shoff + use->sh_link * eh->e_shentsize : 0;
+  if (!st || st + sizeof(Elf64_Shdr) > sz) return;
+  const Elf64_Shdr *str = (const Elf64_Shdr *)(b + st);
+  if (str->sh_offset >= sz) return;
+  size_t strsz = str->sh_size;
+  if (str->sh_offset + strsz > sz) strsz = sz - str->sh_offset;
+  const char *strb = (const char *)(b + str->sh_offset);
+  if (nsym > MAXJIT) nsym = MAXJIT;
+  if (so + nsym * use->sh_entsize > sz) nsym = (sz > so) ? (sz - so) / use->sh_entsize : 0;
+  if (!nsym) return;
+  Sym *arr = malloc(nsym * sizeof(Sym));
+  if (!arr) return;
+  int n = 0;
+  for (size_t i = 0; i < nsym; i++) {
+    const Elf64_Sym *sy = (const Elf64_Sym *)(b + so + i * use->sh_entsize);
+    if (!sy->st_value || !sy->st_name) continue;
+    if (sy->st_name >= strsz) continue;                  /* strtab bounds */
+    const char *nm = strb + sy->st_name;
+    if (!nm[0] || strnlen(nm, strsz - sy->st_name) >= strsz - sy->st_name) continue;
+    int t = ELF64_ST_TYPE(sy->st_info);
+    if (t != STT_FUNC && t != STT_OBJECT && t != STT_NOTYPE && t != STT_GNU_IFUNC) continue;
+    arr[n].v = sy->st_value;
+    arr[n].nm = (char *)nm;
+    n++;
+  }
+  if (!n) { free(arr); return; }
+  qsort(arr, n, sizeof(Sym), symcmp);
+  e->s = arr; e->n = n;
+}
+
+static Elf *elf_get(const char *path) {
+  if (!path || path[0] != '/') return NULL;
+  for (int i = 0; i < g_nelf; i++) if (!strcmp(g_elf[i].path, path)) return &g_elf[i];
+  if (strstr(path, " (deleted)")) return NULL;   /* can't reopen reliably: don't cache */
+  if (g_nelf >= MAXELF) { g_elf_full++; return NULL; }
+  if (g_nelf == g_capelf) {
+    int c = g_capelf ? g_capelf * 2 : 32;
+    Elf *q = realloc(g_elf, (size_t)c * sizeof(Elf));
+    if (!q) return NULL;
+    g_elf = q; g_capelf = c;
+  }
+  Elf *e = &g_elf[g_nelf++];
+  memset(e, 0, sizeof *e);
+  snprintf(e->path, sizeof e->path, "%s", path);
+  e->tried = 1;
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd >= 0) {
+    struct stat st;
+    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 64 && st.st_size <= (off_t)(512 << 20)) {
+      void *b = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+      if (b != MAP_FAILED) {
+        unsigned char *p = b;
+        /* e_ident: 0x7f 'E' 'L' 'F', EI_CLASS=2 (ELFCLASS64), EI_DATA=1 (LSB) */
+        if (p[0] == 0x7f && p[1] == 'E' && p[2] == 'L' && p[3] == 'F' && p[4] == 2 && p[5] == 1) {
+          e->base = b; e->fsz = (size_t)st.st_size;
+          elf_parse(e);
+        }
+        if (!e->base) munmap(b, (size_t)st.st_size);
+      }
+    }
+    close(fd);
+  }
+  return e;
+}
+
+/* file offset -> virtual address via PT_LOAD (0 = no segment covers it) */
+static unsigned long off2va(const Elf *e, unsigned long off) {
+  if (!e) return 0;
+  for (int i = 0; i < e->nseg; i++)
+    if (off >= e->seg[i].off && off < e->seg[i].off + e->seg[i].filesz)
+      return e->seg[i].vaddr + (off - e->seg[i].off);
+  if (!e->nseg) return off;      /* no phdr: legacy p_vaddr==p_offset assumption */
+  return 0;
+}
+
+static const char *elf_sym(Elf *e, unsigned long fileoff) {
+  if (!e || !e->s || !e->n) return NULL;
+  unsigned long long va = off2va(e, fileoff);
+  if (!va) return NULL;
+  int lo = 0, hi = e->n - 1, best = -1;
+  while (lo <= hi) {
+    int mid = lo + (hi - lo) / 2;
+    if (e->s[mid].v <= va) { best = mid; lo = mid + 1; } else hi = mid - 1;
+  }
+  return (best < 0) ? NULL : e->s[best].nm;
+}
+
+/* ------------------------------------------------------------------ maps */
+typedef struct { unsigned long start, end, off; char path[512]; } MapR;
+static MapR g_map[MAXMAPS];
+static int g_nmap, g_map_trunc;
+static long g_maps_reads;
+
+/* Rebuild in place, in file order (maps is sorted): consecutive lines with the same
+ * start AND path are merged, so stale entries from a previous snapshot can't survive.
+ * A vanished target (fopen fails) keeps the last snapshot -- exit races are expected. */
+static void maps_read(pid_t pid) {
+  char p[64];
+  snprintf(p, sizeof p, "/proc/%d/maps", pid);
+  FILE *f = fopen(p, "re");
+  if (!f) return;
+  int n = 0, trunc = 0;
   char line[1400];
-  while (fgets(line,sizeof line,f)){
-    unsigned long s=0,e=0,o=0; char perms[8]; char path[512]; path[0]=0;
-    int n=sscanf(line,"%lx-%lx %7s %lx %*s %*s %511s",&s,&e,perms,&o,path);
-    if (n<4 || n<1) continue;
-    int dup=0;
-    for (int i=0;i<g_nmap;i++) if (g_map[i].start==s){ dup=1; break; }
-    if (dup || g_nmap>=MAXMAPS) continue;
-    MapR *m=&g_map[g_nmap++];
-    m->start=s; m->end=e; m->off=o; snprintf(m->perms,8,"%s",perms);
-    snprintf(m->path,512,"%s",(n>=5)?path:"");
+  while (fgets(line, sizeof line, f)) {
+    unsigned long a = 0, b = 0, off = 0;
+    char perms[8] = {0}, path[512] = {0};
+    int k = sscanf(line, "%lx-%lx %7s %lx %*s %*s %511[^\n]", &a, &b, perms, &off, path);
+    if (k < 4) continue;
+    if (k < 5) path[0] = 0;      /* no pathname column: anonymous */
+    else {
+      char *q = path;
+      while (*q == ' ') q++;
+      if (q != path) memmove(path, q, strlen(q) + 1);
+      if (!strcmp(path, "(deleted)")) path[0] = 0;
+    }
+    if (n > 0 && g_map[n - 1].start == a && !strcmp(g_map[n - 1].path, path)) { g_map[n - 1].end = b; continue; }
+    if (n >= MAXMAPS) { trunc = 1; break; }
+    g_map[n].start = a; g_map[n].end = b; g_map[n].off = off;
+    snprintf(g_map[n].path, sizeof g_map[n].path, "%s", path);
+    n++;
   }
   fclose(f);
+  g_nmap = n; g_map_trunc = trunc; g_maps_reads++;
 }
 
-static const char *base_name(const char *p){
-  const char *s=strrchr(p,'/');
-  return s? s+1 : p;
+static MapR *map_find(unsigned long ip) {
+  int lo = 0, hi = g_nmap - 1;
+  while (lo <= hi) {
+    int m = lo + (hi - lo) / 2;
+    if (ip < g_map[m].start) hi = m - 1;
+    else if (ip >= g_map[m].end) lo = m + 1;
+    else return &g_map[m];
+  }
+  return NULL;
 }
 
-/* ---------- sampling + attribution ---------- */
-typedef struct { char obj[192]; char sym[192]; long cnt; } Hit;
-#define MAXHITS 8192
-static Hit g_hit[MAXHITS]; static int g_nhit;
+/* ------------------------------------------------------------------- jit */
+typedef struct { unsigned long start, size; char *nm; } JitE;
+static JitE *g_jit;
+static int g_njit;
+static time_t g_jit_mt;
+static off_t g_jit_sz = -1;
+static int g_jit_loaded;
 
-static void hit_add(const char *obj, const char *sym){
-  for (int i=0;i<g_nhit;i++)
-    if (!strcmp(g_hit[i].obj,obj) && !strcmp(g_hit[i].sym,sym)){ g_hit[i].cnt++; return; }
-  if (g_nhit>=MAXHITS) return;
-  Hit *h=&g_hit[g_nhit++];
-  snprintf(h->obj,sizeof h->obj,"%s",obj);
-  snprintf(h->sym,sizeof h->sym,"%s",sym);
-  h->cnt=1;
-}
-typedef struct { char obj[192]; long cnt; } ObjTot;
-static ObjTot g_obj[256]; static int g_nobj;
-static void obj_add(const char *obj){
-  for (int i=0;i<g_nobj;i++) if (!strcmp(g_obj[i].obj,obj)){ g_obj[i].cnt++; return; }
-  if (g_nobj>=256) return;
-  snprintf(g_obj[g_nobj].obj,sizeof g_obj[0].obj,"%s",obj);
-  g_obj[g_nobj].cnt=1; g_nobj++;
+static void jit_free(void) {
+  for (int i = 0; i < g_njit; i++) free(g_jit[i].nm);
+  free(g_jit); g_jit = NULL; g_njit = 0; g_jit_sz = -1; g_jit_mt = 0; g_jit_loaded = 0;
 }
 
-static int hitcmp(const void *a, const void *b){
-  long x=((const Hit*)a)->cnt, y=((const Hit*)b)->cnt;
-  return x<y?1:(x>y?-1:0);
-}
-static int objcmp(const void *a, const void *b){
-  long x=((const ObjTot*)a)->cnt, y=((const ObjTot*)b)->cnt;
-  return x<y?1:(x>y?-1:0);
+static int jitcmp(const void *a, const void *b) {
+  unsigned long x = ((const JitE *)a)->start, y = ((const JitE *)b)->start;
+  return (x < y) ? -1 : (x > y) ? 1 : 0;
 }
 
-static int peo(struct perf_event_attr *a, pid_t pid){
-  return (int)syscall(__NR_perf_event_open, a, pid, -1, -1, 0);
+/* /tmp/perf-<pid>.map: "%lx %lx <name>", unsorted, rewritten as code is generated. */
+static void jit_load(pid_t pid) {
+  char p[64];
+  snprintf(p, sizeof p, "/tmp/perf-%d.map", (int)pid);
+  struct stat st;
+  if (stat(p, &st) != 0) { if (g_jit_loaded) jit_free(); return; }
+  if (g_jit_loaded && st.st_mtime == g_jit_mt && st.st_size == g_jit_sz) return;
+  jit_free();
+  g_jit_loaded = 1; g_jit_mt = st.st_mtime; g_jit_sz = st.st_size;
+  FILE *f = fopen(p, "re");
+  if (!f) return;
+  int cap = 1024;
+  char line[600];
+  while (fgets(line, sizeof line, f)) {
+    unsigned long a = 0, n = 0; char nm[256];
+    if (sscanf(line, "%lx %lx %255[^\n]", &a, &n, nm) != 3) continue;
+    if (!n || !nm[0]) continue;
+    if (g_njit >= cap) {
+      if (cap >= MAXJIT) break;
+      int c = cap * 2; if (c > MAXJIT) c = MAXJIT;
+      JitE *q = realloc(g_jit, (size_t)c * sizeof(JitE));
+      if (!q) break;
+      g_jit = q; cap = c;
+    }
+    char *d = strdup(nm);
+    if (!d) break;
+    g_jit[g_njit].start = a; g_jit[g_njit].size = n; g_jit[g_njit].nm = d;
+    g_njit++;
+  }
+  fclose(f);
+  if (g_njit) qsort(g_jit, g_njit, sizeof(JitE), jitcmp);
 }
 
-#define RING_SZ (1u<<20)
+static const char *jit_sym(unsigned long ip) {
+  if (!g_njit) return NULL;
+  int lo = 0, hi = g_njit - 1, best = -1;
+  while (lo <= hi) {
+    int m = lo + (hi - lo) / 2;
+    if (g_jit[m].start <= ip) { best = m; lo = m + 1; } else hi = m - 1;
+  }
+  if (best < 0) return NULL;
+  return (ip - g_jit[best].start < g_jit[best].size) ? g_jit[best].nm : NULL;
+}
 
-/* drain ring into ips[]; returns count appended */
-static int drain(void *buf, unsigned long *ips, int nips, int cap, long *lost){
-  struct perf_event_mmap_page *meta=(struct perf_event_mmap_page*)buf;
+/* ----------------------------------------------------------------- probe */
+static const char *base_name(const char *p) {
+  const char *s = strrchr(p, '/');
+  return s ? s + 1 : p;
+}
+
+static const char *paranoid_str(void) {
+  static char v[16];
+  if (!v[0]) {
+    snprintf(v, sizeof v, "?");
+    FILE *f = fopen("/proc/sys/kernel/perf_event_paranoid", "re");
+    if (f) { if (fgets(v, sizeof v, f)) { char *n = strchr(v, '\n'); if (n) *n = 0; } fclose(f); }
+  }
+  return v;
+}
+
+static long long now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Arm a CPU_CLOCK counter that starts counting at the child's execve.
+ * paranoid>=2 denies kernel-space counters to unprivileged users, so fall back to
+ * user-only and tell the caller (kernel_excluded). */
+static int open_counter(pid_t pid, int freq, int want_kernel, int *kernel_excluded, char *err, size_t errsz) {
+  unsigned long long period = freq > 0 ? 1000000000ULL / (unsigned long long)freq : 10000000ULL;
+  if (!period) period = 1;
+  int order[2], ntry = 0;
+  if (want_kernel) order[ntry++] = 0;
+  order[ntry++] = 1;
+  for (int t = 0; t < ntry; t++) {
+    struct perf_event_attr a;
+    memset(&a, 0, sizeof a);
+    a.size = sizeof a;
+    a.type = PERF_TYPE_SOFTWARE;
+    a.config = PERF_COUNT_SW_CPU_CLOCK;
+    a.sample_period = period;
+    a.sample_type = PERF_SAMPLE_IP;
+    a.disabled = 1;
+    a.enable_on_exec = 1;          /* never count before exec */
+    a.wakeup_events = 1;           /* wake poll() per sample instead of per watermark */
+    a.exclude_kernel = (unsigned)order[t];
+    a.exclude_hv = 1;
+    a.inherit = 0;
+    int fd = (int)syscall(SYS_perf_event_open, &a, pid, -1, -1, 0);
+    if (fd >= 0) { *kernel_excluded = order[t]; return fd; }
+    int e = errno;
+    if (t == 0 && (e == EACCES || e == EPERM)) continue;   /* retry user-only */
+    snprintf(err, errsz, "perf_event_open: %s (perf_event_paranoid=%s)", strerror(e), paranoid_str());
+    return -1;
+  }
+  snprintf(err, errsz, "perf_event_open: no usable configuration");
+  return -1;
+}
+
+/* Consume the ring. Returns the number of sample records seen (>= stored ones),
+ * *dropped counts samples lost to our own capacity, *lost sums PERF_RECORD_LOST. */
+static int drain(void *buf, size_t pagesz, unsigned long *ips, int nips, int cap, long *lost, long *dropped) {
+  struct perf_event_mmap_page *meta = (struct perf_event_mmap_page *)buf;
   __sync_synchronize();
-  unsigned long head=meta->data_head, tail=meta->data_tail;
-  char *data=(char*)buf + 4096;
-  int added=0;
-  while (tail < head){
-    struct perf_event_header *h=(struct perf_event_header*)(data + (tail & (RING_SZ-1)));
-    if (h->size==0) break;
-    if (h->type==PERF_RECORD_SAMPLE){
-      unsigned long ip=*(unsigned long*)((char*)(h+1));
-      if (nips+added < cap) ips[nips+added]=ip;
-      added++;
-    } else if (h->type==PERF_RECORD_LOST) (*lost)++;
+  unsigned long head = meta->data_head;
+  unsigned long tail = meta->data_tail;
+  char *data = (char *)buf + pagesz;
+  int seen = 0;
+  while (head - tail >= sizeof(struct perf_event_header)) {
+    struct perf_event_header *h = (struct perf_event_header *)(data + (tail & (RING_SZ - 1)));
+    if (h->size < sizeof *h || (unsigned long)h->size > head - tail) break;
+    if (h->type == PERF_RECORD_SAMPLE && h->size >= sizeof(*h) + 8) {
+      unsigned long ip = 0;
+      memcpy(&ip, (char *)h + sizeof(*h), 8);
+      if (nips + seen < cap) ips[nips + seen] = ip;
+      else if (dropped) (*dropped)++;
+      seen++;
+    } else if (h->type == PERF_RECORD_LOST && h->size >= sizeof(*h) + 16) {
+      unsigned long long n = 0;
+      memcpy(&n, (char *)h + sizeof(*h) + 8, 8);
+      if (lost) *lost += (long)n;
+    }
     tail += h->size;
-    /* tail may wrap; recompute linear offset */
-    if (tail + 4096 < head && (tail & (RING_SZ-1)) == 0) { }
   }
-  meta->data_tail=tail;
-  return added;
+  meta->data_tail = tail;
+  return seen;
 }
 
-static char *run_probe(const char *input, size_t inlen){
-  (void)inlen;
-  Buf out; binit(&out);
+typedef struct { char name[128]; int n; } ObjTot;
+typedef struct { char sym[160]; char obj[128]; int n; } SymTot;
 
-  /* argv */
-  char *args[64]; int nargs=0;
-  const char *ap=jfind(input,"argv");
-  if (!ap){ bputs(&out,"{\"ok\":0,\"error\":\"missing argv\"}"); return out.p; }
-  ap=strchr(ap,'['); if(!ap){ bputs(&out,"{\"ok\":0,\"error\":\"bad argv\"}"); return out.p; }
-  ap++;
-  while (*ap && *ap!=']' && nargs<63){
-    while (*ap==' '||*ap==','||*ap=='\n'||*ap=='\t') ap++;
-    if (*ap=='"'){ char *s=jstr(&ap); if(s) args[nargs++]=s; }
-    else break;
+static int objcmp(const void *a, const void *b) {
+  int x = ((const ObjTot *)a)->n, y = ((const ObjTot *)b)->n;
+  return (x < y) ? 1 : (x > y) ? -1 : 0;
+}
+static int symcmp_n(const void *a, const void *b) {
+  int x = ((const SymTot *)a)->n, y = ((const SymTot *)b)->n;
+  return (x < y) ? 1 : (x > y) ? -1 : 0;
+}
+
+static char *run_probe(const char *in) {
+  Buf b; binit(&b);
+  char err[512];
+  const char *stage = "parse";
+  err[0] = 0;
+
+  char *argv[MAXARGV + 1];
+  int argc = 0;
+  unsigned long *ips = NULL;
+  void *ring = MAP_FAILED;
+  size_t ringsz = 0, pagesz = 0;
+  int fd = -1, ep0 = -1;
+  pid_t pid = -1;
+  int reaped = 0, st = 0, timed_out = 0, killed = 0, exec_done = 0;
+  int kernel_excluded = 0;
+  long lost = 0, dropped = 0;
+  int nips = 0;
+  long long t0 = now_ms();
+  double spent = 0;
+  int cap = 0, freq = 0, top = 0, secs = 0, want_kernel = 1, show_out = 0;
+
+  secs = (int)jnum(in, "seconds", 600);
+  if (secs < 1) secs = 1;
+  if (secs > 3600) secs = 3600;
+  freq = (int)jnum(in, "freq", 99);
+  if (freq < 1) freq = 1;
+  if (freq > 5000) freq = 5000;
+  top = (int)jnum(in, "top", 20);
+  if (top < 1) top = 1;
+  if (top > 200) top = 200;
+  cap = (int)jnum(in, "max_samples", DEFCAP);
+  if (cap < 1000) cap = 1000;
+  if (cap > MAXCAP) cap = MAXCAP;
+  want_kernel = jbool(in, "kernel", 1);
+  show_out = jbool(in, "show_output", 0);
+
+  argc = jargv(in, argv, MAXARGV);
+  if (argc <= 0) {
+    argc = 0;
+    char cmd[2048];
+    if (jstr(in, "command", cmd, sizeof cmd) && cmd[0]) {
+      char *dup = strdup(cmd), *p = dup;
+      if (!dup) { snprintf(err, sizeof err, "out of memory"); goto out; }
+      while (*p && argc < MAXARGV) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        char *s = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        int more = (*p != 0);
+        *p = 0;
+        argv[argc] = strdup(s);
+        if (!argv[argc]) { free(dup); snprintf(err, sizeof err, "out of memory"); goto out; }
+        argc++;
+        if (!more) break;
+        p++;
+      }
+      free(dup);
+    }
   }
-  args[nargs]=NULL;
-  if (!nargs){ bputs(&out,"{\"ok\":0,\"error\":\"empty argv\"}"); return out.p; }
+  if (argc <= 0) { snprintf(err, sizeof err, "缺 argv / command"); goto out; }
+  argv[argc] = NULL;          /* execvp walks until NULL, not until argc */
 
-  double freq=jnum(input,"freq",99.0); if(freq<1) freq=1; if(freq>5000) freq=5000;
-  double seconds=jnum(input,"seconds",600.0); if(seconds<=0) seconds=600.0;
-  int top=(int)jnum(input,"top",20); if(top<1) top=20; if(top>200) top=200;
-  int show=jbool(input,"show_output",0);
+  pagesz = (size_t)sysconf(_SC_PAGESIZE);
+  if (pagesz < 4096) pagesz = 4096;
+  ringsz = RING_SZ + pagesz;
+  ips = malloc((size_t)cap * sizeof(unsigned long));
+  if (!ips) { snprintf(err, sizeof err, "out of memory for %d samples", cap); goto out; }
 
-  /* child; a CLOEXEC pipe reports exec failures back (close-on-exec => EOF on success) */
+  stage = "fork";
   int ep[2];
-  if (pipe(ep)!=0){ bprintf(&out,"{\"ok\":0,\"error\":\"pipe: %s\"}",strerror(errno)); return out.p; }
-  fcntl(ep[0],F_SETFL,O_NONBLOCK);
-  fcntl(ep[1],F_SETFD,FD_CLOEXEC);
-  pid_t pid=fork();
-  if (pid==0){
+  if (pipe2(ep, O_CLOEXEC) != 0) { snprintf(err, sizeof err, "pipe2: %s", strerror(errno)); goto out; }
+  pid = fork();
+  if (pid < 0) { close(ep[0]); close(ep[1]); snprintf(err, sizeof err, "fork: %s", strerror(errno)); goto out; }
+  if (pid == 0) {
     close(ep[0]);
-    int dn=open("/dev/null",O_WRONLY);
-    if (dn>=0){ dup2(dn,1); if(!show) dup2(dn,2); }
-    execvp(args[0],args);
-    int e=errno;
-    if (write(ep[1],&e,sizeof e)!=(ssize_t)sizeof e) _exit(127);
+    int dn = open("/dev/null", O_RDWR);
+    if (dn >= 0) {
+      dup2(dn, 0);
+      if (!show_out) { dup2(dn, 1); dup2(dn, 2); }
+      if (dn > 2) close(dn);
+    }
+    raise(SIGSTOP);                 /* parent arms the counter, then SIGCONTs us */
+    execvp(argv[0], argv);
+    int ce = errno;
+    ssize_t w = write(ep[1], &ce, sizeof ce);
+    (void)w;
     _exit(127);
   }
-  if (pid<0){ close(ep[0]); close(ep[1]);
-    bprintf(&out,"{\"ok\":0,\"error\":\"fork: %s\"}",strerror(errno)); return out.p; }
+  ep0 = ep[0];
   close(ep[1]);
 
-  usleep(3000);
-  { int ee=0; ssize_t rn=read(ep[0],&ee,sizeof ee);
-    if (rn==(ssize_t)sizeof ee){
-      close(ep[0]); waitpid(pid,NULL,0);
-      bprintf(&out,"{\"ok\":0,\"error\":\"exec %s\"}",strerror(ee)); return out.p; }
-    close(ep[0]);
+  stage = "handshake";
+  for (;;) {
+    pid_t w = waitpid(pid, &st, WUNTRACED);
+    if (w == pid) break;
+    if (w < 0 && errno == EINTR) continue;
+    snprintf(err, sizeof err, "waitpid: %s", strerror(errno));
+    goto out;
   }
-  struct perf_event_attr a; memset(&a,0,sizeof a);
-  a.type=PERF_TYPE_SOFTWARE;
-  a.config=PERF_COUNT_SW_CPU_CLOCK;
-  a.size=sizeof a;
-  a.sample_period=(unsigned long long)(1e9/freq);
-  a.sample_type=PERF_SAMPLE_IP;
-  a.disabled=1;
-  a.exclude_kernel=1;
-  a.exclude_hv=1;
-  a.wakeup_events=1;
-  int fd=peo(&a,pid);
-  if (fd<0){
-    int e=errno;
-    int st=0; pid_t wr=waitpid(pid,&st,WNOHANG);
-    if (wr==pid){
-      bprintf(&out,"{\"ok\":0,\"samples\":0,\"exit\":%d,\"error\":\"target exited before sampling started\"}",WIFEXITED(st)?WEXITSTATUS(st):-1);
-      return out.p;
-    }
-    kill(pid,9); waitpid(pid,NULL,0);
-    bprintf(&out,"{\"ok\":0,\"error\":\"perf_event_open: %s (paranoid=%d)\"}",strerror(e),
-      ({ int v=-1; FILE*f=fopen("/proc/sys/kernel/perf_event_paranoid","r"); if(f){ if(fscanf(f,"%d",&v)!=1) v=-1; fclose(f);} v; }));
-    return out.p;
+  if (!WIFSTOPPED(st)) {
+    snprintf(err, sizeof err, "child did not stop (status 0x%x)", st);
+    goto out;
   }
-  size_t ring=(size_t)RING_SZ+4096;
-  void *buf=mmap(NULL,ring,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
-  if (buf==MAP_FAILED){
-    kill(pid,9); waitpid(pid,NULL,0); close(fd);
-    bprintf(&out,"{\"ok\":0,\"error\":\"mmap: %s\"}",strerror(errno)); return out.p;
-  }
-  g_nmap=0; g_nhit=0; g_nobj=0;
-  maps_read(pid);
-  ioctl(fd,PERF_EVENT_IOC_ENABLE,0);
 
-  int cap=600000; unsigned long *ips=(unsigned long*)malloc((size_t)cap*sizeof(unsigned long));
-  int nips=0; long lost=0;
-  struct timespec t0,t1; clock_gettime(CLOCK_MONOTONIC,&t0);
-  double spent=0; int status=0; int it=0;
-  for (;;){
-    struct pollfd pf={.fd=fd,.events=POLLIN};
-    poll(&pf,1,50);
-    nips += drain(buf,ips,nips,cap,&lost);
-    if ((++it & 3)==0) maps_read(pid);
-    pid_t r=waitpid(pid,&status,WNOHANG);
-    if (r==pid){ nips += drain(buf,ips,nips,cap,&lost); break; }
-    clock_gettime(CLOCK_MONOTONIC,&t1);
-    spent=(double)(t1.tv_sec-t0.tv_sec)+(double)(t1.tv_nsec-t0.tv_nsec)/1e9;
-    if (spent>seconds){ kill(pid,9); waitpid(pid,&status,0); break; }
-  }
-  ioctl(fd,PERF_EVENT_IOC_DISABLE,0);
-  maps_read(pid);
-  munmap(buf,ring); close(fd);
-  if (nips>cap) nips=cap;
+  stage = "perf_event_open";
+  fd = open_counter(pid, freq, want_kernel, &kernel_excluded, err, sizeof err);
+  if (fd < 0) goto out;
 
-  /* attribute */
-  for (int i=0;i<nips;i++){
-    unsigned long ip=ips[i];
-    MapR *m=NULL;
-    for (int k=0;k<g_nmap;k++)
-      if (ip>=g_map[k].start && ip<g_map[k].end){ m=&g_map[k]; break; }
-    const char *obj = (m && m->path[0]) ? base_name(m->path) : "[anon]";
-    char obuf[192]; snprintf(obuf,sizeof obuf,"%s",obj);
-    const char *sym=NULL;
-    if (m && m->path[0]=='/'){
-      unsigned long off = ip - m->start + m->off;
-      ElfT *e=elf_get(m->path);
-      sym=elf_sym(e,off);
+  ring = mmap(NULL, ringsz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (ring == MAP_FAILED) { snprintf(err, sizeof err, "mmap ring: %s", strerror(errno)); goto out; }
+
+  stage = "run";
+  if (kill(pid, SIGCONT) != 0) { snprintf(err, sizeof err, "SIGCONT: %s", strerror(errno)); goto out; }
+
+  long long last_rf = 0;
+  for (;;) {
+    if (!exec_done) {
+      int ce = 0;
+      ssize_t rn = read(ep0, &ce, sizeof ce);
+      if (rn == (ssize_t)sizeof ce) {
+        snprintf(err, sizeof err, "execvp(%s): %s", argv[0], strerror(ce));
+        stage = "exec";
+        goto out;
+      }
+      if (rn <= 0 && (rn == 0 || (errno != EAGAIN && errno != EINTR))) {
+        exec_done = 1;
+        close(ep0); ep0 = -1;
+        maps_read(pid); jit_load(pid);
+        last_rf = now_ms();
+      }
     }
-    if (!sym){
-      if (m && m->path[0])      sym = "[nosym]";           /* file-backed, stripped */
-      else if (m && strchr(m->perms,'x')) sym = "[anon:exec]";
-      else                      sym = "[data]";
-    }
-    hit_add(obuf,sym);
-    obj_add(obuf);
+
+    int room = cap - nips;
+    int seen = drain(ring, pagesz, ips, nips, cap, &lost, &dropped);
+    nips += (seen > room) ? room : seen;
+    if (nips >= cap) { killed = 1; kill(pid, SIGKILL); break; }
+
+    struct pollfd pf;
+    pf.fd = fd; pf.events = POLLIN; pf.revents = 0;
+    poll(&pf, 1, 10);
+
+    pid_t w = waitpid(pid, &st, WNOHANG);
+    if (w == pid) { reaped = 1; break; }
+    if (w < 0 && errno != EINTR) { reaped = 1; break; }
+
+    long long t = now_ms();
+    if (exec_done && t - last_rf >= 250) { maps_read(pid); jit_load(pid); last_rf = t; }
+    if (t - t0 >= (long long)secs * 1000) { timed_out = 1; killed = 1; kill(pid, SIGKILL); break; }
   }
+
+  spent = (double)(now_ms() - t0) / 1000.0;
+  if (ring != MAP_FAILED) {
+    int room = cap - nips;
+    int seen = drain(ring, pagesz, ips, nips, cap, &lost, &dropped);
+    nips += (seen > room) ? room : seen;
+  }
+  if (ep0 >= 0) { close(ep0); ep0 = -1; }
+  if (fd >= 0) { close(fd); fd = -1; }
+  if (!reaped) {
+    kill(pid, SIGKILL);
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    reaped = 1;
+  }
+
+  int ex = WIFEXITED(st) ? WEXITSTATUS(st) : 0;
+  int sig = WIFSIGNALED(st) ? WTERMSIG(st) : 0;
+  stage = "attribute";
+
+  /* ---- attribution ---------------------------------------------------- */
+  static ObjTot obj[MAXOBJ];
+  static SymTot sym[MAXHITS];
+  int nobj = 0, nsym = 0, nsym_extra = 0;
+  long n_anon = 0, n_jitv = 0, n_kern = 0, n_unmapped = 0;
+
+  for (int i = 0; i < nips; i++) {
+    unsigned long ip = ips[i];
+    const char *oname = "[unmapped]";
+    const char *sname = "[unmapped]";
+
+    if (ip >= 0xffff800000000000UL) {
+      oname = "[kernel]"; sname = "[k]"; n_kern++;
+    } else {
+      MapR *m = map_find(ip);
+      if (m && m->path[0] == '/') {
+        oname = base_name(m->path);
+        Elf *e = elf_get(m->path);
+        const char *s = elf_sym(e, ip - m->start + m->off);
+        if (s) sname = s;
+        else sname = "[nosym]";
+      } else if (m && m->path[0] == '[') {
+        oname = m->path; sname = m->path;
+      } else {
+        if (m && m->path[0] == 0) n_anon++; else if (!m) n_unmapped++;
+        const char *j = jit_sym(ip);
+        if (j) { oname = "[jit]"; sname = j; n_jitv++; }
+        else if (m) { oname = "[anon]"; sname = "[anon]"; }
+      }
+    }
+
+    int k;
+    for (k = 0; k < nobj; k++) if (!strcmp(obj[k].name, oname)) break;
+    if (k == nobj && nobj < MAXOBJ) { snprintf(obj[nobj].name, sizeof obj[nobj].name, "%s", oname); obj[nobj].n = 0; nobj++; }
+    if (k < nobj) obj[k].n++;
+
+    for (k = 0; k < nsym; k++) if (!strcmp(sym[k].sym, sname) && !strcmp(sym[k].obj, oname)) break;
+    if (k == nsym) {
+      if (nsym < MAXHITS) {
+        snprintf(sym[nsym].sym, sizeof sym[nsym].sym, "%s", sname);
+        snprintf(sym[nsym].obj, sizeof sym[nsym].obj, "%s", oname);
+        sym[nsym].n = 0;
+        nsym++;
+      } else nsym_extra++;
+    }
+    if (k < nsym) sym[k].n++;
+  }
+  if (nsym_extra) { /* fold overflow into one bucket */
+    if (nsym < MAXHITS) { snprintf(sym[nsym].sym, sizeof sym[nsym].sym, "[+%d more]", nsym_extra); snprintf(sym[nsym].obj, sizeof sym[nsym].obj, "-"); sym[nsym].n = nsym_extra; nsym++; }
+  }
+
+  qsort(obj, (size_t)nobj, sizeof obj[0], objcmp);
+  qsort(sym, (size_t)nsym, sizeof sym[0], symcmp_n);
+
+  double dn = nips > 0 ? (double)nips : 1.0;
+  bputs(&b, "{\"ok\":1,\"target\":");
+  bjstr(&b, base_name(argv[0]));
+  bprintf(&b, ",\"samples\":%d,\"lost\":%ld,\"dropped\":%ld,\"exit\":%d,\"signal\":%d", nips, lost, dropped, ex, sig);
+  bprintf(&b, ",\"killed\":%d,\"seconds\":%.3f,\"timed_out\":%d", killed && !timed_out ? 1 : 0, spent, timed_out);
+  bprintf(&b, ",\"maps\":%d,\"maps_truncated\":%d,\"freq\":%d,\"cap\":%d", g_nmap, g_map_trunc, freq, cap);
+  bprintf(&b, ",\"kernel_excluded\":%d,\"truncated\":%d", kernel_excluded, (lost > 0 || dropped > 0));
+  bprintf(&b, ",\"anon_pct\":%.1f,\"jit_pct\":%.1f,\"kernel_pct\":%.1f,\"unmapped_pct\":%.1f",
+          100.0 * (double)n_anon / dn, 100.0 * (double)n_jitv / dn, 100.0 * (double)n_kern / dn,
+          100.0 * (double)n_unmapped / dn);
+  if (nips == 0) {
+    bputs(&b, ",\"hint\":");
+    bjstr(&b, kernel_excluded
+      ? "0 个样本：目标比 1/freq 秒还短，或 CPU 未调度到它（内核计数被 paranoid 关掉了）"
+      : "0 个样本：目标比 1/freq 秒还短，或 CPU 未调度到它");
+  } else if (g_elf_full) {
+    bprintf(&b, ",\"elf_cache_full\":%ld", g_elf_full);
+  }
+  bputs(&b, ",\"objects\":[");
+  for (int i = 0; i < nobj && i < top; i++)
+    bprintf(&b, "%s{\"name\":\"%s\",\"samples\":%d,\"pct\":%.1f}",
+            i ? "," : "", obj[i].name, obj[i].n, 100.0 * (double)obj[i].n / dn);
+  bputs(&b, "],\"symbols\":[");
+  for (int i = 0; i < nsym && i < top; i++) {
+    bputs(&b, i ? ",{\"symbol\":" : "{\"symbol\":");
+    bjstr(&b, sym[i].sym);
+    bputs(&b, ",\"object\":");
+    bjstr(&b, sym[i].obj);
+    bprintf(&b, ",\"samples\":%d,\"pct\":%.1f}", sym[i].n, 100.0 * (double)sym[i].n / dn);
+  }
+  bputs(&b, "]}");
+
+out:
+  if (ring != MAP_FAILED) munmap(ring, ringsz);
+  if (fd >= 0) close(fd);
+  if (ep0 >= 0) close(ep0);
+  if (pid > 0 && !reaped) {
+    kill(pid, SIGKILL);
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+  }
+  elf_release_all();
+  jit_free();
   free(ips);
-  qsort(g_hit,(size_t)g_nhit,sizeof(Hit),hitcmp);
-  qsort(g_obj,(size_t)g_nobj,sizeof(ObjTot),objcmp);
-
-  int code = WIFEXITED(status)? WEXITSTATUS(status) : -1;
-  double anon=0;
-  for (int i=0;i<g_nobj;i++) if (!strcmp(g_obj[i].obj,"[anon]")) anon=100.0*(double)g_obj[i].cnt/(double)(nips?nips:1);
-  bprintf(&out,"{\"ok\":1,\"samples\":%d,\"lost\":%ld,\"exit\":%d,\"seconds\":%.3f,"
-               "\"maps\":%d,\"freq\":%.0f,\"anon_pct\":%.2f,",nips,lost,code,spent,g_nmap,freq,anon);
-  bputs(&out,"\"objects\":[");
-  { int lim=g_nobj<top?g_nobj:top;
-    for (int i=0;i<lim;i++){
-      if(i) bputs(&out,",");
-      bprintf(&out,"{\"name\":"); bjstr(&out,g_obj[i].obj);
-      bprintf(&out,",\"samples\":%ld,\"pct\":%.1f}",g_obj[i].cnt,
-        nips? 100.0*(double)g_obj[i].cnt/(double)nips : 0.0);
-    } }
-  bputs(&out,"],\"symbols\":[");
-  { int lim=g_nhit<top?g_nhit:top;
-    for (int i=0;i<lim;i++){
-      if(i) bputs(&out,",");
-      bprintf(&out,"{\"symbol\":"); bjstr(&out,g_hit[i].sym);
-      bprintf(&out,",\"object\":"); bjstr(&out,g_hit[i].obj);
-      bprintf(&out,",\"samples\":%ld,\"pct\":%.2f}",g_hit[i].cnt,
-        nips? 100.0*(double)g_hit[i].cnt/(double)nips : 0.0);
-    } }
-  bputs(&out,"]}");
-  return out.p;
+  freeargv(argv, argc);
+  if (err[0]) {
+    b.n = 0; if (b.p) b.p[0] = 0;
+    bprintf(&b, "{\"ok\":0,\"samples\":0,\"exit\":0,\"freq\":%d,\"stage\":", freq);
+    bjstr(&b, stage);
+    bputs(&b, ",\"error\":");
+    bjstr(&b, err);
+    bputs(&b, "}");
+  }
+  return b.p;
 }
 
-char *lite_helper(const char *input){
-  return run_probe(input?input:"{}", input?strlen(input):2);
-}
-void lite_helper_free(char *out){ free(out); }
+char *lite_helper(const char *input) { return run_probe(input && input[0] ? input : "{}"); }
+void lite_helper_free(char *out) { free(out); }

@@ -28,6 +28,15 @@ if ! "$ROOT/tools/lite-lua" "$ROOT/tools/html_img_check.lua"; then
     echo "FAIL html_img" >&2; exit 1
 fi
 
+echo "== perfprobe =="
+# CPU 采样探针（helper/perfprobe.c）：现场 cc 编 PIE 与 -no-pie 两个 fixture，钉住两件
+# 「看起来成功了其实全错」的事：ET_EXEC 的 fileoff→vaddr 归因（否则整表 [nosym]）、
+# ok=0 必须带 stage 标签（Lua 里 `not 0` 是假，错误曾被渲染成「0 样本」的成功）。
+# 全离线；paranoid 3/4 时 SKIP 而不是 FAIL（环境问题不是回归）。
+if ! timeout 120 "$ROOT/tools/lite-lua" "$ROOT/tools/perfprobe_check.lua"; then
+    echo "FAIL perfprobe" >&2; exit 1
+fi
+
 echo "== http =="
 # 无数据超时（LITE_HTTP_LOW_SPEED_TIME）：桩服务端 accept 后一个字节不回（半开，
 # 模拟 LB 黑洞 / 进程被 kill 而 socket 还挂着），此时必须在 ~3s 收场且 rc=28，

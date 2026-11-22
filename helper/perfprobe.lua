@@ -30,16 +30,34 @@ local function render(res)
     if not ok or type(d) ~= "table" then
         return "perfprobe: bad helper output: " .. tostring(res):sub(1, 300)
     end
-    if not d.ok then
-        return string.format("perfprobe: %s\n  required: argv=[\"prog\",\"arg1\"] | command=\"prog arg1\"", tostring(d.error))
+    -- cjson 把 0 解成 Lua 的 0（真值），所以不能写 `if not d.ok`
+    if d.ok ~= 1 then
+        local tag = d.stage and (" [" .. tostring(d.stage) .. "]") or ""
+        return string.format("perfprobe:%s %s\n  required: argv=[\"prog\",\"arg1\"] | command=\"prog arg1\"", tag, tostring(d.error))
     end
     local out = {}
-    out[#out + 1] = string.format(
+    local head = string.format(
         "%d samples (%.0f Hz, lost %d) | target exit %d | wall %.2fs | %d mappings",
         d.samples or 0, d.freq or 0, d.lost or 0, d.exit or 0, d.seconds or 0, d.maps or 0)
+    if (d.signal or 0) ~= 0 then head = head .. string.format(" | killed by signal %d", d.signal) end
+    if (d.dropped or 0) > 0 then head = head .. string.format(" | %d records unusable", d.dropped) end
+    out[#out + 1] = head
+    if d.timed_out == 1 then
+        out[#out + 1] = "  note: seconds budget hit -> target killed, profile covers the window only"
+    end
     if (d.samples or 0) == 0 then
-        out[#out + 1] = "  no samples: target too short or perf blocked (paranoid > 2 needs root)"
+        if d.hint and d.hint ~= cjson.null then
+            out[#out + 1] = "  no samples: " .. tostring(d.hint)
+        else
+            out[#out + 1] = "  no samples: target too short or perf blocked (paranoid > 2 needs root)"
+        end
         return table.concat(out, "\n")
+    end
+    if (d.maps_truncated or 0) == 1 then
+        out[#out + 1] = "  note: mapping table hit its cap -> symbol attribution is partial"
+    end
+    if (d.truncated or 0) == 1 then
+        out[#out + 1] = "  note: sample pool hit its cap -> later samples were dropped"
     end
     out[#out + 1] = "  -- by object --"
     for _, o in ipairs(d.objects or {}) do
@@ -49,8 +67,14 @@ local function render(res)
     for _, s in ipairs(d.symbols or {}) do
         out[#out + 1] = string.format("  %6.2f%%  %-34s %s", s.pct or 0, (s.symbol or "?"):sub(1, 34), (s.object or ""):sub(1, 24))
     end
+    if (d.jit_pct or 0) > 0 then
+        out[#out + 1] = string.format("  note: %.1f%% in /tmp/perf-<pid>.map (JIT frames, named by that table)", d.jit_pct)
+    end
     if (d.anon_pct or 0) > 0 then
         out[#out + 1] = string.format("  note: %.1f%% in anonymous exec memory (JIT/AOT code has no ELF symbols)", d.anon_pct)
+    end
+    if (d.kernel_excluded or 0) == 1 then
+        out[#out + 1] = "  note: kernel samples excluded (perf_event_paranoid)"
     end
     return table.concat(out, "\n")
 end
