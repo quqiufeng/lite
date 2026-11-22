@@ -44,7 +44,18 @@ local function map_candidates()
     return { dir .. "/lib/app_wechat_map.lua", cwd .. "/helper/lib/app_wechat_map.lua" }
 end
 
-local D = { min_sim = 0.5 }   -- min_sim 是 OCR 阈值，不是坐标（拍照常把手认成丰）
+-- min_sim 是 OCR 阈值，不是坐标（拍照常把手认成丰）。
+-- bubble_h：气泡验收只 OCR 聊天区**底部这条带**——整块聊天区太大，det 会漏掉最新那条小气泡。
+-- tmp_prefix：中间产物（剪贴板/全屏截图/裁剪图）带 pid。原来是三处写死 /tmp/wechat-*.png，
+--   两个 lite 实例（不同 cwd 不共享 mem.lock）或 cluster.sh 并发时互相覆盖剪贴板与截图，
+--   症状是「验收通过但发错内容」——比失败更难查。
+pcall(ffi.cdef, "int getpid(void);")
+local pid_ok, pid = pcall(function() return ffi.C.getpid() end)
+local D = {
+    min_sim = 0.5,
+    bubble_h = 420,
+    tmp_prefix = string.format("/tmp/wechat-%d", pid_ok and pid or 0),
+}
 
 local function load_map()
     local tried = map_candidates()
@@ -137,7 +148,12 @@ end
 local function find_win()
     libs()
     local ok, r = pcall(W.resolve, { name = "微信", class = "wechat", pick = 1 })
-    local id = ok and r and (r.id or r.win) or (ok and type(r) == "number" and r)
+    -- resolve 可能返回表（{id=…}）也可能返回裸 number；先判类型再取字段——
+    -- 原来写 `r.id or r.win or (type(r)=="number" and r)`，r 是 number 时
+    -- 第一个 `r.id` 就 "attempt to index a number value"，兜底永远走不到。
+    local id
+    if ok and type(r) == "table" then id = r.id or r.win
+    elseif ok and type(r) == "number" then id = r end
     if not id then error("wechat 窗口没找到（先打开微信，并确保不在最小化状态）") end
     return id
 end
@@ -160,12 +176,20 @@ local function key(seq)
     ensure(); xdo:key(0, seq, 15000); sleep(200)
 end
 
-local function paste(text)
-    local f = assert(io.open("/tmp/wechat-clip.txt", "w")); f:write(text); f:close()
+-- 写剪贴板是 send / sendfile 共用的第一步：抽出来只是为了别让两处各写一遍
+-- xclip 调用、各漏一种失败判据（原来 sendfile 那处拿到的文件句柄连 fsync 都没做）。
+local function set_clipboard(text)
+    local p = D.tmp_prefix .. "-clip.txt"
+    local f = assert(io.open(p, "w")); f:write(text); f:close()
     -- xclip -i 在本机同步退出（3ms），可安全接力
-    local ok = os.execute("xclip -selection clipboard -i /tmp/wechat-clip.txt >/dev/null 2>&1")
+    local ok = os.execute("xclip -selection clipboard -i " .. p .. " >/dev/null 2>&1")
     if ok ~= 0 and ok ~= true then error("写剪贴板失败：xclip 不可用") end
-    sleep(250); key("ctrl+v"); sleep(800)
+    sleep(250)
+end
+
+local function paste(text)
+    set_clipboard(text)
+    key("ctrl+v"); sleep(800)
 end
 
 local function norm(s)
@@ -193,14 +217,14 @@ end
 -- 截屏 + 裁剪 + OCR，返回 boxes（坐标已换回屏幕像素）和全文
 local function ocr_area(tag, r)
     ensure(); sleep(200)
-    local shot = "/tmp/wechat-shot.png"
+    local shot = D.tmp_prefix .. "-shot.png"
     W.capture_screen(shot)
     local x0, y0, x1, y1 = r[1], r[2], r[3], r[4]
-    local crop = "/tmp/wechat-ocr-" .. tag .. ".png"
+    local cut = D.tmp_prefix .. "-ocr-" .. tag .. ".png"   -- 别叫 crop：会遮蔽模块级 crop(name)
     os.execute(string.format(
         "convert %s -crop %dx%d+%d+%d +repage -colorspace Gray -level 25%%,85%% -sharpen 0x1 %s",
-        shot, x1 - x0, y1 - y0, x0, y0, crop))
-    local boxes = OCR.run(crop) or {}
+        shot, x1 - x0, y1 - y0, x0, y0, cut))
+    local boxes = OCR.run(cut) or {}
     for _, b in ipairs(boxes) do
         b.cx = x0 + (b.x or 0) + (b.w or 0) / 2
         b.cy = y0 + (b.y or 0) + (b.h or 0) / 2
@@ -239,14 +263,22 @@ local function do_search(name, index)
         boxes, text = ocr_area("candidates", crop("candidates"))
         if norm(text) ~= "" then break end
     end
-    local want, k = {}, tonumber(index) or 1
+    local want, k = {}, math.max(1, tonumber(index) or 1)
     for _, b in ipairs(boxes) do
         if sim(b.text, name) >= D.min_sim and norm(b.text) ~= "" then want[#want + 1] = b end
     end
+    -- 按面板的视觉顺序（y）排：det 输出的顺序不等于行的顺序，而下面 open_hit
+    -- 找「第一行」也是按 min y —— 两处口径必须一致，否则 index=2 有概率点到第一行。
+    table.sort(want, function(a, b) return (a.y or 0) < (b.y or 0) end)
     if #want == 0 then
         if norm(text) == "" then
-            -- OCR 不可用（无模型/空白截图）：不猜候选行坐标（猜错一行就进错会话），
-            -- 直接回车接受搜索框默认项 —— 微信默认项就是第一个真实结果。
+            -- OCR 不可用（无模型/空白截图）：不猜候选行坐标（猜错一行就进错会话）。
+            -- index=1 回车接受默认项是对的（微信默认项就是第一个真实结果）；
+            -- 但 index>1 时回车必然进第一项，与请求不符——宁可报错，也不能静默发错人。
+            if k > 1 then
+                error(string.format("搜索 %q 要第 %d 行候选，但面板 OCR 全空，拒绝盲点（去掉 index 或修 OCR）",
+                    name, k))
+            end
             return { enter = true, blind = true, text = "" }
         end
         error(string.format("搜索 %q 后候选面板没看到该名字（OCR=%q，required: name）",
@@ -287,7 +319,10 @@ local function do_open(name, index)
     return open_hit(b, name)
 end
 
-local function do_send(text, name)
+-- needle = 气泡里应该看到的字符串（通常就是 text 本身），不是联系人名。
+-- 原来第二参数叫 name，`send` 分支传了 args.name → 拿「张三」去匹配气泡里的「你好」，
+-- 必然失败或靠 blind() 假过。参数名和调用点必须同口径。
+local function do_send(text, needle)
     ensure()
     click(point("input"))
     key("ctrl+a"); key("BackSpace")
@@ -295,15 +330,15 @@ local function do_send(text, name)
     key("Return"); sleep(1200)
     -- 只 OCR 聊天区底部条带：整块聊天区太大，det 会漏掉最新那条小气泡
     local strip = crop("bubble")
-    strip[2] = strip[4] - 420
+    strip[2] = strip[4] - D.bubble_h
     local seen = ""
     for _ = 1, 3 do
         seen = select(2, ocr_area("bubble", strip))
-        if not name or sim(seen, name) >= D.min_sim then return true end
+        if not needle or sim(seen, needle) >= D.min_sim then return true end
         sleep(600)
     end
-    if blind(seen) then return true end        -- OCR 不可用：盲过，不阻塞
-    error(string.format("发送后气泡里没看到 %q（OCR=%q）", text, norm(seen):sub(1, 120)))
+    if blind(seen) then return true, true end  -- 第二返回值 = blind（调用方在返回值里标出来）
+    error(string.format("发送后气泡里没看到 %q（OCR=%q）", needle, norm(seen):sub(1, 120)))
 end
 
 -- 文件选择框是独立窗口：不能用 click()/key()（它们会 ensure() 抢回微信主窗口）
@@ -319,14 +354,14 @@ local function dialog_id()
 end
 
 local function bubble_has(needle)
-    local strip = crop("bubble"); strip[2] = strip[4] - 420
+    local strip = crop("bubble"); strip[2] = strip[4] - D.bubble_h
     local seen = ""
     for _ = 1, 4 do
         seen = select(2, ocr_area("bubble", strip)) or ""
         if seen:lower():find(needle:lower(), 1, true) then return true end
         sleep(900)
     end
-    if blind(seen) then return true, "" end     -- OCR 不可用：盲过，不阻塞
+    if blind(seen) then return true, "", true end   -- 第三值 = blind：调用方必须标出来，别谎报 true
     return false, seen
 end
 
@@ -340,10 +375,8 @@ local function do_sendfile(path, name, index)
     -- 弹窗默认焦点就在「文件名称」输入框：只激活窗口，不点（点会写脏 fileinput 坐标依赖）
     pcall(function() xdo:activate(id) end); sleep(400)
     dkey("ctrl+a"); dkey("BackSpace")
-    local f = assert(io.open("/tmp/wechat-clip.txt", "w")); f:write(path); f:close()
-    local okc = os.execute("xclip -selection clipboard -i /tmp/wechat-clip.txt >/dev/null 2>&1")
-    if okc ~= 0 and okc ~= true then error("写剪贴板失败：xclip 不可用") end
-    sleep(250); dkey("ctrl+v"); sleep(700)
+    set_clipboard(path)                  -- 与 send 同一条通路，别再各写一份 xclip
+    dkey("ctrl+v"); sleep(700)
     dkey("Return"); sleep(1200)
     for _ = 1, 6 do
         if not dialog_id() then break end
@@ -353,11 +386,12 @@ local function do_sendfile(path, name, index)
     ensure(); sleep(300)
     dkey("Return"); sleep(1500)          -- 主窗口回车 = 发送
     ensure()
-    local seen, txt = bubble_has(base)
+    local seen, txt, sblind = bubble_has(base)
     if not seen then
         error(string.format("发送后气泡里没看到 %q（OCR=%q）", base, norm(txt or ""):sub(1, 120)))
     end
-    return string.format("sendfile: %s -> %s (bubble_seen=true)", path, name or "当前会话")
+    return string.format("sendfile: %s -> %s (bubble_seen=%s)", path, name or "当前会话",
+        sblind and "blind(OCR不可用)" or "true")
 end
 
 -- 剪贴板里是否有 PNG（微信截图器/xfce 都会给 image/png target）
@@ -410,6 +444,11 @@ local function do_screenshot(a, name, index)
         end
         sleep(900)
     end
+    -- OCR 全空时与其它动作同口径：盲过但标明，别让调用方以为验过了
+    if blind(seen) then
+        return string.format("screenshot: %dx%d -> %s (preview=blind,OCR不可用)",
+            x1 - x0, y1 - y0, name or "当前会话")
+    end
     error(string.format("发图后左栏没看到「图片」预览（OCR=%q）", norm(seen):sub(1, 120)))
 end
 
@@ -435,8 +474,13 @@ function M.run(args, env)
     win = find_win()
     local action = args.action or "run"
     local bg = args.background
-    local needs = (action == "sendfile" and { "sendfile" })
-        or (action == "screenshot" and { "shotbtn" }) or nil
+    -- 依赖 region 只列**真的会按坐标点**的那些：
+    --   sendfile → fileopen（文件框右下「打开」），sendfile 按钮本身
+    --   screenshot → panel（收尾验左栏预览「[图片]」）
+    -- 原来 screenshot 登记的是 shotbtn，可 shotbtn 恰恰是**不能用**的那个按钮
+    -- （内部截图器粘不进剪贴板，走 alt+a），登记它只会误导后来人。
+    local needs = (action == "sendfile" and { "sendfile", "fileopen" })
+        or (action == "screenshot" and { "panel" }) or nil
     local ok, err = check(needs)
     if not ok then return "error: " .. err end
     -- 所有动作都在这层 pcall 里跑：成功 or 抛错，收尾都 leave(bg) 把微信放回后台。
@@ -467,8 +511,9 @@ function M.run(args, env)
             local how = do_open(assert(args.name, "required: name"), args.index)
             return "opened: " .. args.name .. " (" .. tostring(how) .. ")"
         elseif action == "send" then
-            do_send(assert(args.text, "required: text"), args.name)
-            return "sent: " .. args.text
+            local text = assert(args.text, "required: text")
+            local _, sblind = do_send(text, text)   -- 气泡里该看到的就是 text 本身
+            return "sent: " .. text .. " (bubble_seen=" .. (sblind and "blind,OCR不可用" or "true") .. ")"
         elseif action == "run" then
             local name = assert(args.name, "required: name")
             local text = assert(args.text, "required: text")
@@ -477,11 +522,13 @@ function M.run(args, env)
                 b.enter and "enter" or string.format("%q @ %d,%d", norm(b.text),
                     math.floor(b.cx), math.floor(b.cy)))
             local how = open_hit(b, name)
-            do_send(text, text)
+            local _, sblind = do_send(text, text)
             return head .. "\nopened: " .. name .. " (" .. tostring(how) .. ")"
-                .. "\nsent: " .. text .. " (bubble_seen=true)"
+                .. "\nsent: " .. text .. " (bubble_seen=" .. (sblind and "blind,OCR不可用" or "true") .. ")"
         end
-        error("未知 action: " .. tostring(action) .. "（run|search|open|send|sendfile）")
+        -- 动作清单写在这里就一种下场：加了新 action 忘了同步这行。列全。
+        error("未知 action: " .. tostring(action)
+            .. "（run|search|open|send|sendfile|screenshot）")
     end
 
     local okd, res = pcall(dispatch)
