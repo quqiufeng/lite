@@ -121,6 +121,26 @@ check(sym_pct(d2, "hot_beta") ~= nil, "spin_exec.sym_beta", "ET_EXEC lost hot_be
 check(sym_pct(d2, "[nosym]") == nil, "spin_exec.no_nosym",
       string.format("nosym=%.1f%%", sym_pct(d2, "[nosym]") or 0))
 
+-- 无符号表退化层：strip -s 只删 .symtab，.eh_frame 的 FDE 边界还在，必须给出 sub_<入口>
+local _, rc4 = sh(("cp %s/b/spin_pie %s/b/spin_strip && strip -s %s/b/spin_strip"):format(D, D, D))
+if rc4 == 0 then
+    local d5, raw5 = probe({ D .. "/b/spin_strip" })
+    check(d5 and d5.ok == 1, "strip.ok", raw5:sub(1, 160))
+    check((d5 and d5.samples or 0) > 0, "strip.samples", d5 and d5.samples)
+    check(sym_pct(d5, "[nosym]") == nil, "strip.no_nosym",
+          string.format("nosym=%.1f%%", sym_pct(d5, "[nosym]") or 0))
+    local sub_pct, nsub = 0, 0
+    for _, s in ipairs((d5 and d5.symbols) or {}) do
+        if type(s.symbol) == "string" and s.symbol:match("^sub_%x+$") then
+            nsub = nsub + 1; sub_pct = sub_pct + (s.pct or 0)
+        end
+    end
+    check(nsub > 0, "strip.has_sub", "无 sub_<addr>，FDE 解析没生效")
+    check(sub_pct > 50, "strip.sub_hot", string.format("sub_* 合计 %.1f%%", sub_pct))
+else
+    io.stderr:write("  SKIP strip.* (strip 不可用)\n")
+end
+
 -- 短命目标：样本很少但不能崩，main 至少要认出来
 local d3, raw3 = probe({ D .. "/b/brief" }, 5)
 check(d3 and d3.ok == 1, "brief.ok", raw3:sub(1, 160))

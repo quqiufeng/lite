@@ -22,6 +22,16 @@
  *
  * /tmp/perf-<pid>.map (perfmap) is read and reloaded when it changes so LuaJIT/JVM
  * frames get real names instead of an anonymous blob.
+ *
+ * Why .eh_frame when there is no symbol table: `strip -s` deletes .symtab, so a
+ * binary shipped without debug info answers nothing -- yet .eh_frame (needed by
+ * C++ unwinding / backtrace) survives and holds one FDE per function with its
+ * pc_begin/pc_end. We parse the CFI header chain (length + CIE pointer + FDE
+ * encoding), resolve pcrel/datarel values against the section address, and
+ * report "sub_<pc_begin>" -- coarse (no args, static funcs included) but a
+ * hundred times better than [nosym]. Same fallback exists in lua/trace/engine.lua
+ * for --sym; the two parsers are independent on purpose (engine is Lua/FFI,
+ * this one is C in-process) so one bug cannot hide the other.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -199,12 +209,15 @@ static void freeargv(char **argv, int n) { for (int i = 0; i < n; i++) free(argv
 /* ------------------------------------------------------------------- elf */
 typedef struct { unsigned long off, vaddr, filesz; } Seg;
 typedef struct { unsigned long long v; char *nm; } Sym;
+typedef struct { unsigned long long b, e; } Fde;      /* .eh_frame 的 pc 范围 */
 typedef struct {
   char path[512];
   unsigned char *base;
   size_t fsz;
   Sym *s;
   int n;
+  Fde *f;         /* 无符号表时的退化层：FDE 边界 */
+  int nf;
   Seg seg[8];
   int nseg;
   int tried;      /* 1 = parsed (s may still be NULL) */
@@ -217,6 +230,7 @@ static long g_elf_full;
 static void elf_release_all(void) {
   for (int i = 0; i < g_nelf; i++) {
     free(g_elf[i].s);
+    free(g_elf[i].f);
     if (g_elf[i].base) munmap(g_elf[i].base, g_elf[i].fsz);   /* base is mmap'ed, not malloc'ed */
   }
   free(g_elf); g_elf = NULL; g_nelf = g_capelf = 0; g_elf_full = 0;
@@ -225,6 +239,165 @@ static void elf_release_all(void) {
 static int symcmp(const void *a, const void *b) {
   unsigned long long x = ((const Sym *)a)->v, y = ((const Sym *)b)->v;
   return (x < y) ? -1 : (x > y) ? 1 : 0;
+}
+
+/* ---- .eh_frame：strip -s 只删 .symtab，CFI 还在；FDE 的 pc 范围就是函数边界。
+   拿不到名字时至少给出 sub_<入口地址>，比一片 [nosym] 有用。DWARF32 only。 */
+static int fdecmp(const void *a, const void *b) {
+  unsigned long long x = ((const Fde *)a)->b, y = ((const Fde *)b)->b;
+  return (x < y) ? -1 : (x > y) ? 1 : 0;
+}
+
+static int uleb(const unsigned char *p, const unsigned char *end, unsigned long long *out,
+                const unsigned char **np) {
+  unsigned long long v = 0;
+  int sh = 0;
+  while (p < end && sh <= 63) {
+    unsigned char c = *p++;
+    v |= (unsigned long long)(c & 0x7f) << sh;
+    if (!(c & 0x80)) { *out = v; *np = p; return 1; }
+    sh += 7;
+  }
+  return 0;
+}
+
+static int sleb(const unsigned char *p, const unsigned char *end, long long *out,
+                const unsigned char **np) {
+  long long v = 0;
+  int sh = 0;
+  unsigned char c = 0;
+  while (p < end && sh <= 63) {
+    c = *p++;
+    v |= (long long)(c & 0x7f) << sh;
+    sh += 7;
+    if (!(c & 0x80)) {
+      if (sh < 64 && (c & 0x40)) v |= -((long long)1 << sh);   /* 符号扩展 */
+      *out = v; *np = p; return 1;
+    }
+  }
+  return 0;
+}
+
+/* 按 DW_EH_PE 的 format 位读一个值（不含 application） */
+static int read_val(const unsigned char **pp, const unsigned char *end, int fmt,
+                    unsigned long long *v) {
+  const unsigned char *p = *pp;
+  unsigned long long x;
+  switch (fmt) {
+    case 0x01: if (!uleb(p, end, &x, pp)) return 0; break;                    /* uleb128 */
+    case 0x09: { long long s; if (!sleb(p, end, &s, pp)) return 0;
+                 x = (unsigned long long)s; break; }                          /* sleb128 */
+    case 0x02: if (p + 2 > end) return 0; { uint16_t t; memcpy(&t, p, 2); x = t; } *pp = p + 2; break;
+    case 0x0a: if (p + 2 > end) return 0; { int16_t t; memcpy(&t, p, 2);
+                 x = (unsigned long long)(long long)t; } *pp = p + 2; break;
+    case 0x03: if (p + 4 > end) return 0; { uint32_t t; memcpy(&t, p, 4); x = t; } *pp = p + 4; break;
+    case 0x0b: if (p + 4 > end) return 0; { int32_t t; memcpy(&t, p, 4);
+                 x = (unsigned long long)(long long)t; } *pp = p + 4; break;
+    case 0x04: case 0x0c: if (p + 8 > end) return 0;
+                 { uint64_t t; memcpy(&t, p, 8); x = t; } *pp = p + 8; break;
+    default: return 0;
+  }
+  *v = x;
+  return 1;
+}
+
+/* field_va = 该字段在内存里的虚拟地址（pcrel 的基址） */
+static int enc_val(const unsigned char **pp, const unsigned char *end, int enc,
+                   unsigned long long field_va, unsigned long long *out) {
+  int fmt = enc & 0x0f, app = enc & 0x70;
+  if (!enc) return 0;
+  if (fmt == 0) fmt = 0x0c;             /* absptr：x86-64 下就是 8 字节 */
+  if (app && app != 0x10) return 0;     /* datarel/textrel/funcrel 一律放弃 */
+  const unsigned char *save = *pp;
+  unsigned long long v;
+  if (!read_val(pp, end, fmt, &v)) { *pp = save; return 0; }
+  *out = (app == 0x10) ? field_va + v : v;
+  return 1;
+}
+
+/* 两遍扫：先收 CIE 的 FDE 指针编码（'zR'），再解 FDE 的 pc_begin/range。 */
+static void elf_parse_eh(Elf *e, size_t sec_off, size_t sec_sz, unsigned long long sec_addr) {
+  const unsigned char *b = e->base;
+  size_t over = (sec_off + sec_sz > e->fsz) ? e->fsz : sec_off + sec_sz;
+  struct { unsigned long rec; int enc; } cie[16];
+  int ncie = 0;
+  size_t cap = 64, n = 0;
+  Fde *arr = malloc(cap * sizeof *arr);
+  if (!arr) return;
+
+  size_t p = sec_off;
+  while (p + 8 <= over) {
+    uint32_t len;
+    memcpy(&len, b + p, 4);
+    if (!len) break;
+    if (len == 0xffffffffu) break;                        /* DWARF64：极少见，放弃 */
+    size_t body = p + 4, nextp = body + len;
+    if (nextp <= body || nextp > over) break;
+    uint32_t cid;
+    memcpy(&cid, b + body, 4);
+
+    if (cid == 0) {                                       /* CIE */
+      unsigned char ver = b[body + 4];
+      const unsigned char *q = b + body + 5, *qe = b + nextp;
+      char aug[16] = {0};
+      int na = 0;
+      while (q < qe && *q && na < 15) aug[na++] = (char)*q++;
+      q++;
+      if (ver >= 4) q += 2;                               /* address_size + segment_size */
+      unsigned long long u;
+      long long s;
+      if (!uleb(q, qe, &u, &q) || !sleb(q, qe, &s, &q)) { p = nextp; continue; }
+      if (ver == 1) q += 1;
+      else { unsigned long long ra; if (!uleb(q, qe, &ra, &q)) { p = nextp; continue; } }
+      int enc = 0;
+      if (aug[0] == 'z') {
+        unsigned long long alen;
+        if (!uleb(q, qe, &alen, &q)) { p = nextp; continue; }
+        const unsigned char *ae = (q + alen < qe) ? q + alen : qe;
+        for (char *a = aug + 1; *a && q < ae; a++) {
+          if (*a == 'R') enc = *q++;
+          else if (*a == 'L') q++;
+          else if (*a == 'P') {
+            int pe = *q++;
+            unsigned long long dv;
+            if (!enc_val(&q, ae, pe, 0, &dv)) break;
+          } else if (*a == 'S') { }
+          else break;
+        }
+      }
+      if (ncie < 16) { cie[ncie].rec = p; cie[ncie].enc = enc; ncie++; }
+      p = nextp;
+      continue;
+    }
+
+    unsigned long co = (unsigned long)(body - cid);        /* FDE 的 CIE 指针相对自身 */
+    int enc = -1;
+    for (int i = 0; i < ncie; i++) if (cie[i].rec == co) { enc = cie[i].enc; break; }
+    if (enc <= 0) { p = nextp; continue; }
+    const unsigned char *q = b + body + 4, *qe = b + nextp;
+    unsigned long long begin, range;
+    unsigned long long field_va = sec_addr + (unsigned long long)(body + 4 - sec_off);
+    if (!enc_val(&q, qe, enc, field_va, &begin)) { p = nextp; continue; }
+    int rf = enc & 0x0f;
+    if (rf == 0) rf = 0x03;
+    if (!read_val(&q, qe, rf, &range)) { p = nextp; continue; }
+    if (!begin || !range) { p = nextp; continue; }
+    if (n == cap) {
+      Fde *na2 = realloc(arr, cap * 2 * sizeof *arr);
+      if (!na2) break;
+      arr = na2; cap *= 2;
+    }
+    arr[n].b = begin;
+    arr[n].e = begin + range;
+    n++;
+    p = nextp;
+  }
+  if (n) { qsort(arr, n, sizeof *arr, fdecmp); e->f = arr; e->nf = (int)n; }
+  else free(arr);
+}
+
+static void elf_fde_try(Elf *e, const Elf64_Shdr *sh) {
+  if (sh) elf_parse_eh(e, sh->sh_offset, sh->sh_size, sh->sh_addr);
 }
 
 /* Fill e->seg[] from PT_LOAD and e->s[] from .symtab (fallback .dynsym). */
@@ -245,6 +418,28 @@ static void elf_parse(Elf *e) {
     e->nseg++;
   }
   if (eh->e_shentsize != sizeof(Elf64_Shdr)) return;
+  /* .eh_frame 的位置：无符号表时靠它的 FDE 边界兜底 */
+  const Elf64_Shdr *ehsec = NULL;
+  if (eh->e_shstrndx < eh->e_shnum) {
+    size_t no = (size_t)eh->e_shoff + (size_t)eh->e_shstrndx * eh->e_shentsize;
+    if (no + sizeof(Elf64_Shdr) <= sz) {
+      const Elf64_Shdr *sn = (const Elf64_Shdr *)(b + no);
+      if (sn->sh_offset < sz) {
+        const char *nmb = (const char *)(b + sn->sh_offset);
+        size_t nl = sn->sh_size;
+        if (sn->sh_offset + nl > sz) nl = sz - sn->sh_offset;
+        for (int i = 0; i < eh->e_shnum; i++) {
+          size_t o = (size_t)eh->e_shoff + (size_t)i * eh->e_shentsize;
+          if (o + sizeof(Elf64_Shdr) > sz) break;
+          const Elf64_Shdr *sh = (const Elf64_Shdr *)(b + o);
+          if (sh->sh_name >= nl || sh->sh_type == SHT_NOBITS) continue;
+          const char *cn = nmb + sh->sh_name;
+          size_t rem = nl - sh->sh_name;                  /* ".eh_frame" 精确匹配，排除 _hdr */
+          if (rem > 9 && !strncmp(cn, ".eh_frame", 9) && cn[9] == 0) { ehsec = sh; break; }
+        }
+      }
+    }
+  }
   const Elf64_Shdr *use = NULL;
   size_t nsym = 0;
   const Elf64_Shdr *dyn = NULL;
@@ -256,20 +451,20 @@ static void elf_parse(Elf *e) {
     else if (sh->sh_type == SHT_DYNSYM && !dyn) dyn = sh;
   }
   if (!use && dyn) { use = dyn; nsym = dyn->sh_size / dyn->sh_entsize; }
-  if (!use || !use->sh_entsize) return;
+  if (!use || !use->sh_entsize) { elf_fde_try(e, ehsec); return; }
   size_t so = use->sh_offset;
   size_t st = use->sh_link < (size_t)eh->e_shnum ? (size_t)eh->e_shoff + use->sh_link * eh->e_shentsize : 0;
-  if (!st || st + sizeof(Elf64_Shdr) > sz) return;
+  if (!st || st + sizeof(Elf64_Shdr) > sz) { elf_fde_try(e, ehsec); return; }
   const Elf64_Shdr *str = (const Elf64_Shdr *)(b + st);
-  if (str->sh_offset >= sz) return;
+  if (str->sh_offset >= sz) { elf_fde_try(e, ehsec); return; }
   size_t strsz = str->sh_size;
   if (str->sh_offset + strsz > sz) strsz = sz - str->sh_offset;
   const char *strb = (const char *)(b + str->sh_offset);
   if (nsym > MAXJIT) nsym = MAXJIT;
   if (so + nsym * use->sh_entsize > sz) nsym = (sz > so) ? (sz - so) / use->sh_entsize : 0;
-  if (!nsym) return;
+  if (!nsym) { elf_fde_try(e, ehsec); return; }
   Sym *arr = malloc(nsym * sizeof(Sym));
-  if (!arr) return;
+  if (!arr) { elf_fde_try(e, ehsec); return; }
   int n = 0;
   for (size_t i = 0; i < nsym; i++) {
     const Elf64_Sym *sy = (const Elf64_Sym *)(b + so + i * use->sh_entsize);
@@ -283,7 +478,7 @@ static void elf_parse(Elf *e) {
     arr[n].nm = (char *)nm;
     n++;
   }
-  if (!n) { free(arr); return; }
+  if (!n) { free(arr); elf_fde_try(e, ehsec); return; }
   qsort(arr, n, sizeof(Sym), symcmp);
   e->s = arr; e->n = n;
 }
@@ -343,6 +538,22 @@ static const char *elf_sym(Elf *e, unsigned long fileoff) {
     if (e->s[mid].v <= va) { best = mid; lo = mid + 1; } else hi = mid - 1;
   }
   return (best < 0) ? NULL : e->s[best].nm;
+}
+
+/* 无符号表时的兜底：命中 FDE 范围就返回 sub_<入口地址> */
+static const char *elf_fde(Elf *e, unsigned long fileoff) {
+  static char buf[32];
+  if (!e || !e->f || !e->nf) return NULL;
+  unsigned long long va = off2va(e, fileoff);
+  if (!va) return NULL;
+  int lo = 0, hi = e->nf - 1, best = -1;
+  while (lo <= hi) {
+    int mid = lo + (hi - lo) / 2;
+    if (e->f[mid].b <= va) { best = mid; lo = mid + 1; } else hi = mid - 1;
+  }
+  if (best < 0 || va >= e->f[best].e) return NULL;
+  snprintf(buf, sizeof buf, "sub_%llx", e->f[best].b);
+  return buf;
 }
 
 /* ------------------------------------------------------------------ maps */
@@ -741,7 +952,15 @@ static char *run_probe(const char *in) {
         Elf *e = elf_get(m->path);
         const char *s = elf_sym(e, ip - m->start + m->off);
         if (s) sname = s;
-        else sname = "[nosym]";
+        else {
+          s = elf_fde(e, ip - m->start + m->off);
+          if (s) sname = s;
+          else {                      /* 连 FDE 都没有：至少给 模块+偏移 */
+            static char nb[160];
+            snprintf(nb, sizeof nb, "%s+0x%lx", base_name(m->path), ip - m->start + m->off);
+            sname = nb;
+          }
+        }
       } else if (m && m->path[0] == '[') {
         oname = m->path; sname = m->path;
       } else {
