@@ -483,6 +483,23 @@ function M:estimate_tokens(chars)
     return math.floor((chars or 0) * r)
 end
 
+-- 这条请求装得下吗？chars 是消息字符数（不含 schema），reserve 是还没拼上的尾巴
+-- （召回块 + runtime block）。
+-- 口径比 request_stream 的本地自检**偏保守**：这里算 schema（工具定义也进
+-- prompt_tokens），也不会因为没校准过就把未知当安全 —— 救场要一次到位，
+-- 少算一点就又是「压完仍超线」的下一轮。
+function M:request_fits(chars, reserve)
+    local s = self.ctx.settings or {}
+    local window = tonumber(s.context_window) or 0
+    if window <= 0 then return true end          -- 没配窗口 = 没有可判的线
+    local r = self:tok_per_char()
+    if not r or r <= 0 then return true end      -- 未校准：不拿经验值当硬判决
+    local est = math.floor(((chars or 0) + (tonumber(reserve) or 0)
+        + self:schema_chars()) * r)
+    local min_out = (self.provider and self.provider.MIN_OUT) or 1024
+    return window - est - (tonumber(s.reserve_tokens) or 0) >= min_out
+end
+
 -- 丢弃优先（默认）：不摘要，靠 hard_window 从最新往回装，更老的整条丢，
 -- 需要时让模型自己 recall。settings.compact=true（LITE_COMPACT=1）恢复旧策略。
 function M:drop_first()
@@ -721,11 +738,16 @@ end
 -- 踩过一次很难复现的坑：hard_window 返回 (msgs, trimmed, dropped, dropped_chars)，
 -- 第一个是**消息表**不是布尔，误当 `trimmed, dropped, chars` 解包就会在这条救场
 -- 路径上抛 "attempt to compare number with boolean" —— 本该救场的压缩变成整轮崩。
+-- budget 是**整条请求**的预算，fixed 成本（system/digest/schema）先扣掉：
+-- 不扣就会出现「按 budget*ratio 裁完，加上 system 又超线」—— 救场路径上
+-- 少扣这一次 fixed 成本，等于把天花板往下挪的同时把地板往上抬。
 function M:shrink_hard(ratio)
     local c = self:compactor()
     ratio = tonumber(ratio) or 0.7
+    local budget = math.floor(c.budget * ratio) - self:overhead_chars()
+    if budget < 0 then budget = 0 end
     local kept, trimmed, dropped, chars =
-        self:hard_window(self:view_messages(), math.floor(c.budget * ratio))
+        self:hard_window(self:view_messages(), budget)
     if not trimmed then return nil end
     -- 重试换了前缀基座，必须记一次 reset：漏了它，retry 之后那条请求会被算进
     -- miss_clean，把"trim 的白付成本"摊薄。但它**不是**一次用户可见的 trim：
@@ -733,6 +755,62 @@ function M:shrink_hard(ratio)
     self.ctx:note_cache_reset(dropped > 0 and "hard_window" or "other",
         { dropped = dropped, chars = chars, retry = true })
     return kept
+end
+
+-- 上下文重建：压缩之后**仍然**超过上限时，不是「再压一次试试」，而是按尺寸重算。
+--
+-- 为什么试探式救不了：maybe_compact 摘要完规模还是超线时，shrink_hard 只按
+-- budget*ratio 砍一刀，然后看 hard_window 有没有 trim —— 而 sticky 前沿一旦
+-- 觉得「上一轮窗口还装得下」就返回 trimmed=false，于是救场变成「宁可报错交白卷」。
+-- 用户看得见的结果就是那一屏 `input 61795 leaves only 141`。
+--
+-- 所以这里改成算出来：目标 = min(配置的 context_chars, (window-reserve)/tok_per_char)
+-- × keep（默认 0.6，就是「滑动窗口只取 60%」），先扣 fixed 成本，解除 sticky，
+-- 再逐档减半（1, 1/2, 1/4, 1/8, 0）；每档都用 request_fits 真的验一次装不装得下，
+-- 装得下就停（能多留就多留）。最后一档 budget=0 靠 hard_window 的地板（最后两条
+-- + 本轮 user）兜底。返回重启后的消息表；连地板都装不下则返回 nil。
+function M:rebuild_window(keep, reserve)
+    local s = self.ctx.settings or {}
+    local c = self:compactor()
+    keep = tonumber(keep) or 0.6
+    local target = math.floor(c.budget * keep)
+    local window = tonumber(s.context_window) or 0
+    local r = self:tok_per_char()
+    if window > 0 and r and r > 0 then
+        -- token 侧换算出的字符天花板：这才是真正的硬边界，字符预算只是代理。
+        local allowed = window - (tonumber(reserve) or 0) - (tonumber(s.reserve_tokens) or 0)
+            - self:schema_chars()
+        local chars = math.floor(allowed / r)
+        if chars > 0 and chars < target then target = chars end
+    end
+    if target < 0 then target = 0 end
+    local before = Compact.total(self:view_messages())
+    local overhead = self:overhead_chars()
+    local kept, info
+    for _, f in ipairs({ 1, 0.5, 0.25, 0.125, 0 }) do
+        local budget = math.floor(target * f) - overhead
+        if budget < 0 then budget = 0 end
+        -- 解除粘性前沿：它省的是缓存位移，压不动的时候它就是障碍。
+        self._hw_anchor = nil
+        local k, trimmed, dropped, chars = self:hard_window(self:view_messages(), budget)
+        if trimmed then
+            local total = Compact.total(k)
+            kept, info = k, { total = total, dropped = dropped, chars = chars, factor = f }
+            if self:request_fits(total, reserve) then break end
+            -- f=0 仍装不下：地板已经是「最后两条 + 本轮 user」，没有更小的合法请求了
+        end
+    end
+    if not kept then return nil end
+    -- 没真丢东西（只是换了前沿）也算一次重建：前缀基座变了，账要分开记，
+    -- 否则重建的白付成本会被摊进 miss_clean。
+    self.ctx:note_cache_reset(info.dropped > 0 and "hard_window" or "other",
+        { dropped = info.dropped, chars = info.chars, rebuild = true })
+    self.ctx:emit("compact", {
+        ok = true, reason = "rebuild", dropped = info.dropped,
+        chars = info.chars, before = before, after = info.total,
+        factor = info.factor,
+    })
+    return kept, info
 end
 
 -- 组装发出去的完整消息列表：视图 + 召回块。
@@ -1179,12 +1257,17 @@ function M:_loop(text, stream)
     -- 上下文超限的补救：先摘要压缩，压不动就硬裁到 budget 的 ratio 倍。
     -- 三条触发路径（provider 报 overflow / 本地算出没空间 / 空回复被 length 截断）
     -- 共用同一份，免得各写一遍、各自漏记 cache reset。
+    -- 顺序是「摘要 → 验 → 重建」：压缩成功不代表装得下（摘要本身就有几百字符，
+    -- 而且摘要换掉了原文却不一定变小）。所以压完先 request_fits 验一次，
+    -- 还超线就直接重建窗口，而不是再压一次去赌。
     local function recover_context(ratio, inject)
         local compacted = self:maybe_compact(stream, 0, true)
         if compacted then
-            return self:request_messages(text, stream, { inject_context = inject })
+            local retry = self:request_messages(text, stream, { inject_context = inject })
+            if self:request_fits(Compact.total(retry)) then return retry end
+            return self:rebuild_window(ratio) or retry
         end
-        return self:shrink_hard(ratio)
+        return self:shrink_hard(ratio) or self:rebuild_window(ratio)
     end
 
     for iter = 1, max_turns do

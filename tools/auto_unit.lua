@@ -468,6 +468,67 @@ do
         { role = "user", content = "NEW-REQUEST" },
     }
     check(anchor_agent:compact_state().baseline == 1, "missing compact anchor rebases to head")
+
+    -- 压缩后仍超线 → 必须重建窗口，不能「再压一次」也不能交白卷。
+    -- 复现的就是真机那一屏 `input 61795 leaves only 141`：摘要做完了、字面预算
+    -- 看着还富裕（context_chars 200k），但 token 侧窗口装不下 ——
+    -- shrink_hard 按 0.7 裁一刀发现「一条都不用丢」返回 nil，救场就此死掉。
+    local function rebuild_fixture(window, reserve)
+        local rctx = Context.new({
+            cwd = "/tmp", max_turns = 4,
+            context_chars = 200000, context_window = window,
+            reserve_tokens = reserve, model = "deepseek-flash",
+        })
+        local msgs = { { role = "system", content = "SYS" } }
+        for i = 1, 20 do
+            msgs[#msgs + 1] = { role = "user", content = ("Q%02d-"):format(i) .. string.rep("q", 2000) }
+            msgs[#msgs + 1] = { role = "assistant", content = ("A%02d-"):format(i) .. string.rep("a", 2000) }
+        end
+        msgs[#msgs + 1] = { role = "user", content = "REBUILD-CURRENT" }
+        rctx.session.messages = msgs
+        -- 校准 chars→tokens 比：0.5（真机 DeepSeek 量级），否则 request_fits 无从判断。
+        rctx.session.usage.last = { prompt = 40000 }
+        local a = Agent.new(rctx, { stream = function() end, MIN_OUT = 1024 },
+            { schemas = function() return {} end }, { append = function() end })
+        a._last_request_chars = 80000
+        a._compact_state = nil
+        return a, rctx
+    end
+
+    local Compact = require("core.compact")
+    local ra, rctx = rebuild_fixture(40000, 8192)
+    local before_chars = 0
+    for _, m in ipairs(rctx.session.messages) do
+        if type(m.content) == "string" then before_chars = before_chars + #m.content end
+    end
+    check(not ra:request_fits(before_chars, 0), "rebuild fixture starts over the line")
+    check(ra:shrink_hard(0.7) == nil, "shrink_hard gives up when nothing may be dropped")
+    local rbuilt, rinfo = ra:rebuild_window(0.7)
+    check(rbuilt ~= nil, "rebuild_window builds a request when packing is over the line")
+    local rkept_user, rkept_chars, rkept_old = false, 0, false
+    for _, m in ipairs(rbuilt or {}) do
+        if type(m.content) == "string" then
+            rkept_chars = rkept_chars + #m.content
+            if m.content == "REBUILD-CURRENT" then rkept_user = true end
+            if m.content:find("Q01-", 1, true) then rkept_old = true end
+        end
+    end
+    check(rkept_user, "rebuild keeps the current user")
+    check(not rkept_old, "rebuild drops the oldest history")
+    check(rkept_chars < before_chars, "rebuild shrinks the request")
+    check(ra:request_fits(rkept_chars), "rebuilt request fits the token window")
+    check(rinfo and rinfo.total == Compact.total(rbuilt), "rebuild reports what it kept")
+
+    -- 更狠的窗口：60% 仍装不下 → 必须逐档减半，而不是原样发出去再撞墙。
+    local ta = rebuild_fixture(12000, 512)
+    local tbuilt, tinfo = ta:rebuild_window(0.6)
+    check(tbuilt ~= nil and tinfo and tinfo.factor < 1,
+        "rebuild halves the target until the request fits")
+    local tchars = 0
+    for _, m in ipairs(tbuilt or {}) do
+        if type(m.content) == "string" then tchars = tchars + #m.content end
+    end
+    check(ta:request_fits(tchars), "halved rebuild fits the token window")
 end
 
 -- tools

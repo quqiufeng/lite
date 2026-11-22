@@ -166,6 +166,10 @@ export LITE_MEMDB_SPLIT=1                        # 仅在多机 NFS 上用：退
 更老的整条丢，`session.messages` 和记忆一条不删 —— 「压缩」在这里只是缩小发出去的窗口。
 `LITE_COMPACT=1` 恢复三段式摘要（稳定前缀 / 结构化 digest / 近期原文尾巴）。
 `/compact` 手动把窗口滑到 `budget*LITE_KEEP_RATIO`。
+摘要后**仍然**超线时不再「再压一次」赌运气，而是重建窗口：按
+`min(context_chars, (context_window - reserve)/tok_per_char) × 0.6` 算出目标、扣掉
+system/schema 固定成本、解除 sticky 前沿，逐档减半直到这条请求真装得下
+（退到最后一档仍保底「最后两条 + 本轮 user」）。见 `lua/core/agent.lua:rebuild_window`。
 
 ## 环境变量
 
