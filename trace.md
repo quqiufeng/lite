@@ -52,6 +52,7 @@ tracefs 目录是 `0700 root`：非 root **读不到内容 ≠ 没挂载**，`st
 
 `/proc/kallsyms` → `/boot/System.map-$(uname -r)` → `/boot/System.map`（内核侧）；
 `/tmp/perf-<pid>.map` → ELF `.symtab`/`.dynsym` → `.eh_frame` FDE → `模块+文件偏移`（用户侧）。
+第一层对 LuaJIT 是 `jitmap.lua` 自动写，对 **Chez AOT 产物（StaticPy）要程序自己写**（`lib/chez-perfmap.scm`，见 §10）。
 
 ### 2.4 出图（PNG）
 
@@ -157,6 +158,8 @@ luajit lua/trace/engine.lua   ← 独立 CLI，可脱离 lite 直接跑
 `模块名+0x偏移`（可直接喂 `addr2line -e libfoo.so 0xoffset`）。开 `--sym` 再往深走：
 
 1. `/tmp/perf-<pid>.map`：JIT（LuaJIT/Node/JVM）运行时地址表，绝对地址，优先命中；
+   Chez AOT 产物的顶层过程也走这张表（AOT 码在匿名可执行区，ELF 里查不到）——
+   lite 的输出把**所有**来自这张表的帧都标成 `[jit]`，别误以为是 LuaJIT；
 2. 模块 ELF：先按 `PT_LOAD` 把文件偏移折回 vaddr，再在 `.symtab`（strip 后只剩 `.dynsym`）
    二分最近的 `STT_FUNC`；
 3. 无符号表 → 解 `.eh_frame` 的 **FDE**（`[pc_begin, pc_end)`）。FDE strip 不掉
@@ -269,6 +272,7 @@ trace action=render json_in=/tmp/t.json kind=flame out=/tmp/f.svg  # 换图不�
 |---|---|---|
 | 非 root 且无 `CAP_PERFMON` | 内核对 `perf_event_open` 的硬限制 | 配 `sudo -n` NOPASSWD，或有 `perf_event_paranoid` 放宽的场景 |
 | 纯解释执行的 Lua 帧 | native 栈上只有解释器 C 帧 | `luasamp.lua` hook 采样 |
+| Chez AOT 产物的 lambda/内联代码 | AOT 码在匿名可执行区，perfmap 只能标顶层过程入口 | `STATICPY_PROFILE=source` + `sprof` 出到行（§10.4） |
 | 行号 / 内联展开 | 需要 debuginfo，`.eh_frame` 只有函数边界 | `addr2line -e <模块> <偏移>`（engine 已给出文件偏移） |
 | KASLR 内核 + 非 root 的精确符号 | `System.map` 是链接时地址，整体平移未知 | 以 root 跑（`/proc/kallsyms` 可读）；或只看导出符号 |
 | `strip -s` 后的函数名 | 名字被删了，FDE 只能给 `sub_<地址>` | 保留符号表 / 装 debuginfo / 用 build-id 找 ddebs |
@@ -345,3 +349,112 @@ engine 自己的 `folded` 是 `leaf-first`。**改这个字段会让三张图上
 
 `tools/test.sh` 的 `== trace ==` 段在拿不到 root 时 **SKIP 而不是 FAIL**：环境问题不算回归。
 改了 engine/render 之后，还要至少跑一次真实出图（`--tui --snapshot` 不适用，直接 `read` PNG）。
+
+## 10. 优化 StaticPy 产物（Chez AOT）怎么办
+
+StaticPy 的产物是「Chez AOT 编出的匿名可执行段 + 独立 ELF」。它不像 LuaJIT 有 `jitmap.lua`，
+也不像 C 程序有完整符号表——**默认 68% 的样本是 `[anon]`**（translator 实测），
+直接看成"热点不可读"。这一章给出把 `[anon]` 变成可改名字的完整闭环。
+
+### 10.1 先选层：名字 / 行 / 库，三层不重叠
+
+| 你想知道 | 用什么 | 得到的名字 | 天花板 |
+|---|---|---|---|
+| 哪个**顶层过程**在烧 CPU | perfmap 自报 + `oncpu`/perfprobe | `static_tget`、`string-hash`、`sweep_generation_pass` | 只覆盖顶层过程；lambda/内联代码仍是 `[anon]` |
+| 哪**一行 Python** 在烧 CPU | `STATICPY_PROFILE=source` + `dist/sprof` | `parse_lib.static.py:541` | 要专门重编一次；只归因 py 侧，Scheme 运行时算在 runtime 名下 |
+| 哪个 **C 库/GC** 在烧 CPU | `oncpu` 默认就够（不用额外准备） | `libc.so.6+0x188d80`、`libstaticpyrt.so` 内的 `sweep_generation_pass` | strip 过的库只能到 `sub_<入口>` |
+
+判据：**先跑 §10.2 拿到函数级**（免重编、一次到位），**只有需要精确到行才上 §10.4**。
+
+### 10.2 让产物自报名字（构建期门禁）
+
+```bash
+# 1. 翻译这一步带环境变量：IR 里就会多出一段"运行期自报"的调用
+STATICPY_PERFMAP=1 ./dist/translator app.static.py > ~/iso_gen/app.code.scm
+#    （走 build 脚本也行：翻译在脚本内部跑，env 一样生效）
+bash staticpy/static_build_comfycli.sh ~/iso_gen/app.code.scm app
+# 2. 直接采，不用任何附加动作：产物启动时自己写 /tmp/perf-<pid>.map
+perfprobe argv=["/opt/StaticPy/dist/app"] freq=199
+```
+
+原理只有五条，不需要任何名字表：
+
+1. `(environment-symbols (interaction-environment))` 在 **AOT 产物里能枚举到全部顶层符号**
+   ——程序自己的定义 + 内联进去的库 + prelude，全在。
+2. `top-level-value` 对未绑定名抛**普通条件**，`guard` 兜得住，所以可以闭眼逐个探。
+3. `(object->reference-address p)` 掩掉低 3 位就是 code entry。
+4. 码长用「与下一个入口的间距」估，上限 `#x2000`（没跑过的函数估不准，宁短勿长）。
+5. 写在 `(static_main)` **之后**：函数跑过一轮，对象才稳定指向代码段。
+
+覆盖量：translator 从 **399 条 → 2283 条（5.7×）**。构建期门禁只影响这份 IR，
+**不开 `STATICPY_PERFMAP` 时 IR 逐字节不变**（`n5` → 2104828 B，`cmp` 通过）。
+
+### 10.3 读结果：哪类名字代表什么
+
+采样 translator 后的真实分布（`[jit]` 占 25.3%，全部有名）：
+
+| 名字 | 占比 | 是什么 |
+|---|---|---|
+| `[anon]` | 45.8% | lambda / 内联展开 / 闭包体 —— **perfmap 的固有上限**，只能靠 §10.4 |
+| `sweep_generation_pass` | 10.2% | Chez GC 清扫 |
+| `string-hash` / `string=?` / `dict-get` | 4.0 / 3.1 / 2.7% | **符号表/字典查找**——合集约 10%，是最肥的可改块 |
+| `static_tget` | 1.8% | tokenizer 读字符（`int_array_ref` 每次都调） |
+| `sub_188d80`（libc） | 3.1% | `__memmove_avx_unaligned_erms`（AVX2 版 memmove） |
+
+**经验判读**：
+- 名字带 `static_` 前缀 = 程序自己的顶层函数；不带前缀且不是 C 库 = prelude（内联进来的）。
+- `[jit]` 不是 LuaJIT；在 Chez AOT 场景它就是"自报的那批顶层过程"。
+- libc 里 `sub_<地址>` 且落地在 `vmovdqu` + `and $-32` = AVX2 `memmove/memcpy` 变体，
+  优化方向是**减少调用次数与字节数**（列表增长、结构体拷贝），而不是调 GC。
+- 看到 `__nss_database_lookup`、`malloc` 这类"一眼不对"的大头，先怀疑符号归因
+  （IFUNC 变体没有 `st_size`，会被折到最近的前一个符号上），别顺着它优化。
+
+### 10.4 行级：sprof（perfmap 代替不了）
+
+```bash
+STATICPY_PROFILE=source STATICPY_CACHE=$HOME/iso_gen/prof-cache \
+  STATICPY_OUTDIR=$HOME/iso_gen/prof_src bash staticpy/static_build_comfycli.sh app.static.py app
+./dist/app && ./dist/sprof --top=15        # 读 ~/iso_gen/prof/*.prof
+```
+
+输出两截：**py 行**（`parse_binop_left` 4.1%、`tget` 11.4% 之类，直接对着改）
+与 **runtime 过程名**（`py-list-ref` 12.3%、`str_code_at` 4.3%），后者和 §10.2 的
+函数级画像能对上号。注意 source 模式要**独立 cache 目录**，否则污染正常构建缓存。
+
+### 10.5 改完怎么判断"真的快了"
+
+1. **A/B 交替**：两个二进制放不同目录，交替跑 10+ 轮，比 **min**（或 med）；
+   单次读数在 ±5% 抖动，同一台机器上"看起来快了"经常是噪声。
+2. **IR 门禁**：`dist/translator ~/iso_gen/n5.static.py` 必须仍是 2104828 B 且 `cmp` 一致
+   ——emit 侧改动最容易悄悄改变输出。
+3. **四层验收**（改翻译器/runtime 时）：`check_tokenize.sh` → `check_parse.sh` →
+   `check_translate.sh` → `semantics_diff.py`；插件单一真源 `tools/split_plugins.py --check`
+   必须报「变更 0 个文件」。
+4. **分层优化顺序**：先砍**调用次数/字节数**（memmove、`py-list-length` 重复算），
+   再谈标量特化——translator 上多个"局部加速"方案实测是负收益，别凭直觉改。
+
+### 10.6 别的 Chez AOT 项目也能用
+
+自报逻辑不依赖 StaticPy，通用件是 `lib/chez-perfmap.scm`（66 行，只依赖 Chez 自带过程）：
+
+```scheme
+(load "chez-perfmap.scm")
+... (main) ...
+(chez-perfmap-publish!)      ; 必须放最后
+```
+
+纯 `.scm` 通道（不走 StaticPy）实测 1967 条，程序自己的定义在册，码长也估对了。
+StaticPy 的 `emit_lib` 只是把同一段代码内联进 IR。
+
+### 10.7 这一层的坑
+
+- **map 是 per-pid 的**：进程退出即失效；要复现必须"当次采、当次写"，地址每轮都漂（ASLR + 分配顺序）。
+- **只有顶层过程有名**：`[anon]` 45% 是常态，别指望把火焰图里每一帧都点亮。
+- **`publish` 必须在 `(main)` 之后**：早调会让"首字指向代码段"这条不成立，名字全丢。
+- **IFUNC/strip**：libc 的 memcpy/memset 是一堆 17 字节的变体，归因必须按 `st_size` 判界内，
+  否则会出现 37.8% 的假热点（踩着 `.eh_frame` FDE 才收敛成一个 `sub_<addr>`）。
+- **别把 `STATICPY_PERFMAP` 当成常开**：它只影响 IR 里那一段，但开了就和基准 IR 不同，
+  做性能对照时两边必须同时开或同时关。
+- **StaticPy 侧的说明**在 `docs/HOTATTR.md`（§「更省事的路径」）；`hotattr` 是另一条
+  **不重编**的路（按 4K/64B 切块命名），名字是坐标而非函数名，适合"先定位再决定要不要重编"。
+
