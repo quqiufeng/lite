@@ -446,8 +446,9 @@ STATICPY_PROFILE=source STATICPY_CACHE=$HOME/iso_gen/prof-cache \
 
 ```scheme
 (load "chez-perfmap.scm")
+(chez-perfmap-publish!)      ; ① 起手先发一次：live 采样才看得见名字
 ... (main) ...
-(chez-perfmap-publish!)      ; 必须放最后
+(chez-perfmap-publish!)      ; ② 收尾再发一次覆盖：修准尺寸与首调漂移
 ```
 
 纯 `.scm` 通道（不走 StaticPy）实测 1967 条，程序自己的定义在册，码长也估对了。
@@ -457,7 +458,14 @@ StaticPy 的 `emit_lib` 只是把同一段代码内联进 IR。
 
 - **map 是 per-pid 的**：进程退出即失效；要复现必须"当次采、当次写"，地址每轮都漂（ASLR + 分配顺序）。
 - **只有顶层过程有名**：`[anon]` 45% 是常态，别指望把火焰图里每一帧都点亮。
-- **`publish` 必须在 `(main)` 之后**：早调会让"首字指向代码段"这条不成立，名字全丢。
+- **`publish` 要发两次（起手 + 收尾），别只发末尾**：只在最后发，map 直到进程退出前
+  才落盘，而 `trace oncpu --sym` / `perfrecord` 这类**边采边符号化**的工具在样本到手的
+  那一刻就去读表 → 整个运行期只见 `[anon]`，自报等于白做（实测：同程序仅末尾发布，
+  进程跑到 t≈1s 时 `/tmp/perf-<pid>.map` 根本不存在）。
+  早调的顾虑——"过程首字还没指向代码段"——实测不成立：1550 个顶层的纯 Chez 产物，
+  起手发布 **1550/1550 条已落在可执行段**，与收尾发布地址一致率 **99.6%**
+  （漂移的只有"自报时还没跑过"的那几个）。收尾那次负责把尺寸/漂移修准。
+  StaticPy 产物实测：t≈50ms 表即落盘，`--sym` 直接给出 `static_spin` / `remainder` / `py-mod`。
 - **IFUNC/strip**：libc 的 memcpy/memset 是一堆 17 字节的变体，归因必须按 `st_size` 判界内，
   否则会出现 37.8% 的假热点（踩着 `.eh_frame` FDE 才收敛成一个 `sub_<addr>`）。
 - **别把 `STATICPY_PERFMAP` 当成常开**：它只影响 IR 里那一段，但开了就和基准 IR 不同，
