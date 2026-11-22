@@ -3,6 +3,7 @@
 `perf_event_open` + 内核 tracefs 探针，在 lite 进程外起一个 luajit 采样子进程，
 把结果折成火焰图 / 热力图 / 卡点排行。工具入口是 `helper/trace.lua`（action=run/render/status），
 本目录是**正式模块**：进仓库、有单测（`tools/auto_unit.lua`）、接口稳定。
+实现原理 / 依赖 / 能力边界见 [trace.md](trace.md)（本文只讲怎么用）。
 
 | 文件 | 职责 |
 |---|---|
@@ -51,7 +52,11 @@ trace action=render json_in=/tmp/t.json kind=flame out=/tmp/f.png   # 从 JSON �
   「没挂载」和「挂了但非 root 读不到内容」。
 - 内核开关：`FTRACE` / `TRACEPOINTS` / `PERF_EVENTS` / `KPROBE_EVENTS` / `UPROBES`。
   `events=0` 先看 status 的五环，别在 Lua 侧乱改。
-- `--sym` 依赖 kallsyms；`kptr_restrict≠0` 时符号会糊，status 里会提示。
+- `--sym` 依赖 kallsyms；`kptr_restrict≠0` 时 `/proc/kallsyms` 的地址全是 0，engine 退到
+  `/boot/System.map-<release>`（同一份数据，自编内核可读）。查「到底用的哪个源」：
+  `engine.lua --ksym` → `216997 条  源=/boot/System.map-<rel>`。注意 System.map 是**链接时**
+  地址：KASLR 开机的内核帧带平移，退化路解不出来（`sym()` 的 `off >= 0x20000` 守卫会挡住，
+  宁可不给名字也不给错名字）；root 下 `/proc/kallsyms` 可读，不走这条。
 - ring 溢出（`lost`/`throttled`）说明统计偏小 → 调大 `ring_size`（页数，默认 8=32KB/CPU，
   oncpu/offcpu/folded 插件默认给 64）或收窄探针。
 - `pid=` 跟**进程的全部线程**（展开 `/proc/PID/task`），内核里 `common_pid` 是 tid 不是 tgid。
@@ -162,5 +167,10 @@ trace action=prof path=/tmp/pf.json   # 读退出时落的快照（进程已退 
 `./tools/test.sh` 里的 `trace *` 用例覆盖：探针参数归一、summary 各模式输出、
 SVG 生成与尺寸、PNG 转换（缺库时跳过）、engine 的 JSON 字段契约；
 内核侧真采样不进单测（要 root，机器相关），靠 `action=status` + `count` 现场验。
+
+`tools/trace_check.lua`（`== trace ==` 段）钉的是**符号化**这一层：`--ksym` 必须报出源与
+条数（非 root 下 = System.map 退化路），`--sym` 采现场编的 spin fixture 必须出 `hot_alpha`，
+`strip -s` 后必须出 `sub_<入口>`（`.eh_frame` FDE）。用户态那半要 `perf_event_open`，
+脚本走 `sudo -n`，拿不到 root 就 SKIP——环境问题不算回归。
 `prof` 的记账/聚合/落盘读回/关闭语义与 `action=prof`（含空账本退化读快照）在
 `tools/auto_unit.lua` 的 `trace.prof` 段。

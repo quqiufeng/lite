@@ -37,6 +37,15 @@ if ! timeout 120 "$ROOT/tools/lite-lua" "$ROOT/tools/perfprobe_check.lua"; then
     echo "FAIL perfprobe" >&2; exit 1
 fi
 
+echo "== trace =="
+# engine 两侧符号化（lua/trace/engine.lua）：① kptr_restrict>0 时非 root 读
+# /proc/kallsyms 地址全 0，必须退到 /boot/System.map-<release>（--ksym 自检直接问）；
+# ② strip -s 的二进制没有 .symtab，只剩 .eh_frame 的 FDE，栈里必须出 sub_<入口>
+# 而不是整屏 0x55b3…（用户态那侧要 perf_event_open，走 sudo -n，没权限就 SKIP）。
+if ! timeout 120 "$ROOT/tools/lite-lua" "$ROOT/tools/trace_check.lua"; then
+    echo "FAIL trace" >&2; exit 1
+fi
+
 echo "== http =="
 # 无数据超时（LITE_HTTP_LOW_SPEED_TIME）：桩服务端 accept 后一个字节不回（半开，
 # 模拟 LB 黑洞 / 进程被 kill 而 socket 还挂着），此时必须在 ~3s 收场且 rc=28，

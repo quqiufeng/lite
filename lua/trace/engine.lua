@@ -645,6 +645,7 @@ do
     elseif a == "--rank-top" then opt.rank_top = tonumber(val())
     elseif a == "--rank-by"  then opt.rank_by = tostring(val())
     elseif a == "--sym"      then opt.sym = true
+    elseif a == "--ksym"     then opt.ksym = true
     elseif a == "--json"     then opt.json = true
     else io.stderr:write("未知参数: "..tostring(a).."\n") os.exit(2) end
     i = i + 1
@@ -696,7 +697,7 @@ else
   end
 end
 -- --folded-in 不吃 perf：读文件出图，不需要任何探针（hook 采样路因此不用 root）
-if #probes == 0 and opt.mode ~= "oncpu" and not opt.folded_in then fail("没有探针") end
+if #probes == 0 and opt.mode ~= "oncpu" and not opt.folded_in and not opt.ksym then fail("没有探针") end
 local by_id = {}
 for _, p in ipairs(probes) do by_id[p.id] = p end
 
@@ -901,6 +902,7 @@ end
 -- folded：内核栈符号化
 ------------------------------------------------------------------------
 local ksym_addr = nil            -- nil = 未加载（不能初始化成 {}，否则缓存哨兵失效）
+local ksym_src = nil             -- 符号从哪来：/proc/kallsyms 或 /boot/System.map-<rel>
 -- 内核地址超出 double 精度(2^53)：全程 16 位小写 hex 字符串比较（等长 hex 字典序 == 数值序）
 local function hxstr(a)
   a = tostring(a):lower():gsub("0x", "")
@@ -908,15 +910,55 @@ local function hxstr(a)
   return a:sub(-16)
 end
 
+-- 往 lines 里塞一份 kallsyms/System.map 格式的文本，返回非零地址条数。
+local function ksym_parse(lines, txt)
+  local nz = 0
+  for line in (txt or ""):gmatch("[^\n]+") do
+    local addr, nm = line:match("^(%x+)%s+%a%s+([%w_%.]+)")
+    if addr then
+      local h = hxstr(addr)
+      if h ~= "0000000000000000" then nz = nz + 1 end
+      lines[#lines+1] = { h, nm }              -- 直接存原串，不经过 tonumber
+    end
+  end
+  return nz
+end
+
 local function load_kallsyms()
   if ksym_addr then return end
-  local txt = rf("/proc/kallsyms") or ""
   local lines = {}
-  for addr, ty, nm in txt:gmatch("(%x+)%s+(%a)%s+([%w_%.]+)") do
-    lines[#lines+1] = { hxstr(addr), nm }      -- 直接存原串，不经过 tonumber
+  -- kptr_restrict=1 时非特权进程读 /proc/kallsyms 全是 0：名字还在，地址被糊掉。
+  -- 自编内核的 /boot/System.map-<release> 是明文、可读、已排序，是同一份数据。
+  ksym_src = "/proc/kallsyms"
+  if ksym_parse(lines, rf("/proc/kallsyms")) == 0 then
+    lines = {}
+    local rel = (rf("/proc/sys/kernel/osrelease") or ""):match("^%s*(.-)%s*$")
+    if rel ~= "" then
+      ksym_src = "/boot/System.map-" .. rel
+      ksym_parse(lines, rf(ksym_src))
+    end
+    if #lines == 0 then
+      ksym_src = "/boot/System.map"
+      ksym_parse(lines, rf(ksym_src))
+    end
+    for i = #lines, 1, -1 do                  -- 仍全 0 的条目留着只会骗人
+      if lines[i][1] == "0000000000000000" then table.remove(lines, i) end
+    end
   end
   table.sort(lines, function(a, b) return a[1] < b[1] end)
   ksym_addr = lines
+end
+
+-- --ksym：符号表自检 —— 报「从哪读、多少条」，不装探针、免 root。
+-- 为什么需要它：kptr_restrict>0 时非 root 读 /proc/kallsyms 地址全 0，engine 退到
+-- /boot/System.map-<release>；这条退化路没法用真采样验（内核帧要 root，而 root 下
+-- /proc/kallsyms 又可读，退化分支永远不触发），只能直接问它一句。
+if opt.ksym then
+  load_kallsyms()
+  local n = #ksym_addr
+  print(("%d 条  源=%s  最大地址符号=%s"):format(n, ksym_src or "?",
+    n > 0 and ksym_addr[n][2] or "-"))
+  os.exit(n > 0 and 0 or 1)
 end
 
 -- key: 16 位 hex 串（调用方从 uint32 高低位拼，绝不 tonumber 64 位）
@@ -1008,6 +1050,146 @@ local function read_build_id(path)
   return nil
 end
 
+-- .eh_frame 的 FDE 记着每个函数的 [pc_begin, pc_end)。它 strip 不掉（C++ 异常、
+-- 线程栈展开都靠它），所以符号表一行不剩时，它还能把「一片地址」切成一个个函数框。
+-- 只吃 DWARF32 + 常见编码；解不出就返回空表，让调用方走自己的兜底。
+local function elf_fdes(data, pl)
+  local buf = ffi.cast("const uint8_t*", data)
+  local function u8(o) return buf[o] end
+  local function u16(o) return ffi.cast("const uint16_t*", buf+o)[0] end
+  local function u32(o) return ffi.cast("const uint32_t*", buf+o)[0] end
+  local function u64(o) return tonumber(ffi.cast("const uint64_t*", buf+o)[0]) end
+  local function vaof(off)
+    for _, s in ipairs(pl) do
+      if off >= s.o and off < s.o + s.f then return s.v + (off - s.o) end
+    end
+    return nil
+  end
+  local function uleb(p)
+    local r, sh = 0, 0
+    while sh <= 63 do
+      local b = u8(p) p = p + 1
+      r = r + (b % 128) * 2^sh
+      if b < 128 then return r, p end
+      sh = sh + 7
+    end
+    return nil, p
+  end
+  local function sleb(p)
+    local r, sh = 0, 0
+    while sh <= 63 do
+      local b = u8(p) p = p + 1
+      r = r + (b % 128) * 2^sh
+      sh = sh + 7
+      if b < 128 then if b >= 64 then r = r - 2^sh end return r, p end
+    end
+    return nil, p
+  end
+  -- DW_EH_PE_*：低 4 位=格式，高 3 位=作用基准，0x80=间接（跟不了）
+  local function enc_val(e, p)
+    if e % 16 == 0 and math.floor(e / 16) % 8 == 0 then e = 0x0b end   -- absptr 当 sdata4 读更省事
+    local fmt, app, p0 = e % 16, math.floor(e / 16) % 8, p
+    if e >= 0x80 then return nil, p end
+    local v
+    if fmt == 2 then v = u16(p) p = p + 2
+    elseif fmt == 3 then v = u32(p) p = p + 4
+    elseif fmt == 4 then v = u64(p) p = p + 8
+    elseif fmt == 10 then v = u16(p) if v >= 0x8000 then v = v - 0x10000 end p = p + 2
+    elseif fmt == 11 then v = u32(p) if v >= 0x80000000 then v = v - 0x100000000 end p = p + 4
+    elseif fmt == 12 then v = u64(p) p = p + 8
+    elseif fmt == 1 then v, p = uleb(p)
+    elseif fmt == 9 then v, p = sleb(p)
+    else return nil, p end
+    if not v then return nil, p end
+    if app == 1 then                       -- pcrel(0x10)：相对指针自身所在位置
+      local a = vaof(p0)
+      if not a then return nil, p end
+      v = v + a
+    elseif app ~= 0 then return nil, p end -- datarel/textrel 不在能力范围
+    return v, p
+  end
+  local shoff, shentsize, shnum = u64(40), u16(58), u16(60)
+  local shstrndx = u16(62)
+  if shstrndx >= shnum or shentsize < 40 then return {} end
+  local stroff = u64(shoff + shstrndx * shentsize + 24)
+  local sec
+  for i = 0, shnum - 1 do
+    local o = shoff + i * shentsize
+    local q = stroff + u32(o)
+    if buf[q] == 46 and buf[q+1] == 101 and buf[q+2] == 104 and buf[q+3] == 95      -- ".eh_"
+       and buf[q+4] == 102 and buf[q+5] == 114 and buf[q+6] == 97                     -- "fram"
+       and buf[q+7] == 109 and buf[q+8] == 101 and buf[q+9] == 0 then                 -- "e\0"
+      sec = o break
+    end
+  end
+  if not sec then return {} end
+  local base, size = u64(sec + 24), u64(sec + 32)
+  local over = base + size
+  if size < 8 or over > #data then over = math.min(base + size, #data) end
+  -- 记录头：len(4) + CIE_id(4) + body；len==0xffffffff 是 DWARF64
+  local function walk(fn)
+    local p = base
+    while p + 8 <= over do
+      local len, body = u32(p), p + 4
+      if len == 0 then return end
+      local nextp
+      if len == 0xffffffff then
+        len = u64(body) body = body + 8
+        nextp = body + len
+      else
+        nextp = body + len
+      end
+      if nextp <= body or nextp > over then return end
+      fn(u32(body), body, nextp, p)          -- 末位是记录起点：FDE 的 CIE 指针相对它
+      p = nextp
+    end
+  end
+  local fenc = {}
+  walk(function(cid, body, nextp, start)             -- 第一遍：CIE 的 FDE 指针编码
+    if cid ~= 0 then return end
+    local ver, q = u8(body + 4), body + 5
+    local aug = {}
+    while q < nextp and buf[q] ~= 0 and #aug < 8 do aug[#aug+1] = string.char(buf[q]) q = q + 1 end
+    aug = table.concat(aug) q = q + 1
+    if ver >= 4 then q = q + 2 end                   -- address_size + segment_size
+    local ca; ca, q = uleb(q)
+    local da; da, q = sleb(q)
+    if not ca or not da then return end
+    if ver == 1 then q = q + 1 else local _; _, q = uleb(q) end
+    local e = 0
+    if aug:sub(1, 1) == "z" then
+      local alen; alen, q = uleb(q)
+      if not alen then return end
+      local aq, aend = q, math.min(q + alen, nextp)
+      for i = 2, #aug do
+        local c = aug:sub(i, i)
+        if c == "R" then e = u8(aq) aq = aq + 1
+        elseif c == "L" then aq = aq + 1
+        elseif c == "P" then
+          local pe = u8(aq) aq = aq + 1
+          local _, np = enc_val(pe, aq)
+          aq = np or aend
+        else aq = aend break end                     -- 不认识的增强位：本 CIE 到此为止
+      end
+    end
+    fenc[start] = e
+  end)
+  local out = {}
+  walk(function(cid, body, nextp, start)             -- 第二遍：FDE 的 pc 范围
+    if cid == 0 then return end
+    local e = fenc[body - cid]
+    if not e then return end
+    local pc, range, q
+    pc, q = enc_val(e, body + 4)
+    if not pc then return end
+    range, q = enc_val(e % 16, q)                    -- 长度只用格式位，没有作用基准
+    if range and range > 0 then out[#out+1] = { b = pc, e = pc + range } end
+  end)
+  if #out == 0 then return out end
+  table.sort(out, function(a, b) return a.b < b.b end)
+  return out
+end
+
 local function elf_syms(path)
   local c = elf_cache[path]
   if c ~= nil then return c or nil end
@@ -1060,7 +1242,9 @@ local function elf_syms(path)
   for i = 1, #syms - 1 do           -- 汇编标签常没 st_size，用下一个符号当上界
     if syms[i].sz == 0 then syms[i].sz = syms[i+1].v - syms[i].v end
   end
-  local r = { pl = pl, syms = syms }
+  local fdes = {}
+  if #syms == 0 then fdes = elf_fdes(data, pl) end   -- 有符号表就不花这个钱
+  local r = { pl = pl, syms = syms, fdes = fdes }
   if elf_n < ELF_MAX then elf_cache[path] = r elf_n = elf_n + 1 end
   return r
 end
@@ -1078,8 +1262,9 @@ end
 
 local function elf_lookup(path, fileoff)
   local e = elf_syms(path)
-  if e and #e.syms == 0 then e = elf_debug_syms(path) end
-  if not e or #e.syms == 0 then return nil end
+  -- 注意 `or e`：找不到 debuginfo 时不能把已解析出的 FDE 一起丢掉（strip 二进制就靠它）
+  if e and #e.syms == 0 then e = elf_debug_syms(path) or e end
+  if not e then return nil end
   local va
   for _, s in ipairs(e.pl) do
     if fileoff >= s.o and fileoff < s.o + s.f then va = s.v + (fileoff - s.o) break end
@@ -1091,10 +1276,21 @@ local function elf_lookup(path, fileoff)
     local mid = math.floor((lo + hi) / 2)
     if syms[mid].v <= va then best = syms[mid] lo = mid + 1 else hi = mid - 1 end
   end
-  if not best then return nil end
-  local d = va - best.v
-  if d >= best.sz then return nil end       -- 落在函数尾巴外的空洞，别硬塞个名字
-  return best.n, d
+  if best then
+    local d = va - best.v
+    if d < best.sz then return best.n, d end   -- 落在函数尾巴外的空洞，别硬塞个名字
+  end
+  -- strip 干净了：用 .eh_frame 的 FDE 边界给出 sub_<入口地址>，至少能看出几个函数
+  local f = e.fdes
+  if f and #f > 0 then
+    local l, h, hit = 1, #f, nil
+    while l <= h do
+      local mid = math.floor((l + h) / 2)
+      if f[mid].b <= va then hit = f[mid] l = mid + 1 else h = mid - 1 end
+    end
+    if hit and va < hit.e then return ("sub_%x"):format(hit.b), va - hit.b end
+  end
+  return nil
 end
 
 local function perf_map(pid)
