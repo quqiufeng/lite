@@ -466,6 +466,11 @@ StaticPy 的 `emit_lib` 只是把同一段代码内联进 IR。
   起手发布 **1550/1550 条已落在可执行段**，与收尾发布地址一致率 **99.6%**
   （漂移的只有"自报时还没跑过"的那几个）。收尾那次负责把尺寸/漂移修准。
   StaticPy 产物实测：t≈50ms 表即落盘，`--sym` 直接给出 `static_spin` / `remainder` / `py-mod`。
+- **起手那次覆盖不全，属正常**：自报是运行期枚举顶层环境（`environment-symbols` +
+  `top-level-value` + `procedure?`），不是构建期名单——所以只认"**此刻已绑定**"的过程，
+  后面才 `(define ...)` 的和 prelude 里还没首次调用的，要等收尾那次补齐。
+  实测：纯 Chez 产物 1550/1550；StaticPy 的 t 产物 起手 1160 → 收尾 2283 条。
+  热点函数通常先定义，所以起手那半张表已经够 live 归因用。
 - **IFUNC/strip**：libc 的 memcpy/memset 是一堆 17 字节的变体，归因必须按 `st_size` 判界内，
   否则会出现 37.8% 的假热点（踩着 `.eh_frame` FDE 才收敛成一个 `sub_<addr>`）。
 - **别把 `STATICPY_PERFMAP` 当成常开**：它只影响 IR 里那一段，但开了就和基准 IR 不同，
