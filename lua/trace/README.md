@@ -3,7 +3,7 @@
 `perf_event_open` + 内核 tracefs 探针，在 lite 进程外起一个 luajit 采样子进程，
 把结果折成火焰图 / 热力图 / 卡点排行。工具入口是 `helper/trace.lua`（action=run/render/status），
 本目录是**正式模块**：进仓库、有单测（`tools/auto_unit.lua`）、接口稳定。
-实现原理 / 依赖 / 能力边界见 [trace.md](trace.md)（本文只讲怎么用）。
+实现原理 / 依赖 / 能力边界见仓库根的 [trace.md](../../trace.md)（本文只讲怎么用）。
 
 | 文件 | 职责 |
 |---|---|

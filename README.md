@@ -254,7 +254,8 @@ LITE_ORT_PREFER=cpu ./tools/ort_link.sh copy
 P0 基础设施 · P1 无 UI agent · P1.5 上下文记忆 · P2 TUI · P3 serve/attach · 插件与自扩展 全部落地。
 未做：无人值守下的完整审批/沙箱收口、上下文逐轮曲线落 KV。
 
-设计取舍见 [design.md](design.md)；开发/测试规范与插件细节见 [AGENTS.md](AGENTS.md)。
+设计取舍见 [design.md](design.md)；开发/测试规范与插件细节见 [AGENTS.md](AGENTS.md)；
+动态追踪子系统（trace）的原理/依赖/能力边界见 [trace.md](trace.md)。
 
 **用 lite 这套体系开别的项目**（同样必须遵守，不是 lite 私有）：
 `./tools/newproject.sh <目录> --name <名字>` 生成可跑骨架（LuaJIT FFI + Lua 编排 + C 内核 +

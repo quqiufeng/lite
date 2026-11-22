@@ -46,7 +46,7 @@ prune_stale_helper_so() {
     fi
 }
 prune_stale_helper_so "$DIST/helper"
-cp "$ROOT/AGENTS.md" "$ROOT/design.md" "$DIST/"
+cp "$ROOT/AGENTS.md" "$ROOT/design.md" "$ROOT/trace.md" "$DIST/"
 if [ -f "$ROOT/build/liblite_cache.so" ]; then
     cp "$ROOT/build/liblite_cache.so" "$DIST/build/"
 fi
