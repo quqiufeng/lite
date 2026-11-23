@@ -118,7 +118,7 @@ end
 local MAX_GAP = 4        -- 一个图标内部的合法空隙
 local MIN_COL_PX = 2     -- 单列至少几个绿像素才算图标的一部分
 
-function M.locate(X11, dpy, root, sw, sh)
+function M.candidates(X11, dpy, root, sw, sh)
     local p = panel_rect(X11, dpy, root, sw, sh)
     local band_x = math.max(0, p.x)
     local band_y = math.max(0, math.min(p.y, sh - 1))
@@ -145,8 +145,11 @@ function M.locate(X11, dpy, root, sw, sh)
         X11.XDestroyImage(img)
         return nil, "面板里没找到微信绿（图标被藏了？）"
     end
-    -- 切连续列段，取总绿量最大的那段
-    local best, cur, cur_n, gap = nil, nil, 0, 0
+    -- 切连续列段，**全部留下**：面板上不止微信一个是绿的。只取「绿量最大的那段」会锁到
+    -- 错的那个（实测面板左边还有个 12x14 的绿块，比真托盘图标先被扫到），而 cache.rect
+    -- 一旦指向它，rect_alive 就恒真 —— 盯着一块永远静止的绿，永远判「没新消息」。
+    -- 症状正是「手机上发了消息，daemon 一直没反应」，日志还骗人说图标没闪。
+    local segs, cur, cur_n, gap = {}, nil, 0, 0
     for xx = 0, img.width - 1 do
         if hist[xx] >= MIN_COL_PX then
             cur = cur or xx
@@ -155,39 +158,55 @@ function M.locate(X11, dpy, root, sw, sh)
         elseif cur then
             gap = gap + 1
             if gap > MAX_GAP then
-                if not best or cur_n > best.n then best = { x0 = cur, x1 = xx - gap, n = cur_n } end
+                segs[#segs + 1] = { x0 = cur, x1 = xx - gap, n = cur_n }
                 cur, cur_n, gap = nil, 0, 0
             end
         end
     end
-    if cur and (not best or cur_n > best.n) then
-        best = { x0 = cur, x1 = img.width - 1 - gap, n = cur_n }
+    if cur then
+        segs[#segs + 1] = { x0 = cur, x1 = img.width - 1 - gap, n = cur_n }
     end
-    if not best then
+    if #segs == 0 then
         X11.XDestroyImage(img)
         return nil, "绿像素没连成图标形状"
     end
-    local minx, maxx, miny, maxy, cnt = 1e9, -1, 1e9, -1, 0
-    for yy = 0, img.height - 1 do
-        local row = d + yy * bpl
-        for xx = best.x0, math.min(best.x1, img.width - 1) do
-            local px = row + xx * 4
-            if is_wx_green(px[2], px[1], px[0]) then
-                cnt = cnt + 1
-                if xx < minx then minx = xx end
-                if xx > maxx then maxx = xx end
-                if yy < miny then miny = yy end
-                if yy > maxy then maxy = yy end
+    local out, why = {}, {}
+    for _, seg in ipairs(segs) do
+        local minx, maxx, miny, maxy, cnt = 1e9, -1, 1e9, -1, 0
+        for yy = 0, img.height - 1 do
+            local row = d + yy * bpl
+            for xx = seg.x0, math.min(seg.x1, img.width - 1) do
+                local px = row + xx * 4
+                if is_wx_green(px[2], px[1], px[0]) then
+                    cnt = cnt + 1
+                    if xx < minx then minx = xx end
+                    if xx > maxx then maxx = xx end
+                    if yy < miny then miny = yy end
+                    if yy > maxy then maxy = yy end
+                end
             end
+        end
+        local bw, bh = maxx - minx + 1, maxy - miny + 1
+        if cnt >= 30 and bw >= 8 and bh >= 8 and bw <= 64 and bh <= 64 then
+            out[#out + 1] = { x = band_x + minx, y = band_y + miny, w = bw, h = bh, px = cnt }
+        else
+            why[#why + 1] = string.format("%dx%d/%dpx", bw, bh, cnt)
         end
     end
     X11.XDestroyImage(img)
-    if cnt < 30 then return nil, "图标区域绿像素过少" end
-    local bw, bh = maxx - minx + 1, maxy - miny + 1
-    if bw < 8 or bh < 8 or bw > 64 or bh > 64 then
-        return nil, string.format("绿色块尺寸不像托盘图标（%dx%d, %d px）", bw, bh, cnt)
+    if #out == 0 then
+        return nil, "没有尺寸像托盘图标的绿块（" .. table.concat(why, " ") .. "）"
     end
-    return { x = band_x + minx, y = band_y + miny, w = bw, h = bh, px = cnt }
+    -- 实心的赢：真图标是一块实心绿，零散抗锯齿点像素少，按 px 降序就是「最像图标」在前。
+    table.sort(out, function(a, b) return a.px > b.px end)
+    return out
+end
+
+-- 只要一个（CLI 自检与旧调用方用）：取最像的那个。
+function M.locate(X11, dpy, root, sw, sh)
+    local list, err = M.candidates(X11, dpy, root, sw, sh)
+    if not list then return nil, err end
+    return list[1]
 end
 
 -- 在 rect 里还有没有微信绿：用来判「缓存的矩形是不是过期了」。
@@ -239,23 +258,49 @@ function M.blinking(X11, dpy, root, rect, opts)
     return false, string.format("%d 帧画面完全一致（图标静止）", tries), order
 end
 
--- 一站式：面板定标 → 判闪。cache 是 {rect=...} 的可变表，跨轮复用省掉整条横带的扫描。
+-- 一站式：面板定标 → 判闪。cache 是 {rect=..., miss=n} 的可变表，跨轮复用省掉整条横带的扫描。
 -- 返回 blink(boolean), why(string), rect。
+--
+-- **必须自愈**：cache.rect 只能在「还绿着」时复用，但绿着不等于「还是微信图标」——面板上
+-- 可能并排着别的绿块，一旦锁错就永远静止、永远 idle（用户看到的就是「微信模式没响应」）。
+-- 所以连续 miss 轮静止就丢掉缓存重扫，并对**每个**候选做短采样：会变的那个才是真图标。
+-- 这个自愈不能省成「反正重启就好」：daemon 是常驻的，没人会去盯它的日志。
+local MISS_RELOCATE = 2
+
 function M.check(X11, dpy, root, sw, sh, cache, opts)
     cache = cache or {}
     local rect = cache.rect
     if rect and not M.rect_alive(X11, dpy, root, rect) then
-        rect = nil
-        cache.rect = nil
+        rect, cache.rect, cache.miss = nil, nil, 0
     end
-    if not rect then
-        local r, err = M.locate(X11, dpy, root, sw, sh)
-        if not r then return false, err, nil end
-        rect = r
-        cache.rect = r
+    if rect then
+        local blink, why = M.blinking(X11, dpy, root, rect, opts)
+        if blink or blink == nil then
+            cache.miss = 0
+            return blink, why, rect
+        end
+        cache.miss = (cache.miss or 0) + 1
+        if cache.miss < MISS_RELOCATE then
+            return blink, why, rect
+        end
+        rect, cache.rect, cache.miss = nil, nil, 0   -- 连轮静止：这块绿大概不是托盘图标
     end
-    local blink, why = M.blinking(X11, dpy, root, rect, opts)
-    return blink, why, rect
+    local list, err = M.candidates(X11, dpy, root, sw, sh)
+    if not list then return false, err, nil end
+    -- 多候选：3 帧快筛（480ms/个）。有消息时第一个会闪的立刻返回，不必等满 15 帧。
+    local best, bestwhy = nil, nil
+    for _, c in ipairs(list) do
+        local b, w = M.blinking(X11, dpy, root, c, { pad = 4, tries = 3, gap_ms = 160 })
+        if b then
+            cache.rect = c
+            return true, w, c
+        end
+        if not best then best, bestwhy = c, w end
+    end
+    -- 都不闪：取最像图标的一个缓存下来，并给一次完整的 15 帧采样（防快筛窗口太短漏判）。
+    cache.rect = best
+    local blink, why = M.blinking(X11, dpy, root, best, opts)
+    return blink, why or bestwhy, best
 end
 
 function M.open()

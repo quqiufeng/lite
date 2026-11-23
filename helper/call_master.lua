@@ -163,11 +163,21 @@ function M.run(args, env)
     -- 无条件补一次抬键：粘成没粘成都清掉按下的键（幂等）。少了这句，一次 keyup 丢失
     -- 就会满屏 vvvvvvvv —— 实测踩过。
     pcall(function() x:key_up(win.id, "ctrl+shift+v") end)
-    os.execute(string.format("sleep %.2f", (tonumber(args.settle) or 900) / 1000))
+    -- 粘贴是**键盘事件流**，不是一次原子写入：字数越多、TUI 越忙，吃进 composer 越慢。
+    -- 以前固定 900ms，735 字的指令在忙时吃不完 —— 回车落在「composer 还是空的」那一刻，
+    -- submit() 见 text=="" 直接 return，整段指令留在输入框没人提交。现象就是投递报 ok、
+    -- 会话里却什么都没有（用户看到的是「微信派了活但主进程不响应」）。
+    local settle = tonumber(args.settle) or math.min(4000, 600 + #text * 3)
+    os.execute(string.format("sleep %.2f", settle / 1000))
     local sent_enter = false
     if args.enter ~= false then
+        -- 回车发两次：第一次被上面那种时序吞掉时第二次补上；第一次真成功的话 composer
+        -- 已经空了，第二次 submit() 的 text=="" 还是 return —— 幂等，不会派两遍。
         x:key(win.id, "Return")
         pcall(function() x:key_up(win.id, "Return") end)   -- 同理：Return 卡住就是满屏空行
+        os.execute("sleep 0.35")
+        x:key(win.id, "Return")
+        pcall(function() x:key_up(win.id, "Return") end)
         sent_enter = true
     end
     os.remove(tmp)
