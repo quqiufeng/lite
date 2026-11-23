@@ -128,21 +128,56 @@ function M.is_reply(text, tag)
     return n:sub(1, #kt) == kt
 end
 
--- 触发前缀：不设就全收（危险，文件传输助手本来就是发笔记/文件的地方），
--- 设了就只认 "lite xxx" / "lite：xxx"。
-function M.has_trigger(text, prefix)
-    if not prefix or prefix == "" then return true end
-    local n = M.key(text or "")
-    return n ~= "" and n:sub(1, #M.key(prefix)) == M.key(prefix)
+-- 触发前缀默认 "#lite"：文件传输助手平时还是发笔记/文件的中转站，裸 "lite" 太容易误触
+-- （任何以 lite 开头的英文单词都会被吃进去）。加 # 后只有真想派活才命中。
+M.PREFIX = "#lite"
+
+-- 触发比对的归一：**必须用 norm 不能用 key** —— key 把标点一起抹掉，"#lite" 就退化成
+-- 裸 "lite"，# 白加；而 is_reply 那边同理，两者一旦同形，"#lite 帮我…" 会被当回执丢掉。
+-- OCR 常把 "#" 认成全角 "＃"、或在 "# lite" 中间塞空格，统一归一。
+local function trig(s)
+    return (M.norm(s):gsub("＃", "#"):gsub("#%s+", "#")):lower()
 end
 
--- 去掉触发前缀，交给 agent 的正文更干净
+-- 骨架：除了 # 的形态，PP-OCRv4 还常把小写 i 认成 l/1/!（实测 "#lite 列一下" 出
+-- "lite"、"#llte"、"1ite" 三种），所以比对时把这几兄弟归一成 i，两边同样处理。
+local function skeleton(s)
+    return (trig(s):gsub("[1!|]", "i"):gsub("l", "i"):gsub("^#", ""))
+end
+
+-- 不设就全收（危险）；设了就只认 "#lite xxx" / "#lite：xxx" / "＃lite xxx"。
+-- 井号缺失也算命中：实测 OCR 会把 "#lite 列一下 /tmp" 认成 "lite"，严格只认 # 会漏指令
+-- （宁可偶尔把以 lite 开头的笔记当指令，也不要静默丢指令——daemon 日志会把这种命中标出来）。
+-- 边界：OCR 会吞空格，"#lite测试" 也必须算指令，所以只挡 ASCII 词字符，
+-- "#litex" 这种蹭前缀的英文单词不认，中文直接跟上照收。
+function M.has_trigger(text, prefix)
+    if not prefix or prefix == "" then return true end
+    local n, p = skeleton(text), skeleton(prefix)
+    if p == "" or n:sub(1, #p) ~= p then return false end
+    local rest = n:sub(#p + 1, #p + 1)
+    return rest == "" or not rest:match("^[a-z0-9_]$")
+end
+
+-- 命中的形态："hash"（带井号）/"loose"（OCR 吞了 #）——daemon 用它区分日志级别。
+function M.trigger_form(text, prefix)
+    if not prefix or prefix == "" then return "any" end
+    if not M.has_trigger(text, prefix) then return nil end
+    return trig(text):sub(1, 1) == "#" and "hash" or "loose"
+end
+
+-- 去掉触发前缀，交给 agent 的正文更干净。井号在原文里可能被 OCR 吞掉，
+-- 所以两种长度（带 # / 不带）都试，命中哪个切哪个。
 function M.strip_trigger(text, prefix)
-    if not prefix or prefix == "" then return M.norm(text) end
-    local t = M.norm(text)
-    local p = M.norm(prefix)
-    local head = t:sub(1, #p)
-    if head:lower() == p:lower() then t = t:sub(#p + 1) end
+    local t = (M.norm(text):gsub("＃", "#"):gsub("#%s+", "#"))
+    if not prefix or prefix == "" then return t end
+    local p = skeleton(prefix)
+    if p ~= "" then
+        for _, cut in ipairs({ #prefix, #prefix - 1 }) do
+            if cut > 0 and skeleton(t:sub(1, cut)) == p then
+                return (M.norm(t:sub(cut + 1):gsub("^[:：,，.。%s]+", "")))
+            end
+        end
+    end
     return (M.norm(t:gsub("^[:：,，.。%s]+", "")))
 end
 

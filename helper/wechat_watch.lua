@@ -6,8 +6,9 @@
 -- 放在 agent 线程里会把每一轮对话都卡住；派发走 serve 的 HTTP /prompt，agent 在自己的
 -- 进程里跑，互不干扰（同一时刻只有一边在动微信窗口）。
 --
--- 触发前缀（默认 "lite"）：文件传输助手平时还是发笔记/文件的中转站，全收会把随手记
--- 也当指令执行。只认 "lite 帮我看看磁盘" / "lite：跑一下测试"，其余只记日志不执行；
+-- 触发前缀（默认 "#lite"）：文件传输助手平时还是发笔记/文件的中转站，全收会把随手记
+-- 也当指令执行。加 # 是因为裸 "lite" 太容易误触（任何以 lite 开头的单词都算）。
+-- 只认 "#lite 帮我看看磁盘" / "#lite：跑一下测试"，其余只记日志不执行；
 -- 想全收就 prefix=""（注意：那一刻起，凡是你自己发到箱子的东西都会被当指令跑）。
 local function q(s) return "'" .. tostring(s):gsub("'", "'\\''") .. "'" end
 
@@ -50,6 +51,7 @@ local function opts(a)
     if a.prefix ~= nil then o[#o + 1] = "--prefix " .. q(a.prefix) end
     if a.chat then o[#o + 1] = "--chat " .. q(a.chat) end
     if a.max_new then o[#o + 1] = "--max-new " .. tonumber(a.max_new) end
+    if a.hide == false then o[#o + 1] = "--no-hide" end
     if a.no_raise then o[#o + 1] = "--no-raise" end
     if a.no_spawn then o[#o + 1] = "--no-spawn" end
     return table.concat(o, " ")
@@ -66,13 +68,14 @@ M.schema = {
             action = { type = "string",
                 enum = { "start", "stop", "status", "once", "tail" },
                 description = "start=拉起常驻；stop=收掉；status=进程/日志；once=单轮试跑（默认只看不执行）；tail=看日志" },
-            interval = { type = "integer", description = "轮询间隔秒，默认 6" },
+            interval = { type = "integer", description = "轮询间隔秒，默认 10" },
             port = { type = "integer", description = "serve 端口，默认 8765" },
-            prefix = { type = "string", description = "触发前缀，默认 lite；给空串=全收" },
+            prefix = { type = "string", description = "触发前缀，默认 #lite；给空串=全收" },
             chat = { type = "string", description = "目标会话名，默认 文件传输助手" },
             max_new = { type = "integer", description = "单轮最多执行几条，默认 3" },
             dispatch = { type = "boolean", description = "once：true=真的派发执行（默认只看不跑）" },
             dry_run = { type = "boolean", description = "start：true=只记录不执行（排错用）" },
+            hide = { type = "boolean", description = "没新消息时是否最小化微信，默认 true；false=让它一直摊着" },
             no_raise = { type = "boolean", description = "true=不抢微信前台（窗口会遮挡，OCR 会读到别的窗口）" },
             no_spawn = { type = "boolean", description = "true=不自动拉起 serve（没 serve 时退回一次性执行）" },
             lines = { type = "integer", description = "tail：日志行数，默认 40" },
@@ -110,8 +113,8 @@ function M.run(args, env)
             local np = pid()
             if alive(np) then
                 return string.format("已启动：pid %s\n间隔 %ds · 前缀 %q · 会话 %s\n日志：%s",
-                    np, tonumber(args.interval) or 6,
-                    args.prefix ~= nil and args.prefix or "lite",
+                    np, tonumber(args.interval) or 10,
+                    args.prefix ~= nil and args.prefix or "#lite",
                     args.chat or "文件传输助手", logf)
             end
             os.execute("sleep 0.1")

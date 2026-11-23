@@ -15,8 +15,12 @@
 -- 派发是同步的：POST /prompt 一直阻塞到那一轮 agent 跑完，所以 agent 在会话里发回执时，
 -- 本进程正好停在等回复上，不会和它抢微信窗口。跑完继续采，回执会被识别成回执。
 --
--- 用法：tools/lite-lua helper/lib/wx_watch_daemon.lua --interval 6 [--port 8765]
---        [--prefix lite] [--dry-run] [--once] [--no-spawn] [--no-raise]
+-- 空闲收起：每轮没认出新消息就把微信 minimize（--no-hide 关掉）。注意这必然带来闪烁
+-- —— 截图取的是屏幕像素，窗口最小化就读不到气泡，所以每轮得先 activate 再收起来，
+-- 窗口可见时长 ≈ 一次截屏 + OCR（1~2s）。
+--
+-- 用法：tools/lite-lua helper/lib/wx_watch_daemon.lua --interval 10 [--port 8765]
+--        [--prefix "#lite"] [--dry-run] [--once] [--no-spawn] [--no-raise] [--no-hide]
 -- 由 helper/wechat_watch.lua 拉起/收掉，别手写 nohup（pidfile/日志在对面的状态目录里）。
 local ROOT = os.getenv("LITE_ROOT") or "."
 package.path = ROOT .. "/lua/?.lua;" .. ROOT .. "/?.lua;" .. package.path
@@ -38,9 +42,10 @@ local function sleep(ms) ffi.C.usleep(ms * 1000); pcall(function() xdo:sync() en
 
 -- ── 配置 ─────────────────────────────────────────────────────────────
 local C = {
-    interval = 6, port = 8765, host = "127.0.0.1",
-    prefix = "lite", chat = "文件传输助手", tag = "lite:",
-    once = false, dry = false, spawn = true, raise = true, max_new = 3,
+    interval = 10, port = 8765, host = "127.0.0.1",
+    -- 触发前缀；改这里就得同步 wx_watch.lua 的 M.PREFIX（单测钉的是那边的语义）
+    prefix = "#lite", chat = "文件传输助手", tag = "lite:",
+    once = false, dry = false, spawn = true, raise = true, hide = true, max_new = 3,
     http_timeout = 1500, cwd = os.getenv("LITE_CWD") or os.getenv("PWD") or ".",
     state = os.getenv("LITE_WX_STATE") or
         ((os.getenv("XDG_DATA_HOME") or (os.getenv("HOME") or "/tmp") .. "/.local/share")
@@ -63,6 +68,7 @@ do
         elseif a == "--dry-run" then C.dry = true; i = i + 1
         elseif a == "--no-spawn" then C.spawn = false; i = i + 1
         elseif a == "--no-raise" then C.raise = false; i = i + 1
+        elseif a == "--no-hide" then C.hide = false; i = i + 1
         elseif a == "--dump" then C.dump = true; C.once = true; C.dry = true; i = i + 1
         else
             io.stderr:write("unknown arg: " .. tostring(a) .. "\n")
@@ -133,14 +139,22 @@ end
 -- 会话标题 OCR：不是目标会话就调 wechat 插件的 open（它自己会 ensure_geom/搜索/回车）
 local function focus()
     if not win_refresh() then return nil end
-    if C.raise then
+    if C.raise or C.hide then
         -- xdo 的方法吃的是裸 Window id，传 W.resolve 的表会 "cannot convert 'table'"，
         -- 被 pcall 吞掉后表现成「微信永远抬不起来、标题一直是别人窗口的」。
         pcall(function() xdo:raise(win.id) end)
         if xdo:active() ~= win.id then
             pcall(function() xdo:activate(win.id) end)
         end
-        sleep(250)
+        -- 从最小化恢复是异步的（WM 动画 + 重绘）：固定 sleep 250ms 在恢复慢的时候
+        -- 截到的还是「标题为空/别人的画面」，于是白白 skip 一整轮 —— 空闲收起功能
+        -- 让这个窗口每轮都要走恢复路径，必须等到真的可见再往下截图。
+        for _ = 1, 15 do
+            if xdo:active() == win.id and xdo:_is_viewable(win.id) then break end
+            if not xdo:_is_viewable(win.id) then pcall(function() xdo:activate(win.id) end) end
+            sleep(120)
+        end
+        sleep(150)
     end
     return win
 end
@@ -159,12 +173,15 @@ local function ensure_chat_via(region_title)
     local joined = title_text()
     if joined:find(want, 1, true) then return true end
     if joined == "" then
-        -- 标题认不出来 = 窗口还没抬起来/被别的东西挡着。这时气泡区大概率也是别人的画面，
-        -- 拿它更新 prev 会污染基线，所以宁可跳一轮。
         sleep(300)
         joined = title_text()
-        if joined == "" then return false, "标题识别为空（微信被遮挡？）" end
-        if joined:find(want, 1, true) then return true end
+        if joined ~= "" and joined:find(want, 1, true) then return true end
+        -- 标题空有两种：窗口还没抬起来（遮挡），或抬起来了但停在通讯录/设置等页面。
+        -- 前者截图是别人的画面，拿它更新 prev 会污染基线 → 跳一轮；后者必须切回会话。
+        -- 用「窗口是否真的可见」区分，不能一律跳过，否则一旦微信停在通讯录就永久空转。
+        if joined == "" and not xdo:_is_viewable(win.id) then
+            return false, "窗口不可见且标题识别为空（微信被遮挡？）"
+        end
     end
     local wx = wechat_lib()
     if not wx then return false, "找不到 helper/wechat.lua，无法自动切会话" end
@@ -419,6 +436,9 @@ local function tick()
             log("忽略新块（%s）：%s", own, Watch.norm(text):sub(1, 60))
         elseif not Watch.has_trigger(text, C.prefix) then
             log("忽略新块（无触发前缀 %q）：%s", C.prefix, Watch.norm(text):sub(1, 60))
+        elseif Watch.trigger_form(text, C.prefix) == "loose" then
+            -- 宽容命中的那条路：OCR 把 "#" 吞了。照跑，但日志留痕，方便区分误触。
+            log("warn: 触发前缀 %q 的 # 被 OCR 吞了，按指令处理", C.prefix)
         elseif dup_of(text) then
             log("跳过重复（滚动/重排导致的旧消息回流）：%s", Watch.norm(text):sub(1, 60))
         else
@@ -486,16 +506,28 @@ if C.dump then
     os.exit(0)
 end
 
+-- 空闲就收起微信：hide 用的是 minimize（任务栏还在，点一下回来），不是 unmap 到
+-- 无影无踪；下一轮 focus() 的 activate 会把它拉回来（raise 对最小化的窗口无效）。
+local function hide_idle()
+    if not C.hide or not win then return end
+    pcall(function() xdo:minimize(win.id) end)
+    pcall(function() xdo:sync() end)
+end
+
 local rounds = 0
 while true do
     rounds = rounds + 1
+    local added = 0
     local ok, err = pcall(function()
         local ready, why = ensure_chat_via(TITLE_R)
         if not ready then log("skip: %s", tostring(why)); return end
-        tick()
+        added = tick() or 0
         drain()
     end)
     if not ok then log("error: %s", tostring(err)) end
+    -- 有新消息时窗口留着（用户可能正在看回执）；没新消息且这一轮跑通了才收起。
+    -- 认不出窗口（ok=false）就不动它，免得把用户自己的操作搅了。
+    if ok and added == 0 then hide_idle() end
     if C.once then break end
     sleep(C.interval * 1000)
 end
