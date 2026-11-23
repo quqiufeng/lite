@@ -77,14 +77,18 @@ function M.enter()
     ffi.C.tcsetattr(0, TCSANOW, raw)
 
     -- 1002 = 按键按下/松开 + 拖拽移动（选区复制用）；1006 = SGR 坐标
-    M.write("\27[?1049h\27[?25l\27[?1000h\27[?1002h\27[?1006h\27[2J\27[H")
+    -- 2004 = bracketed paste：**必须开**。不开的话终端把一次粘贴当裸按键流送来，
+    -- 文本里的每个换行都变成 enter 事件 —— 一段多行提示词会被按行切成好几轮分别提交
+    -- （实测 735 字的远程指令被切成 3 轮，正文只剩半句）。开了之后终端把整块内容裹进
+    -- \27[200~ … \27[201~，input.lua 出一个 paste 事件整体喂给 composer:insert。
+    M.write("\27[?1049h\27[?25l\27[?2004h\27[?1000h\27[?1002h\27[?1006h\27[2J\27[H")
     return { orig = orig, active = true }
 end
 
 function M.leave(t)
     if not t or not t.active then return end
     t.active = false
-    M.write("\27[0m\27[?25h\27[?1006l\27[?1002l\27[?1000l\27[?1049l")
+    M.write("\27[0m\27[?25h\27[?2004l\27[?1006l\27[?1002l\27[?1000l\27[?1049l")
     ffi.C.tcsetattr(0, TCSANOW, t.orig)
 end
 
