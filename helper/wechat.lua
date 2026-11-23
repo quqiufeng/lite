@@ -164,32 +164,56 @@ end
 -- 每步前都重新激活：任何键盘事件都可能让 openbox 把微信收回后台。
 -- 250ms 只在「真的发起了激活」时才付：窗口已在前台时它纯属白等，
 -- 而 do_search 一条路径就要 ensure 十几次（click 前后各一次 + 每个 key）。
-local function ensure()
-    local cur = xdo.active and xdo:active() or nil
-    if cur ~= win then
-        pcall(function() xdo:activate(win) end)
-        sleep(250)
-    end
+-- 前向声明：sig/wait_change/pad_to 依赖下面那套截图轮询，mark 依赖下面的 TRACE。
+-- 必须在第一个用到它们的函数（ensure/click）**之前**声明成 local，否则函数体里
+-- 编译期解析成全局变量，而定义处写的是 local → 运行时 "call a nil value"。
+local sig, wait_change, pad_to, mark
+
+local tvb = ffi.new("struct timeval")
+local function now_ms()
+    ffi.C.gettimeofday(tvb, nil)
+    return tonumber(tvb.tv_sec) * 1000 + tonumber(tvb.tv_usec) / 1000
 end
 
--- 定义在下面（依赖 sig/cap 那套截图轮询），这里前向声明给 click/key 用。
--- sig 也必须在列表里：click() 在它定义之前就调用了，漏掉就是「attempt to call
--- global 'sig' (a nil value)」—— 鼠标点下去那一步直接崩，比优化前更糟。
-local sig, wait_change, pad_to
+local function ensure()
+    local t = now_ms()
+    local cur = xdo.active and xdo:active() or nil
+    mark("  ens.query", t)
+    if cur ~= win then
+        pcall(function() xdo:activate(win) end)
+        mark("  ens.activate", t)
+        sleep(250)
+        mark("  ens.sleep", t)
+    end
+end
 
 -- 点一下，然后盯「这块画面变了」就走。
 -- 老写法是 move 后 160ms + click 后 420ms 纯盲等：一条搜索路径三次 click 就 1.74s，
 -- 而界面通常几十毫秒就反应完了。r = 想等的区域（省略则用点击点周围 60x60）；
 -- 盼不到变化就补足到原节拍，所以最坏情况跟老写法一样慢，不会更慢。
-local function click(x, y, r)
+-- skip_ensure=true：点完**不要**再抢焦点（默认抢，好让后续盲打键盘落到微信）。
+-- 必须能关掉的原因——这是个 15s 的坑，不是洁癖：点「发送文件」后 GTK 的 modal
+-- 文件框正在 map（内部枚举 gvfs 挂载点时抓 X server），此时对父窗口调
+-- xdo:activate → XSetInputFocus/XSync 要 15076ms 才返回（实测，`WECHAT_TRACE=1`
+-- 打 `ens.activate`）。而下一步本来就要 activate(dialog_id)，抢父窗口纯属白等 + 跟
+-- modal 抢焦点。21.1s 的 sendfile 里 15.1s 就是这一个调用。
+local function click(x, y, r, skip_ensure)
+    local t = now_ms()
+    mark("start", t)
     ensure()
+    mark("ensure", t)
     xdo:move_abs(x, y); sleep(160)
+    mark("move", t)
     local box = r or { x - 30, y - 30, x + 30, y + 30 }
     local base = sig(box)                       -- 点击前基准（鼠标已就位、hover 已生效）
+    mark("sig", t)
     xdo:click_abs(x, y, 1)
+    mark("click_abs", t)
     local ok, el = wait_change(box, base, 420, 25)
     if not ok then pad_to(420, el) end
-    ensure()
+    mark("wait_change ok=" .. tostring(ok), t)
+    if not skip_ensure then ensure() end
+    mark("ensure2", t)
 end
 
 local function key(seq)
@@ -215,16 +239,10 @@ local function cap()
     return CAP or nil
 end
 
-local tvb = ffi.new("struct timeval")
-local function now_ms()
-    ffi.C.gettimeofday(tvb, nil)
-    return tonumber(tvb.tv_sec) * 1000 + tonumber(tvb.tv_usec) / 1000
-end
-
 -- 分段耗时：`WECHAT_TRACE=1` 才打印到 stderr，平时零成本（一次 getenv）。
 -- 不 print stdout：run 的返回值要能被 JSON 化，混进日志会把调用方解析搞坏。
 local TRACE = os.getenv("WECHAT_TRACE")
-local function mark(tag, t0)
+mark = function(tag, t0)
     if not TRACE then return end
     io.stderr:write(string.format("[mark] %6.0fms %s\n", now_ms() - t0, tag))
 end
@@ -551,7 +569,11 @@ local function do_sendfile(path, name, index)
     if name then do_open(name, index) else ensure() end
     mark("open", t0)
     local fi = crop("fileinput")         -- 「文件名称」输入行：粘贴/清空验收就看这一小块
-    click(point("sendfile"))
+    -- 点完不抢焦点（skip_ensure）：下面立刻要 activate(dialog_id)，而 modal 正在 map 时
+    -- 抢父窗口要白等 15s，见 click() 头注释。point 返回两个值，先取出来再传，别写成
+    -- click(point("sendfile"), nil, true) —— 参数表中间的多返回值会被截成第一个。
+    local bx, by = point("sendfile")
+    click(bx, by, nil, true)
     mark("click sendfile", t0)
     -- 等对话框真的出来（实测 581ms）。老写法是「盲等 900ms + 12 轮 400ms」：
     -- 该慢的时候慢、该快的时候也慢，且失败要 4.8s 才知道。
