@@ -114,6 +114,8 @@ int xdo_move_window(const xdo_t *xdo, Window wid, int x, int y);
 int xdo_click_window(const xdo_t *xdo, Window window, int button);
 int xdo_send_keysequence_window(const xdo_t *xdo, Window window,
     const char *keysequence, unsigned int delay);
+int xdo_send_keysequence_window_up(const xdo_t *xdo, Window window,
+    const char *keysequence, unsigned int delay);
 int xdo_enter_text_window(const xdo_t *xdo, Window window,
     const char *string, unsigned int delay);
 ]]
@@ -147,6 +149,74 @@ end
 function Xdo:close()
     if self.handle ~= nil then lib.xdo_free(self.handle); self.handle = nil end
     if self.dpy ~= nil then X11.XCloseDisplay(self.dpy); self.dpy = nil end
+end
+
+-- 最顶层的普通窗口 id（_NET_CLIENT_LIST_STACKING 的最后一项）。
+-- 「viewable」只说明窗口被 map 了，**不说明它没被别的窗口盖住**：两个窗口都最大化时，
+-- 下面的那个照样 viewable=true，截屏却截到上面那个（实测：微信被最大化终端完全盖住，
+-- 截全屏读到的是终端内容 → 标题 OCR="" → 误判「会话不对」）。判「真能看见」要问层叠序。
+-- WM 没提供该属性时返回 nil（调用方自己降级，不要因此卡死）。
+function Xdo:top_window()
+    local root = X11.XDefaultRootWindow(self.dpy)
+    local atom = X11.XInternAtom(self.dpy, "_NET_CLIENT_LIST_STACKING", 0)
+    if atom == 0 then return nil end
+    local actual, fmt = ffi.new("Atom[1]"), ffi.new("int[1]")
+    local n, after = ffi.new("unsigned long[1]"), ffi.new("unsigned long[1]")
+    local prop = ffi.new("unsigned char *[1]")
+    local rc = X11.XGetWindowProperty(self.dpy, root, atom, 0, 1024, 0,
+        X11.XInternAtom(self.dpy, "WINDOW", 0), actual, fmt, n, after, prop)
+    if rc ~= 0 or prop[0] == nil or n[0] == 0 then return nil end
+    local list = ffi.cast("Window *", prop[0])
+    local top = list[tonumber(n[0]) - 1]
+    X11.XFree(prop[0])
+    return tonumber(top)
+end
+
+-- 被更高层的窗口盖掉的比例（0..1）：拿 windows() 的 z 和几何算交叠，
+-- 只关心「盖住我多少」，不比绝对层序 —— 面板永远在最顶（z 小但 override panel 常驻），
+-- 拿「谁最顶」当判据会把 lxqt-panel 当成遮挡者，每次都说看不见。
+-- ratio 默认 0.5：盖住过半就当看不见。窗口自己的子孙/同 id 跳过。
+function Xdo:covered_ratio(win, ratio)
+    ratio = ratio or 0.5
+    win = tonumber(win)
+    if win == nil or win == 0 then return 0, ratio end
+    local list = self:windows() or {}
+    local me
+    for _, w in ipairs(list) do
+        if tonumber(w.id) == win then me = w; break end
+    end
+    if not me or not me.geom then return 0, ratio end
+    local g = me.geom
+    if (g.w or 0) <= 0 or (g.h or 0) <= 0 then return 0, ratio end
+    -- 本身最小化/隐藏时 map_state 不是 viewable，直接当全遮挡
+    if me.viewable == false then return 1, ratio end
+    local area = g.w * g.h
+    local worst = 0
+    for _, w in ipairs(list) do
+        if tonumber(w.id) ~= win and w.viewable ~= false and w.geom
+           and (w.z or 0) > (me.z or 0) then
+            local ox = math.max(0, math.min(g.x + g.w, w.geom.x + w.geom.w) - math.max(g.x, w.geom.x))
+            local oy = math.max(0, math.min(g.y + g.h, w.geom.y + w.geom.h) - math.max(g.y, w.geom.y))
+            local r = (ox * oy) / area
+            if r > worst then worst = r end
+        end
+    end
+    return worst, ratio
+end
+
+-- 是否「真的看得见」：没被盖住过半。
+function Xdo:visible(win, ratio)
+    local r, th = self:covered_ratio(win, ratio)
+    return r < th, r
+end
+
+-- win 是否在最顶层。属性缺失（nil top）时返回 true：宁可按「看得见」继续跑，
+-- 也不要把「无法判断」当成失败把整轮 skip 掉。
+function Xdo:is_top(win)
+    if win == nil or win == 0 then return false end
+    local top = self:top_window()
+    if top == nil then return true end
+    return top == tonumber(win)
 end
 
 function Xdo:_name(win)
@@ -261,6 +331,26 @@ end
 
 function Xdo:is_maximized(win) return self:wm_state(win).maximized end
 
+-- _NET_CLIENT_LIST_STACKING → { [win_id] = 序号 }，序号大的在上。
+-- 别拿 _NET_CLIENT_LIST 当层序：那是 WM 的**管理顺序**（≈创建顺序），raise/lower 都不改它，
+-- 用它判「谁在上面」会永远指着同一个窗口（实测：raise 之后 z 一点不动，误判成 raise 失效）。
+function Xdo:_stacking()
+    local root = X11.XDefaultRootWindow(self.dpy)
+    local atom = X11.XInternAtom(self.dpy, "_NET_CLIENT_LIST_STACKING", 0)
+    local map = {}
+    if atom == 0 then return map end
+    local actual, fmt = ffi.new("Atom[1]"), ffi.new("int[1]")
+    local n, after = ffi.new("unsigned long[1]"), ffi.new("unsigned long[1]")
+    local prop = ffi.new("unsigned char *[1]")
+    local rc = X11.XGetWindowProperty(self.dpy, root, atom, 0, 4096, 0, 33,
+        actual, fmt, n, after, prop)
+    if rc ~= 0 or prop[0] == nil then return map end
+    local list = ffi.cast("Window *", prop[0])
+    for i = 0, tonumber(n[0]) - 1 do map[tonumber(list[i])] = i + 1 end
+    X11.XFree(prop[0])
+    return map
+end
+
 function Xdo:windows()
     local root = X11.XDefaultRootWindow(self.dpy)
     local atom = X11.XInternAtom(self.dpy, "_NET_CLIENT_LIST", 0)
@@ -271,6 +361,7 @@ function Xdo:windows()
         actual, fmt, n, after, prop)
     if rc ~= 0 or prop[0] == nil then return {} end
     local list = ffi.cast("Window *", prop[0])
+    local stack = self:_stacking()
     local out = {}
     for i = 0, tonumber(n[0]) - 1 do
         local win = list[i]
@@ -286,8 +377,10 @@ function Xdo:windows()
             viewable = at.viewable,
             override_redirect = at.override_redirect,
             maximized = self:is_maximized(win),
-            -- 堆叠顺序：_NET_CLIENT_LIST 是自下而上，末尾最靠前
-            z = i + 1,
+            -- z 是**层叠**顺序（_NET_CLIENT_LIST_STACKING，自下而上，末尾最靠前），
+            -- 不是 _NET_CLIENT_LIST 的下标：后者是管理顺序，raise 不改它。
+            -- 拿不到 stacking 属性时退回 client-list 下标（至少稳定，只是不代表前后）。
+            z = stack[tonumber(win)] or (i + 1),
         }
     end
     X11.XFree(prop[0])
@@ -534,7 +627,24 @@ function Xdo:display_size()
     return tonumber(X11.XDisplayWidth(self.dpy, 0)), tonumber(X11.XDisplayHeight(self.dpy, 0))
 end
 function Xdo:key(win, seq, delay)
-    return lib.xdo_send_keysequence_window(self.handle, win, seq, delay or 12000) == 0
+    if win == nil or win == 0 then return false end
+    return lib.xdo_send_keysequence_window(self.handle, win, seq, delay or 40000) == 0
+end
+
+-- 显式抬键。libxdo 的 send_keysequence 是「修饰键全 down → 点主键 → 修饰键 up」，
+-- 中途任何一步失败就提前 return，**已按下的键不补 up**。丢掉一个 v 的 keyup，
+-- X server 就当它一直按着，按键盘重复率无限刷 vvvvvvvv（实测：往 TUI 贴中文后满屏 v）。
+-- 反序全抬一遍是幂等的——本来没按着的键多收一次 keyup 无害，所以可以无条件调用。
+function Xdo:key_up(win, seq, delay)
+    if win == nil or win == 0 then return false end
+    return lib.xdo_send_keysequence_window_up(self.handle, win, seq, delay or 40000) == 0
+end
+
+-- 等窗口真的拿到焦点（库自带 1s 超时）。固定 sleep 赌不准：终端在重绘，
+-- v 的 press/release 跨到别的窗口时 release 会丢，那正是刷 v 的另一个来源。
+function Xdo:wait_active(win, activate)
+    if win == nil or win == 0 then return false end
+    return lib.xdo_wait_for_window_active(self.handle, win, activate and 1 or 0) == 0
 end
 function Xdo:type(win, text, delay)
     return lib.xdo_enter_text_window(self.handle, win, text, delay or 12000) == 0
