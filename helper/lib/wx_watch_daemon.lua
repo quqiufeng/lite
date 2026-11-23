@@ -43,6 +43,9 @@ local cjson = require("cjson")
 local W = require("ffi.x11")
 local OCR = require("ffi.ocr")
 local xdo = require("ffi.xdo").new()
+-- 常驻进程，全程起子进程（xterm/xclip/pgrep）；X socket 不标 CLOEXEC 会被子进程继承，
+-- 两个进程抢同一条事件流 → 注入的按键静默失效。见 xdo.lua:protect_fd
+xdo:protect_fd()
 
 local SELF = arg and arg[0] or ""
 local LIBDIR = SELF:match("^(.*)/[^/]+$") or "."
@@ -297,8 +300,20 @@ local function ensure_chat_via(region_title)
     take_focus()        -- open 要往搜索框打字，这一步必须真焦点（收尾会还回去）
     pcall(wx.run, { action = "open", name = C.chat, background = false })
     sleep(400)
+    -- 切完必须**确认**切成了：只读一次标题就放行，会在标题读空时（窗口正在重绘 /
+    -- 搜索面板还没收）把「什么都没切」当成成功，接下去抓的帧是别的窗口（实测是终端的
+    -- 命令行回显），那些垃圾没有 #lite 前缀 → 一律忽略 → 手机那头只看到微信闪一下、
+    -- 永远没有回应。所以读空要轮询到重绘完；仍然读空就判失败跳这一轮。
     joined = title_text()
-    if joined ~= "" and not joined:find(want, 1, true) then
+    for _ = 1, 16 do
+        if joined ~= "" then break end
+        sleep(250)
+        joined = title_text()
+    end
+    if joined == "" then
+        return false, "切「" .. C.chat .. "」后标题仍识别为空（窗口没重绘或截到了别的窗口），本轮跳过"
+    end
+    if not joined:find(want, 1, true) then
         return false, "切成「" .. C.chat .. "」失败（标题 OCR=" .. joined:sub(1, 30) .. "）"
     end
     return true

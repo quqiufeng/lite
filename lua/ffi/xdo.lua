@@ -106,7 +106,12 @@ int XFlush(Display *display);
 int XMoveWindow(Display *display, Window w, int x, int y);
 int XDisplayWidth(Display *display, int screen);
 int XDisplayHeight(Display *display, int screen);
+int XConnectionNumber(Display *display);
+int fcntl(int fd, int cmd, ...);
 int XTestFakeButtonEvent(Display *display, unsigned int button, Bool is_press, unsigned long delay);
+int XTestFakeKeyEvent(Display *display, unsigned int keycode, Bool is_press, unsigned long delay);
+unsigned long XStringToKeysym(const char *s);
+unsigned char XKeysymToKeycode(Display *display, unsigned long ks);
 int usleep(unsigned int usec);
 
 xdo_t *xdo_new(const char *display);
@@ -660,6 +665,15 @@ function Xdo:click(win, x, y, button)
     if not self:move(win, x, y) then return false end
     return self:click_current(button)
 end
+-- 把 X 连接的 fd 标成 CLOEXEC，再 fork 子进程（xclip 那类）时 fd 会随 exec 关闭。
+-- libX11 的 socket 默认**没有** CLOEXEC：子进程继承同一个 socket，两个进程读同一
+-- 条事件流 → 事件被兄弟抢走。症状是「长驻进程里 ctrl+v / ctrl+a 完全没反应，同一个
+-- 调用在一次性脚本里却好好的」，极难从现象反推（焦点、剪贴板内容全都对）。
+function Xdo:protect_fd()
+    local fd = X11.XConnectionNumber(self.dpy)
+    if fd and fd >= 0 then ffi.C.fcntl(fd, 2, 1) end   -- F_SETFD, FD_CLOEXEC
+    return fd
+end
 function Xdo:sync()
     X11.XSync(self.dpy, 0)
 end
@@ -676,9 +690,74 @@ end
 function Xdo:display_size()
     return tonumber(X11.XDisplayWidth(self.dpy, 0)), tonumber(X11.XDisplayHeight(self.dpy, 0))
 end
+-- win == 0 是 libxdo 的 CURRENTWINDOW（XTEST 本来就是全局注入、`window` 只做激活用），
+-- 所以 0 必须**照发**，不能短路：`helper/wechat.lua:key()` 一路传的就是 0，短路等于
+-- 把这个插件的 ctrl+a/BackSpace/ctrl+v/Return 全部变成空操作（实测：搜索框粘不进关键词，
+-- 候选面板不出现，OCR 读到的是左侧通讯录列表 → 误报「没看到该名字」）。只有 nil 才算没给。
+-- ── 键盘：Xtst 直发（libxdo 的 keysequence 在本机恒定失败，见下）──
+-- 实测（2026-11-23）：`xdo_send_keysequence_window` 对 "ctrl+v"/"ctrl+a"/"BackSpace"/"a"
+-- **一律返回非 0**（失败），而同一进程里 XTestFakeKeyEvent 直发完全正常；调用方又都没看
+-- 返回值，于是表现为「粘贴不进去、清空无效、候选面板不出现」，查剪贴板/焦点/fd 全都正常，
+-- 极难反推。libxdo 库内解析（修饰键表、keysym→keycode）是黑盒且 ABI 也核对过没问题，
+-- 所以这里不修它、只做自解析 + Xtst，libxdo 成功就照旧走它。
+local MODS = {
+    ctrl = "Control_L", control = "Control_L", shift = "Shift_L",
+    alt = "Alt_L", meta = "Super_L", super = "Super_L", win = "Super_L",
+}
+
+-- keysym 名字大小写敏感（"backspace" 取不到，"BackSpace" 才行）；单字符两个方向都试。
+function Xdo:_keycode(name)
+    local ks = X11.XStringToKeysym(name)
+    if ks == 0 and #name == 1 then ks = X11.XStringToKeysym(name:upper()) end
+    if ks == 0 then return nil end
+    local code = tonumber(X11.XKeysymToKeycode(self.dpy, ks))
+    if not code or code == 0 then return nil end
+    return code
+end
+
+-- "ctrl+shift+t" → mods={ctrl,shift 的 keycode}, main=t 的 keycode；认不出的键返回 nil
+function Xdo:_parse_seq(seq)
+    local tokens = {}
+    for t in tostring(seq):gmatch("[^+]+") do tokens[#tokens + 1] = t end
+    if #tokens == 0 then return nil end
+    local main = tokens[#tokens]
+    local mods = {}
+    for i = 1, #tokens - 1 do
+        local name = MODS[tokens[i]:lower()] or tokens[i]
+        local c = self:_keycode(name)
+        if not c then return nil end
+        mods[#mods + 1] = c
+    end
+    local m = self:_keycode(main)
+    if not m then return nil end
+    return mods, m
+end
+
+function Xdo:key_xtest(seq, delay)
+    local mods, main = self:_parse_seq(seq)
+    if not mods then return false end
+    local hold = math.floor((delay or 40000) / 1000)   -- usec → ms，最多 40ms
+    if hold > 40 then hold = 40 end
+    for i = 1, #mods do
+        Xtst.XTestFakeKeyEvent(self.dpy, mods[i], 1, 0)
+        ffi.C.usleep(2000)
+    end
+    Xtst.XTestFakeKeyEvent(self.dpy, main, 1, 0)
+    ffi.C.usleep(hold * 1000)
+    Xtst.XTestFakeKeyEvent(self.dpy, main, 0, 0)
+    for i = #mods, 1, -1 do
+        ffi.C.usleep(2000)
+        Xtst.XTestFakeKeyEvent(self.dpy, mods[i], 0, 0)
+    end
+    X11.XSync(self.dpy, 0)
+    return true
+end
+
 function Xdo:key(win, seq, delay)
-    if win == nil or win == 0 then return false end
-    return lib.xdo_send_keysequence_window(self.handle, win, seq, delay or 40000) == 0
+    if win == nil then return false end
+    local ok = lib.xdo_send_keysequence_window(self.handle, win, seq, delay or 40000) == 0
+    if ok then return true end
+    return self:key_xtest(seq, delay)
 end
 
 -- 显式抬键。libxdo 的 send_keysequence 是「修饰键全 down → 点主键 → 修饰键 up」，
@@ -687,7 +766,15 @@ end
 -- 反序全抬一遍是幂等的——本来没按着的键多收一次 keyup 无害，所以可以无条件调用。
 function Xdo:key_up(win, seq, delay)
     if win == nil or win == 0 then return false end
-    return lib.xdo_send_keysequence_window_up(self.handle, win, seq, delay or 40000) == 0
+    local ok = lib.xdo_send_keysequence_window_up(self.handle, win, seq, delay or 40000) == 0
+    if ok then return true end
+    -- 兜底：不管 win 是谁，把 seq 里的键全抬一遍（幂等，见上）
+    local mods, main = self:_parse_seq(seq)
+    if not main then return false end
+    for i = 1, #mods do Xtst.XTestFakeKeyEvent(self.dpy, mods[i], 0, 0) end
+    Xtst.XTestFakeKeyEvent(self.dpy, main, 0, 0)
+    X11.XSync(self.dpy, 0)
+    return true
 end
 
 -- 等窗口真的拿到焦点（库自带 1s 超时）。固定 sleep 赌不准：终端在重绘，

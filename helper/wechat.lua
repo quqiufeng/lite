@@ -156,6 +156,10 @@ local function libs()
     if not W then
         W = require("ffi.x11")
         xdo = require("ffi.xdo").new()
+        -- 必须紧跟着标 CLOEXEC：下面 set_clipboard() 用 os.execute 起 xclip，
+        -- 子进程会继承 X socket，两个进程抢同一条事件流 → ctrl+v/ctrl+a 静默失效
+        -- （同一调用在一次性脚本里正常，长驻进程里没反应）。见 xdo.lua:protect_fd
+        xdo:protect_fd()
         OCR = require("ffi.ocr")
     end
 end
@@ -187,16 +191,45 @@ local function now_ms()
     return tonumber(tvb.tv_sec) * 1000 + tonumber(tvb.tv_usec) / 1000
 end
 
+-- 最小化/图标态的窗口 activate() 是**空操作**（openbox 不会因为你 activate 一个
+-- iconic 窗口就 deiconify），于是后面所有 XTEST 按键都落到当时的焦点窗口上：
+-- 实测过一次 send 就这样把关键词打进了别处，crop("candidates") 抓到的还是旧画面，
+-- 报「候选面板没看到该名字」。所以 activate 之后必须回读状态，hidden 就先 show。
 local function ensure()
     local t = now_ms()
     local cur = xdo.active and xdo:active() or nil
     mark("  ens.query", t)
+    local st
+    pcall(function() st = xdo:wm_state(win) end)
+    if st and st.hidden then
+        pcall(function() xdo:show(win) end)
+        mark("  ens.show", t)
+        sleep(150)
+        cur = nil
+    end
     if cur ~= win then
         pcall(function() xdo:activate(win) end)
         mark("  ens.activate", t)
         sleep(250)
         mark("  ens.sleep", t)
     end
+    -- 光看 active() 不够：长驻进程里读到的 active 可能是过期值，于是这里静默跳过激活，
+    -- 后面 ctrl+a/ctrl+v/Return 全落到当时的焦点窗口上（实测：工具通道里剪贴板明明写着
+    -- 「文件传输助手」，搜索框却一个字符都没进去，OCR 读到通讯录左栏 → 误报
+    -- 「候选面板没看到该名字」；同一份代码在一次性进程里跑却正常）。所以激活必须回读确认。
+    local ok = false
+    pcall(function() ok = xdo:wait_active(win, true) end)
+    if not ok then
+        -- 再抢一次（raise 到栈顶 + 重新 activate），仍不成交给调用方：宁可报焦点错，
+        -- 也不能把按键打到别人的窗口里。
+        pcall(function()
+            xdo:raise(win)
+            xdo:activate(win)
+        end)
+        pcall(function() ok = xdo:wait_active(win, true) end)
+        mark("  ens.retry", t)
+    end
+    if not ok then error("微信拿不到焦点：按键会被别的窗口吃掉（先手动点一下微信再重试）") end
 end
 
 -- 几何守门：把窗口弄回 map 标定的那个几何，否则后面每个 point()/crop() 都是错的。
@@ -404,13 +437,26 @@ local function set_clipboard(text, wait)
     sleep(wait or 250)
 end
 
--- paste 的 r（可选）：给了就把「字进去了」当判据，省掉固定 800ms；
--- 抓不到区域指纹时退回原节拍，绝不因为优化引入新的失败。
+-- paste 的 r（可选）：给了就把「字进去了」当判据，省掉固定 800ms；没给就按原节拍。
+-- 粘贴**必须验证**。老写法 `if not wait_typed(...) then sleep(800) end` 把失败吞掉了：
+-- 搜索框一个字都没进去，函数照样返回，几十行之后才在 do_search 报
+-- 「候选面板没看到该名字」，那是假线索（实测踩过：剪贴板里明明是「文件传输助手」，
+-- 面板停在微信搜索首页，OCR 读到左栏导航 → 白查一圈焦点和 OCR）。
+-- 现在：验证不上就重写剪贴板再粘一次（selection 交接慢于首次等待时首粘会落空），
+-- 还不成就直接报「粘贴失败」，让错误出现在它真实发生的那一行。
 local function paste(text, r)
     local base = r and sig(r)
     set_clipboard(text, base and 40 or 250)
     key("ctrl+v")
-    if not (base and wait_typed(r, base, 3, 3000)) then sleep(800) end
+    if base and wait_typed(r, base, 3, 3000) then return true end
+    if base then
+        set_clipboard(text, 250)
+        key("ctrl+v")
+        if wait_typed(r, base, 3, 3000) then return true end
+        error("粘贴失败：剪贴板已写入但输入区没变（焦点不在输入框，或 ctrl+v 被吃掉）")
+    end
+    -- 抓不到区域指纹（无截图库/裁剪越界）时退回原节拍：不因为优化引入新失败。
+    sleep(800)
 end
 
 local function norm(s)
@@ -509,7 +555,7 @@ local function do_search(name, index)
     click(lcx, lcy, crop("search"))
     click(point("search"))
     key("ctrl+a"); key("BackSpace")
-    paste(name)
+    paste(name, crop("search"))
 
     -- k==1 走快路径：不 OCR、不猜候选行坐标，回车就跳。
     local k = math.max(1, tonumber(index) or 1)

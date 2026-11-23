@@ -105,6 +105,9 @@ function M.run(args, env)
 
     local Xdo = require("ffi.xdo")
     local x = Xdo.new()
+    -- 本插件要粘贴，也会起子进程（cp/读 mem.lock），X socket 必须 CLOEXEC，
+    -- 否则子进程抢事件流 → 贴进输入框的指令丢半句。见 xdo.lua:protect_fd
+    x:protect_fd()
 
     local win, chain = nil, {}
     if tonumber(args.window) then
