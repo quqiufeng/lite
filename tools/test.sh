@@ -57,6 +57,13 @@ if ! timeout 90 "$ROOT/tools/lite-lua" "$ROOT/tools/http_check.lua"; then
     echo "FAIL http.idle_timeout" >&2; exit 1
 fi
 
+echo "== wx_watch =="
+# 微信「文件传输助手」轮询的纯逻辑（helper/lib/wx_watch.lua）：回执标记 vs 触发前缀
+# 同形导致的**自激**（自己的回复被当指令再执行一遍）与 diff 只认尾部后缀。
+if ! "$ROOT/tools/lite-lua" "$ROOT/tools/wx_watch_check.lua"; then
+    echo "FAIL wx_watch" >&2; exit 1
+fi
+
 echo "== live =="
 "$ROOT/tools/live_smoke.sh"
 
