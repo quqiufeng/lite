@@ -67,6 +67,10 @@ local C = {
     -- 派完等主进程闲下来：最少等 settle_min 秒（防「刚 paste 还没动起来就判闲」），
     -- 最多等 wait 秒（主进程在跑长任务时不至于把守护进程饿死，超时就照常继续采）
     settle_min = 15, wait = 1800,
+    -- 兜底强检间隔：托盘「有未读」的闪烁只持续一两秒（实测），而轮询间隔 10s、采样窗 2.4s，
+    -- 整段错过是常态。只靠闪烁门 = 消息到了却永远不点开（用户看到的就是「微信模式没响应」）。
+    -- 所以再久也要定期进去看一眼；0=关掉（调试闪烁门本身时用）。
+    force_every = 120,
     cwd = os.getenv("LITE_CWD") or os.getenv("PWD") or ".",
     state = os.getenv("LITE_WX_STATE") or
         ((os.getenv("XDG_DATA_HOME") or (os.getenv("HOME") or "/tmp") .. "/.local/share")
@@ -81,6 +85,7 @@ do
         elseif a == "--host" then C.host = v; i = i + 2            -- 同上
         elseif a == "--wait" then C.wait = tonumber(v); i = i + 2
         elseif a == "--settle" then C.settle_min = tonumber(v); i = i + 2
+        elseif a == "--force-every" then C.force_every = tonumber(v); i = i + 2
         elseif a == "--prefix" then C.prefix = v; i = i + 2
         elseif a == "--chat" then C.chat = v; i = i + 2
         elseif a == "--tag" then C.tag = v; i = i + 2
@@ -388,17 +393,11 @@ local function copy_at(x, y)
 end
 
 -- ── 派发 ─────────────────────────────────────────────────────────────
-local PROMPT = [[
-【微信远程指令】主人在手机上发给微信「文件传输助手」的消息，原文如下：
-
-%s
-
-执行约定（每条都算数）：
-1. 先自己判风险：不可逆、改系统、删数据、花钱、往外发敏感内容 —— 先只回一句确认，别动手。
-2. 干完必须用 wechat 工具（action=send, name=文件传输助手）把结论发回去：守护进程只转发指令、不补发回执，你不发手机那头就只有沉默。正文第一行以 `lite:` 开头，这是回环标记，必须保留（不带标记会被当成新指令再跑一遍）。
-3. 手机屏幕小：结论 ≤800 字；长内容发文件或给本机路径。
-4. 只做这一件事，别顺手扩活。
-]]
+-- 派发提示词：**必须单行**。走 call_master 粘贴时多行会被终端切成多次回车 →
+-- 一条指令拆成好几轮（bracketed paste 没生效时尤其明显），碎片全进主进程。
+-- 只加一句「做完用 wechat 回复」，别再加长：约定越长，拆出来的废轮次越多。
+local PROMPT = "微信远程指令（%s）：做完请用 wechat 插件（action=send, name=文件传输助手）回复我，" ..
+    "首行以 lite: 开头（回环标记，缺了会被当新指令再跑）；不可逆/花钱/外发敏感内容先问再动。"
 
 -- 主进程 = 攥着 <cwd>/mem.lock 的那个（单写者，见 AGENTS §4）。
 local function master_pid()
@@ -556,7 +555,9 @@ local MASTER_DONE = {}
 -- 没有兜底执行：起了主进程之外的 agent 就绕开 mem.lock 的单写者约定，那一路既写不进
 -- 记忆也发不出回执（表现是「看起来跑了，什么都没留下」），所以宁可留着等下轮。
 local function dispatch(text)
-    local prompt = string.format(PROMPT, text)
+    -- 手机发来的多行也被拍平：粘贴里每多一个 \n，就多一次回车 → 多一轮废指令。
+    local body = text:gsub("%s*\n%s*", " ")
+    local prompt = string.format(PROMPT, body)
     local cm, pid = master_mod(), master_pid()
     if not cm then return nil, "加载不了 call_master（helper/call_master.lua）" end
     if not pid then return nil, "没有主进程（" .. C.cwd .. "/mem.lock 里没有活着的 pid）" end
@@ -733,14 +734,14 @@ local function mark_done(text)
     while #st.done > 60 do table.remove(st.done, 1) end
 end
 
--- 回执的指纹只有一种：lite: 前缀（主进程自己发的，见 PROMPT 第 2 条）。
+-- 回执的指纹只有一种：lite: 前缀（主进程自己发的，见 PROMPT 里那句回环标记）。
 -- 以前还有一路「本进程补发过的回执哈希」，补发删掉后它就是恒空的死状态。
 local function is_own(text)
     if Watch.is_reply(text, C.tag) then return "回执标记" end
     return nil
 end
 
--- 回执只由主进程发（PROMPT 第 2 条）：本进程只转发，验帧/补发整段删掉了。
+-- 回执只由主进程发（PROMPT 里那句 wechat 回复）：本进程只转发，验帧/补发整段删掉了。
 -- 补发看着贴心，实则两个进程抢同一个输入框 + 用户会收到「GG 没做却有条回执」的假消息；
 -- 沉默的代价更小，而且更像真的——主进程不吭声就是它没跑完。
 
@@ -914,6 +915,7 @@ local function hide_idle()
 end
 
 local rounds = 0
+local last_real = os.time()          -- 上次真正进去检查的时刻（兜底强检用它计时）
 while true do
     rounds = rounds + 1
     local added = 0
@@ -922,8 +924,15 @@ while true do
         -- 先过廉价门：图标没闪就整轮不做 —— 不抢焦点、不截图、不 OCR。这一步放在
         -- fix_geom 之前，因为救几何本身就要抢焦点开微信，那正是用户抱怨的打扰。
         local pend, gwhy0 = news_pending()
+        -- 闪烁只亮一两秒，轮询 10s 一轮很容易整段错过；只靠闪烁门等于「消息到了不点开」。
+        -- 所以隔 force_every 秒兜底强检一次。0 = 关（专测闪烁门本身时用）。
+        if not pend and C.force_every > 0 and os.time() - last_real >= C.force_every then
+            pend, gwhy0 = true, string.format("兜底强检（%ds 没进去过）", os.time() - last_real)
+        end
         if not pend then
-            if not gate_quiet then log("skip: 微信图标没闪（无新消息），不点开检查"); gate_quiet = true end
+            -- 日志要写**真实原因**：以前这里固定成「图标没闪」，把 tray_err（定位失败）
+            -- 也一起吞成这句，于是「一直在 skip」和「门本身就坏了」分不开。
+            if not gate_quiet then log("skip: %s（没点开检查）", tostring(gwhy0)); gate_quiet = true end
             return
         end
         if gate_quiet then log("恢复检查：%s", tostring(gwhy0)); gate_quiet = false end
@@ -933,6 +942,7 @@ while true do
         if not gok then log("skip: %s", tostring(gwhy)); return end
         local ready, why = ensure_chat_via(TITLE_R)
         if not ready then log("skip: %s", tostring(why)); return end
+        last_real = os.time()
         added = tick() or 0
         drain()
     end)
