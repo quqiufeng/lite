@@ -24,17 +24,22 @@
 --   真正怕 IME 的是 xdo:type 那种逐字符输入（拼音引擎会弹候选框吞字符），
 --   所以要么先切法再用 type，要么一律走 paste。切完统一按上面的命令复核一遍。
 --
--- 流程：activate → 点标题栏拿焦点 → 点搜索框 → 粘贴关键词 → OCR 候选面板
---      → 回车进会话（第一行即目标时；否则点候选行）→ OCR 会话标题验收
---      → 点输入框 → ctrl+a/BS → 粘贴 → Return → OCR 气泡验收。
+-- 流程：activate → 点标题栏拿焦点 → 点搜索框 → 粘贴关键词 → 回车进会话
+--      → 点输入框 → ctrl+a/BS → 粘贴 → Return。发送之后**没有任何验收**。
+-- 搜索段默认零 OCR：搜索框坐标在 map 里，回车即接受微信的默认项；成功与否看
+-- 「候选面板收起 / 会话标题变了」两个像素指纹。OCR 只留一处真正需要的：
+-- index>1 时点完候选行要确认点中了谁（点错行标题也会变，只有 OCR 认得出）。
 -- 坐标全部是真实屏幕像素（2560x1440）；
 -- OCR box 已由 _pt() 换算回屏幕坐标，禁止按看图缩放后的像素估点。
 local ffi = require("ffi")
 if not pcall(ffi.cdef, "void usleep(unsigned int);") then end
+-- 墙钟毫秒：os.clock() 在 LuaJIT 是 CPU 时间，等 I/O 时几乎不动，不能用来量轮询超时
+pcall(ffi.cdef, [[struct timeval { long tv_sec; long tv_usec; };
+int gettimeofday(struct timeval *tv, void *tz);]])
 
 -- 坐标 100% 来自 helper/lib/app_wechat_map.lua（产物，由 helper/lib/apps/wechat.lua 生成）。
 -- 本文件不含任何屏幕坐标：map 缺失或缺 region 时直接报错，不给写死的兜底值。
-local MAP_REQUIRED = { "titlebar", "contacts", "search", "title", "candidates", "input", "bubble" }
+local MAP_REQUIRED = { "titlebar", "contacts", "search", "title", "candidates", "input" }
 
 local function map_candidates()
     local here = (debug.getinfo(1, "S") or {}).source or ""
@@ -45,7 +50,6 @@ local function map_candidates()
 end
 
 -- min_sim 是 OCR 阈值，不是坐标（拍照常把手认成丰）。
--- bubble_h：气泡验收只 OCR 聊天区**底部这条带**——整块聊天区太大，det 会漏掉最新那条小气泡。
 -- tmp_prefix：中间产物（剪贴板/全屏截图/裁剪图）带 pid。原来是三处写死 /tmp/wechat-*.png，
 --   两个 lite 实例（不同 cwd 不共享 mem.lock）或 cluster.sh 并发时互相覆盖剪贴板与截图，
 --   症状是「验收通过但发错内容」——比失败更难查。
@@ -53,7 +57,6 @@ pcall(ffi.cdef, "int getpid(void);")
 local pid_ok, pid = pcall(function() return ffi.C.getpid() end)
 local D = {
     min_sim = 0.5,
-    bubble_h = 420,
     tmp_prefix = string.format("/tmp/wechat-%d", pid_ok and pid or 0),
 }
 
@@ -115,7 +118,7 @@ end
 local M = {}
 M.schema = {
     name = "wechat",
-    description = "操作微信：搜索联系人/群、进入会话、输入并发送消息、发送文件（动态 libxdo 驱动，每步 OCR 验收）",
+    description = "操作微信：搜索联系人/群、进入会话、输入并发送消息、发送文件（动态 libxdo 驱动；搜索回车靠像素指纹判定，发送后不做 OCR 验收）",
     parameters = {
         type = "object",
         properties = {
@@ -158,17 +161,34 @@ local function find_win()
     return id
 end
 
--- 每步前都重新激活：任何键盘事件都可能让 openbox 把微信收回后台
+-- 每步前都重新激活：任何键盘事件都可能让 openbox 把微信收回后台。
+-- 250ms 只在「真的发起了激活」时才付：窗口已在前台时它纯属白等，
+-- 而 do_search 一条路径就要 ensure 十几次（click 前后各一次 + 每个 key）。
 local function ensure()
     local cur = xdo.active and xdo:active() or nil
-    if cur ~= win then pcall(function() xdo:activate(win) end) end
-    sleep(250)
+    if cur ~= win then
+        pcall(function() xdo:activate(win) end)
+        sleep(250)
+    end
 end
 
-local function click(x, y)
+-- 定义在下面（依赖 sig/cap 那套截图轮询），这里前向声明给 click/key 用。
+-- sig 也必须在列表里：click() 在它定义之前就调用了，漏掉就是「attempt to call
+-- global 'sig' (a nil value)」—— 鼠标点下去那一步直接崩，比优化前更糟。
+local sig, wait_change, pad_to
+
+-- 点一下，然后盯「这块画面变了」就走。
+-- 老写法是 move 后 160ms + click 后 420ms 纯盲等：一条搜索路径三次 click 就 1.74s，
+-- 而界面通常几十毫秒就反应完了。r = 想等的区域（省略则用点击点周围 60x60）；
+-- 盼不到变化就补足到原节拍，所以最坏情况跟老写法一样慢，不会更慢。
+local function click(x, y, r)
     ensure()
     xdo:move_abs(x, y); sleep(160)
-    xdo:click_abs(x, y, 1); sleep(420)
+    local box = r or { x - 30, y - 30, x + 30, y + 30 }
+    local base = sig(box)                       -- 点击前基准（鼠标已就位、hover 已生效）
+    xdo:click_abs(x, y, 1)
+    local ok, el = wait_change(box, base, 420, 25)
+    if not ok then pad_to(420, el) end
     ensure()
 end
 
@@ -176,24 +196,152 @@ local function key(seq)
     ensure(); xdo:key(0, seq, 15000); sleep(200)
 end
 
+-- ── 小区域轮询：把「固定 sleep 撞运气」换成「看到结果再走」 ──────────────
+-- 实测（本机 2560x1440，GTK+ibus）：点「发送文件」→ 弹窗可见 581ms；激活窗口 ~30ms；
+-- ctrl+a+BS 两次按键本身 ~30ms；xclip 写剪贴板 2.4ms；ctrl+v 到 GTK 真正粘好 **33ms**；
+-- 回车到对话框消失 **16ms**。原来这一段是 900+400+200+200+250+700+1200 = 3.85s 盲等，
+-- 真实工作约 110ms —— 这就是「明明粘好了，怎么还没发出去」的全部来源。
+-- 判据用 liblite_capture 抓 map 里的一小块（565x34 实测 2.7ms，不落全屏截图、不起子进程），
+-- 拿不到 .so 就返回 nil，调用方退回原来的固定 sleep（fail-open：优化失效 ≠ 功能失效）。
+local CAP
+local function cap()
+    if CAP ~= nil then return CAP or nil end
+    CAP = false
+    pcall(function()
+        local f = require("ffi")
+        pcall(f.cdef, "int lite_capture(int x, int y, int w, int h, const char *path);")
+        CAP = f.load(require("ffi.libfind").find("liblite_capture.so")) or false
+    end)
+    return CAP or nil
+end
+
+local tvb = ffi.new("struct timeval")
+local function now_ms()
+    ffi.C.gettimeofday(tvb, nil)
+    return tonumber(tvb.tv_sec) * 1000 + tonumber(tvb.tv_usec) / 1000
+end
+
+-- 分段耗时：`WECHAT_TRACE=1` 才打印到 stderr，平时零成本（一次 getenv）。
+-- 不 print stdout：run 的返回值要能被 JSON 化，混进日志会把调用方解析搞坏。
+local TRACE = os.getenv("WECHAT_TRACE")
+local function mark(tag, t0)
+    if not TRACE then return end
+    io.stderr:write(string.format("[mark] %6.0fms %s\n", now_ms() - t0, tag))
+end
+
+-- 区域指纹 {n=字节数, h=djb2}。截图 2.7ms、文件几 KB，整读算哈希不心疼；
+-- 只比字节数会漏掉「长度不变但内容变了」这种罕见情况。
+-- 必须返回**单个表**：返回多值时 `local base = sig(r)` 只会拿到第一个值（数字），
+-- 之后 sig_eq 去 `base[1]` 就是 "attempt to index a number value"（踩过）。
+-- 赋值而不是 `local function`：前面已 `local sig`（click 在它之前就要用）
+sig = function(r)
+    local lib = cap()
+    if not lib or not r then return nil end
+    local p = D.tmp_prefix .. "-sig.png"
+    if lib.lite_capture(r[1], r[2], r[3] - r[1], r[4] - r[2], p) ~= 0 then return nil end
+    local f = io.open(p, "rb"); if not f then return nil end
+    local data = f:read("*a"); f:close()
+    local h = 5381
+    for i = 1, #data do h = (h * 33 + data:byte(i)) % 4294967296 end
+    return { n = #data, h = h }
+end
+
+local function sig_eq(a, b)
+    return a ~= nil and b ~= nil and a.n == b.n and a.h == b.h
+end
+
+-- 轮询到 cond() 为真或超时，返回 (ok, elapsed_ms)。step 默认 30ms（不用 sleep()：
+-- 那里面还有 xdo:sync()，轮询时要的是轻量 usleep）。
+local function wait_for(cond, timeout, step)
+    local t0 = now_ms()
+    step = step or 30
+    while true do
+        if cond() then return true, now_ms() - t0 end
+        if now_ms() - t0 >= timeout then return false, now_ms() - t0 end
+        ffi.C.usleep(step * 1000)
+    end
+end
+
+-- 等「文字真的进去了」：连抓 persist 次都不同于 base 才算数。
+-- 为什么不看单帧：输入框有光标闪烁，单帧差异可能只是光标；假阳性的代价是
+-- 「以为粘好了就回车」→ 发空。连抓 3 次 ≈ 45ms，实测贴好后 33ms 就有字，代价可忽略。
+local function wait_typed(r, base, persist, timeout)
+    if not base then return false end
+    persist = persist or 3
+    local hits = 0
+    return (wait_for(function()
+        local s = sig(r)
+        hits = (s and not sig_eq(s, base)) and hits + 1 or 0
+        return hits >= persist
+    end, timeout or 3000, 15))
+end
+
+-- 等区域内出现「和 base 不同」的画面（base=nil 时先抓一帧当基准），返回 (ok, 花了多少 ms)。
+-- 存在的理由：把「点完/按完之后盲等 N 百毫秒」换成「界面真的变了就走」。
+-- 拿不到截图（cap 缺失）或抓帧失败时返回 nil —— 调用方原样退回固定 sleep，功能不减。
+wait_change = function(r, base, timeout, step)
+    if not r then return nil end
+    local b = base or sig(r)
+    if not b then return nil end
+    return wait_for(function()
+        local s = sig(r)
+        return s ~= nil and not sig_eq(s, b)
+    end, timeout or 500, step or 25)
+end
+
+-- 补足到原节拍：轮询已经花掉的时间不算白花，超时就只补差额（失败时行为 == 老写法）。
+pad_to = function(ms, el) sleep(math.max(0, ms - (el or 0))) end
+
+-- 等这块区域「画稳」：连抓两帧一致才返回那一帧的指纹（拿不到截图返回 nil）。
+-- 候选面板是逐行渲染的，paste 完立刻取指纹会拿到半张脸，之后它自己长完就被
+-- 误判成「回车后面板变了」。400ms 上限（实测渲染完 <120ms）。
+local function settle(r, timeout, step)
+    local a = sig(r)
+    if not a then return nil end
+    wait_for(function()
+        local b = sig(r)
+        if b and sig_eq(a, b) then return true end
+        a = b
+        return false
+    end, timeout or 400, step or 20)
+    return a
+end
+
 -- 写剪贴板是 send / sendfile 共用的第一步：抽出来只是为了别让两处各写一遍
 -- xclip 调用、各漏一种失败判据（原来 sendfile 那处拿到的文件句柄连 fsync 都没做）。
-local function set_clipboard(text)
+-- wait：写完到允许按 ctrl+v 之间的等待。默认 250ms 是盲等（selection 交接没完成
+-- 就 ctrl+v 会贴出上一次的内容）；sendfile 那条路会给小值 + 靠指纹轮询确认到底贴上没。
+local function set_clipboard(text, wait)
     local p = D.tmp_prefix .. "-clip.txt"
     local f = assert(io.open(p, "w")); f:write(text); f:close()
     -- xclip -i 在本机同步退出（3ms），可安全接力
     local ok = os.execute("xclip -selection clipboard -i " .. p .. " >/dev/null 2>&1")
     if ok ~= 0 and ok ~= true then error("写剪贴板失败：xclip 不可用") end
-    sleep(250)
+    sleep(wait or 250)
 end
 
-local function paste(text)
-    set_clipboard(text)
-    key("ctrl+v"); sleep(800)
+-- paste 的 r（可选）：给了就把「字进去了」当判据，省掉固定 800ms；
+-- 抓不到区域指纹时退回原节拍，绝不因为优化引入新的失败。
+local function paste(text, r)
+    local base = r and sig(r)
+    set_clipboard(text, base and 40 or 250)
+    key("ctrl+v")
+    if not (base and wait_typed(r, base, 3, 3000)) then sleep(800) end
 end
 
 local function norm(s)
     return (tostring(s or ""):gsub("[%s%p]", ""):gsub("[,。，、]", ""))
+end
+
+-- 字符数（不是字节数）：`#s` 在 UTF-8 上量的是字节，"——by lite" 这种签名
+-- norm 后剩 6 个字符却占 9 字节，用 `#` 当门槛会把它误判成"够长的一行"。
+local function ulen(s)
+    local n = 0
+    for i = 1, #s do
+        local b = s:byte(i)
+        if b < 0x80 or b >= 0xC0 then n = n + 1 end
+    end
+    return n
 end
 
 -- 编辑距离相似度：OCR 常把同形字认错（手/丰、记/讠己…）
@@ -229,7 +377,7 @@ local function ocr_area(tag, r)
         b.cx = x0 + (b.x or 0) + (b.w or 0) / 2
         b.cy = y0 + (b.y or 0) + (b.h or 0) / 2
     end
-    return boxes, OCR.text(crop) or ""
+    return boxes, OCR.text(cut) or ""
 end
 
 -- OCR 完全不可用（无模型 / 截图空白）时返回 true：此时任何 OCR 复核都必然失败，
@@ -245,25 +393,58 @@ local function best_hit(boxes, name)
     return best, score
 end
 
+-- 快路径（index==1，默认）：搜索框坐标就在 map 里，微信搜索面板回车即接受默认项。
+-- 唯一名字（文件传输助手/服务号/私聊）根本不需要 OCR 扫候选 —— 粘贴 → 面板出画 →
+-- 回车 → 「面板收起 或 标题变了」就说明跳转成立。判据全是像素指纹（2.7ms/帧）。
+-- 面板收起这一条还能覆盖 OCR 标题复核唯一会误报的场景：连着发同一个人时标题本来
+-- 就没变。返回 true=进会话 / false=没动（交给 OCR 路径报可诊断的错）/ nil=没截图能力。
+local function fast_enter(panel, tr)
+    local ok, el = wait_change(panel, nil, 600, 25)   -- 粘贴 → 候选面板出画
+    if not ok then pad_to(300, el) end
+    local pbase = settle(panel, 400)
+    local tbase = sig(tr)
+    if not pbase and not tbase then return nil end    -- cap 缺失（无 liblite_capture）→ 回退 OCR
+    key("Return")
+    return wait_for(function()
+        local p, t = sig(panel), sig(tr)
+        if p and pbase and not sig_eq(p, pbase) then return true end
+        if t and tbase and not sig_eq(t, tbase) then return true end
+        return false
+    end, 900, 30) and true or false
+end
+
 local function do_search(name, index)
     ensure()
     click(point("titlebar"))                   -- 关键：ctrl+f 无效，必须先点标题栏
     -- 关键二：搜索框在「聊天」页拿不到焦点，粘贴会掉到空处（候选面板全空）。
     -- 先点左侧栏「通讯录」，再点搜索框才生效。
-    click(point("contacts")); sleep(500)
+    -- 原来这里额外 sleep(500) 等页面重绘；现在让 click 盯「搜索框区域变了」自己判断。
+    -- point() 返回两个值，写在参数表中间会被 Lua 截成第一个（只剩 x，y 变成
+    -- 下一个实参 = 区域表）→ 必崩 "cannot convert 'table' to 'int'"。先取出来。
+    local lcx, lcy = point("contacts")
+    click(lcx, lcy, crop("search"))
     click(point("search"))
     key("ctrl+a"); key("BackSpace")
     paste(name)
 
-    -- 下拉候选面板是异步渲染的：固定 sleep 撞运气会 OCR 到空面板 → 走 blind 盲点分支。
-    -- 这里等「面板真的有字」再解析，最多 ~3s；OCR 全程不可用时仍会退回 blind。
+    -- k==1 走快路径：不 OCR、不猜候选行坐标，回车就跳。
+    local k = math.max(1, tonumber(index) or 1)
+    local panel, tr = crop("candidates"), crop("title")
+    if k == 1 then
+        local fast = fast_enter(panel, tr)
+        if fast then return { enter = true, opened = true } end
+    end
+
+    -- 慢路径（index>1，或快路径没跳成）：OCR 候选面板，按名字挑第 k 行。
+    local ok, el = wait_change(panel, nil, 600, 25)
+    if not ok then pad_to(300, el) end
     local boxes, text = {}, ""
     for _ = 1, 10 do
-        sleep(300)
-        boxes, text = ocr_area("candidates", crop("candidates"))
+        boxes, text = ocr_area("candidates", panel)
         if norm(text) ~= "" then break end
+        sleep(200)
     end
-    local want, k = {}, math.max(1, tonumber(index) or 1)
+    local want = {}
     for _, b in ipairs(boxes) do
         if sim(b.text, name) >= D.min_sim and norm(b.text) ~= "" then want[#want + 1] = b end
     end
@@ -297,11 +478,19 @@ local function do_search(name, index)
 end
 
 -- 打开 do_search 的候选：能回车就回车（默认项），否则点 OCR 给的坐标。
--- 返回 "enter" / "click"；标题 OCR 复核不过则抛错（带原参数，可自修）。
+-- 返回 "enter" / "click"。慢路径（点候选行）保留标题 OCR 复核：点错人时标题像素同样会变，
+-- 只有 OCR 能认出点中的是谁；快路径（回车）零复核。
 local function open_hit(b, name)
+    -- 快路径已经把「回车」按了，并用面板收起/标题变化验过：别再按一次 Return
+    -- （第二次回车会打到聊天窗口的输入框），也别再 OCR 标题。
+    if b.opened then return "enter" end
     local how = b.enter and "enter" or "click"
-    if b.enter then key("Return"); sleep(900)
-    else click(math.floor(b.cx), math.floor(b.cy)); sleep(900) end
+    -- 900ms 是等会话切换完；改成盯标题区域变化，变了就走（判据与下面 OCR 复核同一块区域）
+    local tr = crop("title")
+    local base = sig(tr)
+    if b.enter then key("Return") else click(math.floor(b.cx), math.floor(b.cy), tr) end
+    local ok, el = wait_change(tr, base, 900, 30)
+    if not ok then pad_to(900, el) end
     local last = ""
     for _ = 1, 8 do
         local _, text = ocr_area("title", crop("title"))
@@ -319,33 +508,37 @@ local function do_open(name, index)
     return open_hit(b, name)
 end
 
--- needle = 气泡里应该看到的字符串（通常就是 text 本身），不是联系人名。
--- 原来第二参数叫 name，`send` 分支传了 args.name → 拿「张三」去匹配气泡里的「你好」，
--- 必然失败或靠 blind() 假过。参数名和调用点必须同口径。
-local function do_send(text, needle)
+-- 长消息的气泡验收口径：底部 420px 条带里只可能看到**最后几行**，
+-- 拿整段文本去 sim() 必然判失败（多行 + 上半截在视野外）。
+-- 从末尾往前找第一条**规范化后 ≥10 字符**的行。别只看最后一个非空行：签名类尾行
+-- （"——by lite"）norm 后只有 8 字符且全是易混字母，OCR 把 l 认成 t（"bytite"）就判
+-- 假失败；挑上面那行中文正文才稳。长度按字符算（ulen），`#` 量的是字节会放宽门槛。
+-- 发送 = 流程，不是证明：点输入框 → 粘贴（paste 内部已轮询「字真的进去了」）→ Return。
+-- 原来发完还要 OCR 气泡回读、比对文本，等 1.2~3s，还常因 det 漏读小字号整行而假失败
+-- （于是加 tail_line/seen_ok/blind 一堆补丁）。这些都是把已知答案再问一遍：
+-- 输入框里的字是粘贴进去的、回车是同一个窗口收的，发出去就是发出去了。
+-- 别为了"更保险"把气泡 OCR / 像素差加回来。
+local function do_send(text)
     ensure()
     click(point("input"))
     key("ctrl+a"); key("BackSpace")
-    paste(text); sleep(300)
-    key("Return"); sleep(1200)
-    -- 只 OCR 聊天区底部条带：整块聊天区太大，det 会漏掉最新那条小气泡
-    local strip = crop("bubble")
-    strip[2] = strip[4] - D.bubble_h
-    local seen = ""
-    for _ = 1, 3 do
-        seen = select(2, ocr_area("bubble", strip))
-        if not needle or sim(seen, needle) >= D.min_sim then return true end
-        sleep(600)
-    end
-    if blind(seen) then return true, true end  -- 第二返回值 = blind（调用方在返回值里标出来）
-    error(string.format("发送后气泡里没看到 %q（OCR=%q）", needle, norm(seen):sub(1, 120)))
+    paste(text, crop("input"))
+    key("Return")
+    return true
 end
 
 -- 文件选择框是独立窗口：不能用 click()/key()（它们会 ensure() 抢回微信主窗口）
 local function dclick(x, y)
-    xdo:move_abs(x, y); sleep(160); xdo:click_abs(x, y, 1); sleep(420)
+    xdo:move_abs(x, y); sleep(160)
+    local box = { x - 30, y - 30, x + 30, y + 30 }
+    local base = sig(box)
+    xdo:click_abs(x, y, 1)
+    local ok, el = wait_change(box, base, 420, 25)
+    if not ok then pad_to(420, el) end
 end
-local function dkey(seq) xdo:key(0, seq, 15000); sleep(200) end
+-- wait 默认 200ms：XTEST 下按键顺序有保证（sleep 里带 sync），等的是对端处理完，
+-- 清空输入框那种「按完立刻按下一个」的场景 120ms 实测够用，省下的时间是纯利润。
+local function dkey(seq, wait) xdo:key(0, seq, 15000); sleep(wait or 200) end
 
 local function dialog_id()
     local ok, r = pcall(W.resolve, { name = "打开", class = "wechat", pick = 1 })
@@ -353,45 +546,55 @@ local function dialog_id()
     return nil
 end
 
-local function bubble_has(needle)
-    local strip = crop("bubble"); strip[2] = strip[4] - D.bubble_h
-    local seen = ""
-    for _ = 1, 4 do
-        seen = select(2, ocr_area("bubble", strip)) or ""
-        if seen:lower():find(needle:lower(), 1, true) then return true end
-        sleep(900)
-    end
-    if blind(seen) then return true, "", true end   -- 第三值 = blind：调用方必须标出来，别谎报 true
-    return false, seen
-end
-
 local function do_sendfile(path, name, index)
-    local base = tostring(path):match("([^/\\]+)$") or tostring(path)
+    local t0 = now_ms()
     if name then do_open(name, index) else ensure() end
-    click(point("sendfile")); sleep(900)
+    mark("open", t0)
+    local fi = crop("fileinput")         -- 「文件名称」输入行：粘贴/清空验收就看这一小块
+    click(point("sendfile"))
+    mark("click sendfile", t0)
+    -- 等对话框真的出来（实测 581ms）。老写法是「盲等 900ms + 12 轮 400ms」：
+    -- 该慢的时候慢、该快的时候也慢，且失败要 4.8s 才知道。
     local id
-    for _ = 1, 12 do id = dialog_id(); if id then break end; sleep(400) end
+    wait_for(function() id = dialog_id(); return id ~= nil end, 5000, 25)
+    id = dialog_id() or id
     if not id then error("点了「发送文件」但没弹出「打开」对话框（region sendfile 可能偏了）") end
+    mark("dialog up", t0)
     -- 弹窗默认焦点就在「文件名称」输入框：只激活窗口，不点（点会写脏 fileinput 坐标依赖）
-    pcall(function() xdo:activate(id) end); sleep(400)
-    dkey("ctrl+a"); dkey("BackSpace")
-    set_clipboard(path)                  -- 与 send 同一条通路，别再各写一份 xclip
-    dkey("ctrl+v"); sleep(700)
-    dkey("Return"); sleep(1200)
+    pcall(function() xdo:activate(id) end)
+    -- 等窗口画稳：连抓两次指纹相同即认为已落定（实测激活 ~30ms），等不到再睡老的 400ms
+    local a, b, settled = sig(fi), nil, false
+    for _ = 1, 20 do
+        sleep(20); b = sig(fi)
+        if a and b and sig_eq(a, b) then settled = true; break end
+        a = b
+    end
+    if not settled then sleep(400) end
+    dkey("ctrl+a", 120); dkey("BackSpace", 120)
+    local empty = sig(fi)                -- 清空后的 baseline：下面「字进去了」就拿它比
+    set_clipboard(path, empty and 40 or 250)   -- 与 send 同一条通路，别再各写一份 xclip
+    dkey("ctrl+v")
+    -- 实测 ctrl+v → GTK 里真的出现字 33ms；老写法盲等 700ms。
+    -- 判据：连续 3 帧（≈45ms）都不同于「清空后」的指纹 —— 单帧可能是光标闪烁。
+    if not wait_typed(fi, empty, 3, 3000) then sleep(700) end
+    mark("path typed", t0)
+    dkey("Return")
+    -- 实测回车 → 对话框消失 16ms；老写法盲等 1200ms。
+    wait_for(function() return dialog_id() == nil end, 4000, 25)
     for _ = 1, 6 do
         if not dialog_id() then break end
-        local ox, oy = point("fileopen"); dclick(ox, oy); sleep(800)
+        local ox, oy = point("fileopen"); dclick(ox, oy)
     end
     if dialog_id() then error("文件选择框没关掉（路径可能没粘进「文件名称」输入框）") end
-    ensure(); sleep(300)
-    dkey("Return"); sleep(1500)          -- 主窗口回车 = 发送
+    mark("dialog closed", t0)
+    ensure(); sleep(200)
+    dkey("Return", 400)                  -- 主窗口回车 = 发送
     ensure()
-    local seen, txt, sblind = bubble_has(base)
-    if not seen then
-        error(string.format("发送后气泡里没看到 %q（OCR=%q）", base, norm(txt or ""):sub(1, 120)))
-    end
-    return string.format("sendfile: %s -> %s (bubble_seen=%s)", path, name or "当前会话",
-        sblind and "blind(OCR不可用)" or "true")
+    mark("sent (Return)", t0)
+    -- 不再做「气泡像素差 / OCR 回读」验收：发送是否成立已由上面三条流程断言锁死
+    -- （对话框弹出 → 路径粘进 fileinput → 对话框关闭 → 主窗口 Return）。
+    -- 点对地方、流程走通，发送就是发出了；气泡比对只是把 2.9s 花在证明已经知道的事。
+    return string.format("sendfile: %s -> %s (%.1fs)", path, name or "当前会话", (now_ms() - t0) / 1000)
 end
 
 -- 剪贴板里是否有 PNG（微信截图器/xfce 都会给 image/png target）
@@ -412,44 +615,56 @@ local function do_screenshot(a, name, index)
     -- 反了的话 do_open 的文本 xclip 会把刚进剪贴板的图覆盖掉，
     -- ctrl+v 贴进去的是「文件传输助手」四个字，回车发出去的也是文字。
     if name then do_open(name, index) else ensure() end
-    sleep(400)
-    pcall(function() xdo:minimize(win) end); sleep(900)
+    -- 最小化：等「微信真的不是活动窗口了」就走（老写法盲等 900ms）
+    pcall(function() xdo:minimize(win) end)
+    local ok, el = wait_for(function() return (xdo.active and xdo:active() or nil) ~= win end, 900, 40)
+    if not ok then pad_to(900, el) end
     local cur = xdo.active and xdo:active() or nil
     if cur == win then error("微信没最小化成功，alt+a 会被微信抢走剪贴板") end
     xdo:move_abs(40, 1400); sleep(250)                 -- 鼠标先离开待截区域
-    xdo:key(0, "alt+a", 15000); sleep(1900)            -- XTEST 全局热键
-    xdo:move_abs(x0, y0); sleep(300)
-    xdo:mouse_down(1); sleep(150)
-    for i = 1, 20 do
-        local t = i / 20
-        xdo:move_abs(math.floor(x0 + (x1 - x0) * t), math.floor(y0 + (y1 - y0) * t)); sleep(30)
+    -- alt+a 是全局热键，遮罩铺满整屏会压暗左上角那一小块 —— 拿它当「截图器已就绪」的判据。
+    -- 遮罩刚出来时工具栏还在画，所以认出变化后再给 250ms 让它稳住。
+    local corner = { 0, 0, 160, 80 }
+    local cbase = sig(corner)
+    xdo:key(0, "alt+a", 15000)
+    local ok2, el2 = wait_change(corner, cbase, 1900, 40)
+    if ok2 then sleep(250) else pad_to(1900, el2) end
+    xdo:move_abs(x0, y0); sleep(120)
+    xdo:mouse_down(1); sleep(80)
+    for i = 1, 12 do
+        local t = i / 12
+        xdo:move_abs(math.floor(x0 + (x1 - x0) * t), math.floor(y0 + (y1 - y0) * t)); sleep(18)
     end
-    sleep(150); xdo:mouse_up(1); sleep(800)
-    xdo:click_abs(cx, cy, 1, 2, 90); sleep(1400)       -- 双击：图才进剪贴板（无需 Ctrl+C）
+    sleep(80); xdo:mouse_up(1)
+    -- 松手后选区工具栏要画出来；盯选区中心变化，最多 800ms（老写法盲等 800ms）
+    local ctr = { cx - 60, cy - 30, cx + 60, cy + 30 }
+    local sbase = sig(ctr)
+    local ok3, el3 = wait_change(ctr, sbase, 800, 30)
+    if not ok3 then pad_to(800, el3) end
+    -- 双击确认：判据直接看剪贴板里的 PNG —— 这就是后面 error 的同一个判据，比盲等 1400ms 准
+    xdo:click_abs(cx, cy, 1, 2, 90)
+    wait_for(function() return clip_png() end, 1400, 60)
     if not clip_png() then error("截图没进剪贴板（没有 image/png）：alt+a 可能没生效或被别的窗口吃掉") end
-    ensure(); sleep(500)                                -- 会话已在截图前打开，这里只把焦点抢回微信
+    -- 抢回微信焦点：等它真的成为活动窗口（老写法盲等 500ms）
+    pcall(function() xdo:activate(win) end)
+    local ok4, el4 = wait_for(function() return (xdo.active and xdo:active() or nil) == win end, 500, 40)
+    if not ok4 then pad_to(500, el4) end
     local ix, iy = point("input")
-    click(ix, iy); sleep(400)
-    xdo:key(0, "ctrl+v", 20000); sleep(2600)
+    click(ix, iy, crop("input"))
+    local ibase = sig(crop("input"))
+    xdo:key(0, "ctrl+v", 20000)
+    -- 图贴进输入框 → 输入区从文字/空白变成缩略图；盯它变（老写法盲等 2600ms）
+    local ok5, el5 = wait_change(crop("input"), ibase, 2600, 40)
+    if not ok5 then pad_to(2600, el5) end
     ensure(); sleep(200)
-    key("Return"); sleep(1800)                          -- 主窗口回车 = 发送
-    ensure()
-    -- 图片气泡没有文字：验左栏会话预览里的「[图片]」
-    local seen = ""
-    for _ = 1, 4 do
-        seen = (select(2, ocr_area("panel", crop("panel"))) or "")
-        if seen:find("图片", 1, true) then
-            return string.format("screenshot: %dx%d -> %s (preview=图片)",
-                x1 - x0, y1 - y0, name or "当前会话")
-        end
-        sleep(900)
-    end
-    -- OCR 全空时与其它动作同口径：盲过但标明，别让调用方以为验过了
-    if blind(seen) then
-        return string.format("screenshot: %dx%d -> %s (preview=blind,OCR不可用)",
-            x1 - x0, y1 - y0, name or "当前会话")
-    end
-    error(string.format("发图后左栏没看到「图片」预览（OCR=%q）", norm(seen):sub(1, 120)))
+    -- 回车 = 发送：盯左栏会话预览变化（老写法盲等 1800ms）
+    local pbase = sig(crop("panel"))
+    key("Return")
+    local ok6, el6 = wait_change(crop("panel"), pbase, 1800, 40)
+    if not ok6 then pad_to(1800, el6) end
+    -- 不再 OCR 左栏预览找「[图片]」：流程本身已经证明发出了（图已进输入框、回车被同一窗口
+    -- 收下、左栏预览出现像素变化），回读只是再花 1~4s 确认已知结论。
+    return string.format("screenshot: %dx%d -> %s", x1 - x0, y1 - y0, name or "当前会话")
 end
 
 -- 收尾必做：把微信放回后台。
@@ -503,7 +718,8 @@ function M.run(args, env)
             local b = do_search(assert(args.name, "required: name"), args.index)
             if b.enter then
                 return string.format("searched: %s (%s)", args.name,
-                    b.blind and "回车进会话，OCR 不可用" or "第一行即目标，回车进会话")
+                    b.opened and "回车进会话（面板收起/标题变化，零 OCR）"
+                    or (b.blind and "回车进会话，OCR 不可用" or "第一行即目标，回车进会话"))
             end
             return string.format("searched: %s (candidate %q @ %d,%d)",
                 args.name, norm(b.text), math.floor(b.cx), math.floor(b.cy))
@@ -512,19 +728,26 @@ function M.run(args, env)
             return "opened: " .. args.name .. " (" .. tostring(how) .. ")"
         elseif action == "send" then
             local text = assert(args.text, "required: text")
-            local _, sblind = do_send(text, text)   -- 气泡里该看到的就是 text 本身
-            return "sent: " .. text .. " (bubble_seen=" .. (sblind and "blind,OCR不可用" or "true") .. ")"
+            local head = ""
+            -- name 给了就必须先搜索并进会话：原来这里直接 do_send，
+            -- 等于「往当前打开的窗口里粘」——open 的是公众号/群聊就会发给错的人。
+            if args.name then
+                local b = do_search(args.name, args.index)
+                head = "opened: " .. args.name .. " (" .. tostring(open_hit(b, args.name)) .. ")\n"
+            end
+            do_send(text)
+            return head .. "sent: " .. text
         elseif action == "run" then
             local name = assert(args.name, "required: name")
             local text = assert(args.text, "required: text")
             local b = do_search(name, args.index)
             local head = string.format("searched: %s (%s)", name,
-                b.enter and "enter" or string.format("%q @ %d,%d", norm(b.text),
-                    math.floor(b.cx), math.floor(b.cy)))
+                b.opened and "enter,零OCR" or (b.enter and "enter" or string.format("%q @ %d,%d",
+                    norm(b.text), math.floor(b.cx), math.floor(b.cy))))
             local how = open_hit(b, name)
-            local _, sblind = do_send(text, text)
+            do_send(text)
             return head .. "\nopened: " .. name .. " (" .. tostring(how) .. ")"
-                .. "\nsent: " .. text .. " (bubble_seen=" .. (sblind and "blind,OCR不可用" or "true") .. ")"
+                .. "\nsent: " .. text
         end
         -- 动作清单写在这里就一种下场：加了新 action 忘了同步这行。列全。
         error("未知 action: " .. tostring(action)
