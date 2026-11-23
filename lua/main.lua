@@ -25,6 +25,8 @@ lite — DeepSeek 终端 coding agent
   lite --tui --snapshot out.txt   输出整屏快照（AI 验收）
   lite --reboot                重启后自动继续：起来就把上一轮 /reboot 留下的提示词发出去
                                （没留就用默认的「重启成功，继续工作。」）
+  lite --wx                    微信模式起手：常驻轮询「文件传输助手」，手机发的
+                               「lite 指令」当任务跑，回执发回微信（= #微信模式）
   lite state [--json]          输出会话/记忆/todo 状态
   lite sessions [--json]       列出同 cwd 会话
   lite plugins [--json]        列出 helper/ 插件与加载错误
@@ -50,6 +52,8 @@ lite — DeepSeek 终端 coding agent
   --approval auto|ask|deny     工具审批策略（默认 auto）
   --no-plugins                 禁用 helper/ 插件与 hook（默认启用）
   --reboot                     重启后自动继续（见用法里那条）
+  --wx                         起手就把微信模式拉起来（= 在输入框敲 #微信模式）
+  --wx-interval N              微信轮询间隔秒（默认 10）
   --max-turns N                单次任务工具循环上限（默认 256）
   --readonly                   明知不落盘也照跑（mem.lock 被占时不拒绝启动）
   --debug                      开启调试日志（默认 $TMPDIR/lite-debug.jsonl）
@@ -121,7 +125,7 @@ local VALUE_FLAGS = {
     ["--snapshot"] = true, ["--snapshot-text"] = true, ["--width"] = true,
     ["--height"] = true, ["--session"] = true, ["--reasoning-effort"] = true,
     ["--approval"] = true, ["--max-turns"] = true, ["--debug-log"] = true,
-    ["--prefix"] = true,
+    ["--prefix"] = true, ["--wx-interval"] = true,
 }
 
 local cmd, cmd_at, rest = nil, nil, {}
@@ -221,6 +225,12 @@ local function parse_flags(list)
         elseif a == "--reboot" then
             flags.reboot = true
             i = i + 1
+        elseif a == "--wx" then
+            flags.wx = true
+            i = i + 1
+        elseif a == "--wx-interval" then
+            flags.wx_interval = tonumber(list[i + 1])
+            i = i + 2
         elseif a == "--no-plugins" then
             flags.no_plugins = true
             i = i + 1
@@ -892,6 +902,11 @@ elseif cmd == "--tui" or cmd == "--gui" then
         messages = restored,
         reboot = flags.reboot,
         reboot_text = reboot_text,
+        -- --wx / --wx-interval：起手就把「手机微信→本机执行」的常驻轮询拉起来
+        -- （等价于在输入框敲 #微信模式）。port 顺手带过去，守护进程派发走同一个 serve。
+        wx = flags.wx,
+        wx_interval = flags.wx_interval,
+        port = flags.port,
     })
     -- shutdown 工具置的 exit 压过 reboot：说了退出就不再 execv，直接 os.exit(0)。
     local reboot = ctx.settings and ctx.settings.reboot and not ctx.settings.exit

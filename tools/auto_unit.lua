@@ -5318,12 +5318,15 @@ do
     check(W.command("#监工模式") == "on", "watchdog command on")
     check(W.command("  #监工模式  ") == "on", "watchdog command on trimmed")
     check(W.command("#终止监工") == "off", "watchdog command off")
-    -- 三个同义词都得认，用户嘴上说「退出监工」不算新命令
+    -- 关闭动词全局共用（tui/modecmd.lua）：带不带「模式」都得认
     check(W.command("#退出监工") == "off", "watchdog command off (退出)")
+    check(W.command("#退出监工模式") == "off", "watchdog command off (退出+模式)")
     check(W.command("#关闭监工") == "off", "watchdog command off (关闭)")
-    check(W.command("  #退出监工\t") == "off", "watchdog command off trimmed")
-    for _, w in ipairs(W.OFF_WORDS) do
-        check(W.command(w) == nil, "watchdog off word alone is not a command (" .. w .. ")")
+    check(W.command("  #退出监工模式\t") == "off", "watchdog command off trimmed")
+    local MC = require("tui.modecmd")
+    for _, w in ipairs(MC.OFF) do
+        check(W.command("#" .. w) == nil, "watchdog off verb alone is not its command (" .. w .. ")")
+        check(W.command("#" .. w .. "微信模式") == nil, "watchdog ignores other mode (" .. w .. ")")
     end
     check(W.command("#监工") == nil, "watchdog command partial ignored")
     check(W.command("帮我看看 #监工模式 怎么写的") == nil, "watchdog command mid-text ignored")

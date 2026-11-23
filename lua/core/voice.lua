@@ -118,13 +118,16 @@ wait
 ]==], dir, asr, c.tailf, c.minf, c.maxf, c.thr, c.mic))
 end
 
--- 识别输入框里的语音指令：整行是标记，或标记跟在本轮转写文字后面
+-- 识别输入框里的语音指令：整行是标记，或标记跟在本轮转写文字后面。
+-- 关闭动词与其它模式共用（tui/modecmd）：#退出语音模式 / #退出语音；
+-- 裸 #退出 归 tui/loop 统一处理（关掉所有开着的模式），这里只留转写尾巴那种写法。
 function M.command(s)
   if type(s) ~= "string" then return nil end
   s = s:gsub("^%s+", ""):gsub("%s+$", "")
   if s == "#语音模式" or s:match("%s#语音模式$") then return "toggle" end
-  if s == "#退出" or s:match("%s#退出$") then return "off" end
-  if s:match("^#退出$") then return "off" end
+  if s:match("%s#退出$") or s:match("%s#退出语音$") then return "off" end
+  local ok, ModeCmd = pcall(require, "tui.modecmd")
+  if ok and ModeCmd.is(s, { "语音" }) then return "off" end
   return nil
 end
 

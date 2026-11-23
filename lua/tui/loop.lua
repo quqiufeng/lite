@@ -14,6 +14,8 @@ local ApprovalView = require("tui.approval_view")
 local Complete = require("tui.complete")
 local SessionView = require("tui.session_view")
 local Watchdog = require("tui.watchdog")
+local WxMode = require("tui.wxmode")
+local ModeCmd = require("tui.modecmd")
 local Session = require("core.session")
 local Reload = require("core.reload")
 local CoreText = require("core.text")
@@ -139,6 +141,30 @@ function M.run(ctx, agent, memory, opts)
     end
 
     watchdog_load()
+
+    -- 微信模式：手机→文件传输助手→本机执行（常驻轮询在进程外，见 helper/wechat_watch.lua）。
+    -- 插件按名调用（core/tools.lua:execute），清单里没它也能调，插件被删就报一句错。
+    local wxmode = WxMode.new(function(name, args)
+        local t = agent and agent.tools
+        if not t then return "error: 没有 tools（--no-plugins？）" end
+        return t:execute(name, args)
+    end)
+
+    local function wx_save()
+        local id = ctx.session and ctx.session.id
+        if not (memory and id) then return end
+        local ttl = (memory.TTL and memory.TTL.long) or 0
+        memory:put("/agent/session", id .. "/wx", wxmode.on, ttl)
+    end
+
+    local function wx_load(id)
+        id = id or (ctx.session and ctx.session.id)
+        local v = (memory and id) and memory:get("/agent/session", id .. "/wx") or nil
+        if v == true then wxmode.on = true end
+        return wxmode.on
+    end
+
+    wx_load()
 
     local HINT = "lite TUI · Enter 发送 · Ctrl+J 换行 · Tab 补全 · 左键拖选=复制 · /session 会话 · Esc×2 终止 · Ctrl+G diff · Ctrl+T todo · ? help · Ctrl+D 退出"
 
@@ -492,6 +518,30 @@ function M.run(ctx, agent, memory, opts)
     local function submit()
         local text = composer:get_text()
         if text == "" then return end
+        -- 关闭命令全区共用：「#退出<模式>」上面各模式自己认，「#退出」裸敲 = 把开着的都关掉。
+        if ModeCmd.bare(text) then
+            composer:clear()
+            local closed = {}
+            if voice_on then
+                voice_on = false
+                vmod().stop()
+                closed[#closed + 1] = "语音"
+            end
+            if watchdog.on then
+                watchdog:stop()
+                watchdog_save()
+                closed[#closed + 1] = "监工"
+            end
+            if wxmode.on then
+                closed[#closed + 1] = "微信（" .. wxmode:stop() .. "）"
+                wx_save()
+            end
+            transcript:add("system", #closed > 0
+                and ("已退出模式：" .. table.concat(closed, "、"))
+                or "当前没有开着的模式（#语音模式 / #监工模式 / #微信模式）")
+            if draw then draw() end
+            return
+        end
         local vcmd = vmod().command(text)
         if vcmd == "toggle" then
             composer:clear()
@@ -503,7 +553,7 @@ function M.run(ctx, agent, memory, opts)
             else
                 local ok, e = vm.start()
                 voice_on = ok and true or false
-                transcript:add("system", ok and "语音模式已开启:说话即转文字,再输入 #退出 关闭"
+                transcript:add("system", ok and "语音模式已开启:说话即转文字,再输入 #退出 或 #退出语音模式 关闭"
                     or ("语音不可用: " .. tostring(e)))
             end
             if draw then draw() end
@@ -517,20 +567,43 @@ function M.run(ctx, agent, memory, opts)
             if draw then draw() end
             return
         end
-        -- 监工模式开关：#监工模式 / #终止监工（#关闭监工、#退出监工同义）
+        -- 监工模式开关：#监工模式 开；#退出监工模式 关（动词共用，见 tui/modecmd.lua）
         local wcmd = Watchdog.command(text)
         if wcmd then
             composer:clear()
             if wcmd == "on" then
                 watchdog:start()
                 transcript:add("system", string.format(
-                    "监工模式已开启：每 %d 秒自动替你发一句「%s」（仅在空闲且输入框为空时发）。输入 #终止监工（或 #退出监工 / #关闭监工）关闭",
+                    "监工模式已开启：每 %d 秒自动替你发一句「%s」（仅在空闲且输入框为空时发）。输入 #退出监工模式 关闭（#退出 一把全关）",
                     watchdog.sec, Watchdog.TEXT))
             else
                 watchdog:stop()
                 transcript:add("system", "监工模式已关闭")
             end
             watchdog_save()      -- 开着/关掉都要落盘，否则重启后又回到默认关闭
+            if draw then draw() end
+            return
+        end
+        -- 微信模式开关：#微信模式 开；#退出微信模式 关（动词共用，见 tui/modecmd.lua）
+        local xcmd = WxMode.command(text)
+        if xcmd then
+            composer:clear()
+            if xcmd == "on" then
+                transcript:add("system", "微信模式启动中（拉起常驻轮询，约 1~3 秒）…")
+                if draw then draw() end
+                local ok, msg = wxmode:start({
+                    interval = opts.wx_interval,
+                    port = opts.port,
+                })
+                transcript:add("system", ok
+                    and ("微信模式已开启：" .. msg
+                        .. "。手机微信给「文件传输助手」发「#lite 指令」即执行；"
+                        .. "输入 #退出微信模式 关闭（#退出 一把全关）")
+                    or ("微信模式起不来：" .. msg))
+            else
+                transcript:add("system", "微信模式已关闭：" .. wxmode:stop())
+            end
+            wx_save()            -- 开关状态跟会话走：重启/换回该会话自动接上
             if draw then draw() end
             return
         end
@@ -871,6 +944,7 @@ function M.run(ctx, agent, memory, opts)
                 todos = todo_items,
                 queue = #queue,
                 watchdog = watchdog.on and watchdog:left() or nil,
+                wx = wxmode.on,
                 spinner = busy and SPINNER[spinner_i + 1] or nil,
                 status = current_tool and ("tool:" .. current_tool) or nil,
             })
@@ -887,6 +961,22 @@ function M.run(ctx, agent, memory, opts)
     if opts.reboot then
         composer:set_text(opts.reboot_text or REBOOT_TEXT)
         submit()
+    end
+
+    -- 微信模式起手：`lite --wx` 直接拉起，或上一个进程开着（状态落在会话里）就接上。
+    -- 守护进程在进程外，机器重启/被杀后不会自己回来，所以「开着」要真去验一遍再补拉。
+    if opts.wx or wxmode.on then
+        local st = wxmode.on and not opts.wx and wxmode:status() or ""
+        if st:find("运行中", 1, true) then
+            transcript:add("system", "微信模式：守护进程已在跑（" .. WxMode.head(st) .. "）")
+        else
+            local ok, msg = wxmode:start({ interval = opts.wx_interval, port = opts.port })
+            transcript:add("system", ok
+                and ("微信模式已开启：" .. msg
+                    .. "。手机发「#lite 指令」到「文件传输助手」即执行；#退出微信模式 关闭")
+                or ("微信模式起不来：" .. msg))
+            wx_save()
+        end
     end
 
     while not quitting do

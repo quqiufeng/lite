@@ -52,8 +52,9 @@ MUST NOT：`python`/`sed -i` 改仓库文件（用 `edit`/`write`）；Chrome/We
 
 - **`cluster.sh`**：一行一槽 `<box>\t<dir>\t<prompt>[\t<task>]`，`local`/`-` 跑本机；并发度 = 槽数
   （`mem.lock` 定上限）；退出码 0 全 ok / 1 有任务失败 / 2 用法错误。字段与产物格式见其头注释。
-- **TUI 快捷开关**（`submit()` 先拦，不进模型）：`#语音模式`；`#监工模式`/`#终止监工` 每 180s 在空闲时
-  补发「继续」（`lua/tui/watchdog.lua`）；**输入框空时 Tab** 写 `cwd/.plan` 进只读模式，再按删掉退出，
+- **TUI 快捷开关**（`submit()` 先拦，不进模型）：`#语音模式`；`#监工模式`/`#退出监工模式` 每 180s 在空闲时
+  补发「继续」（`lua/tui/watchdog.lua`）；`#微信模式`/`#退出微信模式`（`lite --wx` 起手同效）拉/收
+  进程外的「文件传输助手」轮询（`lua/tui/wxmode.lua` + `helper/wechat_watch.lua`），手机发 `#lite 指令` 才执行，开着状态栏亮 `WX`；**输入框空时 Tab** 写 `cwd/.plan` 进只读模式，再按删掉退出，
   放行清单见 `helper/plan.lua` 头注释。
 - **HTML→PNG 三件套**走 `build/liblite_html.so`，与 `liblitehtml.so.0`/`libgumbo.so.0` 同目录靠 `$ORIGIN`：
   源码树要 `/opt/litehtml` 才能**编**，安装版不必也能**跑**；缺库别误读成「liblite_html 没编译」。
