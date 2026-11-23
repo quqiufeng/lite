@@ -66,7 +66,7 @@ M.schema = {
         type = "object",
         properties = {
             action = { type = "string",
-                enum = { "start", "stop", "status", "once", "tail" },
+                enum = { "start", "stop", "status", "once", "tail", "tray" },
                 description = "start=拉起常驻；stop=收掉；status=进程/日志；once=单轮试跑（默认只看不执行）；tail=看日志" },
             interval = { type = "integer", description = "轮询间隔秒，默认 10" },
             port = { type = "integer", description = "serve 端口，默认 8765" },
@@ -164,6 +164,17 @@ function M.run(args, env)
         for line in (tail .. "\n"):gmatch("(.-)\n") do lns[#lns + 1] = line end
         local from = math.max(1, #lns - n + 1)
         return table.concat(lns, "\n", from, #lns)
+    elseif action == "tray" then
+        -- 只测「托盘图标闪不闪」这一个判据：新消息到达时跑一次应该出 blink，
+        -- 看完消息（图标静止）再跑应该出 idle。是守护进程设门前的独立验收口。
+        local cmd = string.format("cd %s && %s %s %s 2>&1",
+            q(cwd), q(lua), q(root_of(env) .. "/helper/lib/wx_tray.lua"),
+            args.quiet and "--quiet" or "")
+        local h = io.popen(cmd)
+        if not h then return "error: 起不来 " .. lua end
+        local out = h:read("*a") or ""
+        h:close()
+        return (out:gsub("%s+$", ""))
     elseif action == "once" then
         local flags = opts(args) .. " --once"
         if not args.dispatch then flags = flags .. " --dry-run" end

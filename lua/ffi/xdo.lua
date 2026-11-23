@@ -32,6 +32,21 @@ int XUnmapWindow(Display *display, Window w);
 int XIconifyWindow(Display *display, Window w, int screen);
 int XGetClassHint(Display *display, Window w, XClassHint *class_hints);
 
+/* ICCCM 的「求注意」信号。微信收到新消息且窗口不在前台时，托盘图标闪动的**同时**
+   会置 XUrgencyHint（很多托盘实现靠它驱动闪动），所以判「有没有新消息」用它比截屏
+   比对图标便宜三个数量级，也不用抢焦点。字段按 64 位布局写（flags 是 long）。 */
+typedef struct {
+    long flags;
+    int input;
+    int initial_state;
+    unsigned long icon_pixmap;
+    unsigned long icon_window;
+    int icon_x, icon_y;
+    unsigned long icon_mask;
+    unsigned long window_group;
+} XWMHints;
+XWMHints *XGetWMHints(Display *display, Window w);
+
 /* 只用到 map_state（0=IsUnmapped 1=IsUnviewable 2=IsViewable）与 override_redirect。
    其余字段按 XWindowAttributes 的真实布局声明，保证偏移正确。 */
 typedef struct {
@@ -330,6 +345,41 @@ function Xdo:wm_state(win)
 end
 
 function Xdo:is_maximized(win) return self:wm_state(win).maximized end
+
+-- 「窗口在求注意吗」。两条信号都读，任一亮就算：
+--   urgency  = WM_HINTS.flags & XUrgencyHint   —— ICCCM 老规矩，客户端自己设，点开才清
+--   attention = _NET_WM_STATE 里的 DEMANDS_ATTENTION —— EWMH 版，WM 可能也会替客户端设
+-- 返回 { urgency=, attention=, any= }；win 为 nil/0 直接全 false（None 会 BadWindow 炸进程）。
+--
+-- **别拿它当微信「有没有新消息」的门**（试过，不通）：微信把图标交给 StatusNotifier 画在
+-- nm-tray 窗口里，收到消息时只闪图标、并不置 urgency/DEMANDS_ATTENTION，于是「有新消息也判
+-- 没消息」，整轮被静默跳过。要判未读就采托盘像素看「有没有出现第二种画面」
+-- （helper/lib/wx_tray.lua），或用 helper/lib/wx_sni.lua 直读 SNI IconPixmap 当真值源。
+function Xdo:urgent(win)
+    local r = { urgency = false, attention = false, any = false }
+    if win == nil or win == 0 then return r end
+    local h = X11.XGetWMHints(self.dpy, win)
+    if h ~= nil then
+        r.urgency = bit.band(tonumber(h.flags), 0x100) ~= 0    -- XUrgencyHint = 1L<<8
+        X11.XFree(h)
+    end
+    local prop = ffi.new("unsigned char *[1]")
+    local actual, fmt = ffi.new("Atom[1]"), ffi.new("int[1]")
+    local n, after = ffi.new("unsigned long[1]"), ffi.new("unsigned long[1]")
+    local rc = X11.XGetWindowProperty(self.dpy, win,
+        X11.XInternAtom(self.dpy, "_NET_WM_STATE", 0), 0, 64, 0,
+        X11.XInternAtom(self.dpy, "ATOM", 0), actual, fmt, n, after, prop)
+    if rc == 0 and prop[0] ~= nil then
+        local want = X11.XInternAtom(self.dpy, "_NET_WM_STATE_DEMANDS_ATTENTION", 0)
+        local list = ffi.cast("Atom *", prop[0])
+        for i = 0, tonumber(n[0]) - 1 do
+            if list[i] == want then r.attention = true; break end
+        end
+        X11.XFree(prop[0])
+    end
+    r.any = r.urgency or r.attention
+    return r
+end
 
 -- _NET_CLIENT_LIST_STACKING → { [win_id] = 序号 }，序号大的在上。
 -- 别拿 _NET_CLIENT_LIST 当层序：那是 WM 的**管理顺序**（≈创建顺序），raise/lower 都不改它，

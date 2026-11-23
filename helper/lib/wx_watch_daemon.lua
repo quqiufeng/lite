@@ -611,6 +611,54 @@ local function fix_geom()
     return geom_ok()
 end
 
+-- ── 「图标不闪就不点开」的门 ────────────────────────────────────────
+-- 判据就是用户说的那句话：**托盘里的微信图标不闪 = 没有新消息**。微信 Linux 版收到新消息
+-- 时图标在两组画面之间来回换（周期约 0.9s），看过消息就静止。所以盯住托盘那一小块
+-- 像素就够：不用抢焦点、不用截全屏、不用 OCR。
+--
+-- **不要按「红点」判**：用 SNI IconPixmap 直读（helper/lib/wx_sni.lua）验过，未读时换的是
+-- {64x64,22x22} 与 {16x16,16x16} 两组帧，64x64 那张**不带红点**，闪动停止后也是它。
+-- 所以 wx_tray 只比「有没有出现第二种画面」，不比某个像素图案；哪天微信改了配色也不至于失效。
+--
+-- 早先试过读 ICCCM urgency（`xdo:urgent`）当门，不可靠：微信把图标交给 StatusNotifier
+-- 画在 nm-tray 窗口里，客户端不一定还置 urgency，于是「有新消息也判没消息」，整轮被静默跳过。
+-- 像素判据不看客户端配合，只要画出来了就认得出。
+--
+-- 采样窗口 15 帧 × 160ms ≈ 2.4s，见到第二种画面立刻返回（有消息时快）。
+-- 托盘图标定位/缓存/失效重定位都在 helper/lib/wx_tray.lua，本轮只持有一份 cache。
+local gate_quiet = false          -- 上一轮已判「没闪」，用来把日志压成状态边沿
+local tray_cache = {}
+local tray, tray_err, tray_env
+
+-- 一次性备好 X 句柄：和主 xdo 共用同一个 Display，别另开连接（多一份往返 + 退出漏关）。
+local function tray_ready()
+    if tray_env then return tray_env end
+    local ok, X11 = pcall(ffi.load, "X11")
+    if not ok then return nil, "load libX11 失败" end
+    local sw, sh = screen_wh()
+    tray_env = { X11 = X11, dpy = xdo.dpy, root = X11.XDefaultRootWindow(xdo.dpy),
+                 sw = sw, sh = sh }
+    return tray_env
+end
+
+local function news_pending()
+    if not win_refresh() then return false, "认不出微信窗口" end
+    -- 门就是门，没有「窗口可见就放行」的旁路：那条旁路一旦打开，微信被留在桌面上
+    -- （最小化失败、或被用户自己摊开）就会每轮都冲进去抢焦点。宁可漏一轮，也别打扰。
+    if tray_err then return false, tray_err end       -- 上次就起不来，别每轮重试
+    if not tray then
+        local ok, mod = pcall(require, "helper.lib.wx_tray")
+        if not ok then tray_err = "载不到 wx_tray: " .. tostring(mod); return false, tray_err end
+        tray = mod
+    end
+    local env, eerr = tray_ready()
+    if not env then return false, eerr end
+    local blink, why, rect = tray.check(env.X11, env.dpy, env.root, env.sw, env.sh, tray_cache)
+    if blink then return true, why end
+    if not rect and why then tray_err = why end
+    return false, why
+end
+
 -- 鼠标落点一律用**窗口相对坐标**（libxdo 的 xdo_move_mouse_relative_to_window），
 -- 不要写屏幕绝对像素：绝对坐标绑死 2560x1408 这套几何，换显示器/改分辨率后可能落在
 -- 窗口外，浮标挪不走、滚轮也滚不到会话上，而症状只是「OCR 多几行杂字」或「一直没新消息」。
@@ -893,6 +941,14 @@ while true do
     local added = 0
     touched = false                       -- 上一轮没收尾（ok=false）也要清零，别把旧状态带进来
     local ok, err = pcall(function()
+        -- 先过廉价门：图标没闪就整轮不做 —— 不抢焦点、不截图、不 OCR。这一步放在
+        -- fix_geom 之前，因为救几何本身就要抢焦点开微信，那正是用户抱怨的打扰。
+        local pend, gwhy0 = news_pending()
+        if not pend then
+            if not gate_quiet then log("skip: 微信图标没闪（无新消息），不点开检查"); gate_quiet = true end
+            return
+        end
+        if gate_quiet then log("恢复检查：%s", tostring(gwhy0)); gate_quiet = false end
         -- 几何先量一遍：坐标失准时截图裁到的不是聊天区，继续跑只会「一直 skip」或把
         -- 别处的字当指令 diff 出来。救不回来就跳过本轮，等下一轮（用户可能正在拖窗口）。
         local gok, gwhy = fix_geom()
