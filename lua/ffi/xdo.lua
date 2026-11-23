@@ -224,6 +224,43 @@ function Xdo:_attrs(win)
     }
 end
 
+-- _NET_WM_STATE（ATOM 列表）。判「已最大化」必须看 VERT **和** HORZ 两个 atom 同时在，
+-- 不能只看几何：窗口被摆成整屏大小 ≠ WM 记着「已最大化」（之后一次 resize 就退回普通态）；
+-- 反过来「已最大化」也可能几何不符（换显示器、面板换位置）。这两个方向都要能分开报。
+-- 面板/桌面/override_redirect 窗口根本没有这个属性：n=0 当「全 false」，不是失败。
+-- win 必须是**活着的**窗口 id：XGetWindowProperty 对无效 id 触发 BadWindow，X11 默认错误处理
+-- 直接 abort 整个进程（不是抛 Lua error，pcall 兜不住）。id 来自 Xdo:windows()/resolve() 才安全。
+function Xdo:wm_state(win)
+    local st = { n = 0, vert = false, horz = false, fullscreen = false,
+                 hidden = false, maximized = false }
+    if win == nil or win == 0 then return st end        -- None 也会 BadWindow，直接短路
+    local atom = X11.XInternAtom(self.dpy, "_NET_WM_STATE", 0)
+    local actual, fmt = ffi.new("Atom[1]"), ffi.new("int[1]")
+    local n, after = ffi.new("unsigned long[1]"), ffi.new("unsigned long[1]")
+    local prop = ffi.new("unsigned char *[1]")
+    local rc = X11.XGetWindowProperty(self.dpy, win, atom, 0, 64, 0,
+        X11.XInternAtom(self.dpy, "ATOM", 0), actual, fmt, n, after, prop)
+    if rc ~= 0 or prop[0] == nil then return st end
+    local vert = X11.XInternAtom(self.dpy, "_NET_WM_STATE_MAXIMIZED_VERT", 0)
+    local horz = X11.XInternAtom(self.dpy, "_NET_WM_STATE_MAXIMIZED_HORZ", 0)
+    local full = X11.XInternAtom(self.dpy, "_NET_WM_STATE_FULLSCREEN", 0)
+    local hid = X11.XInternAtom(self.dpy, "_NET_WM_STATE_HIDDEN", 0)
+    local list = ffi.cast("Atom *", prop[0])
+    for i = 0, tonumber(n[0]) - 1 do
+        local a = list[i]
+        st.n = st.n + 1
+        if a == vert then st.vert = true
+        elseif a == horz then st.horz = true
+        elseif a == full then st.fullscreen = true
+        elseif a == hid then st.hidden = true end
+    end
+    X11.XFree(prop[0])
+    st.maximized = st.vert and st.horz
+    return st
+end
+
+function Xdo:is_maximized(win) return self:wm_state(win).maximized end
+
 function Xdo:windows()
     local root = X11.XDefaultRootWindow(self.dpy)
     local atom = X11.XInternAtom(self.dpy, "_NET_CLIENT_LIST", 0)
@@ -248,6 +285,7 @@ function Xdo:windows()
             pid = self:_pid(win),
             viewable = at.viewable,
             override_redirect = at.override_redirect,
+            maximized = self:is_maximized(win),
             -- 堆叠顺序：_NET_CLIENT_LIST 是自下而上，末尾最靠前
             z = i + 1,
         }
@@ -346,6 +384,39 @@ function Xdo:_change_state(win, state)
     X11.XSendEvent(self.dpy, root, 0, 0x180000, ev)
     X11.XSync(self.dpy, 0)
 end
+
+-- _NET_WM_STATE 客户端消息：0=remove 1=add 2=toggle。
+-- 最大化不是 move/resize 能凑出来的：openbox 只在收到这两个 atom 时才把窗口
+-- 记成「已最大化」，之后用户/自己再 resize 一次就退回普通态。像素坐标类插件
+-- （helper/wechat.lua 的 map 是 2560x1408 标定的绝对坐标）必须先这一步，
+-- 否则窗口一小，所有点全落在别处。
+local function wm_state(self, win, action, vert, horz)
+    vert = (vert == nil) and true or vert
+    horz = (horz == nil) and true or horz
+    local root = X11.XDefaultRootWindow(self.dpy)
+    local atoms = {}
+    if vert then atoms[#atoms + 1] = X11.XInternAtom(self.dpy, "_NET_WM_STATE_MAXIMIZED_VERT", 0) end
+    if horz then atoms[#atoms + 1] = X11.XInternAtom(self.dpy, "_NET_WM_STATE_MAXIMIZED_HORZ", 0) end
+    if #atoms == 0 then return false end
+    local ev = ffi.new("XAnyEvent")
+    ev.xclient.type = 33          -- ClientMessage
+    ev.xclient.send_event = 1
+    ev.xclient.display = self.dpy
+    ev.xclient.window = win
+    ev.xclient.message_type = X11.XInternAtom(self.dpy, "_NET_WM_STATE", 0)
+    ev.xclient.format = 32
+    ev.xclient.data.l[0] = action  -- 0=remove 1=add 2=toggle
+    ev.xclient.data.l[1] = atoms[1]
+    ev.xclient.data.l[2] = atoms[2] or 0
+    ev.xclient.data.l[3] = 1      -- source: normal application
+    -- SubstructureRedirectMask(0x100000) | SubstructureNotifyMask(0x80000)
+    X11.XSendEvent(self.dpy, root, 0, 0x180000, ev)
+    X11.XSync(self.dpy, 0)
+    return true
+end
+
+function Xdo:maximize(win, vert, horz) return wm_state(self, win, 1, vert, horz) end
+function Xdo:restore(win, vert, horz) return wm_state(self, win, 0, vert, horz) end
 
 -- 显示 = xdo_map_window（等价 `xdotool windowmap --sync`）+ 抬栈序。
 -- 实测 openbox 下对 Iconic 窗口调用即可 deiconify 并稳定可见（300ms×30 采样全 IsViewable）[verified p68]

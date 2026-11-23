@@ -29,7 +29,9 @@
 -- 搜索段默认零 OCR：搜索框坐标在 map 里，回车即接受微信的默认项；成功与否看
 -- 「候选面板收起 / 会话标题变了」两个像素指纹。OCR 只留一处真正需要的：
 -- index>1 时点完候选行要确认点中了谁（点错行标题也会变，只有 OCR 认得出）。
--- 坐标全部是真实屏幕像素（2560x1440）；
+-- 坐标全部是真实屏幕像素，按 map.window 标定的几何（2560x1408，即最大化）；
+--   **窗口几何不对时先 ensure_geom() 自动最大化**，最大化也救不回来就报错，
+--   不会硬点（窗口一小每个点都落到别处，症状像"没反应"）。位置偏移走平移兜住。
 -- OCR box 已由 _pt() 换算回屏幕坐标，禁止按看图缩放后的像素估点。
 local ffi = require("ffi")
 if not pcall(ffi.cdef, "void usleep(unsigned int);") then end
@@ -75,6 +77,14 @@ local function load_map()
     return nil
 end
 
+-- map 里的坐标是**绝对屏幕坐标**，按生成 map 时的窗口几何（map.window.w/h）标定。
+-- 窗口一旦换了几何，所有点就落到别处（点空、点到别的按钮，症状像"没反应"）。
+-- 所以每次 run 先 ensure_geom()：尺寸不符就最大化（openbox 只认 _NET_WM_STATE，
+-- move/resize 凑不出来），最大化也救不回来就直接报错——硬点等于随机点。
+-- 尺寸对得上但位置不同（多显示器/面板把最大化窗口顶下去）纯平移就够，走 OFF。
+local OFF = { x = 0, y = 0 }
+local GEOM_TOL = 8      -- 边框/面板可能吃掉几像素
+
 local function region(name)
     local m = D.map or load_map()
     if not m then error(D.map_error) end
@@ -83,7 +93,9 @@ local function region(name)
         error(string.format("wechat map 缺 region %q（%s）；把坐标写进 helper/lib/apps/wechat.lua 后重跑生成脚本",
             name, D.map_path))
     end
-    return g
+    if OFF.x == 0 and OFF.y == 0 then return g end
+    return { x0 = g.x0 + OFF.x, y0 = g.y0 + OFF.y,
+             x1 = g.x1 + OFF.x, y1 = g.y1 + OFF.y, note = g.note }
 end
 
 local function crop(name)
@@ -185,6 +197,60 @@ local function ensure()
         sleep(250)
         mark("  ens.sleep", t)
     end
+end
+
+-- 几何守门：把窗口弄回 map 标定的那个几何，否则后面每个 point()/crop() 都是错的。
+-- 顺序是「先唤醒再看」：最小化/图标态的 XGetGeometry 给的是图标位置，不是真实窗口。
+-- 几何不符时先问 WM 记着的 _NET_WM_STATE，**已经是最大化就别再发 maximize**：openbox
+-- 对已最大化的窗口再收一次是纯无操作，白等 2.5s，而且失败信息会误报成「最大化没生效」。
+-- 两个方向要分开报，用户才知道是重标定还是真没法凑：已最大化 = 面板/显示器变了（只能重标定），
+-- 未最大化 = 消息没被 WM 认（窗口 override_redirect / 没有 EWMH）。
+-- 返回 true 或 nil+原因；原因要能照着做（重跑生成脚本 / 换窗口）。
+local function ensure_geom()
+    local m = D.map or load_map()
+    if not m then return nil, D.map_error end
+    local want = m.window
+    if type(want) ~= "table" or not want.w or not want.h then
+        return true         -- 没标定几何就无从判断，保持旧行为不阻塞
+    end
+    local function fits(g)
+        return g ~= nil and math.abs(g.w - want.w) <= GEOM_TOL and math.abs(g.h - want.h) <= GEOM_TOL
+    end
+    pcall(function() xdo:activate(win) end)
+    sleep(200)
+    local g = xdo:geometry(win)
+    if fits(g) then
+        OFF.x, OFF.y = g.x, g.y
+        if OFF.x ~= 0 or OFF.y ~= 0 then
+            D.geom_note = string.format("窗口在 %d,%d，坐标已平移", OFF.x, OFF.y)
+        end
+        return true
+    end
+    local t = now_ms()
+    local st = xdo:wm_state(win)          -- 没有 _NET_WM_STATE 的窗口返回全 false，不当失败
+    if not st.maximized and not st.fullscreen then
+        pcall(function() xdo:maximize(win) end)
+        local deadline = t + 2500
+        while now_ms() < deadline do
+            sleep(100)
+            g = xdo:geometry(win)
+            if fits(g) then break end
+        end
+        mark("  geom.maximize", t)
+        st = xdo:wm_state(win)
+    else
+        D.geom_note = "窗口已最大化但几何不符（显示器/面板变了），未重发 maximize"
+    end
+    g = xdo:geometry(win) or g
+    if not fits(g) then
+        return nil, string.format(
+            "微信窗口几何 %sx%s ≠ map 标定 %dx%d（%s）；"
+                .. "按当前几何重跑 ./tools/lua.sh helper/lib/apps/wechat.lua 重新标定",
+            tostring(g and g.w), tostring(g and g.h), want.w, want.h,
+            st.maximized and "已是最大化，最大化救不回来" or "发了 maximize 仍不符")
+    end
+    OFF.x, OFF.y = g.x, g.y
+    return true
 end
 
 -- 点一下，然后盯「这块画面变了」就走。
@@ -720,6 +786,9 @@ function M.run(args, env)
         or (action == "screenshot" and { "panel" }) or nil
     local ok, err = check(needs)
     if not ok then return "error: " .. err end
+    -- 坐标是绝对屏幕坐标，窗口几何不对就全错：这一步先把它弄回标定几何。
+    local gok, gerr = ensure_geom()
+    if not gok then return "error: " .. gerr end
     -- 所有动作都在这层 pcall 里跑：成功 or 抛错，收尾都 leave(bg) 把微信放回后台。
     -- 原来「出错就直接 error()」的写法会让一次失败的 send 把微信留在前台挡桌面。
     local function dispatch()
