@@ -59,11 +59,11 @@ local C = {
     interval = 10, port = 8765, host = "127.0.0.1",
     -- 触发前缀；改这里就得同步 wx_watch.lua 的 M.PREFIX（单测钉的是那边的语义）
     prefix = "#lite", chat = "文件传输助手", tag = "lite:",
-    -- 单轮最多执行几条新增指令：默认 1 = 只跑最新那条（用户明确要求「永远只响应最新一条」，
-    -- 没回他会再发）。调大只在调试想复现"积压怎么办"时有意义。
-    once = false, dry = false, raise = true, hide = true, max_new = 1,
-    -- 连续多少帧读到 0 条才认「会话被清空」（见 tick 里的空帧分支）
-    empty_frames = 4,
+    once = false, dry = false, raise = true, hide = true,
+    -- 唯一的一条去重：兜底强检进来、最新一条跟上次派过的**一模一样**时多久之内不重跑。
+    -- 只防「别的会话在闪 → 我们进去却只看到老指令」这一种误重放；用户重发同一句话过了
+    -- 这个窗口就照跑。别做成永久（踩过：派过一次后重发同一条永远静默丢弃）。
+    same_after = 60,
     -- 派完等主进程闲下来：最少等 settle_min 秒（防「刚 paste 还没动起来就判闲」），
     -- 最多等 wait 秒（主进程在跑长任务时不至于把守护进程饿死，超时就照常继续采）
     settle_min = 15, wait = 1800,
@@ -89,7 +89,7 @@ do
         elseif a == "--prefix" then C.prefix = v; i = i + 2
         elseif a == "--chat" then C.chat = v; i = i + 2
         elseif a == "--tag" then C.tag = v; i = i + 2
-        elseif a == "--max-new" then C.max_new = tonumber(v); i = i + 2
+        elseif a == "--same-after" then C.same_after = tonumber(v); i = i + 2
         elseif a == "--cwd" then C.cwd = v; i = i + 2
         elseif a == "--state" then C.state = v; i = i + 2
         elseif a == "--once" then C.once = true; i = i + 1
@@ -117,7 +117,8 @@ local function log(fmt, ...)
 end
 
 -- ── 状态 ─────────────────────────────────────────────────────────────
-local st = { prev = {}, pending = {}, replies = {}, done = {}, seq = 0 }
+-- last/last_t：最近一次派发出去的指令指纹与时刻（见 tick）。没有别的账本了。
+local st = { pending = {}, replies = {}, seq = 0, last = "", last_t = 0 }
 do
     local f = io.open(STATE, "rb")
     if f then
@@ -718,22 +719,6 @@ local function snapshot()
     return blocks
 end
 
--- 已派发过的指令指纹：滚动抖动/几何跳变会让 diff 退化，同一条消息可能被认成新的，
--- 没有这张表就会把同一条指令跑第二遍（跑测试、发消息这种副作用不能重来）。
-local function dup_of(text)
-    local k = Watch.key(text)
-    for _, d in ipairs(st.done or {}) do if d == k then return true end end
-    return false
-end
-
-local function mark_done(text)
-    local k = Watch.key(text)
-    if k == "" then return end
-    st.done = st.done or {}
-    st.done[#st.done + 1] = k
-    while #st.done > 60 do table.remove(st.done, 1) end
-end
-
 -- 回执的指纹只有一种：lite: 前缀（主进程自己发的，见 PROMPT 里那句回环标记）。
 -- 以前还有一路「本进程补发过的回执哈希」，补发删掉后它就是恒空的死状态。
 local function is_own(text)
@@ -745,98 +730,48 @@ end
 -- 补发看着贴心，实则两个进程抢同一个输入框 + 用户会收到「GG 没做却有条回执」的假消息；
 -- 沉默的代价更小，而且更像真的——主进程不吭声就是它没跑完。
 
+-- 模型一句话（用户定的）：**图标闪 = 有新消息 → 进去把最新那条 #lite 抄下来派发**。
+-- 没有基线、没有两帧比对、没有去重表：
+--   * 闪动本身就说明「刚来了新的」，所以同一条文字重发也照跑；
+--   * 点开会话 = 已读，闪动自己停，不会连着点第二回。
+-- 唯一剩下的状态是 st.last/st.last_t，挡的是另一种情况：别的会话在闪、我们进去却只看到
+-- 老指令 —— 文字跟 C.same_after 秒内刚派过的一模一样就不再跑第二遍（副作用不能重来）。
 local function tick()
     local blocks, err = snapshot()
     if not blocks then log("skip: %s", err); return 0 end
-    local keys = Watch.keys(blocks)
-    -- 空帧不能覆盖基线：窗口刚被拉起/正在滚动时 OCR 会读到 0 条，若拿它刷新
-    -- prev，下一帧就从头重建基线，这中间发来的消息会被当历史吞掉（实测丢过 #3）。
-    -- 会话真的清空是极小概率，宁可留旧基线多看一轮，也不悄悄漏指令。
-    if #keys == 0 and #(st.prev or {}) > 0 then
-        -- 连续空帧才认「会话真的被清空了」：单帧空是窗口动画/被遮挡/滚动中，拿它
-        -- 覆盖基线会让下一条消息变成「整屏重放」。但会话真的清空时（实测清空过），
-        -- 老判据会永远 skip —— 基线里那 9 条旧消息再也对不上，指令全部静默丢失。
-        st.empty = (st.empty or 0) + 1
-        if st.empty <= C.empty_frames then
-            log("skip: 这一帧读到 0 条（窗口在动画/被遮挡？），保留上一帧基线（%d/%d）",
-                st.empty, C.empty_frames)
-            save()
-            return 0
-        end
-        log("会话读到连续 %d 帧 0 条：认为被清空，丢掉旧基线重新开始", st.empty)
-        st.prev = {}
-        st.empty = 0
-    end
-    st.empty = 0
-    -- 首次启动只建基线，绝不回放历史消息。判据是 st.inited 而不是「prev 为空」：
-    -- 会话被清空/换了空会话时 prev 天然是空的，老判据会把清空后的第一条指令当成
-    -- 基线吞掉（实测：清空会话后发的 #lite 全静默）。inited 落了盘，重启也不会重放。
-    local baseline = not st.inited
-    st.inited = true
-    -- diff 对「没有基线」返回 m+1（= 别执行，只建基线），会话本来就是空的时候走的
-    -- 正是那条 n==0 分支。所以「已初始化 + prev 为空」要单独放行：清空后第一条就是指令。
-    local from
-    if not baseline and #(st.prev or {}) == 0 then
-        from = #keys > 0 and 1 or (#keys + 1)
+    if #blocks == 0 then log("skip: 这一帧读到 0 条（窗口动画/被遮挡？）"); return 0 end
+    local b = blocks[#blocks]                       -- 永远只认最新那一条
+    local text, why = b.text, "OCR"
+    local exact, cerr = copy_at(b.cx, b.cy)
+    if exact then text, why = exact, "复制"
+    else log("warn: 复制失败(%s)，退回 OCR 文本", tostring(cerr)) end
+    local key, own = Watch.key(text), is_own(text)
+    local age = os.time() - (tonumber(st.last_t) or 0)
+    if own then
+        log("忽略最新条（%s）：%s", own, Watch.norm(text):sub(1, 60))
+    elseif not Watch.has_trigger(text, C.prefix) then
+        log("忽略最新条（无触发前缀 %q）：%s", C.prefix, Watch.norm(text):sub(1, 60))
+    elseif key ~= "" and key == st.last and age < C.same_after then
+        log("最新条与 %ds 前派发的相同，跳过（想重跑：改几个字，或等 %ds）", age, C.same_after)
     else
-        from = Watch.diff(st.prev, keys)
-    end
-    local added = 0
-    local fresh = {}
-    for i = from, #blocks do fresh[#fresh + 1] = blocks[i] end
-    if not baseline and #keys ~= #(st.prev or {}) then
-        log("帧：可见 %d 条（上一帧 %d 条），新增 %d", #keys, #(st.prev or {}), #fresh)
-    end
-    st.prev = keys
-    if baseline then
-        log("基线：%d 条可见消息（不执行历史）", #blocks)
-        save(); return 0
-    end
-    if #fresh == 0 then save(); return 0 end
-    if #fresh > C.max_new then
-        -- 只留最新：旧的那几条当没看见（连日志都只记条数，不逐条念 —— 它们不会被派发，
-        -- 念出来反而像"已处理"）。
-        log("新指令 %d 条，按「只响应最新一条」丢掉前 %d 条", #fresh, #fresh - C.max_new)
-        local cut = {}
-        for i = #fresh - C.max_new + 1, #fresh do cut[#cut + 1] = fresh[i] end
-        fresh = cut
-    end
-    for _, b in ipairs(fresh) do
-        local text, why = b.text, "OCR"
-        local exact, cerr = copy_at(b.cx, b.cy)
-        if exact then text, why = exact, "复制" else log("warn: 复制失败(%s)，退回 OCR 文本", tostring(cerr)) end
-        local own = is_own(text)
-        if own then
-            log("忽略新块（%s）：%s", own, Watch.norm(text):sub(1, 60))
-        elseif not Watch.has_trigger(text, C.prefix) then
-            log("忽略新块（无触发前缀 %q）：%s", C.prefix, Watch.norm(text):sub(1, 60))
-        elseif Watch.trigger_form(text, C.prefix) == "loose" then
-            -- 宽容命中的那条路：OCR 把 "#" 吞了。照跑，但日志留痕，方便区分误触。
+        if Watch.trigger_form(text, C.prefix) == "loose" then
             log("warn: 触发前缀 %q 的 # 被 OCR 吞了，按指令处理", C.prefix)
-        elseif dup_of(text) then
-            log("跳过重复（滚动/重排导致的旧消息回流）：%s", Watch.norm(text):sub(1, 60))
-        else
-            st.seq = (st.seq or 0) + 1
-            local body = Watch.strip_trigger(text, C.prefix)
-            st.pending[#st.pending + 1] = { id = st.seq, text = body, raw = text, via = why }
-            mark_done(text)
-            log("收到指令 #%d（%s）：%s", st.seq, why, Watch.norm(body):sub(1, 120))
-            added = added + 1
         end
+        st.seq = (st.seq or 0) + 1
+        local body = Watch.strip_trigger(text, C.prefix)
+        -- 只留最新一条：上一轮没派出去的（主进程忙、没起来）直接让位——用户没等到回复
+        -- 会再发一句，过时的指令派出去只会拿旧话改现场。
+        st.pending = { { id = st.seq, text = body, raw = text, via = why } }
+        st.last, st.last_t = key, os.time()
+        log("收到指令 #%d（%s）：%s", st.seq, why, Watch.norm(body):sub(1, 120))
+        save()
+        return 1
     end
     save()
-    return added
+    return 0
 end
 
 local function drain()
-    -- 积压折叠：只要最新那条。上一轮派发失败/主进程忙了一整轮，pending 里会攒下几条，
-    -- 按「没回就当他重发了」的用法，前面那些早过期了 —— 派出去只会拿过时的话改现场。
-    if #st.pending > 1 then
-        local keep = st.pending[#st.pending]
-        log("pending 有 %d 条积压，只留最新 #%d（其余丢弃）", #st.pending, keep.id)
-        st.pending = { keep }
-        save()
-    end
     while #st.pending > 0 do
         local item = st.pending[1]
         if C.dry then

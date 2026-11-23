@@ -50,7 +50,7 @@ local function opts(a)
     if a.port then o[#o + 1] = "--port " .. tonumber(a.port) end
     if a.prefix ~= nil then o[#o + 1] = "--prefix " .. q(a.prefix) end
     if a.chat then o[#o + 1] = "--chat " .. q(a.chat) end
-    if a.max_new then o[#o + 1] = "--max-new " .. tonumber(a.max_new) end
+    if a.same_after then o[#o + 1] = "--same-after " .. tonumber(a.same_after) end
     if a.hide == false then o[#o + 1] = "--no-hide" end
     if a.no_raise then o[#o + 1] = "--no-raise" end
     if a.no_spawn then o[#o + 1] = "--no-spawn" end
@@ -72,7 +72,7 @@ M.schema = {
             port = { type = "integer", description = "serve 端口，默认 8765" },
             prefix = { type = "string", description = "触发前缀，默认 #lite；给空串=全收" },
             chat = { type = "string", description = "目标会话名，默认 文件传输助手" },
-            max_new = { type = "integer", description = "单轮最多执行几条，默认 1=只跑最新那条（旧的丢弃）" },
+            same_after = { type = "integer", description = "同一条文字多久之内不重复派发（秒），默认 60" },
             dispatch = { type = "boolean", description = "once：true=真的派发执行（默认只看不跑）" },
             dry_run = { type = "boolean", description = "start：true=只记录不执行（排错用）" },
             hide = { type = "boolean", description = "没新消息时是否最小化微信，默认 true；false=让它一直摊着" },
@@ -139,11 +139,11 @@ function M.run(args, env)
         local p = pid()
         local up = alive(p)
         local st = read_file(sd .. "/state.json")
-        local nprev, npend = 0, 0
+        local last, npend = "", 0
         if st then
             local ok, t = pcall(function() return require("cjson").decode(st) end)
             if ok and type(t) == "table" then
-                nprev = #(t.prev or {}); npend = #(t.pending or {})
+                last = tostring(t.last or ""); npend = #(t.pending or {})
             end
         end
         local tail = read_file(logf) or ""
@@ -153,7 +153,7 @@ function M.run(args, env)
         return table.concat({
             ("状态：%s%s"):format(up and "运行中" or "未运行", up and ("（pid " .. p .. "）") or ""),
             ("状态目录：%s"):format(sd),
-            ("上一帧可见消息 %d 条 · 待派发 %d 条"):format(nprev, npend),
+            ("最近派发：%s · 待派发 %d 条"):format(last ~= "" and last or "（无）", npend),
             "最近日志：",
             table.concat(lns, "\n", from, #lns),
         }, "\n")
