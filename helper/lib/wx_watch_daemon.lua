@@ -16,13 +16,14 @@
 -- 指令一律丢掉（见 tick 的截尾和 drain 的折叠），不做"补跑队列"：手机那头早就不等了，
 -- 补跑只会拿过时的话去改现场，还占着窗口让新一轮指令排队。
 --
+-- **只做转发**：认出指令 → 交给主进程，本进程不执行、不补发回执、不起任何 agent 实例。
 -- 派发走 call_master（helper/call_master.lua）：把提示词粘贴进主 lite 的终端输入框并回车，
--- 由握着 mem.lock 的那个进程自己执行 —— 记忆可写、能回微信。不再走 serve HTTP：HTTP 那条
--- 路只能在后台再起一个 --readonly 实例（不落记忆，和桌面会话是两个人）。
+-- 由握着 mem.lock 的那个进程自己执行 —— 记忆可写、能回微信。不走 serve HTTP，也不走
+-- --once：那两条路都是在后台再起一个 --readonly 实例（不落记忆，和桌面会话是两个人）。
 --
 -- 派完本进程**等主进程闲下来**（撒 CPU 采样，见 wait_master_idle）再继续采，所以不会和它
--- 抢微信窗口；回执由主进程自己发（提示词里要求了 lite: 前缀），本进程不再补发。
--- 主进程不可用（没有活着的 mem.lock / 没有窗口）才退回一次性执行 --once --readonly。
+-- 抢微信窗口；回执由主进程自己发（提示词里要求了 lite: 前缀，它不发手机那头就沉默）。
+-- 主进程不在（mem.lock 里的 pid 已死 / TUI 关着）时指令**留在 pending 原地等**，不执行。
 --
 -- 空闲收起：每轮没认出新消息就把微信 minimize（--no-hide 关掉）。注意这必然带来闪烁
 -- —— 截图取的是屏幕像素，窗口最小化就读不到气泡，所以每轮得先 activate 再收起来，
@@ -379,7 +380,7 @@ local PROMPT = [[
 
 执行约定（每条都算数）：
 1. 先自己判风险：不可逆、改系统、删数据、花钱、往外发敏感内容 —— 先只回一句确认，别动手。
-2. 干完用 wechat 工具（action=send, name=文件传输助手）把结论发回去，正文第一行以 `lite:` 开头，这是回环标记，必须保留（不带标记会被当成新指令再跑一遍）。
+2. 干完必须用 wechat 工具（action=send, name=文件传输助手）把结论发回去：守护进程只转发指令、不补发回执，你不发手机那头就只有沉默。正文第一行以 `lite:` 开头，这是回环标记，必须保留（不带标记会被当成新指令再跑一遍）。
 3. 手机屏幕小：结论 ≤800 字；长内容发文件或给本机路径。
 4. 只做这一件事，别顺手扩活。
 ]]
@@ -533,42 +534,25 @@ local function master_mod()
     return mod
 end
 
-local function oneshot(prompt)
-    local run = ROOT .. "/tools/run.sh"
-    local payload = TMP .. "-one.txt"
-    local f = io.open(payload, "wb"); f:write(prompt); f:close()
-    local h = io.popen(string.format(
-        "cd %s && LITE_ALLOW_READONLY=1 %s --once --readonly --json \"$(cat %s)\" 2>&1",
-        q(C.cwd), q(run), q(payload)))
-    if not h then return nil, "run.sh 起不来" end
-    local out = h:read("*a") or ""
-    h:close()
-    local ok, t = pcall(cjson.decode, out)
-    if ok and type(t) == "table" then return t.text or t.answer or "" end
-    return nil, "一次性执行失败: " .. out:sub(0, 400)
-end
-
 -- 派给主进程后本进程拿不到「那一轮的回答」——回答由它自己发到微信，这里只记一个哨兵。
 local MASTER_DONE = {}
 
+-- 唯一的执行出口：call_master → 主进程终端。返回 MASTER_DONE 或 nil, 原因。
+-- 没有兜底执行：起了主进程之外的 agent 就绕开 mem.lock 的单写者约定，那一路既写不进
+-- 记忆也发不出回执（表现是「看起来跑了，什么都没留下」），所以宁可留着等下轮。
 local function dispatch(text)
     local prompt = string.format(PROMPT, text)
     local cm, pid = master_mod(), master_pid()
-    if cm and pid then
-        local ok, res = pcall(cm.run, { text = prompt }, { cwd = C.cwd })
-        res = tostring(res)
-        if ok and res:sub(1, 3) == "ok:" then
-            log("%s", res:sub(1, 200))
-            wait_master_idle(pid)
-            return MASTER_DONE
-        end
-        log("warn: call_master 没派成：%s", res:sub(1, 200))
-    else
-        log("warn: 没有主进程（%s/mem.lock 里没有活着的 pid），退回一次性执行", C.cwd)
+    if not cm then return nil, "加载不了 call_master（helper/call_master.lua）" end
+    if not pid then return nil, "没有主进程（" .. C.cwd .. "/mem.lock 里没有活着的 pid）" end
+    local ok, res = pcall(cm.run, { text = prompt }, { cwd = C.cwd })
+    res = tostring(res)
+    if ok and res:sub(1, 3) == "ok:" then
+        log("%s", res:sub(1, 200))
+        wait_master_idle(pid)
+        return MASTER_DONE
     end
-    -- 兜底：主进程不在（关着 TUI）时起一个 --once --readonly 实例。这条不会进主会话，
-    -- 所以回执得本进程自己发（见 drain 的 send_fallback）。
-    return oneshot(prompt)
+    return nil, "call_master 没派成：" .. res:sub(1, 200)
 end
 
 -- ── 主循环 ───────────────────────────────────────────────────────────
@@ -734,42 +718,16 @@ local function mark_done(text)
     while #st.done > 60 do table.remove(st.done, 1) end
 end
 
+-- 回执的指纹只有一种：lite: 前缀（主进程自己发的，见 PROMPT 第 2 条）。
+-- 以前还有一路「本进程补发过的回执哈希」，补发删掉后它就是恒空的死状态。
 local function is_own(text)
     if Watch.is_reply(text, C.tag) then return "回执标记" end
-    -- replies 里存的是回执前 200 字的 key，气泡原文可能更长：只能按前缀认，
-    -- 整串相等等于永远不命中。
-    local k = Watch.key(text)
-    for _, r in ipairs(st.replies or {}) do
-        if r ~= "" and #r >= 16 and k:sub(1, #r) == r then return "回执哈希" end
-    end
     return nil
 end
 
--- ── 回执兜底 ─────────────────────────────────────────────────────────
--- PROMPT 第 2 条要求 agent 自己调 wechat send 回执，但模型完全可以不听：实测一句
--- 「只回一行「收到」，不要开工具」就把它顶掉了，agent 乖乖只回文本、没调工具。
--- 手机那头只看到沉默，分不清「跑完了没」和「压根没收到」。所以派发完本进程自己
--- 验一遍这一帧：可见气泡里没有 lite: 回执，就补发（宁可重复一条，不能沉默）。
-local function reply_in_frame()
-    local blocks = snapshot()
-    if not blocks then return false end
-    for _, b in ipairs(blocks) do
-        if is_own(b.text) then return true end
-    end
-    return false
-end
-
-local function send_fallback(text)
-    local wx = wechat_lib()
-    if not wx then return false, "找不到 helper/wechat.lua" end
-    local body = tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", "")
-    if body == "" then return false, "agent 没吐出任何文字" end
-    if #body > 800 then body = body:sub(1, 800) .. "…（截断，全文在本机）" end
-    local ok, res = pcall(wx.run, { action = "send", name = C.chat, text = C.tag .. " " .. body }, { cwd = C.cwd })
-    if not ok then return false, tostring(res) end
-    if type(res) == "string" and res:match("^error") then return false, res end
-    return true, res
-end
+-- 回执只由主进程发（PROMPT 第 2 条）：本进程只转发，验帧/补发整段删掉了。
+-- 补发看着贴心，实则两个进程抢同一个输入框 + 用户会收到「GG 没做却有条回执」的假消息；
+-- 沉默的代价更小，而且更像真的——主进程不吭声就是它没跑完。
 
 local function tick()
     local blocks, err = snapshot()
@@ -873,36 +831,23 @@ local function drain()
             local t0 = os.time()
             local reply, err = dispatch(item.text)
             if reply == MASTER_DONE then
-                -- 主进程自己回微信（提示词里要求 lite: 前缀），别补发、别抢窗口
-                log("完成 #%d（%ds，已交给主进程，回执由它自己发）", item.id, os.time() - t0)
+                -- 主进程自己回微信（提示词里要求 lite: 前缀），本进程不补发、不抢窗口
+                log("完成 #%d（%ds，已交给主进程）", item.id, os.time() - t0)
                 table.remove(st.pending, 1); save()
                 goto continue
-            elseif reply then
-                log("完成 #%d（%ds，%d 字）", item.id, os.time() - t0, #tostring(reply))
-                st.replies[#st.replies + 1] = Watch.key(tostring(reply):sub(1, 200))
-                while #st.replies > 12 do table.remove(st.replies, 1) end
-                -- 回执兜底：agent 没自己发就本进程补一条，别让手机那头等到沉默
-                local seen = reply_in_frame()
-                if not seen then
-                    sleep(1500)
-                    seen = reply_in_frame()
-                end
-                if seen then
-                    log("回执已在微信里（agent 自己发的）")
-                else
-                    log("warn: 这一帧没看到 %s 回执，改由守护进程补发", C.tag)
-                    local sok, sres = send_fallback(reply)
-                    if sok then log("补发回执成功") else log("error: 补发回执失败：%s", tostring(sres)) end
-                end
+            end
+            log("error: #%d 失败：%s", item.id, tostring(err))
+            if err and err:find("没有主进程", 1, true) then
+                -- 主进程不在（TUI 关着）：指令留着原地等，别自己起实例执行
+                log("指令留着，下一轮再派（待办 %d 条）", #st.pending)
+                return
+            end
+            if (item.tries or 0) >= 1 then
+                log("放弃 #%d（已重试一次）", item.id)
             else
-                log("error: #%d 失败：%s", item.id, tostring(err))
-                if (item.tries or 0) >= 1 then
-                    log("放弃 #%d（已重试一次）", item.id)
-                else
-                    item.tries = (item.tries or 0) + 1
-                    save(); sleep(5000)
-                    goto continue
-                end
+                item.tries = (item.tries or 0) + 1
+                save(); sleep(5000)
+                goto continue
             end
             table.remove(st.pending, 1); save()
         end
