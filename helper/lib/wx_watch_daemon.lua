@@ -611,8 +611,12 @@ local function fix_geom()
     return geom_ok()
 end
 
+-- 鼠标落点一律用**窗口相对坐标**（libxdo 的 xdo_move_mouse_relative_to_window），
+-- 不要写屏幕绝对像素：绝对坐标绑死 2560x1408 这套几何，换显示器/改分辨率后可能落在
+-- 窗口外，浮标挪不走、滚轮也滚不到会话上，而症状只是「OCR 多几行杂字」或「一直没新消息」。
 local function grab()
-    pcall(function() xdo:move_abs(1280, 12) end)   -- 挪开鼠标：悬停浮标会污染 OCR
+    -- 挪到窗口左上角（标题/侧栏空白处）：悬停浮标会污染 OCR
+    pcall(function() if win then xdo:move(win.id, 8, 8) end end)
     sleep(120)
     local boxes = ocr_region(REGION, "bubble")
     -- boxes 的坐标在 ocr_region 里已经换成屏幕坐标了：既不能再加偏移（右键会点偏），
@@ -626,7 +630,14 @@ end
 -- 每轮先滚到底（已经到底时滚轮是空操作），再截图，就不用去猜「到底了没有」。
 local function scroll_bottom()
     pcall(function()
-        xdo:move_abs(1500, 700)                  -- 指针必须在聊天区里，滚轮才作用在会话上
+        if not win then return end
+        -- 指针必须在聊天区里，滚轮才作用在会话上；位置取气泡区中心再减窗口原点
+        -- （geom_ok 要求原点 0,0，但仍然按几何算，别假设）。
+        local g = xdo:geometry(win.id)
+        if not g then return end
+        local cx = math.floor((B.x0 + B.x1) / 2) - (g.x or 0)
+        local cy = math.floor((B.y0 + B.y1) / 2) - (g.y or 0)
+        if not xdo:move(win.id, cx, cy) then return end
         for _ = 1, 5 do xdo:mouse_down(5); xdo:mouse_up(5) end
     end)
     sleep(400)
