@@ -10,7 +10,11 @@
 --   2 鼠标挪到标题栏（不然悬停浮标「翻译」会混进 OCR）→ 截聊天区 → OCR → 合并成块
 --   3 和上一帧做尾部后缀比对，只把新增块当候选
 --   4 候选逐个：右键 → 菜单里点「复制」→ 剪贴板 = 精确原文（失败退回 OCR 文本）
---   5 过滤（回执 lite: / 已知回复哈希 / 无触发前缀）→ 入 pending → 派发给**主进程**
+--   5 过滤（回执 lite: / 已知回复哈希 / 无触发前缀）→ 只留**最新一条** → 派发给主进程
+--
+-- 只响应最新一条：这是用户自己的一天用法 —— 没回就当没收到，他会再发一条。所以积压的旧
+-- 指令一律丢掉（见 tick 的截尾和 drain 的折叠），不做"补跑队列"：手机那头早就不等了，
+-- 补跑只会拿过时的话去改现场，还占着窗口让新一轮指令排队。
 --
 -- 派发走 call_master（helper/call_master.lua）：把提示词粘贴进主 lite 的终端输入框并回车，
 -- 由握着 mem.lock 的那个进程自己执行 —— 记忆可写、能回微信。不再走 serve HTTP：HTTP 那条
@@ -51,7 +55,9 @@ local C = {
     interval = 10, port = 8765, host = "127.0.0.1",
     -- 触发前缀；改这里就得同步 wx_watch.lua 的 M.PREFIX（单测钉的是那边的语义）
     prefix = "#lite", chat = "文件传输助手", tag = "lite:",
-    once = false, dry = false, raise = true, hide = true, max_new = 3,
+    -- 单轮最多执行几条新增指令：默认 1 = 只跑最新那条（用户明确要求「永远只响应最新一条」，
+    -- 没回他会再发）。调大只在调试想复现"积压怎么办"时有意义。
+    once = false, dry = false, raise = true, hide = true, max_new = 1,
     -- 连续多少帧读到 0 条才认「会话被清空」（见 tick 里的空帧分支）
     empty_frames = 4,
     -- 派完等主进程闲下来：最少等 settle_min 秒（防「刚 paste 还没动起来就判闲」），
@@ -814,7 +820,9 @@ local function tick()
     end
     if #fresh == 0 then save(); return 0 end
     if #fresh > C.max_new then
-        log("warn: 一次认出 %d 条新增，只取最后 %d 条", #fresh, C.max_new)
+        -- 只留最新：旧的那几条当没看见（连日志都只记条数，不逐条念 —— 它们不会被派发，
+        -- 念出来反而像"已处理"）。
+        log("新指令 %d 条，按「只响应最新一条」丢掉前 %d 条", #fresh, #fresh - C.max_new)
         local cut = {}
         for i = #fresh - C.max_new + 1, #fresh do cut[#cut + 1] = fresh[i] end
         fresh = cut
@@ -847,6 +855,14 @@ local function tick()
 end
 
 local function drain()
+    -- 积压折叠：只要最新那条。上一轮派发失败/主进程忙了一整轮，pending 里会攒下几条，
+    -- 按「没回就当他重发了」的用法，前面那些早过期了 —— 派出去只会拿过时的话改现场。
+    if #st.pending > 1 then
+        local keep = st.pending[#st.pending]
+        log("pending 有 %d 条积压，只留最新 #%d（其余丢弃）", #st.pending, keep.id)
+        st.pending = { keep }
+        save()
+    end
     while #st.pending > 0 do
         local item = st.pending[1]
         if C.dry then
@@ -920,8 +936,10 @@ end
 -- 无影无踪；下一轮 focus() 的 activate 会把它拉回来（raise 对最小化的窗口无效）。
 -- touched=false 时**不动窗口**：微信本来就是摊着的（用户在用），我们只是看了几眼，
 -- 收尾再 minimize 就成了「守护进程每 10 秒把用户的窗口收走一次」。
-local function hide_idle(force)
-    if C.hide and win and (touched or force) then
+-- 没有 force 开关是有意的：需要「不管 touched 都收」的场合只有调试，而调试时直接在
+-- 调完 hide_idle 后手写 xdo:minimize 就行，留一个恒不传的参数只会让人以为有旁路。
+local function hide_idle()
+    if C.hide and win and touched then
         pcall(function() xdo:minimize(win.id) end)
     end
     -- 还焦点这件事**不受 --no-hide 影响**：抢焦点发生在 take_focus()（切会话要往搜索框

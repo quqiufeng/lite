@@ -72,7 +72,7 @@ M.schema = {
             port = { type = "integer", description = "serve 端口，默认 8765" },
             prefix = { type = "string", description = "触发前缀，默认 #lite；给空串=全收" },
             chat = { type = "string", description = "目标会话名，默认 文件传输助手" },
-            max_new = { type = "integer", description = "单轮最多执行几条，默认 3" },
+            max_new = { type = "integer", description = "单轮最多执行几条，默认 1=只跑最新那条（旧的丢弃）" },
             dispatch = { type = "boolean", description = "once：true=真的派发执行（默认只看不跑）" },
             dry_run = { type = "boolean", description = "start：true=只记录不执行（排错用）" },
             hide = { type = "boolean", description = "没新消息时是否最小化微信，默认 true；false=让它一直摊着" },
