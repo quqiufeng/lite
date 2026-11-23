@@ -32,10 +32,13 @@ else
 fi
 
 # $APP 既是安装目录，也是数据目录（sessions/ 会话镜像、codesearch/ 索引、老版本
-# memdb/）。直接 rm -rf 会连用户数据一起删：跑一次 release 就丢全部 codesearch
-# 索引和会话备份（2026-11-13 实测，dfproj 索引 + sessions/*.jsonl 一次 rm 全没）。
+# memdb/、wx-watch/ 微信守护的 state+日志）。直接 rm -rf 会连用户数据一起删：跑一次
+# release 就丢全部 codesearch 索引和会话备份（2026-11-13 实测，dfproj 索引 +
+# sessions/*.jsonl 一次 rm 全没）。
 # 所以先把数据目录挪到临时区，装完再挪回来；KEEP 只列**数据**，装进去的东西照旧全删。
-KEEP="sessions codesearch memdb"
+# 加新目录的判据：它是进程运行期自己写的、删了不可再生（wx-watch 丢了等于派发历史清零，
+# same_after 去重和 last 指纹一起失忆）。dist 里同名目录属于程序本体，不在这个列表。
+KEEP="sessions codesearch memdb wx-watch"
 STASH="$(mktemp -d)"
 for d in $KEEP; do
     [ -e "$APP/$d" ] && mv "$APP/$d" "$STASH/$d"
