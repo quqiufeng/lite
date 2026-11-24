@@ -10,7 +10,8 @@
 --   2 鼠标挪到标题栏（不然悬停浮标「翻译」会混进 OCR）→ 截聊天区 → OCR → 合并成块
 --   3 和上一帧做尾部后缀比对，只把新增块当候选
 --   4 候选逐个：右键 → 菜单里点「复制」→ 剪贴板 = 精确原文（失败退回 OCR 文本）
---   5 过滤（回执 lite: / 已知回复哈希 / 无触发前缀）→ 只留**最新一条** → 派发给主进程
+--   5 过滤（媒体消息[图片/文件/视频，不处理] / 回执 lite: / 无触发前缀[默认全收，见 C.prefix]）
+--     → 只留**最新一条** → 派发给主进程
 --
 -- 只响应最新一条：这是用户自己的一天用法 —— 没回就当没收到，他会再发一条。所以积压的旧
 -- 指令一律丢掉（见 tick 的截尾和 drain 的折叠），不做"补跑队列"：手机那头早就不等了，
@@ -30,7 +31,8 @@
 -- 窗口可见时长 ≈ 一次截屏 + OCR（1~2s）。
 --
 -- 用法：tools/lite-lua helper/lib/wx_watch_daemon.lua --interval 10 [--wait 1800]
---        [--prefix "#lite"] [--dry-run] [--once] [--no-raise] [--no-hide]
+--        [--prefix ""] [--dry-run] [--once] [--no-raise] [--no-hide]
+--   不给 --prefix = 全收：文件传输助手里的新消息一律当指令（微信模式的默认行为）。
 -- 兼容旧调用：--port/--host/--no-spawn 还认，但已经是空转（派发不走 serve HTTP 了）。
 -- 由 helper/wechat_watch.lua 拉起/收掉，别手写 nohup（pidfile/日志在对面的状态目录里）。
 local ROOT = os.getenv("LITE_ROOT") or "."
@@ -57,8 +59,9 @@ local function sleep(ms) ffi.C.usleep(ms * 1000); pcall(function() xdo:sync() en
 -- ── 配置 ─────────────────────────────────────────────────────────────
 local C = {
     interval = 10, port = 8765, host = "127.0.0.1",
-    -- 触发前缀；改这里就得同步 wx_watch.lua 的 M.PREFIX（单测钉的是那边的语义）
-    prefix = "#lite", chat = "文件传输助手", tag = "lite:",
+    -- 触发前缀；默认全收（微信模式的语义 = 手机发什么就跑什么）。要收窄就 "--prefix #lite"，
+    -- 语义钉在 wx_watch.lua 的 M.PREFIX/has_trigger（单测也在那边）。
+    prefix = "", chat = "文件传输助手", tag = "lite:",
     once = false, dry = false, raise = true, hide = true,
     -- 唯一的一条去重：兜底强检进来、最新一条跟上次派过的**一模一样**时多久之内不重跑。
     -- 只防「别的会话在闪 → 我们进去却只看到老指令」这一种误重放；用户重发同一句话过了
@@ -340,6 +343,23 @@ local function clip_has_text()
     end
     return s:find("\nSTRING", 1, true) ~= nil    -- 只认独立一行，别被 UTF8_STRING 蹭中
 end
+-- 剪贴板里是**什么**："text" / "media"（图片、文件）/ nil（认不出）。
+-- 媒体判定只能靠它：文本消息「复制」一定出文本，图片/表情/文件气泡出的是
+-- image/png、text/uri-list 这类二进制或 uri，压根没有文本目标。
+local function clip_kind()
+    local h = io.popen("xclip -selection clipboard -o -t TARGETS 2>/dev/null")
+    if not h then return nil end
+    local s = h:read("*a") or ""
+    h:close()
+    if s == "" then return nil end
+    for _, t in ipairs(TEXT_TARGETS) do
+        if s:find(t, 1, true) then return "text" end
+    end
+    if s:find("\nSTRING", 1, true) or s:sub(1, 6) == "STRING" then return "text" end
+    if s:find("image/", 1, true) then return "media" end
+    if s:find("uri%-list") or s:find("x%-moz%-file") then return "media" end
+    return nil
+end
 -- 返回剪贴板里的**文本**；没有文本内容时返回 nil（和「空文本」区分开）
 local function clip_read()
     if not clip_has_text() then return nil end
@@ -388,9 +408,15 @@ local function copy_at(x, y)
     pcall(function() xdo:click_abs(math.floor(hit.x + hit.w / 2), math.floor(hit.y + hit.h / 2), 1) end)
     sleep(350)
     local got = clip_read()
+    -- 判「复制出来的是什么」必须在**还原用户剪贴板之前**：还原完就只剩 keep 了。
+    local kind = (got and got ~= "") and "text" or clip_kind()
     if keep then clip_write(keep) end   -- 别偷走用户的剪贴板
-    if not got or got == "" then return nil, "复制后剪贴板里没有文本" end
-    return got
+    if kind == "text" then return got end
+    if kind == "media" then
+        -- 图片/表情/文件气泡：复制出来是图或 uri，没有文本。用户定的：这类不处理。
+        return nil, "复制出来不是文本（图片/文件）", "media"
+    end
+    return nil, "复制后剪贴板里没有文本"
 end
 
 -- ── 派发 ─────────────────────────────────────────────────────────────
@@ -555,10 +581,12 @@ local MASTER_DONE = {}
 -- 唯一的执行出口：call_master → 主进程终端。返回 MASTER_DONE 或 nil, 原因。
 -- 没有兜底执行：起了主进程之外的 agent 就绕开 mem.lock 的单写者约定，那一路既写不进
 -- 记忆也发不出回执（表现是「看起来跑了，什么都没留下」），所以宁可留着等下轮。
-local function dispatch(text)
+local function dispatch(text, raw)
     -- 手机发来的多行也被拍平：粘贴里每多一个 \n，就多一次回车 → 多一轮废指令。
     local body = text:gsub("%s*\n%s*", " ")
-    local prompt = string.format(PROMPT, body)
+    -- raw = 模式开关命令（#退出…）：原样贴，让主进程的 submit() 当命令吃掉，不包外壳
+    -- （包了就只是把"退出"这句话交给模型，微信模式关不掉）。
+    local prompt = raw and body or string.format(PROMPT, body)
     local cm, pid = master_mod(), master_pid()
     if not cm then return nil, "加载不了 call_master（helper/call_master.lua）" end
     if not pid then return nil, "没有主进程（" .. C.cwd .. "/mem.lock 里没有活着的 pid）" end
@@ -741,14 +769,42 @@ local function tick()
     if not blocks then log("skip: %s", err); return 0 end
     if #blocks == 0 then log("skip: 这一帧读到 0 条（窗口动画/被遮挡？）"); return 0 end
     local b = blocks[#blocks]                       -- 永远只认最新那一条
+    -- 媒体消息（图片/文件/视频）不处理：用户定的。判据两层，都便宜的先跑：
+    --   ① 这块 OCR 文本自己就长成文件气泡/占位符（wx_watch.lua:is_media）；
+    --   ② 右键「复制」出来不是文本（截图里有字的图片只能靠这条兜住）。
+    -- 同一条媒体消息只判一次：否则每轮 tick 都要右键单击 + 菜单 OCR 一遍（白烧 ~1.2s）。
+    local fp = "#" .. #blocks .. "@" .. tostring(math.floor((b.cy or 0) / 8))
+    local media_age = os.time() - (tonumber(st.media_t) or 0)
+    if st.media == fp and media_age < 3600 then return 0 end
+    if Watch.is_media(b.text) then
+        st.media, st.media_t = fp, os.time()
+        log("忽略最新条（媒体消息，图片/文件不处理）：%s", Watch.norm(b.text):sub(1, 60))
+        save()
+        return 0
+    end
     local text, why = b.text, "OCR"
-    local exact, cerr = copy_at(b.cx, b.cy)
+    local exact, cerr, kind = copy_at(b.cx, b.cy)
     if exact then text, why = exact, "复制"
+    elseif kind == "media" then
+        st.media, st.media_t = fp, os.time()
+        log("忽略最新条（图片/文件：复制出来不是文本），不处理")
+        save()
+        return 0
     else log("warn: 复制失败(%s)，退回 OCR 文本", tostring(cerr)) end
     local key, own = Watch.key(text), is_own(text)
     local age = os.time() - (tonumber(st.last_t) or 0)
+    local body = Watch.strip_trigger(text, C.prefix)
     if own then
         log("忽略最新条（%s）：%s", own, Watch.norm(text):sub(1, 60))
+    elseif Watch.is_mode_cmd(body) then
+        -- 全收模式下这条也会进来。模式开关只能由主进程的 submit() 处理（tui/modecmd.lua），
+        -- 所以原样透传、不套 PROMPT 外壳；去重也跳过（用户连点两下退出不该被 60s 窗口吃掉）。
+        st.seq = (st.seq or 0) + 1
+        st.pending = { { id = st.seq, text = body, raw = text, via = why, modecmd = true } }
+        st.last, st.last_t = "", 0
+        log("收到模式命令 #%d（%s）：%s", st.seq, why, body)
+        save()
+        return 1
     elseif not Watch.has_trigger(text, C.prefix) then
         log("忽略最新条（无触发前缀 %q）：%s", C.prefix, Watch.norm(text):sub(1, 60))
     elseif key ~= "" and key == st.last and age < C.same_after then
@@ -758,7 +814,6 @@ local function tick()
             log("warn: 触发前缀 %q 的 # 被 OCR 吞了，按指令处理", C.prefix)
         end
         st.seq = (st.seq or 0) + 1
-        local body = Watch.strip_trigger(text, C.prefix)
         -- 只留最新一条：上一轮没派出去的（主进程忙、没起来）直接让位——用户没等到回复
         -- 会再发一句，过时的指令派出去只会拿旧话改现场。
         st.pending = { { id = st.seq, text = body, raw = text, via = why } }
@@ -780,7 +835,7 @@ local function drain()
         else
             log("派发 #%d …", item.id)
             local t0 = os.time()
-            local reply, err = dispatch(item.text)
+            local reply, err = dispatch(item.text, item.modecmd)
             if reply == MASTER_DONE then
                 -- 主进程自己回微信（提示词里要求 lite: 前缀），本进程不补发、不抢窗口
                 log("完成 #%d（%ds，已交给主进程）", item.id, os.time() - t0)

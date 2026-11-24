@@ -22,7 +22,7 @@ export DEEPSEEK_API_KEY=...   # 或写进 .env / ~/.config/lite/.env
 
 ./tools/run.sh --tui                          # TUI：改文件后自动弹两栏 diff（Ctrl+G 手动看），/session 选会话，/reboot [提示词] 自动重启并从那句接着干
 ./tools/run.sh --tui --thinking --reasoning-effort high
-./tools/run.sh --wx                           # 微信模式起手：手机发「#lite 指令」到「文件传输助手」即执行（= TUI 里敲 #微信模式）
+./tools/run.sh --wx                           # 微信模式起手：手机给「文件传输助手」发什么就执行什么（不必 #lite 前缀；= TUI 里敲 #微信模式）
 ./tools/run.sh --once --json "解释这个项目"    # 无 UI 一轮，JSONL 事件
 ./tools/run.sh --recall "关键词"               # 查当前目录的本地记忆
 ./tools/run.sh --memory-export kb.jsonl        # 知识层导出成 JSONL（省略文件 / - 打 stdout）

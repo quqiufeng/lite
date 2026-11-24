@@ -5,6 +5,8 @@
 --     （"lite现在是…"），回执认不出来 → 自己的回复被当新指令，无限自激（真发生过）。
 --  ② diff() 只认尾部公共后缀：聊天区只显示最后一屏，整屏都变（换会话）时绝不整屏重放。
 --  ③ blocks() 多行消息必须合成一块：拆成多条会把一条指令切碎成好几个半句去执行。
+--  ④ 媒体消息（图片/文件/视频）不处理：判据 is_media 既不能把文件气泡当指令，
+--     也不能把"帮我看看 xx.md"这种正文误杀。
 local ROOT = (os.getenv("LITE_ROOT") or ".")
 package.path = ROOT .. "/lua/?.lua;" .. ROOT .. "/?.lua;" .. package.path
 
@@ -35,8 +37,9 @@ check(not W.is_reply("帮我看下 /tmp", "lite:"), "unprefixed text is not a re
 check(not W.is_reply("", "lite:"), "empty is not a reply")
 check(not W.is_reply("说", ""), "empty tag never matches")
 
--- 触发前缀默认 "#lite"：# 是标记的一部分，不能被抹平（用 norm 而非 key 比对）。
-eq(W.PREFIX, "#lite", "default trigger is #lite")
+-- 默认**全收**（用户定：每条都敲 #lite 太麻烦）；显式 "#lite" 的形态仍然要对，
+-- 因为用户还能把它当过滤开关用。带 # 的前缀不能被抹平（用 norm 而非 key 比对）。
+eq(W.PREFIX, "", "default trigger is empty (全收)")
 check(W.has_trigger("#lite 列一下 /tmp", "#lite"), "trigger with space")
 check(W.has_trigger("#lite：列一下", "#lite"), "trigger with fullwidth colon")
 check(W.has_trigger("#lite测试", "#lite"), "trigger glued by OCR")
@@ -63,6 +66,27 @@ eq(W.strip_trigger("#Lite 大写保留正文", "#lite"), "大写保留正文", "
 -- 但 daemon 先跑 is_own（is_reply）再判 trigger，回执在更早一步就被拦掉了。
 check(W.is_reply("lite: 结论如下", "lite:"), "reply caught by is_reply before trigger check")
 check(W.has_trigger("lite: 结论如下", "#lite"), "loose trigger would match a reply (why is_own runs first)")
+
+-- 全收（prefix=""）：正文照原样交给模型，只把老习惯的 "#lite" 剥掉。
+eq(W.strip_trigger("帮我看看磁盘", ""), "帮我看看磁盘", "全收: body untouched")
+eq(W.strip_trigger("#lite 帮我看看磁盘", ""), "帮我看看磁盘", "全收: legacy #lite stripped")
+eq(W.strip_trigger("#lite: 报一下时间", ""), "报一下时间", "全收: legacy strip eats colon")
+eq(W.strip_trigger("＃lite 全角井号", ""), "全角井号", "全收: legacy strip accepts fullwidth #")
+eq(W.strip_trigger("#litex 不是前缀", ""), "#litex 不是前缀",
+    "全收: #litex is body, not a prefix")
+eq(W.strip_trigger("lite 井号被吞", ""), "lite 井号被吞",
+    "全收: OCR-dropped # left alone (model reads it)")
+eq(W.strip_trigger("，开头逗号", ""), "开头逗号", "全收: leading punctuation trimmed")
+
+-- 模式开关命令（#退出/#退出微信模式）必须原样透传给主进程的 submit()，
+-- 包进「微信远程指令（…）」外壳就只是一句话，模式关不掉。
+check(W.is_mode_cmd("#退出微信模式"), "mode cmd: #退出微信模式")
+check(W.is_mode_cmd("#退出"), "mode cmd: bare #退出")
+check(W.is_mode_cmd("#退出 微信模式"), "mode cmd: #退出 with space")
+check(W.is_mode_cmd("＃退出微信模式"), "mode cmd: fullwidth # (OCR)")
+check(not W.is_mode_cmd("帮我退出一下这个目录"), "plain text is not a mode cmd")
+check(not W.is_mode_cmd("退出"), "verb without # is not a mode cmd")
+check(not W.is_mode_cmd(""), "empty is not a mode cmd")
 
 -- ② diff：尾部后缀
 eq(W.diff({}, { "a" }), 2, "no baseline never replays history")
@@ -161,6 +185,29 @@ do
     local nok = none:start()
     check(not nok and not none.on, "wx start: 没有工具入口时降级")
 end
+
+-- ④ 媒体消息（图片/文件/视频）：收到的图/文件不处理（用户定的）。
+-- 判据是「OCR 抄出来的这块文本长成什么样」：占位符裸词、裸文件名、文件名+大小两行。
+-- 代价明写：纯正文长得跟文件气泡一样（"xx.png" 单独一行 + "1.2M" 单独一行）会被当媒体跳过，
+-- 反过来（漏判）还有 daemon 的剪贴板信号兜底（wx_watch_daemon.lua:copy_at 返回 "media"）。
+check(W.is_media(""), "media: 空文本（纯图/表情）")
+check(W.is_media("[图片]"), "media: 图片占位符")
+check(W.is_media("【文件】"), "media: 文件占位符（全角括号）")
+check(W.is_media("[视频]"), "media: 视频占位符")
+check(W.is_media("[聊天记录]"), "media: 聊天记录占位符")
+check(W.is_media("报告.pdf"), "media: 裸文件名")
+check(W.is_media("lite-0.1.1.tar.gz"), "media: 裸压缩包名")
+check(W.is_media("截图 2026.png\n1.2K"), "media: 文件名 + 大小两行")
+check(W.is_media("lite-0.1.1.tar.gz\n19.4M"), "media: 两行文件气泡")
+check(W.is_media("312B\n"), "media: 只有字节数也算（B 结尾）")
+check(not W.is_media("清到 5G"), "media: 纯整数+单字母不算（太像正文）")
+check(not W.is_media("把 /tmp 清到 5G"), "media: 正文里带 5G 不算")
+check(not W.is_media("帮我看看 /tmp"), "media: 普通指令不算")
+check(not W.is_media("lite 列一下 /tmp"), "media: 带前缀指令不算")
+check(not W.is_media("看看 README.md"), "media: 文件名夹在句子里不算")
+check(not W.is_media("图片转成 pdf"), "media: 提到「图片」但整句是指令")
+check(not W.is_media("lite: 做完了"), "media: 回执不算")
+check(not W.is_media("把 build 删了\n然后重编"), "media: 多行指令不算")
 
 if fails > 0 then
     io.stderr:write(("FAIL wx_watch (%d/%d)\n"):format(fails, total))

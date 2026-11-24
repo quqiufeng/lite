@@ -128,9 +128,12 @@ function M.is_reply(text, tag)
     return n:sub(1, #kt) == kt
 end
 
--- 触发前缀默认 "#lite"：文件传输助手平时还是发笔记/文件的中转站，裸 "lite" 太容易误触
--- （任何以 lite 开头的英文单词都会被吃进去）。加 # 后只有真想派活才命中。
-M.PREFIX = "#lite"
+-- 默认**全收**（prefix=""）：微信模式开着的时候，凡是新发到「文件传输助手」的消息都当指令
+-- 跑（用户定的：每条都敲 #lite 太麻烦）。想要过滤就显式给 prefix="#lite"。
+-- 代价明确：那一刻起，你自己随手发到箱子的笔记/链接也会被执行 —— 别开着模式发文件。
+M.PREFIX = ""
+-- 老的 "#lite" 写法仍然剥掉（见 strip_trigger），习惯难改，别把前缀当正文喂给模型。
+M.LEGACY = "#lite"
 
 -- 触发比对的归一：**必须用 norm 不能用 key** —— key 把标点一起抹掉，"#lite" 就退化成
 -- 裸 "lite"，# 白加；而 is_reply 那边同理，两者一旦同形，"#lite 帮我…" 会被当回执丢掉。
@@ -167,9 +170,22 @@ end
 
 -- 去掉触发前缀，交给 agent 的正文更干净。井号在原文里可能被 OCR 吞掉，
 -- 所以两种长度（带 # / 不带）都试，命中哪个切哪个。
+-- 全收（prefix=""）时也剥老的 "#lite"：习惯难改，别把前缀当正文喂给模型。
+-- 只剥带 # 的形态（OCR 吞 # 的 "lite 列一下" 在全收下照原样交给模型，它会自己看懂）。
+local function strip_legacy(t)
+    if t:sub(1, 1) ~= "#" then return nil end
+    local p, cut = skeleton(M.LEGACY), #M.LEGACY
+    if skeleton(t:sub(1, cut)) ~= p then return nil end
+    local rest = t:sub(cut + 1, cut + 1)
+    if rest ~= "" and rest:match("^[a-z0-9_]$") then return nil end   -- "#litex" 不是前缀
+    return (M.norm(t:sub(cut + 1):gsub("^[:：,，.。%s]+", "")))
+end
+
 function M.strip_trigger(text, prefix)
     local t = (M.norm(text):gsub("＃", "#"):gsub("#%s+", "#"))
-    if not prefix or prefix == "" then return t end
+    if not prefix or prefix == "" then
+        return strip_legacy(t) or (M.norm(t:gsub("^[:：,，.。%s]+", "")))
+    end
     local p = skeleton(prefix)
     if p ~= "" then
         for _, cut in ipairs({ #prefix, #prefix - 1 }) do
@@ -179,6 +195,77 @@ function M.strip_trigger(text, prefix)
         end
     end
     return (M.norm(t:gsub("^[:：,，.。%s]+", "")))
+end
+
+-- 「模式开关命令」：全收模式下 #退出/#退出微信模式 也会被当成新消息抄下来，但它们必须
+-- **原样**贴给主进程（由 lua/tui/modecmd.lua 的 submit() 拦），不能包进「微信远程指令（…）」
+-- 外壳 —— 主进程只认整行命令，包了壳就退化成让模型念一句"退出"，模式根本关不掉。
+-- 动词表不在这里复制：modecmd 是唯一一份（AGENTS §5）。拿不到就说 false，退回旧行为。
+function M.is_mode_cmd(text)
+    local ok, MC = pcall(require, "tui.modecmd")
+    if not ok or type(MC) ~= "table" then return false end
+    local s = (M.norm(text or ""):gsub("＃", "#"))
+    return MC.command(s) and true or false
+end
+
+-- ── 媒体消息（图片/文件/视频）：不处理 ──────────────────────────────
+-- 用户定的：微信模式收到的**图片和文件不处理**（截图里的字、文件名都不是指令）。
+-- 这里只判「OCR 抄出来的这块文本本身长成什么样」，便宜、先跑；
+-- 文本长得像正文的（截图里有字）由 daemon 的剪贴板信号兜住：图片右键「复制」进
+-- 剪贴板的是 image/png，复制不出文本 —— 那才是权威判据（见 wx_watch_daemon.lua:copy_at）。
+
+-- 微信自己写的占位符（手机端发来的、或某些渲染下会出现的裸词）
+local MEDIA_WORDS = { "图片", "照片", "视频", "文件", "语音", "表情", "动画表情",
+                      "聊天记录", "链接", "位置", "视频通话", "语音通话", "已取消" }
+
+-- OCR 把占位符的括号认成全角是常态（"【文件】"），key() 只抹 ASCII 标点，所以再剥一层全角括号。
+local function bare(s)
+    return (M.key(s):gsub("[【】（）〔〕「」『』]", ""))
+end
+local function is_placeholder(t)
+    local k = bare(t)
+    if k == "" then return false end
+    for _, w in ipairs(MEDIA_WORDS) do
+        if k == bare(w) then return true end
+    end
+    return false
+end
+
+-- 文件气泡的大小行：「19.4M」「1.2K」「312B」「3.05GB」。
+-- 纯整数 + 单字母（"5G"）不算：那太像正文（"清到 5G"），宁可漏判，后面还有剪贴板那层兜。
+local function size_line(l)
+    l = (l or ""):gsub("%s", "")
+    if not l:match("^%d+%.?%d*[BKMG]B?$") then return false end
+    return l:find(".", 1, true) ~= nil or l:sub(-1) == "B"
+end
+
+-- 文件名行：以扩展名收尾
+local function name_line(l)
+    return l:match("%.[%a%d][%a%d]+$") ~= nil
+end
+
+-- text 是 OCR 的块文本（行之间是 \n）。norm 会把换行压成空格，所以**先切行再归一**。
+function M.is_media(text)
+    local raw = tostring(text or "")
+    if M.norm(raw) == "" then return true end      -- 纯图/表情：认不出字 = 没有指令
+    local lines = {}
+    for line in (raw .. "\n"):gmatch("([^\n]*)\n") do
+        local t = M.norm(line)
+        if t ~= "" then lines[#lines + 1] = t end
+    end
+    if #lines == 0 then return true end
+    if #lines == 1 and is_placeholder(lines[1]) then return true end
+    -- 整条就是一个裸文件名（"报告.pdf" / "lite-0.1.1.tar.gz"）：文件气泡只抄得出这个
+    if #lines == 1 and not lines[1]:find("%s") and name_line(lines[1]) then return true end
+    -- 整条就是一串大小（"312B" / "19.4M"）：没人会拿这个当指令
+    if #lines == 1 and size_line(lines[1]) then return true end
+    -- 文件气泡 = 文件名行 + 大小行，两样都在才认
+    local has_name, has_size = false, false
+    for _, l in ipairs(lines) do
+        if size_line(l) then has_size = true end
+        if name_line(l) or (l:find("%s") and l:match("%.[%a%d][%a%d]+%s")) then has_name = true end
+    end
+    return has_name and has_size
 end
 
 return M

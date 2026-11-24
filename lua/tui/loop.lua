@@ -597,7 +597,7 @@ function M.run(ctx, agent, memory, opts)
                 })
                 transcript:add("system", ok
                     and ("微信模式已开启：" .. msg
-                        .. "。手机微信给「文件传输助手」发「#lite 指令」即执行；"
+                        .. "。手机给「文件传输助手」发什么就执行什么（不必 #lite 前缀）；"
                         .. "输入 #退出微信模式 关闭（#退出 一把全关）")
                     or ("微信模式起不来：" .. msg))
             else
@@ -973,7 +973,7 @@ function M.run(ctx, agent, memory, opts)
             local ok, msg = wxmode:start({ interval = opts.wx_interval, port = opts.port })
             transcript:add("system", ok
                 and ("微信模式已开启：" .. msg
-                    .. "。手机发「#lite 指令」到「文件传输助手」即执行；#退出微信模式 关闭")
+                    .. "。手机给「文件传输助手」发什么就执行什么（不必 #lite 前缀）；#退出微信模式 关闭")
                 or ("微信模式起不来：" .. msg))
             wx_save()
         end

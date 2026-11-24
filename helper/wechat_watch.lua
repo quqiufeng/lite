@@ -6,10 +6,14 @@
 -- 放在 agent 线程里会把每一轮对话都卡住。派发走 helper/call_master.lua：把提示词贴进主 lite
 -- 的终端交给它自己跑（记忆可写、回执由它发），本进程在它干活期间不碰微信窗口。
 --
--- 触发前缀（默认 "#lite"）：文件传输助手平时还是发笔记/文件的中转站，全收会把随手记
--- 也当指令执行。加 # 是因为裸 "lite" 太容易误触（任何以 lite 开头的单词都算）。
--- 只认 "#lite 帮我看看磁盘" / "#lite：跑一下测试"，其余只记日志不执行；
--- 想全收就 prefix=""（注意：那一刻起，凡是你自己发到箱子的东西都会被当指令跑）。
+-- 触发前缀（默认 "" = **全收**）：微信模式开着时，凡新发到「文件传输助手」的消息都当指令
+-- 跑（每条都敲 #lite 太麻烦）。要收窄就 prefix="#lite"：只认 "#lite 帮我看看磁盘"，
+-- 其余只记日志不执行。全收的代价讲清楚：那一刻起，你自己随手发到箱子的笔记/链接也会被
+-- 当指令跑（回执只有 lite: 标记这一道闸）。**图片/文件/视频不处理**（用户定的：截图里的字、
+-- 文件名都不是指令）：判据见 helper/lib/wx_watch.lua:is_media + 剪贴板信号
+-- （图片右键「复制」出来是 image/png，没有文本）。
+-- 「模式开关」不走通用外壳：#退出 / #退出微信模式 原样贴给主进程的 submit()（见
+-- helper/lib/wx_watch_daemon.lua:dispatch 的 raw 分支），否则它只当普通任务交给模型。
 local function q(s) return "'" .. tostring(s):gsub("'", "'\\''") .. "'" end
 
 local function root_of(env)
@@ -61,7 +65,7 @@ local M = {}
 
 M.schema = {
     name = "wechat_watch",
-    description = "手机微信→本机执行：常驻轮询「文件传输助手」，带 lite 前缀的消息当指令跑（start/stop/status/once/tail）",
+    description = "手机微信→本机执行：常驻轮询「文件传输助手」，新消息（默认全收，不必前缀）当指令跑（start/stop/status/once/tail）",
     parameters = {
         type = "object",
         properties = {
@@ -70,7 +74,7 @@ M.schema = {
                 description = "start=拉起常驻；stop=收掉；status=进程/日志；once=单轮试跑（默认只看不执行）；tail=看日志" },
             interval = { type = "integer", description = "轮询间隔秒，默认 10" },
             port = { type = "integer", description = "serve 端口，默认 8765" },
-            prefix = { type = "string", description = "触发前缀，默认 #lite；给空串=全收" },
+            prefix = { type = "string", description = "触发前缀，默认空串=全收（发什么都执行）；给 #lite 则只认带前缀的" },
             chat = { type = "string", description = "目标会话名，默认 文件传输助手" },
             same_after = { type = "integer", description = "同一条文字多久之内不重复派发（秒），默认 60" },
             dispatch = { type = "boolean", description = "once：true=真的派发执行（默认只看不跑）" },
@@ -114,7 +118,7 @@ function M.run(args, env)
             if alive(np) then
                 return string.format("已启动：pid %s\n间隔 %ds · 前缀 %q · 会话 %s\n日志：%s",
                     np, tonumber(args.interval) or 10,
-                    args.prefix ~= nil and args.prefix or "#lite",
+                    args.prefix ~= nil and args.prefix or "",
                     args.chat or "文件传输助手", logf)
             end
             os.execute("sleep 0.1")
