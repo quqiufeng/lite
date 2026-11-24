@@ -2991,6 +2991,31 @@ do
     check(probe2:find("新旧混编", 1, true) ~= nil, "libfind warns when two copies differ")
     check(tail_of(probe2):sub(-#"/build/liblite_image.so") == "/build/liblite_image.so",
         "libfind skips a broken copy and keeps going")
+    -- 架构对账：迁移/跨平台拷来的树里，build/ 会残留上个架构的 .so。dlopen 对这种
+    -- 文件报的是 "No such file or directory"（文件明明在），照它排查必然走偏，所以
+    -- libfind 自己读 ELF e_machine 提前跳过并说明原因。
+    local function make_foreign(dst, machine, pad)
+        os.execute("cd " .. shq(lroot) .. " && luajit -e " .. shq(
+            'local s = io.open("build/liblite_image.so", "rb"); local d = s:read("*a"); s:close(); '
+                .. 'local f = io.open(' .. string.format("%q", dst) .. ', "wb"); '
+                .. 'f:write(d:sub(1, 18) .. string.char(' .. (machine % 256) .. ', '
+                .. math.floor(machine / 256) .. ') .. d:sub(21) .. string.rep("x", ' .. pad .. ')); f:close()'))
+    end
+    -- 183 = EM_AARCH64；故意加长 137 字节，「架构不同」和「新旧混编」才会各自露头
+    make_foreign(fake_so, 183, 137)
+    local probe3 = libfind_probe()
+    local p3 = tail_of(probe3)
+    check(p3:sub(-#"/build/liblite_image.so") == "/build/liblite_image.so"
+        and p3:find(fake, 1, true) == nil,
+        "libfind skips a foreign-arch copy and keeps going")
+    check(probe3:find("新旧混编", 1, true) == nil,
+        "a foreign-arch copy is not reported as 新旧混编")
+    check(shrun("cd " .. shq(lroot) .. " && luajit -e " .. shq(
+        'package.path="lua/?.lua;" .. package.path; local lf = require("ffi.libfind"); '
+            .. 'local _, _, e = lf.load("liblite_zzz_probe.so", { extra = { '
+            .. string.format("%q", fake_so) .. ' } }); io.write(tostring(e))'))
+        :find("架构", 1, true) ~= nil,
+        "libfind names the architecture instead of 'No such file'")
 
     -- 仓库内部调用（run.sh/test.sh/check_deps.sh）保持精简，不带 workspace 路径与预加载
     check(shrun(shq(lroot .. "/tools/lite-lua") .. " -e "
