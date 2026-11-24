@@ -283,6 +283,20 @@ local function do_status(root)
     local function add(fmt, ...) L[#L + 1] = fmt:format(...) end
     add("engine: %s", engine_path(root) or ("未找到（LITE_ROOT=" .. tostring(os.getenv("LITE_ROOT")) .. "）"))
     add("render: %s", render_path(root) or "未找到")
+    -- 架构自检：syscall 号各架构不同，ARM 上没登记就是「调用了别的系统调用」，
+    -- 表现成 EBADF/EINVAL 而不是「架构不支持」。--syscheck 不碰 tracefs、不要 root。
+    local ep, lb = engine_path(root), lua_bin(root)
+    if ep and lb then
+        local out, rc = capture(lb .. " " .. shq(ep) .. " --syscheck", 10)
+        out = (out or ""):gsub("%s+$", "")
+        local a, pn, vn = out:match("^(%S+)%s+(%S+)%s+(%S+)")
+        if rc == 0 and a then
+            add("arch: %s（perf_event_open=%s process_vm_readv=%s）", a, pn, vn)
+        else
+            add("arch: 未登记（engine --syscheck rc=%s，输出 %q）→ 补 lua/trace/engine.lua 的 SYS_NR",
+                tostring(rc), out)
+        end
+    end
     add("euid: %d%s", euid(), euid() == 0 and "（root，直接跑）" or "")
     if euid() ~= 0 then
         add("sudo -n: %s", sudo_ok() and "可用" or "不可用 → 配 visudo NOPASSWD，或以 root 启动 lite")

@@ -5675,6 +5675,29 @@ do
     end
     check(has_pm, "trace schema has perfmap action")
 
+    -- 架构无关：syscall 号必须按 ffi.arch 查表。arm64 上写死 298/310 会调到别的系统调用，
+    -- 表现成 EBADF/EINVAL 而不是「架构不支持」。(a) 表里有 arm64 241/270；
+    -- (b) --syscheck 输出的 arch 与本机 jit.arch 一致、号对得上。
+    local ef = assert(io.open(root .. "/lua/trace/engine.lua", "r"))
+    local esrc = ef:read("*a")
+    ef:close()
+    check(esrc:find("arm64%s*=%s*{%s*perf%s*=%s*241,%s*vm_readv%s*=%s*270") ~= nil,
+        "trace SYS_NR arm64 = perf 241 / process_vm_readv 270")
+    local jit = require("jit")
+    local want = ({ x64 = { 298, 310 }, x86 = { 336, 347 },
+                    arm64 = { 241, 270 }, arm = { 364, 376 } })[jit.arch]
+    if want then
+        local h = io.popen(shq(root .. "/tools/lite-lua") .. " "
+            .. shq(root .. "/lua/trace/engine.lua") .. " --syscheck 2>&1")
+        local out = h and h:read("*a") or ""
+        local rc = h and h:close()
+        local a, pn, vn = out:match("^(%S+)%s+(%S+)%s+(%S+)")
+        check((rc == true or rc == 0) and a == jit.arch
+            and tonumber(pn) == want[1] and tonumber(vn) == want[2],
+            "trace --syscheck " .. jit.arch .. " -> " .. want[1] .. "/" .. want[2]
+            .. "，实际 " .. (out:gsub("%s+$", "")))
+    end
+
     -- summary：各模式一句话 + 顶层条目，不崩
     local S = require("trace.summary")
     check(S.render("count", { probes = { "p" }, count = 10, duration = 1, rate = 10 })

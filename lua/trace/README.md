@@ -27,6 +27,11 @@ trace mode=oncpu duration=5 flame=/tmp/oncpu.png sym=true   # 默认 perf 软件
 trace action=render json_in=/tmp/t.json kind=flame out=/tmp/f.png   # 从 JSON 重出图，毫秒级
 ```
 
+> ARM 同样能跑：syscall 号按 `ffi.arch` 查 `engine.lua:SYS_NR`（x64/x86/arm64/arm），
+> `trace action=status` 会打印 `arch:` 一行确认已登记；未登记先补表。
+> 但 fetchargs 寄存器名**不通用**：上面的 `%si` 是 x86_64，arm64 上要写 `%x1`
+> （x0..x30 按 ABI 摆参数），kprobe 点也要挑 arm64 内核里真有的符号。
+
 出图三件套（`flame` / `heat` / `rank`）只吃 `oncpu` / `offcpu` / `folded` 的结果；
 写 `.png` 需要 libcairo2 + librsvg2-2，缺库时插件会保留 `.svg` 并说明，不会假装成功。
 

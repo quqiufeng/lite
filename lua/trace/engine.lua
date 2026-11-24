@@ -1,5 +1,6 @@
 -- trace_engine.lua —— 纯 LuaJIT FFI 的 tracing 引擎（需要 root / cap_perfmon）
--- tracefs 动态探针注册 + perf_event_open(298) ring buffer + format 驱动解码
+-- tracefs 动态探针注册 + perf_event_open ring buffer + format 驱动解码
+-- syscall 号各架构不同，见下方 SYS_NR 表（x64/ARM 都能跑）
 local ffi = require "ffi"
 local bit = require "bit"
 
@@ -17,7 +18,28 @@ int clock_gettime(int clk_id, struct timespec *tp);
 struct pollfd { int fd; short events; short revents; };
 int poll(struct pollfd *fds, unsigned long nfds, int timeout);
 ]]
-local SYS_perf_event_open, SYS_process_vm_readv = 298, 310
+-- syscall 号没有运行时接口可查（没有 libc 导出的常量），只能按 unistd.h 抄。
+-- 各家编号不通用，写死 x86_64 会让 ARM 上 perf_event_open 调到别的系统调用，
+-- 报错五花八门（EBADF/EINVAL/ENOSYS），不像「架构不对」。所以先认架构再取号。
+local SYS_NR = {
+  x64   = { perf = 298, vm_readv = 310 },   -- arch/x86/entry/syscalls/syscall_64.tbl
+  x86   = { perf = 336, vm_readv = 347 },   -- syscall_32.tbl
+  arm64 = { perf = 241, vm_readv = 270 },   -- asm-generic/unistd.h
+  arm   = { perf = 364, vm_readv = 376 },   -- arch/arm/tools/syscall.tbl
+}
+local jit = require "jit"
+local ARCH = tostring(ffi.arch or jit.arch or "?")
+local SYS = SYS_NR[ARCH]
+-- 未登记架构：号取 nil，等真正要开 perf 时才失败并点名架构，别在 require 阶段就
+-- 掀桌子（status/prof 这些不碰 perf 的路径还要能用）。
+local SYS_perf_event_open = SYS and SYS.perf
+local SYS_process_vm_readv = SYS and SYS.vm_readv
+local function syscall_hint()
+  return ("架构 %s 没登记 syscall 号（已知：%s）。在 lua/trace/engine.lua 的 SYS_NR 表里补上，"
+      .. "编号查 asm-generic/unistd.h 或 arch/*/syscalls 表"):format(ARCH,
+      table.concat((function() local t = {} for k in pairs(SYS_NR) do t[#t+1] = k end
+        table.sort(t) return t end)(), "/"))
+end
 local T = "/sys/kernel/tracing"
 ffi.cdef[[ typedef void (*sighandler_t)(int); sighandler_t signal(int, sighandler_t); ]]
 local _stop = ffi.new("volatile int[1]", 0)
@@ -287,6 +309,7 @@ local PERF_TYPE_HARDWARE, PERF_TYPE_SOFTWARE = 0, 1
 local PERF_COUNT_HW_CPU_CYCLES, PERF_COUNT_SW_CPU_CLOCK = 0, 0
 local function perf_open(spec, pid, cpu, sample_type, period, t)
   t = t or {}
+  if not SYS_perf_event_open then return nil, "no-syscall" end
   local attr = ffi.new("uint8_t[?]", 136)
   local etype, econfig, freq, idle = 2, spec, false, false
   if type(spec) == "table" then
@@ -501,6 +524,7 @@ local CBUF = 4096
 local sbuf = ffi.new("char[?]", CBUF)
 local function read_cstr(pid, addr)
   if addr == 0 then return nil end
+  if not SYS_process_vm_readv then return nil end   -- 未登记架构：字符串读不出来，字段留数字
   local li, ri = iov_t(), iov_t()
   li[0].base, li[0].len = sbuf, CBUF
   ri[0].base, ri[0].len = ffi.cast("void*", addr), CBUF
@@ -632,6 +656,14 @@ end
 ------------------------------------------------------------------------
 -- 参数
 ------------------------------------------------------------------------
+-- 架构自检必须在解析之前：它是个独立开关，解析器见未知参数就 exit(2)。
+-- 不碰 tracefs、不要 root；输出 `<ARCH> <perf_nr|-> <vm_readv_nr|->`，未登记退出码 2。
+if arg[1] == "--syscheck" then
+  io.write(("%s %s %s\n"):format(ARCH,
+    SYS_perf_event_open and tostring(SYS_perf_event_open) or "-",
+    SYS_process_vm_readv and tostring(SYS_process_vm_readv) or "-"))
+  os.exit(SYS and 0 or 2)
+end
 local opt = { mode = "count", duration = 2, keys = "comm", limit = 8, limit_set = false }
 local probe_specs, entry_spec, exit_spec, args = {}, nil, nil, {}
 do
@@ -782,7 +814,10 @@ local function run_count()
       fds[#fds+1] = { fd = fd, cpu = t.cpu, tid = t.tid }
     end
   end
-  if #fds == 0 then fail("perf_event_open 全部失败（需 root + perf_event_paranoid<=0）") end
+  if #fds == 0 then
+    if not SYS_perf_event_open then fail("perf_event_open 调不起来：" .. syscall_hint()) end
+    fail("perf_event_open 全部失败（需 root + perf_event_paranoid<=0）")
+  end
   sleep_seconds(opt.duration)
   for _, f in ipairs(fds) do
     ffi.C.ioctl(f.fd, 0x2401, ffi.cast("long", 0))
