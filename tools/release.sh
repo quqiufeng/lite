@@ -7,6 +7,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+. "$ROOT/tools/_arch.sh"
 INSTALL=1
 PREFIX_EXPLICIT=0
 if [ -n "${PREFIX:-}" ]; then
@@ -52,7 +53,7 @@ done
 "$ROOT/tools/package.sh"
 
 if [ "$INSTALL" -eq 0 ]; then
-    echo "package only: $ROOT/dist/lite-linux-x64.tar.gz"
+    echo "package only: $ROOT/dist/$LITE_DIST_NAME.tar.gz"
     exit 0
 fi
 

@@ -25,7 +25,7 @@ end
 -- 找模型/lib 别只看 cwd 和 LITE_ROOT：插件进程（helper/*.lua，会话里动态起的）
 -- 里 LITE_ROOT 未必指向仓库，cwd 也可能是任意 workspace，于是 OCR 在插件里恒
 -- "models not found" → 插件全走 blind 盲点分支。本文件固定住在
--- <root>/lua/ffi/ocr.lua（安装后 dist/lite-linux-x64/lua/ffi/ocr.lua 同理），
+-- <root>/lua/ffi/ocr.lua（安装后 dist/lite-linux-<arch>/lua/ffi/ocr.lua 同理），
 -- 从自身路径反推 <root> 最可靠。
 -- 顺序：LITE_ROOT（显式覆盖）→ 自身路径推出来的根 → cwd。
 local function self_root()

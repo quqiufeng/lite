@@ -230,8 +230,8 @@ OpenMP 运行库（否则 KV cache 加载失败）。`./tools/check_deps.sh` 逐
 
 | 组件 | 体积 | 默认 | 拷到哪里 |
 |---|---|---|---|
-| PP-OCRv4 模型（det + rec + 字典） | 14.8 MB | ❌ | `dist/lite-linux-x64/models/ocr/` |
-| onnxruntime CPU 版 | 22 MB | ❌ | `dist/lite-linux-x64/lib/` |
+| PP-OCRv4 模型（det + rec + 字典） | 14.8 MB | ❌ | `dist/lite-linux-<arch>/models/ocr/` |
+| onnxruntime CPU 版 | 22 MB | ❌ | `dist/lite-linux-<arch>/lib/` |
 | onnxruntime GPU 版 | 26 MB | ❌ | 同上 |
 | `libonnxruntime_providers_cuda.so` | 329 MB | ❌ | 同上（仅 GPU；永不打包） |
 | `ffmpeg` + SenseVoice.cpp CPU + gguf | — | ❌ | 系统包 + `/opt`、`/data`，只调外部 CLI |
@@ -241,7 +241,7 @@ OpenMP 运行库（否则 KV cache 加载失败）。`./tools/check_deps.sh` 逐
 
 ```bash
 # OCR：拷模型和 onnxruntime 进 dist（真拷贝，dist 可整体搬走）
-cd dist/lite-linux-x64
+cd dist/lite-linux-*   # x64 机器上即 lite-linux-x64；aarch64 上是 lite-linux-arm64
 ./tools/ort_link.sh models /path/to/lite/third_party/ocr/models/ocr
 LITE_ORT_PREFER=cpu ./tools/ort_link.sh copy
 ./tools/ort_link.sh status

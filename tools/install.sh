@@ -7,7 +7,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DIST="$ROOT/dist/lite-linux-x64"
+. "$ROOT/tools/_arch.sh"
+DIST="$ROOT/dist/$LITE_DIST_NAME"
 APP="${PREFIX:-$HOME/.local}/share/lite"
 BIN="${PREFIX:-$HOME/.local}/bin"
 

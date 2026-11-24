@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# 生成 dist/lite-linux-x64.tar.gz（LuaJIT + cjson + lua + tools）。
+# 生成 dist/lite-linux-<arch>.tar.gz（LuaJIT + cjson + lua + tools）。
+# 架构后缀见 tools/_arch.sh：x86_64 -> x64，aarch64 -> arm64，可用 LITE_DIST_ARCH 覆盖。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DIST="$ROOT/dist/lite-linux-x64"
+. "$ROOT/tools/_arch.sh"
+DIST="$ROOT/dist/$LITE_DIST_NAME"
 
 rm -rf "$DIST"
 mkdir -p "$DIST/lua" "$DIST/tools" "$DIST/third_party" "$DIST/build" "$DIST/lib" "$DIST/helper" "$DIST/models"
@@ -91,7 +93,7 @@ if [ -d "$ROOT/third_party/ocr/lib" ]; then
                 ;;
         esac
         # 直接拷实体（libocr_simple 76KB）。不能用相对软链：
-        # "../../../third_party/ocr/lib/xxx" 从 dist/lite-linux-x64/lib 往上
+        # "../../../third_party/ocr/lib/xxx" 从 dist/lite-linux-<arch>/lib 往上
         # 三级正好回到源码树根，链会解析到 $ROOT 而不是 dist 内部 ——
         # 单拷 dist 出去就断链，install.sh 的 `cp -rL` 也依赖源树在。
         cp -f "$real" "$DIST/lib/$bn"
@@ -219,5 +221,5 @@ if [ -n "$big" ]; then
     exit 1
 fi
 
-tar -czhf "$ROOT/dist/lite-linux-x64.tar.gz" -C "$ROOT/dist" lite-linux-x64
-echo "package: $ROOT/dist/lite-linux-x64.tar.gz ($(du -h "$ROOT/dist/lite-linux-x64.tar.gz" | cut -f1))"
+tar -czhf "$ROOT/dist/$LITE_DIST_NAME.tar.gz" -C "$ROOT/dist" "$LITE_DIST_NAME"
+echo "package: $ROOT/dist/$LITE_DIST_NAME.tar.gz ($(du -h "$ROOT/dist/$LITE_DIST_NAME.tar.gz" | cut -f1))"
