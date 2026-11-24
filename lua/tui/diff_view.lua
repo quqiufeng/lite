@@ -17,6 +17,7 @@ function M.new(files, opts)
         scroll = 0,
         single = false,
         file_index = 1,
+        folded = {},        -- hunk 表 → true；rebuild 后仍然指同一批 hunk
     }, M)
     self.content_h = math.max(1, self.height - 2)
     self:_rebuild()
@@ -32,7 +33,7 @@ end
 
 function M:_rebuild()
     if self.width < MIN_SPLIT_WIDTH then self.mode = "unified" end
-    self.layout = Layout.new(self:_visible_files(), self.mode, self.width)
+    self.layout = Layout.new(self:_visible_files(), self.mode, self.width, self.folded)
     self:_clamp()
 end
 
@@ -91,6 +92,39 @@ function M:_jump_hunk(dir)
     if pos then self.scroll = pos end
 end
 
+-- 折叠变化会改变总行数，滚动位置必须锚回同一个 hunk 的头部，否则视口会跳走
+-- （折一个大 hunk 时最明显：内容瞬间少几十行，光标留在原地就跑到别的 hunk 里了）。
+function M:_reanchor(hunk)
+    self:_rebuild()
+    local pos = hunk and self.layout:hunk_pos(hunk)
+    if pos then self.scroll = pos end
+    self:_clamp()
+end
+
+-- z：折/展当前 hunk。
+function M:toggle_fold()
+    local e = self.layout:hunk_at(self.scroll)
+    if not e then return end
+    self.folded[e.hunk] = not self.folded[e.hunk] or nil
+    self:_reanchor(e.hunk)
+end
+
+-- Z：还有展开的就全折，全折着就全展（单键到底，不用记方向）。
+function M:toggle_fold_all()
+    local list = {}
+    for _, f in ipairs(self:_visible_files()) do
+        for _, h in ipairs(f.hunks or {}) do list[#list + 1] = h end
+    end
+    if #list == 0 then return end
+    local any_open = false
+    for _, h in ipairs(list) do
+        if not self.folded[h] then any_open = true; break end
+    end
+    local e = self.layout:hunk_at(self.scroll)
+    for _, h in ipairs(list) do self.folded[h] = any_open or nil end
+    self:_reanchor(e and e.hunk)
+end
+
 function M:handle(ev)
     local k = ev.key
 
@@ -103,6 +137,8 @@ function M:handle(ev)
         elseif c == "G" then self.scroll = self.layout:max_scroll(self.content_h)
         elseif c == "n" then self:_jump_hunk(1)
         elseif c == "p" then self:_jump_hunk(-1)
+        elseif c == "z" then self:toggle_fold()
+        elseif c == "Z" then self:toggle_fold_all()
         elseif c == "f" then self:toggle_single()
         elseif c == "]" then self:next_file(1)
         elseif c == "[" then self:next_file(-1)
@@ -155,7 +191,7 @@ function M:render(screen, w, h)
 
     local total = self.layout.total or 0
     local right = string.format(" %d/%d ", math.min(total, self.scroll + self.content_h), total)
-    local hint = " ↑↓ PgUp/PgDn · n/p hunk · Tab split/unified · f single · ]/[ file · q close "
+    local hint = " ↑↓ PgUp/PgDn · n/p hunk · z/Z fold · Tab split · f single · ]/[ file · q close "
     local avail = w - utf8.width_str(right) - 1
     if avail > 0 then
         local cut, cw, i = {}, 0, 1

@@ -3987,6 +3987,71 @@ do
     check(renamed[1].status == "renamed" and renamed[1].path == "new.lua", "diff parse rename")
 end
 
+-- tui diff 的 hunk 折叠：z 折当前、Z 全折/全展；折完滚动要锚回同一个 hunk，
+-- 换模式（rebuild）后折叠状态不能丢——折叠集合按 hunk 表做键就是为了这个。
+do
+    local D = require("tui.diff")
+    local Layout = require("tui.diff_layout")
+    local View = require("tui.diff_view")
+
+    local buf = { "diff --git a/f.lua b/f.lua", "--- a/f.lua", "+++ b/f.lua" }
+    for k = 1, 3 do
+        local s = (k - 1) * 30 + 1
+        buf[#buf + 1] = string.format("@@ -%d,20 +%d,20 @@", s, s)
+        for i = 1, 20 do buf[#buf + 1] = " ctx" .. i end
+    end
+    local files = D.parse(table.concat(buf, "\n") .. "\n")
+    check(#files[1].hunks == 3, "diff fold 三个 hunk")
+    local h1, h2 = files[1].hunks[1], files[1].hunks[2]
+
+    -- 文件头 1 + 每个 hunk（头 1 + 20 行）
+    local open = Layout.new(files, "unified", 80)
+    check(open.total == 64, "diff layout 未折叠行数")
+
+    local lay = Layout.new(files, "unified", 80, { [h1] = true })
+    check(lay.total == 45, "diff 折叠后 20 行正文压成 1 行摘要")
+    local fold_rows, saw_fold = 0, false
+    for _, r in ipairs(lay.rows) do
+        if r.kind == "fold" then
+            fold_rows = fold_rows + 1
+            local t = r.cells[1].text
+            if t:find("20 lines", 1, true) then saw_fold = true end
+        end
+    end
+    check(fold_rows == 1 and saw_fold, "diff 折叠摘要行带行数")
+    check(lay:hunk_at(0).hunk == h1, "diff hunk_at 取第一个")
+    check(lay:hunk_at(22).hunk == h2, "diff hunk_at 跟着滚动走")
+
+    local v = View.new(files, { width = 80, height = 12 })
+    check(v.layout.total == 64, "diff view 初始行数")
+    v.scroll = v.layout:hunk_pos(h2)
+    check(v.scroll == 22, "diff view hunk 位置")
+    v:handle({ key = "char", text = "z" })
+    check(v.folded[h2] == true, "diff z 折当前 hunk")
+    check(v.scroll == 22 and v.layout:hunk_at(v.scroll).hunk == h2,
+        "diff 折叠后滚动仍锚在同一个 hunk")
+    v:handle({ key = "char", text = "z" })
+    check(v.folded[h2] == nil and v.layout.total == 64, "diff z 再按展开还原")
+
+    v:handle({ key = "char", text = "Z" })
+    check(v.folded[h1] and v.folded[h2] == true
+        and v.folded[files[1].hunks[3]] == true, "diff Z 全折")
+    check(v.layout.total == 7, "diff 全折后只剩头 + 摘要")
+    v:handle({ key = "char", text = "Z" })
+    check(v.folded[h1] == nil and v.layout.total == 64, "diff Z 再按全展")
+
+    -- rebuild 路径：切 split / 改宽度都重建排版，折叠状态必须还在
+    local wide = View.new(files, { width = 120, height = 12 })
+    wide.layout = Layout.new(files, "unified", 120, wide.folded)
+    wide.folded[h1] = true
+    wide:_rebuild()
+    wide:toggle_mode()
+    check(wide.mode == "split", "diff fold 用例切到 split")
+    local kept = 0
+    for _, r in ipairs(wide.layout.rows) do if r.kind == "fold" then kept = kept + 1 end end
+    check(kept == 1, "diff 切模式后折叠状态保持")
+end
+
 -- tui 文本内核：liblite_tui.so 的折行/行数/宽度必须与纯 Lua 参考实现逐位等价。
 -- C 路径是快路径，回退路径才是经常被单独跑到的那份；不 here 对拍就只能等线上看出错行。
 do

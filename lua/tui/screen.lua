@@ -25,6 +25,7 @@ local STYLES = {
     diff_del_hl = "\27[41;97m",
     diff_add_hl = "\27[42;30m",
     diff_gutter = "\27[90m",
+    diff_fold = "\27[2;36m",
     italic = "\27[3m",
     code = "\27[33m",
     code_block = "\27[36m",

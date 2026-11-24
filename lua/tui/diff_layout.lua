@@ -102,6 +102,29 @@ local function split_side(self, row, num, base, hl, segs)
     return cells
 end
 
+-- 折叠摘要行：一行顶掉整个 hunk 的正文。省的不只是屏幕，还有 `Diff.pair`
+-- 的词级差分（折叠的 hunk 根本不配对，大 diff 一帧省下的量级在这里）。
+local function fold_counts(h)
+    local add, del, ctx = 0, 0, 0
+    for _, r in ipairs(h.rows or {}) do
+        if r.kind == "add" then add = add + 1
+        elseif r.kind == "del" then del = del + 1
+        else ctx = ctx + 1 end
+    end
+    return add, del, ctx
+end
+
+local function fold_summary(h)
+    local add, del, ctx = fold_counts(h)
+    local n = add + del + ctx
+    if n == 0 then return "    ⋯ empty hunk  [z]" end
+    local parts = { string.format("    ⋯ %d lines", n) }
+    if add > 0 then parts[#parts + 1] = "+" .. add end
+    if del > 0 then parts[#parts + 1] = "-" .. del end
+    parts[#parts + 1] = "[z]"
+    return table.concat(parts, "  ")
+end
+
 local function render_cells(screen, x, y, cells)
     local cx = x
     for _, c in ipairs(cells) do
@@ -110,11 +133,15 @@ local function render_cells(screen, x, y, cells)
     return cx
 end
 
-function M.new(files, mode, width)
+-- folded：以 hunk 表本身为键的折叠集合（`folded[h] = true`）。用表做键而不是
+-- 「第几个文件第几个 hunk」，是因为 rebuild（改窗口宽/切 split/切单文件）后
+-- 序号会变，表还是同一批表。
+function M.new(files, mode, width, folded)
     local self = setmetatable({
         files = files or {},
         mode = mode or "unified",
         width = math.max(20, width or 80),
+        folded = folded or {},
         rows = {},
         hunks = {},
         file_rows = {},
@@ -169,13 +196,18 @@ function M:_add_file(f, fi)
     for _, h in ipairs(f.hunks or {}) do
         local hc = one(h.header or "", "diff_hunk")
         self:_add_row({ kind = "hunk", cells = hc, height = count_lines(hc, self.width) })
-        self.hunks[#self.hunks + 1] = { row = #self.rows, label = h.header or "" }
+        self.hunks[#self.hunks + 1] = { row = #self.rows, hunk = h, label = h.header or "" }
 
-        local paired = Diff.pair(h)
-        if self.mode == "split" then
-            for _, p in ipairs(paired) do self:_add_split_row(p) end
+        if self.folded[h] then
+            local sc = one(fold_summary(h), "diff_fold")
+            self:_add_row({ kind = "fold", cells = sc, height = count_lines(sc, self.width) })
         else
-            for _, p in ipairs(paired) do self:_add_unified_row(p) end
+            local paired = Diff.pair(h)
+            if self.mode == "split" then
+                for _, p in ipairs(paired) do self:_add_split_row(p) end
+            else
+                for _, p in ipairs(paired) do self:_add_unified_row(p) end
+            end
         end
     end
 end
@@ -288,6 +320,22 @@ function M:next_hunk(scroll, dir)
         end
     end
     return best
+end
+
+-- 覆盖 scroll 的 hunk 条目（滚在第一个 hunk 之前时取第一个）：z 就是折它。
+function M:hunk_at(scroll)
+    local best
+    for _, h in ipairs(self.hunks) do
+        if (self.prefix[h.row] or 0) <= scroll then best = h else break end
+    end
+    return best or self.hunks[1]
+end
+
+-- 某个 hunk 头部行在本排版里的 y 偏移；折叠改变行数后用它把滚动锚回同一个 hunk。
+function M:hunk_pos(hunk)
+    for _, h in ipairs(self.hunks) do
+        if h.hunk == hunk then return self.prefix[h.row] or 0 end
+    end
 end
 
 function M:_row_lines(row)
