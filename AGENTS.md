@@ -83,6 +83,16 @@ MUST NOT：`python`/`sed -i` 改仓库文件（用 `edit`/`write`）；Chrome/We
 - **system prompt 必须字节稳定**：时钟/轮次/预算/工具**名字**都在消息末尾的 `runtime_block`，schema 以 API
   `tools` 为准；前缀 reset 按 `fold`/`hard_window`/`window` 记账。截断与环境变量见 README。
 
+**外部 agent 接入（codex / Claude Code）**：`CLAUDE.md` 是指向本文件的软链，两边读同一份约定。
+
+- 读：`lite --recall "<query>" [--shared] [--limit N] [--kind fact,turn]`——只读，不抢 `mem.lock`，
+  lite 正跑着也能查本目录 `mem.bin`；`--shared` 再并上共享库 `memdb/`（其他 agent 写的）。
+- 写：`lite --remember "<text>" [--key K] [--tags a,b]`——**只** append 共享库（`core/memdb.lua`，
+  O_APPEND 单行、无需锁），所以外部进程随时可写；lite 自己的 `recall` 工具会把 memdb 并进结果
+  （`core/tools.lua`），写得进来就读得到。不碰本地 `mem.bin` 是刻意的：那份要持锁。
+- 批量搬：`--memory-export` / `--memory-import`（JSONL，本目录 `mem.bin`）；`--memdb-search` 查共享库。
+- 一句话：**私有 `mem.bin` 归当前目录的 lite 实例，公共 `memdb/` 是所有 agent 的告示板**。
+
 ## 5 扩展
 
 | 通道 | 谁写 | 纪律 |

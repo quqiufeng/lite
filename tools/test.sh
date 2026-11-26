@@ -111,6 +111,21 @@ OUT="$(LITE_MEMDB_DIR="$TMPD" "$ROOT/tools/run.sh" --memdb-search "ollama 端口
 if ! echo "$OUT" | grep -q '"origin":"box-other"'; then
     echo "FAIL cli.memdb_search.json" >&2; rm -rf "$TMPD"; exit 1
 fi
+# 外部 agent 写入口：--remember 只 append 共享库（不需要 mem.lock），
+# 写完 --recall --shared 必须能看到；空文本要拒绝（别在库里留空条目）。
+OUT="$(LITE_MEMDB_DIR="$TMPD" "$ROOT/tools/run.sh" --remember "外部接入 pin" --key /agent/knowledge/pin --json || true)"
+if ! echo "$OUT" | grep -q '"type":"remember"'; then
+    echo "FAIL cli.remember.json" >&2; rm -rf "$TMPD"; exit 1
+fi
+OUT="$(LITE_MEMDB_DIR="$TMPD" "$ROOT/tools/run.sh" --remember "  " --json || true)"
+if ! echo "$OUT" | grep -q '"error"'; then
+    echo "FAIL cli.remember.empty (空文本应报错)" >&2; rm -rf "$TMPD"; exit 1
+fi
+OUT="$(cd "$TMPD" && LITE_MEMDB_DIR="$TMPD" LITE_MEMORY_DIR="$TMPD/mem" \
+    "$ROOT/tools/run.sh" --recall "外部接入" --shared --json || true)"
+if ! echo "$OUT" | grep -q '"shared":1'; then
+    echo "FAIL cli.recall.shared (--shared 没并上共享库)" >&2; rm -rf "$TMPD"; exit 1
+fi
 rm -rf "$TMPD"
 echo "OK cli.json"
 

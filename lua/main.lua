@@ -32,7 +32,11 @@ lite — DeepSeek 终端 coding agent
   lite plugins [--json]        列出 helper/ 插件与加载错误
   lite --check                 检查运行依赖
   lite --once "<prompt>"       无 UI 单轮/工具循环（流式输出）
-  lite --recall "<query>"      查询当前目录的本地记忆
+  lite --recall "<query>" [--shared] [--limit N] [--kind fact,turn]
+                               查询当前目录的本地记忆（--shared 连共享库 memdb/ 一起看）
+  lite --remember "<text>" [--key K] [--tags a,b]
+                               往共享库写一条记忆：不加锁、lite 跑着也能写，
+                               是 codex / Claude Code 等外部 agent 的写入口
   lite --memory-export [f.jsonl] [--prefix P]... [--all]
                                把知识层记忆导出成 JSONL（省略文件则打到 stdout）
   lite --memory-import f.jsonl [--dry-run]
@@ -107,7 +111,8 @@ local SUBCOMMANDS = {
     serve = true, ["--serve"] = true, attach = true, ["--attach"] = true,
     state = true, ["--state"] = true, sessions = true, ["--sessions"] = true,
     plugins = true, ["--plugins"] = true,
-    ["--check"] = true, ["--recall"] = true, ["--tui"] = true, ["--once"] = true,
+    ["--check"] = true, ["--recall"] = true, ["--remember"] = true,
+    ["--tui"] = true, ["--once"] = true,
     ["--memory-export"] = true, ["--memory-import"] = true,
     ["--memdb"] = true, ["--memdb-search"] = true,
     ["--gui"] = true,
@@ -253,6 +258,37 @@ local function parse_flags(list)
             -- 显式认领"本次不落盘"：抢不到 mem.lock 时不再拒绝启动。
             flags.readonly = true
             i = i + 1
+        elseif a == "--key" then
+            -- --remember 的记忆键；缺值当场报错（别让 key 变空走到 append 里报 empty key）
+            local v = list[i + 1]
+            if not v then
+                io.stderr:write("lite: --key needs a value\n")
+                os.exit(2)
+            end
+            flags.key = v
+            i = i + 2
+        elseif a == "--tags" then
+            local v = list[i + 1]
+            if not v then
+                io.stderr:write("lite: --tags needs a value\n")
+                os.exit(2)
+            end
+            flags.tag_list = {}
+            for t in tostring(v):gmatch("[^,]+") do
+                t = t:gsub("^%s+", ""):gsub("%s+$", "")
+                if t ~= "" then flags.tag_list[#flags.tag_list + 1] = t end
+            end
+            i = i + 2
+        elseif a == "--shared" then
+            -- --recall/--remember 是否带上共享库（memdb/，其他 agent 写的）
+            flags.shared = true
+            i = i + 1
+        elseif a == "--limit" then
+            flags.limit = tonumber(list[i + 1])
+            i = i + 2
+        elseif a == "--kind" then
+            flags.kind = list[i + 1]
+            i = i + 2
         elseif a == "--prefix" then
             -- 可重复（--memory-export 一次挑几个前缀）；缺值当场报错，
             -- 别让 nil 一路传到 export 里变成"筛掉一切"的空结果。
@@ -589,7 +625,7 @@ elseif cmd == "--check" then
 elseif cmd == "--recall" then
     -- 走 parse_flags 的 pos，别再拿 rest[1]：`lite --readonly --recall x` 时
     -- rest[1] 是 --readonly，会把选项名当查询词（查空还要以为记忆没了）。
-    local _, pos = parse_flags(rest)
+    local flags, pos = parse_flags(rest)
     local query = table.concat(pos, " ")
     local config = require("core.config").load()
     local Memory = require("core.memory")
@@ -604,9 +640,34 @@ elseif cmd == "--recall" then
         else io.stderr:write("lite: " .. tostring(merr) .. "\n") end
         os.exit(2)
     end
-    local items = memory:search(query, { limit = 10 })
+    local limit = flags.limit or 10
+    local items = memory:recall(query, limit, { kind = flags.kind })
+    -- --shared：连共享库（memdb/，其他 agent 和新进程写的）一起看。
+    -- 本地条目在前、共享条目在后——本机亲眼所见，可信度天然更高；
+    -- 同一段文本两边都有时只留本地那条，别占两行。
+    local shared_n = 0
+    if flags.shared then
+        local Memdb = require("core.memdb")
+        local seen = {}
+        for _, it in ipairs(items) do
+            seen[(it.text or ""):gsub("%s+", " "):lower()] = true
+        end
+        local hits = Memdb.search(query, limit)
+        for _, r in ipairs(hits) do
+            local norm = (r.text or ""):gsub("%s+", " "):lower()
+            if not seen[norm] then
+                seen[norm] = true
+                shared_n = shared_n + 1
+                items[#items + 1] = {
+                    key = "shared@" .. tostring(r.origin or "?"),
+                    text = string.format("%s: %s", tostring(r.key), tostring(r.text)),
+                    score = r.score, shared = true,
+                }
+            end
+        end
+    end
     if json then
-        emit({ type = "memory", dir = memory.dir, items = items })
+        emit({ type = "memory", dir = memory.dir, items = items, shared = shared_n })
     elseif #items == 0 then
         print("no memory in " .. memory.dir)
     else
@@ -615,6 +676,42 @@ elseif cmd == "--recall" then
         end
     end
     memory:close()
+    os.exit(0)
+elseif cmd == "--remember" then
+    -- 外部 agent（codex / Claude Code / 脚本）的写入口。
+    -- 只写共享库 memdb/：O_APPEND 单行，不需要 mem.lock，lite 正跑着也能写。
+    -- 不碰本地 mem.bin 是刻意的——那份要持锁，外人在别人的会话里抢锁会把主进程挤成只读。
+    -- lite 自己的 recall 工具会把 memdb 并进结果（core/tools.lua），所以写得进来就读得到。
+    local flags, pos = parse_flags(rest)
+    local text = table.concat(pos, " ")
+    if text:gsub("%s+", "") == "" then
+        if json then emit({ type = "error", error = "--remember needs text" })
+        else io.stderr:write("lite: --remember \"<text>\" [--key K] [--tags a,b]\n") end
+        os.exit(2)
+    end
+    local key = flags.key
+    if not key or key == "" then
+        -- 没给 key 就用正文打头当键：共享库的 key 只是标签，检索靠 text 打分。
+        local brief = text:gsub("%s+", " ")
+        if #brief > 40 then brief = brief:sub(1, 40) end
+        key = "/agent/knowledge/" .. brief
+    end
+    local Memdb = require("core.memdb")
+    local cwd = require("core.config").load().cwd
+    local ok, res = Memdb.append({
+        key = key, text = text, tags = flags.tag_list,
+        cwd = cwd,
+    })
+    if not ok then
+        if json then emit({ type = "error", error = tostring(res) })
+        else io.stderr:write("lite: remember failed: " .. tostring(res) .. "\n") end
+        os.exit(1)
+    end
+    if json then
+        emit({ type = "remember", key = key, file = res, origin = Memdb.origin() })
+    else
+        print(string.format("remembered %s → %s", key, tostring(res)))
+    end
     os.exit(0)
 elseif cmd == "--memdb" or cmd == "--memdb-search" then
     -- 共享记忆库只有一个操作模型：谁都能 append，谁都能扫全库自己筛。
