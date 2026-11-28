@@ -29,8 +29,14 @@ if [ "${LITE_SKIP_PACKAGE:-0}" = "1" ] || [ "$PREBUILT" = "1" ]; then
     # （build/*.so 之外的 lib/liblite_*.so、$LITE_SYSROOT 里的 liblitehtml/gumbo）
     # 在目标机上根本不存在 —— 实测在 123 上装完 lib/ 全空、build/ 只剩 2 个 .so，
     # html→png 与 tui/capture 一起失联。包是别人打好的，就照用。
-    SRC="$DIST"
-    [ -x "$SRC/tools/lite" ] || SRC="$ROOT"
+    # 优先树根：$DIST 是 <root>/dist/<name>，只在「源码树刚被 release.sh 打好包、
+    # 想复用那份产物」时才该选。反过来先选 $DIST 会中一个隐蔽的陷阱——目标机上
+    # 若残留一个 <root>/dist/<name>（早先 LITE_SKIP_PACKAGE 手工摆的、或有人解包
+    # 到 dist 下），它的 tools/lite 也是可执行的，于是整个安装源切到那份残树：
+    # 装完 lib/ 全空、build/ 只剩 cache+html，tui/capture/image 与 html→png 一起
+    # 失联，而 install.sh 一路不报错（2026-11-28 在 123 上实测踩到）。
+    SRC="$ROOT"
+    [ -x "$SRC/tools/lite" ] || SRC="$DIST"
     [ -x "$SRC/tools/lite" ] || {
         echo "install: skip-package 但既没有 $DIST 也没有 $ROOT/tools/lite" >&2
         exit 1
