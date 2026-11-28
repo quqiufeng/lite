@@ -38,6 +38,7 @@ export DEEPSEEK_API_KEY=...   # 或写进 .env / ~/.config/lite/.env
 ./tools/run.sh serve --wake 300 --task "检查 CI"  # 无人值守定时唤醒
 ./tools/serve_up.sh start                      # 常驻 0.0.0.0:8765 + 自监督循环（reboot/崩溃自愈）
 ./tools/run.sh setup --port 8080               # Web 初始化页：手机填 DeepSeek API Key 写 ~/.config/lite/.env
+./tools/setup_service.sh install               # 把上面那个装成开机自启的 systemd 服务（盒子用）
 ./tools/cluster.sh --jobs 4 tasks.tsv          # 多机/多目录并行派活（TSV 一行一个槽，结果落盘）
 ./build_arm64.sh --package --deploy root@盒子   # 交叉编 arm64 → 打包 → 灌进盒子（x86 本机跑）
 ./tools/test.sh               # 依赖 + 单元 + CLI + TUI(tmux) 冒烟

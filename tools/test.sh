@@ -164,4 +164,15 @@ echo "== tui =="
 echo "== serve =="
 "$ROOT/tools/serve_smoke.sh"
 
+echo "== setup service =="
+# dry-run 不碰系统：断言 unit 里该有的开关都在（缺一个就装不出开机自启）
+UNIT="$(LITE_SETUP_UNIT_DIR=/dev/null LITE_SETUP_PORT=8080 "$ROOT/tools/setup_service.sh" dry-run 2>&1 || true)"
+for pat in "Restart=always" "WantedBy=multi-user.target" "ExecStart=$ROOT/tools/lite setup --host 0.0.0.0 --port 8080" "Type=simple"; do
+    if ! echo "$UNIT" | grep -qF "$pat"; then
+        echo "FAIL setup.service ($pat 缺了)" >&2
+        exit 1
+    fi
+done
+echo "OK setup.service"
+
 echo "== done =="
