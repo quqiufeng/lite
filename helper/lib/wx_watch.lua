@@ -128,6 +128,25 @@ function M.is_reply(text, tag)
     return n:sub(1, #kt) == kt
 end
 
+-- 回执的**续块**：一条长回复被 OCR 切成两块时，第二块丢了 lite: 前缀就成了「新指令」回声
+-- （实测：天气回复的「建议/数据源」那两行被派回去重跑了一遍）。判据只有几何三条，
+-- 都对着「同一条气泡的下半截」：①上一块是回执；②紧贴在它下面（gap 内）；③水平范围大幅
+-- 重叠（同宽度气泡）。缺 ③ 会把「用户在回执下面紧跟一句新指令」误吞——那是真指令，代价更大。
+-- gap 默认 32：实测**同一气泡内的续行**间隙 ≤20（行高 21，续行紧贴），而**两个气泡之间**
+-- 是 56~58。原来写 64 等于把「回执之后用户紧跟的下一句」也算续块——09:04 就这样吞掉了用户
+-- 「把代码修改push到github」，只在 daemon 日志里留一行「忽略最新条」，用户看着像没回。
+function M.is_reply_tail(prev, cur, opt)
+    opt = opt or {}
+    if not (prev and cur) then return false end
+    if not M.is_reply(prev.text, opt.tag) then return false end
+    local gap = opt.gap or 32
+    if ((cur.y or 0) - ((prev.y or 0) + (prev.h or 0))) > gap then return false end
+    local x0 = math.max(prev.x or 0, cur.x or 0)
+    local x1 = math.min((prev.x or 0) + (prev.w or 0), (cur.x or 0) + (cur.w or 0))
+    local narrow = math.min(prev.w or 0, cur.w or 0)
+    return narrow > 0 and (x1 - x0) >= 0.6 * narrow
+end
+
 -- 默认**全收**（prefix=""）：微信模式开着的时候，凡是新发到「文件传输助手」的消息都当指令
 -- 跑（用户定的：每条都敲 #lite 太麻烦）。想要过滤就显式给 prefix="#lite"。
 -- 代价明确：那一刻起，你自己随手发到箱子的笔记/链接也会被执行 —— 别开着模式发文件。
@@ -201,12 +220,33 @@ end
 -- **原样**贴给主进程（由 lua/tui/modecmd.lua 的 submit() 拦），不能包进「微信远程指令（…）」
 -- 外壳 —— 主进程只认整行命令，包了壳就退化成让模型念一句"退出"，模式根本关不掉。
 -- 动词表不在这里复制：modecmd 是唯一一份（AGENTS §5）。拿不到就说 false，退回旧行为。
-function M.is_mode_cmd(text)
-    local ok, MC = pcall(require, "tui.modecmd")
-    if not ok or type(MC) ~= "table" then return false end
+-- 手机上敲 # 也是麻烦事（全收模式本来就是为了免前缀）：裸词也算，但**整行必须就是那个词**。
+-- 返回该透传的规范写法（带 #），不是模式命令返回 nil。
+-- 词表一律不复制：ON 取 tui.wxmode.ON_WORDS，OFF 取 tui.modecmd.OFF（AGENTS §5）。
+-- 裸「退出」**刻意不认**（它更像一句正文，留给人让模型理解）；带模式名的裸「退出微信」认。
+function M.mode_cmd_norm(text)
     local s = (M.norm(text or ""):gsub("＃", "#"))
-    return MC.command(s) and true or false
+    if s == "" then return nil end
+    local MC = select(2, pcall(require, "tui.modecmd"))
+    if s:sub(1, 1) == "#" then
+        if type(MC) == "table" and MC.command(s) then return s end
+        return nil
+    end
+    local WX = select(2, pcall(require, "tui.wxmode"))
+    if type(WX) == "table" then
+        for _, w in ipairs(WX.ON_WORDS or {}) do
+            if (w:gsub("^#", "")) == s then return "#" .. s end
+        end
+    end
+    if type(MC) == "table" then
+        for _, v in ipairs(MC.OFF or {}) do
+            if s == v .. "微信" or s == v .. "微信模式" then return "#" .. s end
+        end
+    end
+    return nil
 end
+
+function M.is_mode_cmd(text) return M.mode_cmd_norm(text) ~= nil end
 
 -- ── 媒体消息（图片/文件/视频）：不处理 ──────────────────────────────
 -- 用户定的：微信模式收到的**图片和文件不处理**（截图里的字、文件名都不是指令）。

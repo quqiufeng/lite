@@ -87,6 +87,15 @@ check(W.is_mode_cmd("＃退出微信模式"), "mode cmd: fullwidth # (OCR)")
 check(not W.is_mode_cmd("帮我退出一下这个目录"), "plain text is not a mode cmd")
 check(not W.is_mode_cmd("退出"), "verb without # is not a mode cmd")
 check(not W.is_mode_cmd(""), "empty is not a mode cmd")
+-- 手机上敲 # 麻烦：裸词也算，透传时补成规范写法（主进程 submit() 只认带 # 的整行）
+eq(W.mode_cmd_norm("微信模式"), "#微信模式", "mode cmd: bare 微信模式 → #微信模式")
+eq(W.mode_cmd_norm("微信"), "#微信", "mode cmd: bare 微信")
+eq(W.mode_cmd_norm("wx"), "#wx", "mode cmd: bare wx")
+eq(W.mode_cmd_norm("退出微信模式"), "#退出微信模式", "mode cmd: bare 退出微信模式")
+eq(W.mode_cmd_norm("＃退出微信"), "#退出微信", "mode cmd: fullwidth #, bare-ish target")
+eq(W.mode_cmd_norm("帮我看看 /tmp"), nil, "mode cmd: 普通正文不是命令")
+eq(W.mode_cmd_norm("退出"), nil, "mode cmd: 裸「退出」刻意不认（像正文）")
+eq(W.mode_cmd_norm("微信模式 帮我清下 tmp"), nil, "mode cmd: 带尾巴不算命令")
 
 -- ② diff：尾部后缀
 eq(W.diff({}, { "a" }), 2, "no baseline never replays history")
@@ -208,6 +217,27 @@ check(not W.is_media("看看 README.md"), "media: 文件名夹在句子里不算
 check(not W.is_media("图片转成 pdf"), "media: 提到「图片」但整句是指令")
 check(not W.is_media("lite: 做完了"), "media: 回执不算")
 check(not W.is_media("把 build 删了\n然后重编"), "media: 多行指令不算")
+
+-- ⑤ 回执续块：长回复被 OCR 切成两块，下半截丢了 lite: 前缀 → 不能当新指令回声。
+-- 判据是几何（上一块是回执 + 紧贴 + 同宽度），不是内容：内容判不了，碎片长得就像指令。
+local function blk(t, x, y, w, h) return { text = t, x = x, y = y, w = w or 300, h = h or 20 } end
+local reply = blk("lite: 杭州明天天气：霾转晴 6~16℃", 700, 500, 420, 60)
+check(W.is_reply_tail(reply, blk("建议早晚加外套", 700, 566), { tag = "lite:" }),
+    "reply_tail: 紧贴同宽的下半截")
+check(W.is_reply_tail(reply, blk("（数据源 wttr.in，仅供参考）", 900, 580, 200), { tag = "lite:" }),
+    "reply_tail: 右对齐的短尾块（水平重叠 >60%）")
+check(not W.is_reply_tail(reply, blk("帮我把 build 删了", 300, 566, 420), { tag = "lite:" }),
+    "reply_tail: 另一侧的新指令（不重叠）不算")
+check(not W.is_reply_tail(reply, blk("建议早晚加外套", 700, 900), { tag = "lite:" }),
+    "reply_tail: 隔得远（过了 gap）不算")
+-- 气泡之间的实测间隙是 56~58（09:04 拿真实截图量的），不能算续块：那是回执之后用户
+-- 紧跟的新指令，吞了就等于「没回」。gap 默认必须小于这个数。
+check(not W.is_reply_tail(reply, blk("把代码修改push到github", 2223, 618, 243), { tag = "lite:" }),
+    "reply_tail: 下一个气泡（gap≈58）是真指令，不算续块")
+check(not W.is_reply_tail(blk("帮我看看 /tmp", 300, 400), blk("好", 300, 460), { tag = "lite:" }),
+    "reply_tail: 上一块不是回执就不算")
+check(not W.is_reply_tail(nil, blk("好", 300, 460), { tag = "lite:" }),
+    "reply_tail: 只有一块（prev 为空）不炸")
 
 if fails > 0 then
     io.stderr:write(("FAIL wx_watch (%d/%d)\n"):format(fails, total))

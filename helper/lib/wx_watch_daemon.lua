@@ -22,8 +22,8 @@
 -- 由握着 mem.lock 的那个进程自己执行 —— 记忆可写、能回微信。不走 serve HTTP，也不走
 -- --once：那两条路都是在后台再起一个 --readonly 实例（不落记忆，和桌面会话是两个人）。
 --
--- 派完本进程**等主进程闲下来**（撒 CPU 采样，见 wait_master_idle）再继续采，所以不会和它
--- 抢微信窗口；回执由主进程自己发（提示词里要求了 lite: 前缀，它不发手机那头就沉默）。
+-- 派完只让路 settle_min 秒（见 dispatch），之后照常轮询 → 不会和 paste 抢窗口，也不会
+-- 因为主进程忙就把整条轮询停掉；回执由主进程自己发（提示词里要求了 lite: 前缀）。
 -- 主进程不在（mem.lock 里的 pid 已死 / TUI 关着）时指令**留在 pending 原地等**，不执行。
 --
 -- 空闲收起：每轮没认出新消息就把微信 minimize（--no-hide 关掉）。注意这必然带来闪烁
@@ -67,9 +67,9 @@ local C = {
     -- 只防「别的会话在闪 → 我们进去却只看到老指令」这一种误重放；用户重发同一句话过了
     -- 这个窗口就照跑。别做成永久（踩过：派过一次后重发同一条永远静默丢弃）。
     same_after = 60,
-    -- 派完等主进程闲下来：最少等 settle_min 秒（防「刚 paste 还没动起来就判闲」），
-    -- 最多等 wait 秒（主进程在跑长任务时不至于把守护进程饿死，超时就照常继续采）
-    settle_min = 15, wait = 1800,
+    -- 派完只让路 settle_min 秒（防「刚 paste 就被下一轮抢走窗口」），之后照常轮询；
+    -- 不再有「等主进程 CPU 闲下来」的超时上限 —— 那个上限本身就意味着最长 30 分钟不看微信。
+    settle_min = 15,
     -- 兜底强检间隔：托盘「有未读」的闪烁只持续一两秒（实测），而轮询间隔 10s、采样窗 2.4s，
     -- 整段错过是常态。只靠闪烁门 = 消息到了却永远不点开（用户看到的就是「微信模式没响应」）。
     -- 所以再久也要定期进去看一眼；0=关掉（调试闪烁门本身时用）。
@@ -86,7 +86,7 @@ do
         if a == "--interval" then C.interval = tonumber(v); i = i + 2
         elseif a == "--port" then C.port = tonumber(v); i = i + 2   -- 空转，留着不炸旧调用
         elseif a == "--host" then C.host = v; i = i + 2            -- 同上
-        elseif a == "--wait" then C.wait = tonumber(v); i = i + 2
+        elseif a == "--wait" then i = i + 2                       -- 空转：不再等主进程干完活
         elseif a == "--settle" then C.settle_min = tonumber(v); i = i + 2
         elseif a == "--force-every" then C.force_every = tonumber(v); i = i + 2
         elseif a == "--prefix" then C.prefix = v; i = i + 2
@@ -424,7 +424,8 @@ end
 -- 一条指令拆成好几轮（bracketed paste 没生效时尤其明显），碎片全进主进程。
 -- 只加一句「做完用 wechat 回复」，别再加长：约定越长，拆出来的废轮次越多。
 local PROMPT = "微信远程指令（%s）：做完请用 wechat 插件（action=send, name=文件传输助手）回复我，" ..
-    "首行以 lite: 开头（回环标记，缺了会被当新指令再跑）；不可逆/花钱/外发敏感内容先问再动。"
+    "首行以 lite: 开头（回环标记，缺了会被当新指令再跑）；**回复控制在 2 行内、中间不要空行**" ..
+    "（长回复会被 OCR 切成两块，下半截丢前缀就变成新指令）；不可逆/花钱/外发敏感内容先问再动。"
 
 -- 主进程 = 攥着 <cwd>/mem.lock 的那个（单写者，见 AGENTS §4）。
 local function master_pid()
@@ -464,102 +465,12 @@ local function listdir(path)
     return out
 end
 
-local function proc_stat(pid)
-    local f = io.open("/proc/" .. pid .. "/stat", "rb")
-    if not f then return nil end
-    local line = f:read("*l") or ""
-    f:close()
-    local _, rest = line:match("^(%d+)%s+%b()%s*(.*)$")
-    if not rest then return nil end
-    local s = {}
-    for tok in rest:gmatch("%S+") do s[#s + 1] = tok end
-    -- 右括号后第 1 字段是 state(3)，所以 ppid 在 2、utime(14)/stime(15) 在 12/13
-    return { ppid = tonumber(s[2]), cpu = (tonumber(s[12]) or 0) + (tonumber(s[13]) or 0) }
-end
-
--- 直接子进程。**本机内核（7.2.12-hwreal）没有 /proc/<pid>/children，children 挂在每个
--- 线程下面（/proc/<pid>/task/<tid>/children）**，两条路都试；都没有才返回 nil 退全表扫。
--- 少算子孙 → 把「还在干活」误判成「闲了」→ 抢微信窗口，比多花点 CPU 贵得多。
-local function proc_children(pid)
-    local kids, found = {}, false
-    local function slurp(p)
-        local f = io.open(p, "rb")
-        if not f then return false end
-        local s = f:read("*a") or ""
-        f:close()
-        for tok in s:gmatch("%d+") do kids[#kids + 1] = tonumber(tok) end
-        return true
-    end
-    if slurp("/proc/" .. pid .. "/children") then return kids end
-    for _, tid in ipairs(listdir("/proc/" .. pid .. "/task") or {}) do
-        if slurp("/proc/" .. pid .. "/task/" .. tid .. "/children") then found = true end
-    end
-    return found and kids or nil
-end
-
-local function tree_cpu(pid)
-    local total, seen, stack, walked = 0, {}, { pid }, 0
-    while #stack > 0 do
-        local p = table.remove(stack)
-        if p and not seen[p] and walked < 4096 then
-            seen[p] = true; walked = walked + 1
-            local s = proc_stat(p)
-            if s then total = total + s.cpu end
-            local kids = proc_children(p)
-            if kids then
-                for _, k in ipairs(kids) do stack[#stack + 1] = k end
-            elseif p == pid then
-                -- children 文件都没有（老内核/容器）：退回全表按 ppid 收子孙
-                local all = {}
-                for _, name in ipairs(listdir("/proc") or {}) do
-                    local n = tonumber(name)
-                    if n then
-                        local st = proc_stat(n)
-                        if st then all[n] = st end
-                    end
-                end
-                local sum, in_tree = 0, { [pid] = true }
-                local changed = true
-                while changed do
-                    changed = false
-                    for id, st in pairs(all) do
-                        if not in_tree[id] and st.ppid and in_tree[st.ppid] then
-                            in_tree[id] = true; changed = true
-                        end
-                    end
-                end
-                for id in pairs(in_tree) do sum = sum + ((all[id] and all[id].cpu) or 0) end
-                return sum
-            end
-        end
-    end
-    return total
-end
-
--- 派完等主进程把这活干完：CPU 连续 3 次采样不涨 + 至少 settle_min 秒才算闲。
--- 建模等 API 时 CPU 也接近 0，所以这不是「精确在跑」的判据，只是「别在它动键盘时抢微信」；
--- 提前判闲最多是多截一帧，主线（回执）由它自己发，不会错。
-local function wait_master_idle(pid)
-    local base = tree_cpu(pid)
-    local t0, last, quiet = os.time(), base, 0
-    while true do
-        sleep(1000)
-        local now_cpu = tree_cpu(pid)
-        local spent = os.time() - t0
-        if base and now_cpu then
-            if now_cpu ~= last then quiet = 0 else quiet = quiet + 1 end
-            last = now_cpu
-        end
-        if spent >= C.settle_min and quiet >= 3 then
-            if spent > C.settle_min + 3 then log("主进程闲了（等了 %ds，CPU 涨 %d tick）", spent, now_cpu and base and (now_cpu - base) or -1) end
-            return true
-        end
-        if spent >= C.wait then
-            log("warn: 等了 %ds 主进程还在动，先继续采（它的回执会被 lite: 前缀认出来）", spent)
-            return false
-        end
-    end
-end
+-- 派完只**短暂让路**，不在这里等主进程干完活。
+-- 早先这里是 while + sleep(1000) 轮询「主进程 CPU 连续 3 次不涨」，实测在用户正跟 lite
+-- 干活时（CPU 一直在涨）能卡满 C.wait=1800s，这段时间**完全不看微信**：手机发的下一条
+-- 指令根本不触发，日志还一片空白（看着像守护进程死了）。远程指令的价值就是「我不在键盘
+-- 前」，让路几秒够避开 paste 回显，不值得为此停掉整条轮询主线。
+local settle_until = 0
 
 local CM_MOD
 local function master_mod()
@@ -594,7 +505,8 @@ local function dispatch(text, raw)
     res = tostring(res)
     if ok and res:sub(1, 3) == "ok:" then
         log("%s", res:sub(1, 200))
-        wait_master_idle(pid)
+        -- 只让路 settle_min 秒让 paste 落地，之后照常轮询（不再等它干完活）
+        settle_until = os.time() + C.settle_min
         return MASTER_DONE
     end
     return nil, "call_master 没派成：" .. res:sub(1, 200)
@@ -773,6 +685,12 @@ local function tick()
     end
     note_blocks(#blocks)
     local b = blocks[#blocks]                       -- 永远只认最新那一条
+    -- 长回复会被 OCR 切成两块，第二块丢 lite: 前缀就成了「新指令」回声（踩过：一遍天气被重跑）。
+    -- 放在复制/OCR 之前判：几何三条就够，别为一块回声再右键点一次菜单。
+    if Watch.is_reply_tail(blocks[#blocks - 1], b, { tag = C.tag }) then
+        log("忽略最新条（回执续块，无前缀也认）：%s", Watch.norm(b.text):sub(1, 60))
+        return 0
+    end
     -- 媒体消息（图片/文件/视频）不处理：用户定的。判据两层，都便宜的先跑：
     --   ① 这块 OCR 文本自己就长成文件气泡/占位符（wx_watch.lua:is_media）；
     --   ② 右键「复制」出来不是文本（截图里有字的图片只能靠这条兜住）。
@@ -800,13 +718,15 @@ local function tick()
     local body = Watch.strip_trigger(text, C.prefix)
     if own then
         log("忽略最新条（%s）：%s", own, Watch.norm(text):sub(1, 60))
-    elseif Watch.is_mode_cmd(body) then
+    elseif Watch.mode_cmd_norm(body) then
         -- 全收模式下这条也会进来。模式开关只能由主进程的 submit() 处理（tui/modecmd.lua），
         -- 所以原样透传、不套 PROMPT 外壳；去重也跳过（用户连点两下退出不该被 60s 窗口吃掉）。
+        -- 透传的是**规范写法**：手机发「微信模式」（没有 #）也补成 #微信模式，否则 submit() 不认。
+        local mcmd = Watch.mode_cmd_norm(body)
         st.seq = (st.seq or 0) + 1
-        st.pending = { { id = st.seq, text = body, raw = text, via = why, modecmd = true } }
+        st.pending = { { id = st.seq, text = mcmd, raw = text, via = why, modecmd = true } }
         st.last, st.last_t = "", 0
-        log("收到模式命令 #%d（%s）：%s", st.seq, why, body)
+        log("收到模式命令 #%d（%s）：%s → %s", st.seq, why, body, mcmd)
         save()
         return 1
     elseif not Watch.has_trigger(text, C.prefix) then
@@ -870,8 +790,8 @@ do
     if not C.once then                       -- 一次性模式不留 pidfile，免得插件以为还活着
         local f = io.open(PIDFILE, "wb"); if f then f:write(pid); f:close() end
     end
-    log("启动 pid=%s interval=%ds prefix=%q chat=%s dry=%s wait=%ds 派发=call_master",
-        pid, C.interval, C.prefix, C.chat, tostring(C.dry), C.wait)
+    log("启动 pid=%s interval=%ds prefix=%q chat=%s dry=%s settle=%ds 派发=call_master",
+        pid, C.interval, C.prefix, C.chat, tostring(C.dry), C.settle_min)
 end
 
 if C.dump then
@@ -917,6 +837,13 @@ while true do
     local ok, err = pcall(function()
         -- 先过廉价门：图标没闪就整轮不做 —— 不抢焦点、不截图、不 OCR。这一步放在
         -- fix_geom 之前，因为救几何本身就要抢焦点开微信，那正是用户抱怨的打扰。
+        -- 刚派完的让路窗口：这轮不进去（保住 paste 落地），但轮询照常跑 —— 早先这段在
+        -- dispatch 里阻塞等主进程闲，主进程一忙就整条轮询停摆（消息到了不触发、日志空）。
+        local wait_s = settle_until - os.time()
+        if wait_s > 0 then
+            if not gate_quiet then log("让路中：%ds 后恢复检查", wait_s); gate_quiet = true end
+            return
+        end
         local pend, gwhy0 = news_pending()
         -- 闪烁只亮一两秒，轮询 10s 一轮很容易整段错过；只靠闪烁门等于「消息到了不点开」。
         -- 所以隔 force_every 秒兜底强检一次。0 = 关（专测闪烁门本身时用）。
