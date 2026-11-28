@@ -8,6 +8,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 mkdir -p "$ROOT/build"
 
+# macOS 没有 nproc（那是 coreutils）：取不到就退化，别让 `-j""` 把构建打空。
+JOBS="${LITE_JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)}"
+
 # ---------------- 架构对账 ----------------
 # 判据是 ELF 头 e_machine（偏移 18，小端 2 字节），不依赖 readelf/file/objdump：
 #   3=i386  40=arm  62=x86-64  183=aarch64
@@ -48,6 +51,17 @@ HOST_ARCH="$(host_machine)"
 LUAJIT_DIR="$ROOT/third_party/luajit"
 LUAJIT_BIN="$LUAJIT_DIR/src/luajit"
 
+# macOS 的可执行文件是 Mach-O，不是 ELF：elf_machine 在上面一律返回 1（「读不出架构」），
+# 于是下面那段「架构不符就重编」永远不触发 —— 从 Linux 树拷来的 luajit 会被当成好的，
+# 一跑就是 exec format error。所以 Darwin 单独判：magic 不是 Mach-O（0xfeedfacf 小端 /
+# 0xcffaedfe 大端读取）就算 stale。
+is_macho() {
+    local magic
+    [ -f "$1" ] || return 1
+    read -r magic < <(od -An -j0 -N4 -tx1 -v "$1" 2>/dev/null | tr -d ' ') || return 1
+    [ "${magic:-}" = "cffaedfe" ] || [ "${magic:-}" = "feedfacf" ]
+}
+
 # ---------------- LuaJIT ----------------
 # 必须在 check_deps 之前：check_deps 自己要用 lite-lua 跑 lua（tools/check_deps.sh:21），
 # 而 lite-lua 只用 bundled 这份（tools/lite-lua:9）。旧顺序在「新平台且没装系统 luajit」
@@ -56,6 +70,11 @@ luajit_stale=0
 if [ ! -x "$LUAJIT_BIN" ]; then
     luajit_stale=1
     echo "lite: building bundled LuaJIT..."
+elif [ "$(uname -s)" = Darwin ]; then
+    if ! is_macho "$LUAJIT_BIN"; then
+        luajit_stale=1
+        echo "lite: bundled LuaJIT 不是 Mach-O（多半是 Linux 树带来的）→ 重编"
+    fi
 else
     bin_arch="$(elf_machine "$LUAJIT_BIN" || true)"
     if [ -n "${bin_arch:-}" ] && [ "$bin_arch" != "$HOST_ARCH" ]; then
@@ -68,7 +87,7 @@ if [ "$luajit_stale" = 1 ]; then
     # 必须先 clean：.o 还在的话 make 认为目标已最新、只重新链接，产物仍是旧架构。
     # （踩过的形态：拷贝整棵树后 make 秒过，然后 exec format error。）
     make -C "$LUAJIT_DIR" clean >/dev/null 2>&1 || true
-    make -C "$LUAJIT_DIR" -j"$(nproc)"
+    make -C "$LUAJIT_DIR" -j"$JOBS"
 fi
 
 "$ROOT/tools/check_deps.sh"
@@ -96,7 +115,7 @@ fi
 
 if [ -f "$ROOT/CMakeLists.txt" ] && [ -d "$ROOT/src" ]; then
     cmake -S "$ROOT" -B "$ROOT/build" -DCMAKE_BUILD_TYPE=Release
-    cmake --build "$ROOT/build" -j"$(nproc)"
+    cmake --build "$ROOT/build" -j"$JOBS"
     echo "lite: native build complete"
 else
     echo "lite: Lua-only build (no src/CMakeLists.txt yet)"

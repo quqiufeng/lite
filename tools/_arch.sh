@@ -20,5 +20,15 @@ _lite_arch() {
     esac
 }
 
+# 系统名：Linux 产物叫 lite-linux-x64（历史包袱，见上），macOS 别跟着叫 linux —— 名字
+# 一旦说谎，后续按名字 dereference 的脚本会拿着 dylib 当 .so 用。package.sh 本身仍是
+# Linux-only（走 ELF/ldd/readelf），这里只保证「名字不骗人」。
+_lite_os() {
+    case "$(uname -s)" in
+        Darwin) echo macos ;;
+        *)      echo linux ;;
+    esac
+}
+
 LITE_DIST_ARCH="${LITE_DIST_ARCH:-$(_lite_arch)}"
-LITE_DIST_NAME="lite-linux-${LITE_DIST_ARCH}"
+LITE_DIST_NAME="lite-$(_lite_os)-${LITE_DIST_ARCH}"
