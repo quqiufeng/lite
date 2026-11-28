@@ -532,7 +532,9 @@ function M.run(ctx, agent, memory, opts)
                 watchdog_save()
                 closed[#closed + 1] = "监工"
             end
-            if wxmode.on then
+            -- 守护进程在进程外：on 只是内存开关，工具里 `wechat_watch start` 起的、或上次
+            -- stop 没杀干净，都会留下「开关说没开、轮询还在跑」。所以两边都对账一遍。
+            if wxmode.on or wxmode:running() then
                 closed[#closed + 1] = "微信（" .. wxmode:stop() .. "）"
                 wx_save()
             end
@@ -977,6 +979,13 @@ function M.run(ctx, agent, memory, opts)
                 or ("微信模式起不来：" .. msg))
             wx_save()
         end
+    elseif wxmode:running() then
+        -- 开关是内存里的标志，进程在盘外：状态丢了但守护进程还活着（`wechat_watch start`
+        -- 从工具里起的、上个会话关了一半）。直接接上，别让它在后台悄悄执行消息而不亮 WX。
+        wxmode.on = true
+        wx_save()
+        transcript:add("system", "微信模式：守护进程本来就在跑（" .. WxMode.head(wxmode:status())
+            .. "），已接上；#退出微信模式 关闭")
     end
 
     while not quitting do

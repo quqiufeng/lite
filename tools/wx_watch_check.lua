@@ -189,20 +189,43 @@ do
     eq(Wx.head("error: 找不到 daemon\n日志…"), "error: 找不到 daemon\n日志…", "wx head: 报错全透出")
     eq(Wx.head(nil), "", "wx head: nil 安全")
 
-    local seen, mode = {}, nil
+    local seen, mode, alive, stopped = {}, nil, false, false
     local m = Wx.new(function(name, args)
         seen[#seen + 1] = name
         mode = args.action
-        if args.action == "start" then return "已启动：pid 7" end
-        if args.action == "stop" then return "已停止" end
-        return "状态：运行中（pid 7）"
+        if args.action == "start" then alive = true; return "已启动：pid 7" end
+        if args.action == "stop" then alive, stopped = false, true; return "已停止（pid 7）" end
+        return alive and "状态：运行中（pid 7）\n状态目录：/tmp/x" or "状态：未运行\n状态目录：/tmp/x"
     end)
     local ok, msg = m:start({ interval = 15 })
     check(ok and m.on and seen[1] == "wechat_watch" and mode == "start", "wx start: 走插件名 start")
     check(msg == "已启动：pid 7" and m.interval == 15, "wx start: 摘要 + 间隔记下")
-    m:stop()
-    check(not m.on and mode == "stop", "wx stop: 关掉开关")
-    check(m:status():find("运行中", 1, true) ~= nil, "wx status: 原样透出")
+    check(m:running() == true, "wx running: 在跑时为真")
+    eq(m:stop(), "已停止（pid 7）", "wx stop: 摘要原样")
+    check(not m.on and stopped, "wx stop: 关掉开关")
+    check(not m:running(), "wx running: 停了为假")
+    check(m:status():find("运行中", 1, true) == nil, "wx status: 停了透出未运行")
+
+    -- 复核必须真去问：插件说「已停止」但进程还活着（pidfile 丢了/杀错 pid，实测发生过），
+    -- on 不能跟着那句谎话变灰 —— 否则状态栏没 WX、后台轮询照样执行消息。
+    local liar = Wx.new(function(_, args)
+        if args.action == "start" then return "已启动：pid 9" end
+        if args.action == "stop" then return "已停止（pid 9）" end
+        return "状态：运行中（pid 9）"
+    end)
+    liar:start()
+    local sres = liar:stop()
+    check(liar.on == true, "wx stop: 复核仍在跑就不算关")
+    check(sres:find("复核仍在运行", 1, true) ~= nil, "wx stop: 明确说还在跑")
+
+    -- 插件报错时也不能当成已关（stop 走 error 分支）
+    local dead = Wx.new(function(_, args)
+        if args.action == "status" then return "error: 没有 state 目录" end
+        return "error: 找不到 daemon"
+    end)
+    dead.on = true
+    dead:stop()
+    check(dead.on == false, "wx stop: 插件报错时按「没进程」收场")
 
     -- 插件报错 / 执行入口缺失：都必须 ok=false + on=false，别亮着假 WX。
     local bad = Wx.new(function() return "error: 找不到 helper/lib/wx_watch_daemon.lua" end)

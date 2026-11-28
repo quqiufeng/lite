@@ -60,9 +60,21 @@ function M.new(exec)
         return ok, M.head(res)
     end
 
+    -- 守护进程真在不在：不信任 on 这个内存开关，去问插件（首行「状态：运行中（pid N）」）。
+    function self:running()
+        return call({ action = "status" }):find("状态：运行中", 1, true) ~= nil
+    end
+
+    -- 关掉之后必须复核：插件杀的是 pidfile 里的 pid，pidfile 丢了/指向别的进程时
+    -- 「已停止」是假话而进程还活着（真踩过：退出模式后轮询继续跑，状态栏也不亮 WX）。
+    -- 所以 on 只跟着**复核结果**走，报错或还活着都保持 on=true，别亮假「已关」。
     function self:stop()
         local res = call({ action = "stop" })
         self.res = res
+        if self:running() then
+            self.on = true
+            return M.head(res) .. "（复核仍在运行，需手工 kill pid）"
+        end
         self.on = false
         return M.head(res)
     end
