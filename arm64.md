@@ -16,6 +16,7 @@
 | 架构 | `aarch64` | `aarch64` |
 | glibc | 2.41-12+deb13u4 | 2.41-12+deb13u4 |
 | lite | `/root/.local/bin/lite` 0.1.1 | 同 |
+| 开机自启 | `lite-serve`(8765) + `lite-setup`(8080)，均 `enabled` [verified 2026-11-28 整机 reboot] | 同（unit md5 一致） |
 
 两台同发行版同 glibc → **一份 sysroot 能同时喂两台**，这是交叉能省事的前提。
 ICMP 被上游封：`ping` 不通 ≠ 离线，判活一律用 `ssh` / `curl /health`。
@@ -211,10 +212,11 @@ ssh root@<box> '~/.local/bin/lite --version
 
 ## 5 serve 模式：让盒子常驻「待命」
 
-盒子不是给人敲命令的，是给 master 派活/远程接管的。用 `tools/serve_up.sh`（**不用 systemd**）：
+盒子不是给人敲命令的，是给 master 派活/远程接管的。手动拉起用 `tools/serve_up.sh`；
+**开机自启交给 systemd**（见 §5.1，盒子断电没人守着，setsid 那套没有开机钩子）：
 
 ```bash
-./serve_up.sh start|stop|restart|status|logs
+./serve_up.sh start|stop|restart|status|logs   # 临时/排错用
 ```
 
 | 项 | 值 / 机制 |
@@ -236,6 +238,44 @@ ssh root@<box> '~/.local/bin/lite --version
 **没有鉴权**。暴露面全靠 `--host`：默认 `127.0.0.1`，盒子上要局域网可达才 `0.0.0.0`。
 现在两台都开在 `0.0.0.0:8765` —— 即局域网内任何人都能让盒子跑任意工具调用（含 `bash`）。
 收回：`LITE_SERVE_HOST=127.0.0.1 ./serve_up.sh restart`。
+
+### 5.1 开机自启：两个 systemd unit [verified 2026-11-28 整机 reboot]
+
+盒子断电后没人 ssh 进去拉，所以**必须** systemd 级自启（`systemd --user` 被禁，也不顶用：
+要登录会话才活）。两台各有两个 unit，缺一个就少一半能力：
+
+| unit | 干什么 | 端口 | 缺了会怎样 |
+|---|---|---|---|
+| `lite-serve.service` | `serve_up.sh --loop` → 常驻 agent | `0.0.0.0:8765` | master 派不了活、`/health` 空，等于盒子离线 |
+| `lite-setup.service` | `lite setup` → API Key 初始化页 | `0.0.0.0:8080` | 换 key 只能 ssh 手改 `~/.config/lite/.env` |
+
+装（**unit 是脚本生成的，别手写/别 cp**）：
+
+```bash
+sudo ./tools/serve_service.sh install [--user root --host 0.0.0.0 --port 8765 --dir D]
+sudo ./tools/setup_service.sh install [--user root --host 0.0.0.0 --port 8080]
+sudo ./tools/serve_service.sh dry-run      # 只看文本，不碰系统
+```
+
+**两层职责不重叠**：外层 systemd 只兜「内层循环自己死了」（OOM/脚本 bug，`Restart=always`），
+内层 `serve_up.sh --loop` 管「serve 死了 5s 退避」和「`/reboot` 的 exit 75 立刻换进程 0.3s」
+——后者的语义 systemd 的单一 `RestartSec` 表达不了，硬塞会把 75 和真崩溃混为一谈。
+
+**判「真自启」只认 enabled + wants 软链**，`is-active` 不算数（手工 start 的也 active）：
+
+```bash
+systemctl is-enabled lite-serve lite-setup                                  # 都要 enabled
+ls -l /etc/systemd/system/multi-user.target.wants/lite-*.service            # 软链齐
+systemd-analyze verify /etc/systemd/system/lite-{serve,setup}.service       # 无 Condition/Assert 命中
+sudo reboot && sleep 80 && systemctl is-active lite-serve lite-setup        # 终审
+```
+
+**踩过的坑（121）**：unit 建了但 `disabled` —— 等于手动开关，断电重启 8765 空着没回来。
+install 脚本本来就有 `enable --now`，出现 `disabled` 是人为 `systemctl stop && disable` 之后没补回。
+另：`stop` 之后别用 `serve_up.sh stop` 停（写 `.stop` + 收进程组会被 `Restart=always` 立刻拉回，看着像停不掉）。
+
+**仓库里的实测快照**：`tools/units/lite-serve.service`、`tools/units/lite-setup.service`
+（与两台机器上的原件逐字节一致，md5 相同，仅供审计/`diff` 对照；路径/用户/端口以脚本参数为准）。
 
 ---
 
@@ -348,4 +388,7 @@ curl -s -X POST http://<box>:8765/prompt -d '{"prompt":"回两个字：在线"}'
 | `tools/_arch.sh` | `LITE_DIST_ARCH` / `LITE_DIST_NAME`（宿主 `uname` 推导，交叉时覆盖） |
 | `tools/install.sh` | 装到 `~/.local/{bin,share/lite}`；`PREBUILT` 区分解包安装 |
 | `tools/serve_up.sh` | `start\|stop\|restart\|status\|logs`，setsid 自监督 |
+| `tools/serve_service.sh` | 装 `lite-serve.service`（8765 开机自启）；`install\|uninstall\|dry-run` |
+| `tools/setup_service.sh` | 装 `lite-setup.service`（8080 key 初始化页）；`install\|uninstall\|dry-run` |
+| `tools/units/*.service` | 两台盒子实测 unit 快照（逐字节一致，**权威源是上面两个脚本**） |
 | `tools/cluster.sh` | TSV → 并行 ssh → 每任务 JSONL/rc/sec |

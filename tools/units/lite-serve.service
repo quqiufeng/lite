@@ -1,0 +1,31 @@
+[Unit]
+Description=lite serve (常驻 agent，0.0.0.0:8765)
+Documentation=file:///root/.local/share/lite/README.md
+# 等网卡真有地址再绑 0.0.0.0，否则开机那一刻绑上去局域网连不上，要等下次重连。
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+Environment=HOME=/root
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=LITE_SERVE_HOST=0.0.0.0
+Environment=LITE_SERVE_PORT=8765
+Environment=LITE_SERVE_DIR=/root/.local/share/lite-serve
+WorkingDirectory=/root/.local/share/lite-serve
+# 陈 pidfile 会让 alive() 假 true（见头注释坑 1）；mkdir 给 --loop 的 cd 兜底。
+ExecStartPre=-/bin/rm -f /root/.local/share/lite-serve/serve.pid /root/.local/share/lite-serve/.stop
+ExecStartPre=-/bin/mkdir -p /root/.local/share/lite-serve
+ExecStart=/root/.local/share/lite/tools/serve_up.sh --loop
+StandardInput=null
+# 内层循环自己不会因 serve 崩溃而退出（它自己重起），这里只兜循环本身死掉。
+Restart=always
+RestartSec=3
+# serve 关停时要刷 mem.bin，给够时间再动刀（默认 90s 太久，20s 足够且重启快）。
+TimeoutStopSec=20
+# control-group：连同内层 lite serve 一起收，否则留下孤儿占着 :8765。
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

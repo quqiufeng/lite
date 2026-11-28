@@ -1,0 +1,22 @@
+[Unit]
+Description=lite setup web (DeepSeek API Key 初始化页)
+Documentation=file:///root/.local/share/lite/README.md
+# network-online 而不是 network：开机那几秒 8080 抢不到网卡也能起，
+# 但要等网卡有地址再绑 0.0.0.0，否则局域网访问会连不上到下次重连。
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+Environment=HOME=/root
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+WorkingDirectory=/root
+ExecStart=/root/.local/share/lite/tools/lite setup --host 0.0.0.0 --port 8080
+# 常驻页不需要 stdin；崩了 3 秒后重起，/reboot 与 kill 都算正常退出也拉回来。
+StandardInput=null
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
