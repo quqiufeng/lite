@@ -4,6 +4,7 @@
 # 原则：装进去的必须由当前源码树现打，绝不复用旧 dist。
 # 旧实现是「dist 存在就直接 cp」，改了 lua 却装上几天前的包，
 # 现象是改的代码"不生效"，排查极浪费时间。package 只要 0.6s，不值得省。
+# 唯一例外：解包安装（树里没有 src/，本来就是别人打好的产物），见 PREBUILT。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -12,13 +13,29 @@ DIST="$ROOT/dist/$LITE_DIST_NAME"
 APP="${PREFIX:-$HOME/.local}/share/lite"
 BIN="${PREFIX:-$HOME/.local}/bin"
 
-if [ "${LITE_SKIP_PACKAGE:-0}" = "1" ]; then
+# 判「这棵树是不是已经打好的包」：没有 src/（release tarball 不含 C 源码），
+# 且 dist/ 或树根上已经有 tools/lite。tar 根目录就是 lite-linux-arm64/ 本身，
+# 里面没有 dist/ 子目录，所以两个位置都要看。
+PREBUILT=0
+if [ ! -d "$ROOT/src" ] && { [ -x "$DIST/tools/lite" ] || [ -x "$ROOT/tools/lite" ]; }; then
+    PREBUILT=1
+fi
+
+if [ "${LITE_SKIP_PACKAGE:-0}" = "1" ] || [ "$PREBUILT" = "1" ]; then
     # 逃生阀：release.sh 刚打完包，或明确知道自己要复用现成产物时用。
-    [ -x "$DIST/tools/lite" ] || {
-        echo "install: LITE_SKIP_PACKAGE=1 but dist is missing" >&2
+    #
+    # 解包安装（release tarball）也走这条路：包里的树没有 src/ 和 CMakeLists.txt，
+    # 在这儿重跑 package.sh 只会把**已经打好的产物再打包一次**，而它的输入
+    # （build/*.so 之外的 lib/liblite_*.so、$LITE_SYSROOT 里的 liblitehtml/gumbo）
+    # 在目标机上根本不存在 —— 实测在 123 上装完 lib/ 全空、build/ 只剩 2 个 .so，
+    # html→png 与 tui/capture 一起失联。包是别人打好的，就照用。
+    SRC="$DIST"
+    [ -x "$SRC/tools/lite" ] || SRC="$ROOT"
+    [ -x "$SRC/tools/lite" ] || {
+        echo "install: skip-package 但既没有 $DIST 也没有 $ROOT/tools/lite" >&2
         exit 1
     }
-    echo "install: reusing existing dist (LITE_SKIP_PACKAGE=1)"
+    echo "install: reusing existing tree ($SRC)"
 else
     # 原生库若比 C 源码旧，先重建；否则 dist 里的 .so 仍是老二进制。
     if [ -f "$ROOT/CMakeLists.txt" ] && [ -d "$ROOT/src" ]; then
@@ -30,6 +47,7 @@ else
         fi
     fi
     "$ROOT/tools/package.sh"
+    SRC="$DIST"
 fi
 
 # $APP 既是安装目录，也是数据目录（sessions/ 会话镜像、codesearch/ 索引、老版本
@@ -46,7 +64,7 @@ for d in $KEEP; do
 done
 rm -rf "$APP"
 mkdir -p "$APP" "$BIN"
-cp -rL "$DIST/." "$APP/"
+cp -rL "$SRC/." "$APP/"
 for d in $KEEP; do
     [ -e "$STASH/$d" ] && mv "$STASH/$d" "$APP/$d"
 done

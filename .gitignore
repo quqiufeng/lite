@@ -47,6 +47,8 @@ luac.out
 
 # lite runtime / build artifacts
 build/
+build-arm64/
+build-armv7/
 dist/
 artifacts/
 cluster-out/

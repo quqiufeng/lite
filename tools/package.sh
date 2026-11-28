@@ -7,6 +7,61 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/tools/_arch.sh"
 DIST="$ROOT/dist/$LITE_DIST_NAME"
 
+# ---------------- 产物目录与「包给谁」 ----------------
+# BUILD_DIR 可覆盖：交叉编译（tools/cross.sh）把产物写进 build-arm64/，本机 build/
+# 留给宿主自己的 lite —— 两份并存，互不覆盖。
+BUILD_DIR="${LITE_BUILD_DIR:-$ROOT/build}"
+
+_elf_machine() { od -An -tu1 -j18 -N2 "$1" 2>/dev/null | awk '{print $1}'; }
+_target_machine() {
+    case "$LITE_DIST_ARCH" in
+        arm64) echo 183 ;;
+        armv7|armv6) echo 40 ;;
+        x86) echo 3 ;;
+        *) echo 62 ;;
+    esac
+}
+case "$(uname -m)" in
+    x86_64|amd64)  HOST_MACHINE=62 ;;
+    aarch64|arm64) HOST_MACHINE=183 ;;
+    armv7l|armv6l) HOST_MACHINE=40 ;;
+    i386|i686)     HOST_MACHINE=3 ;;
+    *)             HOST_MACHINE=0 ;;
+esac
+WANT_MACHINE="$(_target_machine)"
+CROSS_PKG=0
+[ "$WANT_MACHINE" = "$HOST_MACHINE" ] || CROSS_PKG=1
+
+# 一个 .so 的直接依赖 → "<soname>\t<实路径>"（解析不出时路径为空）。
+# 同架构照旧用 ldd：它真的把库 load 起来，最准。
+# 跨架构不能用 ldd —— ldd 是个「跑起来看」的脚本，foreign .so 它会直接说
+# not a dynamic executable，依赖于是空着，随包的 liblitehtml/libgumbo 全漏，
+# 到目标机上才炸 html→png。交叉时静态读 DT_NEEDED，再在 sysroot 里按名解析。
+_sysroot_find() {
+    local name="$1" d
+    [ -n "${LITE_SYSROOT:-}" ] || return 0
+    for d in "$LITE_SYSROOT/usr/lib/aarch64-linux-gnu" "$LITE_SYSROOT/lib/aarch64-linux-gnu" \
+             "$LITE_SYSROOT/opt/litehtml/build-pic/src/gumbo" "$LITE_SYSROOT/opt/litehtml/build-pic" \
+             "$LITE_SYSROOT/usr/lib"; do
+        [ -e "$d/$name" ] && { realpath "$d/$name"; return 0; }
+    done
+    return 0
+}
+_needed_of() {
+    local so="$1"
+    if [ "$CROSS_PKG" = 0 ]; then
+        ldd "$so" 2>/dev/null | awk '$2=="=>" {print $1"\t"$3}'
+        return 0
+    fi
+    # readelf 输出跟着 locale 变（中文 "共享库：[libc.so.6]"），所以别按字段号取，
+    # 直接抓行内第一对方括号 —— 早先 `$5` 在 zh_CN 下取到的是 "共享库：[…]" 整段，
+    # 一头都没匹配上，随包的 liblitehtml/libgumbo 就这么静默漏掉了。
+    LC_ALL=C readelf -d "$so" 2>/dev/null \
+        | awk '/NEEDED/ { if (match($0, /\[[^]]*\]/)) print substr($0, RSTART+1, RLENGTH-2) }' \
+        | while read -r n; do printf '%s\t%s\n' "$n" "$(_sysroot_find "$n")"; done
+}
+
+
 rm -rf "$DIST"
 mkdir -p "$DIST/lua" "$DIST/tools" "$DIST/third_party" "$DIST/build" "$DIST/lib" "$DIST/helper" "$DIST/models"
 
@@ -48,19 +103,40 @@ prune_stale_helper_so() {
     fi
 }
 prune_stale_helper_so "$DIST/helper"
+
+# 交叉打包：helper/*.so 是 native 在**宿主**上编的，e_machine 与目标不符。
+# 打进包里目标机 ffi.load 会失败（plugins 报 load error），而 Lua 插件本身
+# 必须留着（真跨平台），所以只剪 .so 和它的 .json 清单，别的不动。
+prune_foreign_helper_so() {
+    local dir="$1" f base m n=0
+    [ -d "$dir" ] || return 0
+    for f in "$dir"/*.so; do
+        [ -e "$f" ] || continue
+        m="$(_elf_machine "$f" || true)"
+        [ "$m" = "$WANT_MACHINE" ] && continue
+        base="$(basename "$f")"
+        rm -f "$f"
+        n=$((n + 1))
+        # 清单点名这份 .so 的插件一并退化成「只有 lua 逻辑」，别留悬空引用
+        rm -f "$dir/$(basename "${base%.so}" | sed 's/-[0-9].*$//').json"
+    done
+    [ "$n" -gt 0 ] && echo "package: ${dir#$DIST/}/ 剪掉 $n 个非目标架构 .so（e_machine≠$WANT_MACHINE）"
+    return 0
+}
+[ "$CROSS_PKG" = 1 ] && prune_foreign_helper_so "$DIST/helper"
 cp "$ROOT/AGENTS.md" "$ROOT/design.md" "$ROOT/trace.md" "$DIST/"
-if [ -f "$ROOT/build/liblite_cache.so" ]; then
-    cp "$ROOT/build/liblite_cache.so" "$DIST/build/"
+if [ -f "$BUILD_DIR/liblite_cache.so" ]; then
+    cp "$BUILD_DIR/liblite_cache.so" "$DIST/build/"
 fi
-if [ -f "$ROOT/build/liblite_codesearch.so" ]; then
-    cp "$ROOT/build/liblite_codesearch.so" "$DIST/build/"
+if [ -f "$BUILD_DIR/liblite_codesearch.so" ]; then
+    cp "$BUILD_DIR/liblite_codesearch.so" "$DIST/build/"
 fi
 
-if [ -f "$ROOT/build/liblite_capture.so" ]; then
-    cp "$ROOT/build/liblite_capture.so" "$DIST/lib/"
+if [ -f "$BUILD_DIR/liblite_capture.so" ]; then
+    cp "$BUILD_DIR/liblite_capture.so" "$DIST/lib/"
 fi
-if [ -f "$ROOT/build/liblite_tui.so" ]; then
-    cp "$ROOT/build/liblite_tui.so" "$DIST/lib/"
+if [ -f "$BUILD_DIR/liblite_tui.so" ]; then
+    cp "$BUILD_DIR/liblite_tui.so" "$DIST/lib/"
 fi
 
 # 随包的 ocr 库：只收「仓库内实体文件」。
@@ -117,6 +193,10 @@ if [ "${#EXTERNAL_LIBS[@]}" -gt 0 ]; then
     echo "package: 跳过仓库外的系统库（用 tools/cuda_provider.sh 在目标机按需接入）:"
     for i in "${EXTERNAL_LIBS[@]}"; do echo "  - $i"; done
 fi
+# lib/ 里的 libocr_simple.so / libonnxruntime_providers_shared.so 是 OCR 侧随仓库
+# 存的宿主二进制，交叉包里它们加载必炸（ffi.load: invalid ELF header）。OCR 本就是
+# 可选能力（默认连 ORT 都不带），非目标架构的直接剪掉。
+[ "$CROSS_PKG" = 1 ] && prune_foreign_helper_so "$DIST/lib"
 # OCR 模型 14.8MB（det 4.5 + rec 10.3），占解包体积六成。OCR 是可选能力，
 # 默认不随包：目标机需要时把模型目录拷过去，或设 LITE_OCR_MODELS 指向既有副本。
 # 要随包分发：LITE_DIST_WITH_OCR=1 ./tools/package.sh
@@ -132,20 +212,17 @@ if [ -d "$ROOT/third_party/ocr/models/ocr" ]; then
     fi
 fi
 
-if [ -f "$ROOT/build/liblite_image.so" ]; then
-    cp "$ROOT/build/liblite_image.so" "$DIST/lib/"
-    LDD_TMP="$(mktemp)"
-    ldd "$ROOT/build/liblite_image.so" >"$LDD_TMP" 2>/dev/null || true
-    while read -r so arrow path _; do
-        [ "$arrow" = "=>" ] || continue
+if [ -f "$BUILD_DIR/liblite_image.so" ]; then
+    cp "$BUILD_DIR/liblite_image.so" "$DIST/lib/"
+    while IFS=$'\t' read -r so path _; do
+        [ -n "${so:-}" ] || continue
         case "$so" in
             libc.so.*|libm.so.*|libgcc_s.so.*|libpthread.so.*|libdl.so.*|librt.so.*|ld-linux*) continue ;;
         esac
-        if [ -n "$path" ] && [ -f "$path" ]; then
+        if [ -n "${path:-}" ] && [ -f "$path" ]; then
             cp -L "$path" "$DIST/lib/$so"
         fi
-    done <"$LDD_TMP"
-    rm -f "$LDD_TMP"
+    done < <(_needed_of "$BUILD_DIR/liblite_image.so")
 fi
 
 # HTML→PNG 渲染后端：liblite_html.so + 它的私有依赖。
@@ -162,15 +239,14 @@ fi
 # 三个 .so 摆同一目录自解析：liblite_html.so 已把 libgumbo 升成直接 NEEDED 且
 # RUNPATH 是 $ORIGIN（见 CMakeLists.txt 的 lite_html 段），liblitehtml 的
 # 绝对 RUNPATH 找不到 gumbo 时由本目录的 $ORIGIN 兜住。
+LITEHTML_PREFIX="${LITEHTML_PREFIX:-${LITE_SYSROOT:+$LITE_SYSROOT}/opt/litehtml}"
 LITEHTML_PREFIX="${LITEHTML_PREFIX:-/opt/litehtml}"
-if [ -f "$ROOT/build/liblite_html.so" ]; then
-    cp "$ROOT/build/liblite_html.so" "$DIST/build/"
-    LDD_TMP="$(mktemp)"
-    ldd "$ROOT/build/liblite_html.so" >"$LDD_TMP" 2>/dev/null || true
+if [ -f "$BUILD_DIR/liblite_html.so" ]; then
+    cp "$BUILD_DIR/liblite_html.so" "$DIST/build/"
     bundled=()
-    while read -r so arrow path _; do
-        [ "$arrow" = "=>" ] || continue
-        [ -n "$path" ] && [ -f "$path" ] || continue
+    while IFS=$'\t' read -r so path _; do
+        [ -n "${so:-}" ] || continue
+        [ -n "${path:-}" ] && [ -f "$path" ] || continue
         real="$(realpath "$path" 2>/dev/null || echo "$path")"
         case "$real" in
             "$LITEHTML_PREFIX"/*) ;;   # 私有依赖，随包
@@ -178,8 +254,7 @@ if [ -f "$ROOT/build/liblite_html.so" ]; then
         esac
         cp -L "$path" "$DIST/build/$so"
         bundled+=("$so")
-    done <"$LDD_TMP"
-    rm -f "$LDD_TMP"
+    done < <(_needed_of "$BUILD_DIR/liblite_html.so")
     if [ ${#bundled[@]} -gt 0 ]; then
         echo "package: lite_html 随包私有依赖: ${bundled[*]}"
     else
@@ -188,15 +263,68 @@ if [ -f "$ROOT/build/liblite_html.so" ]; then
     fi
 fi
 
+# _arch.sh 必须进包：install.sh / release.sh / package.sh 第一行就 source 它，
+# 漏了它目标机解包后连装都装不上（报 tools/_arch.sh: No such file）。
 for f in lite-lua lua.sh lite run.sh check_deps.sh build.sh test.sh install.sh package.sh release.sh launch.sh \
-         ort_link.sh cuda_provider.sh see.lua cluster.sh; do
+         ort_link.sh cuda_provider.sh see.lua cluster.sh _arch.sh; do
     [ -f "$ROOT/tools/$f" ] && cp "$ROOT/tools/$f" "$DIST/tools/"
 done
 cp "$ROOT/tools/auto_unit.lua" "$DIST/tools/"
 
 mkdir -p "$DIST/third_party/cjson/lua/5.1"
-cp -r "$ROOT/third_party/luajit" "$DIST/third_party/"
-cp "$ROOT/third_party/cjson/lua/5.1/cjson.so" "$DIST/third_party/cjson/lua/5.1/"
+# 随包 LuaJIT：解释器是**二进制**，只在与目标同架构时才敢带上。
+# 交叉打包时仓库里那份是宿主的 x86 ELF，打进 arm64 包后目标机 tools/lite-lua
+# 会 exec 它 → exec format error，连 `lite --version` 都起不来。
+# 处理：整棵树照拷（src/jit/*.lua 是可移植的，LUA_PATH 要用），只删掉那个二进制，
+# 让 lite-lua 退到目标机的系统 luajit（tools/lite-lua:11 的兜底）。
+LUAJIT_SRC="${LITE_LUAJIT_DIR:-$ROOT/third_party/luajit}"
+if [ -d "$LUAJIT_SRC" ]; then
+    cp -r "$LUAJIT_SRC" "$DIST/third_party/"
+    _lj_bin="$DIST/third_party/$(basename "$LUAJIT_SRC")/src/luajit"
+    _lj_m="$(_elf_machine "$_lj_bin" || true)"
+    if [ -n "${_lj_m:-}" ] && [ "$_lj_m" != "$WANT_MACHINE" ]; then
+        rm -f "$_lj_bin"
+        echo "package: bundled LuaJIT 是 e_machine=$_lj_m、目标是 $WANT_MACHINE → 不进包"
+        echo "         目标机需自带解释器（apt install luajit），或 tools/cross.sh --luajit 交叉编一份"
+    fi
+fi
+# 同上：宿主编过的 luajit 树留满 src/*.o、src/host/、src/*.a。交叉包里这些既跑不了
+# 也编不出（host/ 是宿主编出来的 buildvm 中间件），纯涨体积，只留 src/jit/*.lua 与头。
+if [ "$CROSS_PKG" = 1 ]; then
+    _ljd="$DIST/third_party/$(basename "$LUAJIT_SRC")"
+    if [ -d "$_ljd/src" ]; then
+        rm -rf "$_ljd/src/host"
+        find "$_ljd/src" -maxdepth 1 -type f \( -name '*.o' -o -name '*.a' -o -name '*.so' \) -delete
+    fi
+fi
+
+# cjson.so 必须与目标架构一致，否则目标机 require "cjson" 直接 C 层报错、
+# 整个 lite 起不来（现象是 `lite --version` 都跑不了，只剩 stack traceback）。
+# 仓库里的 cjson.so 是**人肉拷进去的二进制**（无源码），rsync 一次源码树就可能把
+# x86 副本带到 arm 宿主、再打进 arm64 包 —— 实测踩过。所以按 ELF e_machine 校验，
+# 不一致就退回系统装的同架构 lua-cjson（apt lua-cjson），sysroot 里的也算一份
+# （交叉打包时宿主没装 arm64 的 lua-cjson，但目标机自己那份可以 rsync 进 sysroot）。
+_cjson="${ROOT}/third_party/cjson/lua/5.1/cjson.so"
+_want="$WANT_MACHINE"
+_got="$(_elf_machine "$_cjson")"
+if [ "$_got" = "$_want" ]; then
+    cp "$_cjson" "$DIST/third_party/cjson/lua/5.1/"
+else
+    _sys=""
+    for c in /usr/lib/*/lua/5.1/cjson.so /usr/lib/lua/5.1/cjson.so \
+             ${LITE_SYSROOT:+$LITE_SYSROOT/usr/lib/lua/5.1/cjson.so} \
+             ${LITE_SYSROOT:+$LITE_SYSROOT/usr/lib/*/lua/5.1/cjson.so}; do
+        [ -f "$c" ] && [ "$(_elf_machine "$c")" = "$_want" ] && { _sys="$c"; break; }
+    done
+    if [ -n "$_sys" ]; then
+        cp -L "$_sys" "$DIST/third_party/cjson/lua/5.1/cjson.so"
+        echo "package: 仓库 cjson.so 架构为 ${_got:-?}（目标 ${_want}），改用系统 $_sys"
+    else
+        echo "package: [WARN] cjson.so 架构为 ${_got:-?}、目标是 ${_want}，且本机没有同架构副本" >&2
+        echo "         目标机 apt install lua-cjson，或用工具链重编 cjson 再打包" >&2
+        cp "$_cjson" "$DIST/third_party/cjson/lua/5.1/" || true
+    fi
+fi
 
 chmod +x "$DIST/tools/lite-lua" "$DIST/tools/lua.sh" "$DIST/tools/lite" "$DIST/tools/run.sh" \
     "$DIST/tools/check_deps.sh" "$DIST/tools/build.sh" "$DIST/tools/test.sh" \
