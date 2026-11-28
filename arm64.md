@@ -16,6 +16,7 @@
 | 架构 | `aarch64` | `aarch64` |
 | glibc | 2.41-12+deb13u4 | 2.41-12+deb13u4 |
 | lite | `/root/.local/bin/lite` 0.1.1 | 同 |
+| luajit | `/usr/local/bin/luajit` → `/opt/reader/bin/luajit`，2.1.1780076327 | 同（同版本同软链） |
 | 开机自启 | `lite-serve`(8765) + `lite-setup`(8080)，均 `enabled` [verified 2026-11-28 整机 reboot] | 同（unit md5 一致） |
 
 两台同发行版同 glibc → **一份 sysroot 能同时喂两台**，这是交叉能省事的前提。
@@ -208,6 +209,55 @@ ssh root@<box> '~/.local/bin/lite --version
 `plugins` 应报 `25 helper tool(s), 1 hook plugin(s), 0 error(s)`；`--once` 需要
 `DEEPSEEK_API_KEY`（在 `~/.config/lite/.env`，**缺了只报变量名，不 print key**）。
 
+### 4.1 目标机必须自带 luajit（交叉包里没有解释器）
+
+lite 的入口 `tools/lite` 是个 shell wrapper，真正执行的是 `tools/lite-lua`；后者按两级找解释器
+（`tools/lite-lua:9-11`）：
+
+```bash
+LUA="$ROOT/third_party/luajit/src/luajit"      # ① 随包自带的
+[ -x "$LUA" ] || LUA="$(command -v luajit || true)"   # ② 退回系统 PATH 里的
+[ -z "$LUA" ] && echo "lite: bundled luajit not found" >&2 && exit 1
+```
+
+**交叉包里 ① 永远不存在**：仓库那份 `third_party/luajit/src/luajit` 是宿主编的 x86 ELF，打进
+arm64 包会让 `lite --version` 直接 exec format error，所以 `package.sh:279-289` 按 `e_machine`
+比对后**主动删掉它**并打印提示：
+
+```
+package: bundled LuaJIT 是 e_machine=62、目标是 183 → 不进包
+         目标机需自带解释器（apt install luajit），或 tools/cross.sh --luajit 交叉编一份
+```
+
+于是**盒子上的 `luajit` 是硬依赖**，缺了就退化成上面那句 `lite: bundled luajit not found`
+（不是「插件没加载」，是**整个 lite 起不来**）。两台盒子都没有 apt 的 luajit 包（`dpkg -l` 只有
+`liblua5.2-0`），现在靠的是 reader 那份：
+
+```bash
+# 当前状态 [verified 2026-11-28 两台]
+ls -l /usr/local/bin/luajit          # -> /opt/reader/bin/luajit（2.1.1780076327）
+/opt/reader/bin/luajit -v            # LuaJIT 2.1.1780076327
+
+# 新机器装法（二选一，软链要落在 PATH 内的目录，/usr/local/bin 已在默认 PATH）
+apt install -y luajit                # 首选：包管理器管版本，不依赖 /opt
+# 或复用 reader 那份（省事，但 /opt/reader 被删/重装就跟着挂）：
+ln -sfn /opt/reader/bin/luajit /usr/local/bin/luajit
+```
+
+验「解释器这条路真通」（别只看 `which`）：
+
+```bash
+env -i HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+  ~/.local/share/lite/tools/lite-lua -e 'print(jit.version)'   # 期望报 lite: bundled luajit not found
+~/.local/share/lite/tools/lite-lua -e 'print(jit.version)'     # 期望 LuaJIT 2.1.x
+```
+
+**为什么软链而不是靠 `LD_LIBRARY_PATH`/改脚本**：`AGENTS.md` 禁止把 `$ROOT/lib` 塞进
+`LD_LIBRARY_PATH`（会污染同机其他程序），而 `lite-lua` 的兜底是纯 `command -v`——只认 PATH。
+**非交互 ssh 的 PATH 不含 `~/.local/bin`**，所以 `lite` 命令本身也要么写全路径
+（`/root/.local/bin/lite`），要么把 `export PATH="$HOME/.local/bin:$PATH"` 写进 `/root/.bashrc`；
+systemd unit 里用的是绝对路径，**服务不受这个影响**。
+
 ---
 
 ## 5 serve 模式：让盒子常驻「待命」
@@ -349,8 +399,12 @@ probe rc=5 (unstable)     → 再采一轮
 od -An -tu1 -j18 -N2 build-arm64/liblite_html.so      # 183
 # 2 包内没混宿主 x86
 tar tzf dist/lite-linux-arm64.tar.gz | grep -c 'liblite_.*\.so'
-# 3 目标机
-ssh root@<box> 'lite --version; lite plugins 2>&1 | tail -1'
+# 2b 包内没有解释器（应该是 0，有的话说明交叉包混进了宿主 x86 luajit）
+tar tzf dist/lite-linux-arm64.tar.gz | grep -c 'luajit/src/luajit$'
+# 3 目标机（非交互 ssh 的 PATH 不含 ~/.local/bin，用绝对路径，别写裸 lite）
+ssh root@<box> '~/.local/bin/lite --version
+                ~/.local/bin/lite plugins 2>&1 | tail -1
+                ls -l $(command -v luajit)'          # 解释器必须在（§4.1）
 # 4 真跑一轮
 curl -s -X POST http://<box>:8765/prompt -d '{"prompt":"回两个字：在线"}'
 # 5 本机回归（改过 shell/lua 必跑）
@@ -373,6 +427,8 @@ curl -s -X POST http://<box>:8765/prompt -d '{"prompt":"回两个字：在线"}'
 | `install.sh: .../_arch.sh: No such file` | `_arch.sh` 没进包复制列表 | 已加进 `package.sh` 复制列表 |
 | 123 上 `LITE_SKIP_PACKAGE=1 ./install.sh` 报「既没有 dist 也没有 tools/lite」 | 解包目录层级不对 | 用 `build_arm64.sh --deploy`，别手敲 |
 | 盒子上 `test.sh` 5 条 FAIL | 3 条 libfind 外架构、ocr 提示文案、`lua.sh` 预加载 bundled .so | 已知，**未改**；都不是真 bug |
+| 盒子上 `lite: bundled luajit not found`，`--version` 都跑不了 | 交叉包按 `e_machine` 删了宿主 luajit，目标机 PATH 里又没有（§4.1） | `apt install luajit`，或 `ln -sfn /opt/reader/bin/luajit /usr/local/bin/luajit` |
+| `ssh <box> 'lite --version'` → `command not found`，但 systemd 服务正常 | 非交互 ssh 的 PATH 不含 `~/.local/bin` | 写全路径 `~/.local/bin/lite`；unit 用绝对路径所以服务不受影响 |
 | 交叉编 armv7 没验过 | `cmake-armv7.cmake` 由 aarch64 版 sed 生成 | **未实测 [static]**，用时先 `--clean` 验 `e_machine=40` |
 
 ---
