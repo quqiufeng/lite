@@ -6,7 +6,7 @@
 -- 指令里的路径和命令必须逐字精确，所以 OCR 只负责"发现新消息 + 定位气泡"。
 --
 -- 一轮节奏（互斥，不并发）：
---   1 确保微信在前台、会话是「文件传输助手」（标题 OCR 不对就调 wechat 插件的 open）
+--   1 确保微信在前台、会话是「文件传输助手」（不认标题：直接搜索框粘名字 + 回车，见 open_chat）
 --   2 鼠标挪到标题栏（不然悬停浮标「翻译」会混进 OCR）→ 截聊天区 → OCR → 合并成块
 --   3 和上一帧做尾部后缀比对，只把新增块当候选
 --   4 候选逐个：右键 → 菜单里点「复制」→ 剪贴板 = 精确原文（失败退回 OCR 文本）
@@ -227,7 +227,25 @@ local function restore_focus()
     pcall(function() xdo:activate(prev_active) end)
 end
 
--- 前向声明：focus() 要等标题认出来，而 title_text 定义在后面。
+-- 窗口刚 map 出来那几百毫秒里截图是残帧（半画、全黑），拿去 OCR 会得到 0 条气泡 →
+-- 白跑一轮。判「重绘完了」看像素：连拍两帧一模一样就算稳定。**不认字**，也就不会因为
+-- 标题是灰色小字/截到遮挡窗口而永远等不到。
+local function wait_repaint(tries)
+    local prev
+    for _ = 1, tries or 12 do
+        local p = TMP .. "-settle.png"
+        W.capture_screen(p)
+        local f = io.open(p, "rb")
+        local cur = f and f:read("*a")
+        if f then f:close() end
+        if cur and prev and cur == prev then return true end
+        prev = cur
+        sleep(250)
+    end
+    return false
+end
+
+-- 前向声明：title_text 只用于日志取证，定义在后面。
 -- 注意 local 必须写在这里 —— 写在 title_text 定义处的话 focus 里看到的是全局 nil。
 local title_text
 
@@ -258,12 +276,8 @@ local function focus()
             log("warn: 微信仍被盖住（无法截图取证），本轮跳过")
             return nil, "微信被其他窗口盖住"
         end
-        -- 从最小化恢复后窗口要过一会儿才重绘：立刻 OCR 会读到空标题（→被误判成
-        -- 「会话不对」而去打字切会话，反而抢焦点）和 0 条气泡。等到认出标题为止。
-        for _ = 1, 20 do
-            sleep(250)
-            if title_text() ~= "" then break end
-        end
+        -- 从最小化恢复后窗口要过一会儿才重绘：立刻截气泡区会读到 0 条（→ 空转一轮）。
+        wait_repaint(12)
     end
     return win
 end
@@ -276,56 +290,42 @@ function title_text()
     return Watch.key(table.concat(txt, ""))
 end
 
-local last_ok_title            -- 上一次确认过的标题（OCR 读空时的兜底）
+-- 进「文件传输助手」= 搜索框粘名字 + 回车（helper/wechat.lua:fast_enter 快路径）。这条路
+-- **零 OCR**：验的是「候选面板收起 / 标题区像素变了」，落点由微信的搜索默认项保证，是确定的。
+-- 所以这里不再截标题去认「现在是哪个会话」—— 那是在验一件已经确定的事，验错的代价却是整轮
+-- skip：标题是灰色小字、窗口刚重绘、或截到遮挡窗口都会读出空串，实测 daemon 因此连续 471 次
+-- 「标题 OCR=""」空转，一条指令都没派出去。切没切成，让下面真读气泡的结果说话：读到 0 条
+-- 就清 chat_ready，下一轮重切（见 note_blocks）。
+local chat_ready = false
 
-local function ensure_chat_via(region_title)
+local function open_chat()
+    local wx = wechat_lib()
+    if not wx then return false, "找不到 helper/wechat.lua，无法切会话" end
+    take_focus()        -- open 要往搜索框打字，这一步必须真焦点（收尾 hide_idle 还回去）
+    local ok, err = pcall(wx.run, { action = "open", name = C.chat, background = false })
+    if not ok then return false, "切「" .. C.chat .. "」失败：" .. tostring(err) end
+    chat_ready = true
+    return true
+end
+
+-- daemon 自己从不换会话（只读气泡区），hide_idle 收尾只最小化、不动会话，所以切一次就够。
+local function ensure_chat()
     local fok, fwhy = focus()
     if not fok then return false, fwhy or "微信窗口找不到" end
-    local want = Watch.key(C.chat)
-    local joined = title_text()
-    if joined:find(want, 1, true) then
-        last_ok_title = joined
-        return true
+    if chat_ready then return true end
+    return open_chat()
+end
+
+-- 读到 0 条 = 可能被用户切去别的会话了，也可能只是残帧。连续两轮才算会话真的不对：单轮
+-- 残帧就重切一次，只会白抢用户焦点，太吵。
+local zero_rounds = 0
+local function note_blocks(n)
+    if n > 0 then zero_rounds = 0; return end
+    zero_rounds = zero_rounds + 1
+    if zero_rounds >= 2 and chat_ready then
+        chat_ready = false
+        log("连续 %d 轮读到 0 条，下一轮重新切会话", zero_rounds)
     end
-    -- 标题 OCR 偶尔读空/读残（窄的灰字），这时上一条已知标题才可信：会话不会自己变，
-    -- 认成「不对」只会白抢一次焦点去打字重开。
-    if joined == "" and last_ok_title and last_ok_title:find(want, 1, true) then
-        return true
-    end
-    if joined == "" then
-        sleep(300)
-        joined = title_text()
-        if joined ~= "" and joined:find(want, 1, true) then return true end
-        -- 标题空有两种：窗口还没抬起来（遮挡），或抬起来了但停在通讯录/设置等页面。
-        -- 前者截图是别人的画面，拿它更新 prev 会污染基线 → 跳一轮；后者必须切回会话。
-        -- 用「窗口是否真的可见」区分，不能一律跳过，否则一旦微信停在通讯录就永久空转。
-        if joined == "" and not xdo:_is_viewable(win.id) then
-            return false, "窗口不可见且标题识别为空（微信被遮挡？）"
-        end
-    end
-    local wx = wechat_lib()
-    if not wx then return false, "找不到 helper/wechat.lua，无法自动切会话" end
-    log("当前会话不是「%s」（标题 OCR=%q），调 wechat open", C.chat, joined:sub(1, 40))
-    take_focus()        -- open 要往搜索框打字，这一步必须真焦点（收尾会还回去）
-    pcall(wx.run, { action = "open", name = C.chat, background = false })
-    sleep(400)
-    -- 切完必须**确认**切成了：只读一次标题就放行，会在标题读空时（窗口正在重绘 /
-    -- 搜索面板还没收）把「什么都没切」当成成功，接下去抓的帧是别的窗口（实测是终端的
-    -- 命令行回显），那些垃圾没有 #lite 前缀 → 一律忽略 → 手机那头只看到微信闪一下、
-    -- 永远没有回应。所以读空要轮询到重绘完；仍然读空就判失败跳这一轮。
-    joined = title_text()
-    for _ = 1, 16 do
-        if joined ~= "" then break end
-        sleep(250)
-        joined = title_text()
-    end
-    if joined == "" then
-        return false, "切「" .. C.chat .. "」后标题仍识别为空（窗口没重绘或截到了别的窗口），本轮跳过"
-    end
-    if not joined:find(want, 1, true) then
-        return false, "切成「" .. C.chat .. "」失败（标题 OCR=" .. joined:sub(1, 30) .. "）"
-    end
-    return true
 end
 
 -- ── 精确原文：右键气泡 → 菜单点「复制」 → 读剪贴板 ───────────────────
@@ -767,7 +767,11 @@ end
 local function tick()
     local blocks, err = snapshot()
     if not blocks then log("skip: %s", err); return 0 end
-    if #blocks == 0 then log("skip: 这一帧读到 0 条（窗口动画/被遮挡？）"); return 0 end
+    if #blocks == 0 then
+        note_blocks(0)
+        log("skip: 这一帧读到 0 条（窗口动画/被遮挡？）"); return 0
+    end
+    note_blocks(#blocks)
     local b = blocks[#blocks]                       -- 永远只认最新那一条
     -- 媒体消息（图片/文件/视频）不处理：用户定的。判据两层，都便宜的先跑：
     --   ① 这块 OCR 文本自己就长成文件气泡/占位符（wx_watch.lua:is_media）；
@@ -930,7 +934,7 @@ while true do
         -- 别处的字当指令 diff 出来。救不回来就跳过本轮，等下一轮（用户可能正在拖窗口）。
         local gok, gwhy = fix_geom()
         if not gok then log("skip: %s", tostring(gwhy)); return end
-        local ready, why = ensure_chat_via(TITLE_R)
+        local ready, why = ensure_chat()
         if not ready then log("skip: %s", tostring(why)); return end
         last_real = os.time()
         added = tick() or 0
