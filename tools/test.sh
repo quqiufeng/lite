@@ -175,4 +175,17 @@ for pat in "Restart=always" "WantedBy=multi-user.target" "ExecStart=$ROOT/tools/
 done
 echo "OK setup.service"
 
+echo "== serve service =="
+# 盒子断电重启后 8765 要自己回来（serve_up.sh 的 setsid 没有开机钩子）；同样只验 unit 文本。
+SUNIT="$(LITE_UNIT_DIR=/dev/null LITE_SERVE_PORT=8765 LITE_SERVE_DIR=/tmp/lite-serve-test "$ROOT/tools/serve_service.sh" dry-run 2>&1 || true)"
+for pat in "Restart=always" "WantedBy=multi-user.target" "ExecStart=$ROOT/tools/serve_up.sh --loop" \
+           "Type=simple" "KillMode=control-group" "Environment=LITE_SERVE_DIR=/tmp/lite-serve-test" \
+           "rm -f /tmp/lite-serve-test/serve.pid"; do
+    if ! echo "$SUNIT" | grep -qF "$pat"; then
+        echo "FAIL serve.service ($pat 缺了)" >&2
+        exit 1
+    fi
+done
+echo "OK serve.service"
+
 echo "== done =="

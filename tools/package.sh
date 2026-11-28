@@ -266,7 +266,7 @@ fi
 # _arch.sh 必须进包：install.sh / release.sh / package.sh 第一行就 source 它，
 # 漏了它目标机解包后连装都装不上（报 tools/_arch.sh: No such file）。
 for f in lite-lua lua.sh lite run.sh check_deps.sh build.sh test.sh install.sh package.sh release.sh launch.sh \
-         ort_link.sh cuda_provider.sh see.lua cluster.sh _arch.sh serve_up.sh setup_service.sh; do
+         ort_link.sh cuda_provider.sh see.lua cluster.sh _arch.sh serve_up.sh setup_service.sh serve_service.sh; do
     [ -f "$ROOT/tools/$f" ] && cp "$ROOT/tools/$f" "$DIST/tools/"
 done
 cp "$ROOT/tools/auto_unit.lua" "$DIST/tools/"
@@ -331,7 +331,7 @@ fi
 # 后面的 strip/tar 全不跑，dist 里的 tar.gz 停在上一次的旧产物 —— 看起来「打包成功」，
 # 实际装出去的是旧代码。这个坑在 121 上真实踩到过一次。
 for f in lite-lua lua.sh lite run.sh check_deps.sh build.sh test.sh install.sh package.sh \
-         release.sh launch.sh ort_link.sh cuda_provider.sh cluster.sh serve_up.sh setup_service.sh; do
+         release.sh launch.sh ort_link.sh cuda_provider.sh cluster.sh serve_up.sh setup_service.sh serve_service.sh; do
     [ -f "$DIST/tools/$f" ] && chmod +x "$DIST/tools/$f"
 done
 

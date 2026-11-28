@@ -164,7 +164,9 @@ cwd 之外的项目。
 超时（`LITE_SERVE_HTTP_TIMEOUT`，900s）回 504。
 
 盒子/长期在线用 `./tools/serve_up.sh start|stop|status|logs`（默认 `0.0.0.0:8765`，workdir
-`$HOME/.local/share/lite-serve`，setsid 自监督 → `reboot` 的 exit 75 与崩溃都自愈；不用 systemd）。
+`$HOME/.local/share/lite-serve`，setsid 自监督 → `reboot` 的 exit 75 与崩溃都自愈）。**要开机自启**
+（盒子断电后没人 ssh 进去拉）用 `sudo ./tools/serve_service.sh install`：system 级 unit 跑
+`serve_up.sh --loop`，内层管 75/崩溃退避、外层 systemd 只管内层死掉；接管后停用 `systemctl stop`。
 
 判「远端闲置没」用 `lite serve --probe HOST:PORT`（采样 3 次、间隔 2s）：**单次采样不当判决**
 （`active_proc:alive()` 是「尽快」不是瞬时）。退出码 0=`wake`、3=`busy`、4=`unreachable`、
