@@ -11,6 +11,7 @@ local ffi = require("ffi")
 local bit = require("bit")
 local cjson = require("cjson")
 local net = require("core.net")
+local netif = require("core.netif")
 local http = require("core.serve_http")
 
 ffi.cdef[[
@@ -450,7 +451,7 @@ function M.route(req, ctx)
         return http.json(200, {
             ok = true, configured = key ~= nil,
             masked = key and M.mask(key) or nil,
-            host = ctx.host, version = M.VERSION,
+            host = ctx.host, url = ctx.url, version = M.VERSION,
             hostname = ctx.hostname,
         })
     end
@@ -562,7 +563,10 @@ function M.run(opts)
         env_path = env_path,
         base_url = opts.base_url or os.getenv("DEEPSEEK_BASE_URL"),
         verify = opts.verify,
-        host = host .. ":" .. tostring(srv.port),
+        -- 绑 0.0.0.0 时印给用户的必须是真实网卡地址：0.0.0.0 浏览器打不开，
+        -- 写死 IP 又会被 DHCP 换掉，所以现取（core/netif.lua）。
+        host = netif.url(srv.port, host):gsub("^http://", ""),
+        url = netif.url(srv.port, host),
         hostname = opts.hostname,
     }
     if opts.on_ready then opts.on_ready(srv) end

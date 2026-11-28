@@ -6246,6 +6246,24 @@ do
     check(setup.env_path("/home/u") == "/home/u/.config/lite/.env", "setup env_path default")
 
     os.execute("rm -rf " .. shq(tmpdir))
+
+    -- netif：本机 IP 现取，不写死。绑通配地址时 URL 里必须是真实网卡地址
+    -- （0.0.0.0 浏览器打不开，写死 IP 会被 DHCP 换掉）。
+    local netif = require("core.netif")
+    local ip = netif.lan_ip()
+    check(ip ~= nil and ip:match("^%d+%.%d+%.%d+%.%d+$") ~= nil, "netif lan_ip is ipv4")
+    check(ip ~= "127.0.0.1" and not ip:match("^0%."), "netif lan_ip not loopback")
+    check(netif.lan_ip() == ip, "netif lan_ip stable")
+    check(netif.url(8080, "0.0.0.0") == "http://" .. ip .. ":8080", "netif url wildcard uses lan ip")
+    check(netif.url(8080, "::") == "http://" .. ip .. ":8080", "netif url v6 wildcard uses lan ip")
+    check(netif.url(9000, "127.0.0.1") == "http://127.0.0.1:9000", "netif url honours bind host")
+    check(netif.url(8080):find("0%.0%.0%.0", 1, true) == nil, "netif url never 0.0.0.0")
+    local seen = {}
+    for _, r in ipairs(netif.ipv4_list()) do
+        check(seen[r.ip] == nil, "netif ipv4_list no dup " .. r.ip)
+        seen[r.ip] = true
+    end
+    check(seen[ip] == true, "netif ipv4_list contains lan_ip")
 end
 
 -- entry

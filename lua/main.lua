@@ -418,7 +418,6 @@ elseif cmd == "setup" or cmd == "--setup" then
     local host = flags.host or setup.DEFAULT_HOST
     local port = flags.port or tonumber(os.getenv("LITE_SETUP_PORT")) or setup.DEFAULT_PORT
     local env_path = flags.env_file or setup.env_path()
-    local shown = (host == "0.0.0.0" or host == "::") and setup.hostname() or host
     local ok, err = setup.run({
         host = host,
         port = port,
@@ -428,9 +427,11 @@ elseif cmd == "setup" or cmd == "--setup" then
         base_url = flags.base_url,
         max_seconds = flags.max_seconds,
         on_ready = function(srv)
+            -- 绑 0.0.0.0 时不能把通配地址印给人：现取本机 IP 拼 URL（core/netif.lua）。
+            local shown = require("core.netif").url(srv.port, host)
             io.write(string.format(
-                "lite setup: 用浏览器打开 http://%s:%d/index.html 填 DeepSeek API Key\n" ..
-                "  写入 %s（0600），Ctrl+C 停。\n", shown, srv.port, env_path))
+                "lite setup: 用浏览器打开 %s/index.html 填 DeepSeek API Key\n" ..
+                "  写入 %s（0600），Ctrl+C 停。\n", shown, env_path))
             io.flush()
         end,
         on_request = function(req, n)
