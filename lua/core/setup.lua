@@ -13,6 +13,8 @@ local cjson = require("cjson")
 local net = require("core.net")
 local netif = require("core.netif")
 local http = require("core.serve_http")
+-- 出站 HTTP 用 core.http（serve_http 只解析入站请求，没有 get）。
+local httpc = require("core.http")
 
 ffi.cdef[[
 int chmod(const char *path, unsigned int mode);
@@ -67,6 +69,17 @@ function M.read_key(path)
     local text = f:read("*a")
     f:close()
     local v = parse_dotenv(text)["DEEPSEEK_API_KEY"]
+    if v and v ~= "" then return v end
+    return nil
+end
+
+-- 读 .env 里某个键的值（配置页回显当前模型用）；没有就返回 nil。
+function M.read_env_value(path, name)
+    local f = io.open(path or M.env_path(), "r")
+    if not f then return nil end
+    local text = f:read("*a")
+    f:close()
+    local v = parse_dotenv(text)[name]
     if v and v ~= "" then return v end
     return nil
 end
@@ -145,7 +158,7 @@ end
 -- 返回 ok, info；info = {balance=…, currency=…, available=…} 或错误文案。
 function M.verify_key(key, base_url, timeout)
     base_url = (base_url or "https://api.deepseek.com"):gsub("/+$", "")
-    local rc, code, body = http.get(base_url .. "/user/balance",
+    local rc, code, body = httpc.get(base_url .. "/user/balance",
         { "Authorization: Bearer " .. key, "Accept: application/json" }, 65536, timeout or 15)
     if rc ~= 0 then return false, "网络不通：" .. tostring(body) end
     if code == 401 then return false, "Key 无效（HTTP 401）" end
@@ -164,6 +177,38 @@ function M.verify_key(key, base_url, timeout)
         info.currency = tostring(b.currency or "")
     end
     return true, info
+end
+
+-- 取真实模型清单：页面下拉不写死。DeepSeek 上/下模型（deepseek-chat、deepseek-reasoner
+-- 都已经从 /models 里消失）时，页面自动跟上，不用改代码发版。
+-- 返回 ok, list；list = {{id=…, name=…, ctx=…, out_max=…}}，或 ok=false + 错误文案。
+function M.list_models(key, base_url, timeout)
+    base_url = (base_url or "https://api.deepseek.com"):gsub("/+$", "")
+    local rc, code, body = httpc.get(base_url .. "/models",
+        { "Authorization: Bearer " .. key, "Accept: application/json" }, 262144, timeout or 15)
+    if rc ~= 0 then return false, "网络不通：" .. tostring(body) end
+    if code == 401 then return false, "Key 无效（HTTP 401）" end
+    if code == 403 then return false, "Key 被禁用（HTTP 403）" end
+    if code ~= 200 then
+        return false, "取模型列表失败（HTTP " .. tostring(code) .. "）" .. tostring(body):sub(1, 120)
+    end
+    local ok, obj = pcall(cjson.decode, body or "")
+    if not ok or type(obj) ~= "table" or type(obj.data) ~= "table" then
+        return false, "模型列表格式不认识"
+    end
+    local list = {}
+    for _, m in ipairs(obj.data) do
+        if type(m) == "table" and type(m.id) == "string" and m.id ~= "" then
+            list[#list + 1] = {
+                id = m.id,
+                name = type(m.name) == "string" and m.name or nil,
+                ctx = tonumber(m.context_window) or nil,
+                out_max = tonumber(m.max_output_tokens) or nil,
+            }
+        end
+    end
+    if #list == 0 then return false, "模型列表为空" end
+    return true, list
 end
 
 -- ---------------------------------------------------------------- 页面
@@ -299,12 +344,12 @@ local PAGE = [==[
     </div>
     <div class="tip" id="tip" style="display:none">已保存的 Key 不会回显；要换就直接填新的，提交后覆盖旧的。</div>
 
-    <label for="model">模型</label>
-    <select id="model" name="model">
-      <option value="deepseek-flash">deepseek-flash（默认，快）</option>
-      <option value="deepseek-chat">deepseek-chat</option>
-      <option value="deepseek-reasoner">deepseek-reasoner（推理）</option>
-    </select>
+    <label for="model">模型
+      <span class="hint" id="model-hint">粘贴 Key 后自动列出可用模型</span>
+    </label>
+    <input id="model" name="model" type="text" list="model-list" spellcheck="false"
+           autocomplete="off" placeholder="deepseek-flash" value="@@MODEL@@">
+    <datalist id="model-list"></datalist>
 
     <div class="row">
       <button class="primary" type="submit" id="save">测试并保存</button>
@@ -334,6 +379,55 @@ local PAGE = [==[
   var badge = document.getElementById('badge');
   var eye = document.getElementById('eye');
   var paste = document.getElementById('paste');
+  var modelEl = document.getElementById('model');
+  var modelList = document.getElementById('model-list');
+  var modelHint = document.getElementById('model-hint');
+  var modelFetchedFor = '';
+  var modelTimer = null;
+
+  /* 模型清单从 /api/models 现取（用你刚填的 key，不问本地已存的），页面不写死：
+     DeepSeek 上/下模型时这里自动跟上，不用改代码重发版 */
+  function fillModels(models){
+    modelList.innerHTML = '';
+    var ids = [];
+    models.forEach(function(m){
+      ids.push(m.id);
+      var o = document.createElement('option');
+      var label = m.name ? (m.name + ' · ' + m.id) : m.id;
+      if (m.ctx) label += ' · ' + Math.round(m.ctx / 1024) + 'K 上下文';
+      o.value = m.id;
+      o.label = label;
+      modelList.appendChild(o);
+    });
+    if (ids.indexOf(modelEl.value) < 0) modelEl.value = ids[0];
+    modelHint.textContent = ids.length + ' 个可用模型（可下拉选，也可手填）';
+  }
+  function fetchModels(force){
+    var key = (input.value || '').trim();
+    if (key.length < 16) { modelHint.textContent = '粘贴 Key 后自动列出可用模型'; return; }
+    if (!force && key === modelFetchedFor) return;
+    modelFetchedFor = key;
+    modelHint.textContent = '正在取模型列表…';
+    fetch('/api/models', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({key: key})
+    }).then(function(r){ return r.json(); })
+      .then(function(b){
+        if (b && b.ok && b.models && b.models.length) { fillModels(b.models); return; }
+        modelFetchedFor = '';
+        modelHint.textContent = (b && b.error && b.error.message) || '取列表失败，可手填模型名';
+      })
+      .catch(function(){
+        modelFetchedFor = '';
+        modelHint.textContent = '取列表失败，可手填模型名';
+      });
+  }
+  input.addEventListener('input', function(){
+    clearTimeout(modelTimer);
+    modelTimer = setTimeout(function(){ fetchModels(false); }, 800);
+  });
+  input.addEventListener('blur', function(){ fetchModels(false); });
 
   function show(kind, text){
     msg.className = 'msg show ' + kind;
@@ -391,6 +485,8 @@ local PAGE = [==[
   });
 
   fetch('/api/state').then(function(r){ return r.json(); }).then(function(s){
+    /* 已配过的模型名回显到输入框（服务端现读 .env，不是页面常量） */
+    if (s && s.model) modelEl.value = s.model;
     if (s && s.configured) {
       badge.className = 'badge on';
       badge.textContent = '已配置';
@@ -423,6 +519,9 @@ function M.page(state)
     put("@@HOSTNAME@@", html_escape(state.hostname or ""))
     put("@@BADGE_CLASS@@", configured and "on" or "off")
     put("@@BADGE@@", configured and "已配置" or "未配置")
+    -- 模型名回显当前 .env 里的值；没有就留空（placeholder 给 deepseek-flash 提示）。
+    -- 这里只做属性转义，不给初始下拉选项——选项由 /api/models 现取。
+    put("@@MODEL@@", html_escape(state.model or ""))
     return out
 end
 
@@ -451,9 +550,36 @@ function M.route(req, ctx)
         return http.json(200, {
             ok = true, configured = key ~= nil,
             masked = key and M.mask(key) or nil,
+            model = M.read_env_value(env_path, "DEEPSEEK_MODEL"),
             host = ctx.host, url = ctx.url, version = M.VERSION,
             hostname = ctx.hostname,
         })
+    end
+
+    -- 模型清单是现取的，不是写死的：用请求里带的 key 打 /models。
+    -- 刻意不读本地已存的 key——否则谁都能借这个端点看「这台机器配了什么」。
+    if path == "/api/models" then
+        if method ~= "POST" then
+            return http.error(405, "use POST", "method_not_allowed")
+        end
+        if #(req.body or "") > M.MAX_BODY then
+            return http.error(413, "body too large", "too_large")
+        end
+        local body = req.body or ""
+        local key
+        local okj, obj = pcall(cjson.decode, body)
+        if okj and type(obj) == "table" then
+            key = obj.key
+        else
+            key = decode_form(body).key
+        end
+        local k, verr = M.validate_key(key)
+        if not k then return http.error(400, verr, "bad_key") end
+        local mok, list = M.list_models(k, ctx.base_url or "https://api.deepseek.com")
+        if not mok then
+            return http.json(400, { ok = false, error = { message = list, code = "models_failed" } })
+        end
+        return http.json(200, { ok = true, models = list })
     end
 
     if path == "/api/key" then
@@ -509,6 +635,7 @@ function M.route(req, ctx)
         local body = M.page({
             configured = key ~= nil, masked = key and M.mask(key),
             host = ctx.host, hostname = ctx.hostname,
+            model = M.read_env_value(env_path, "DEEPSEEK_MODEL"),
         })
         if method == "HEAD" then body = "" end
         return http.response(200, {

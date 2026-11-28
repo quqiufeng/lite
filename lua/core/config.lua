@@ -144,6 +144,8 @@ function M.load(env)
     return {
         api_key = getv("DEEPSEEK_API_KEY") or file.api_key,
         base_url = getv("DEEPSEEK_BASE_URL") or file.base_url or "https://api.deepseek.com",
+        -- 只是「没配时用哪个」的兜底，不是可选清单：真实可用模型由 /models 现取
+        -- （lua/core/setup.lua:M.list_models），页面不写死选项。
         model = getv("DEEPSEEK_MODEL") or file.model or "deepseek-flash",
         cwd = getv("LITE_CWD") or file.cwd or cwd,
         max_turns = tonumber(getv("LITE_MAX_TURNS") or file.max_turns) or 256,

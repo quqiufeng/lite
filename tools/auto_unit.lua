@@ -6245,6 +6245,32 @@ do
     check(setup.route({ method = "HEAD", path = "/index.html" }, ctx):find("200") ~= nil, "setup route HEAD 200")
     check(setup.env_path("/home/u") == "/home/u/.config/lite/.env", "setup env_path default")
 
+    -- 模型不写死：页面只留输入框 + datalist，选项由 /api/models 现取。
+    -- deepseek-chat / deepseek-reasoner 已从 /models 消失，写进页面就是坑。
+    check(page:find("id=\"model%-list\"") ~= nil, "setup page has datalist")
+    check(page:find("<select", 1, true) == nil, "setup page no hardcoded model select")
+    check(page:find("deepseek%-chat") == nil and page:find("deepseek%-reasoner") == nil,
+        "setup page no stale model names")
+    check(page:find("/api/models", 1, true) ~= nil, "setup page fetches models api")
+    check(setup.page({ model = "deepseek-v4-pro" }):find('value="deepseek%-v4%-pro"') ~= nil,
+        "setup page echoes configured model")
+    -- 路由：GET 405、坏 key 400、网络不通时 400+tmodels_failed（不联网也能测）
+    check(setup.route({ method = "GET", path = "/api/models" }, ctx):find("405") ~= nil,
+        "setup models 405")
+    check(setup.route({ method = "POST", path = "/api/models", body = "key=x" }, ctx):find("400") ~= nil,
+        "setup models bad key 400")
+    local mctx = { env_path = envp, verify = false, base_url = "http://127.0.0.1:1" }
+    local mr = setup.route({ method = "POST", path = "/api/models",
+        body = '{"key":"sk-' .. string.rep("a", 32) .. '"}' }, mctx)
+    check(mr:find("400") ~= nil and mr:find("models_failed", 1, true) ~= nil,
+        "setup models network fail 400")
+    -- read_env_value：读 model、缺文件返回 nil
+    setup.write_kv(envp, { DEEPSEEK_API_KEY = key, DEEPSEEK_MODEL = "deepseek-v4-pro" },
+        { order = { "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL" } })
+    check(setup.read_env_value(envp, "DEEPSEEK_MODEL") == "deepseek-v4-pro", "setup read_env_value")
+    check(setup.read_env_value(envp, "NOPE") == nil, "setup read_env_value missing key")
+    check(setup.read_env_value(tmpdir .. "/nope.env", "X") == nil, "setup read_env_value missing file")
+
     os.execute("rm -rf " .. shq(tmpdir))
 
     -- netif：本机 IP 现取，不写死。绑通配地址时 URL 里必须是真实网卡地址
