@@ -141,7 +141,14 @@ if [ "$LUA_ONLY" = 1 ]; then
         echo "        ssh $DEPLOY_HOST 'cd $RDIR && ./tools/serve_up.sh restart'"
     else
         echo "build_arm64: serve 空闲 → 重启刷新 schema"
-        ssh -o BatchMode=yes "$DEPLOY_HOST" "cd '$RDIR' && ./tools/serve_up.sh restart" | tail -2
+        # 归 systemd 管的机器必须走 systemctl：`serve_up.sh restart` 会 setsid 一个
+        # 不归 unit 的看护循环，systemd 随后按 Restart=always 又拉起自己的，两个 loop
+        # 抢同一个 mem.lock，输的那个每 5s 往日志刷 "memory is locked by pid N"。
+        if ssh -o BatchMode=yes "$DEPLOY_HOST" 'systemctl is-active --quiet lite-serve' 2>/dev/null; then
+            ssh -o BatchMode=yes "$DEPLOY_HOST" 'systemctl restart lite-serve'
+        else
+            ssh -o BatchMode=yes "$DEPLOY_HOST" "cd '$RDIR' && ./tools/serve_up.sh restart" | tail -2
+        fi
         echo -n "        /health: "
         ssh -o BatchMode=yes "$DEPLOY_HOST" 'curl -sS -m 5 http://127.0.0.1:8765/health' || echo "（无应答）"
         echo

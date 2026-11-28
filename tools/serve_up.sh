@@ -27,6 +27,7 @@ DIR="${LITE_SERVE_DIR:-$HOME/.local/share/lite-serve}"
 LOG="$DIR/serve.log"
 PIDF="$DIR/serve.pid"
 STOPF="$DIR/.stop"
+LOOPLOCK="$DIR/loop.lock"
 BACKOFF="${LITE_SERVE_BACKOFF:-5}"
 
 lite_bin() {
@@ -49,8 +50,27 @@ port_busy() {
     return 1
 }
 
+acquire_loop_lock() {
+    # 同一 workdir 只允许一个看护循环。原先没有这道门：systemd 的 ExecStart 会起一个
+    # `--loop`，而 `serve_up.sh restart`（build_arm64.sh --deploy 走的就是它）又 setsid
+    # 起一个，两个 loop 各自拉 serve 抢同一个 mem.lock，输的那个每 BACKOFF 秒往日志里
+    # 刷 "memory is locked by pid N"，看着像孤儿进程 —— 其实是双看护。
+    # flock 随进程退出自动释放；被占时把持有者打出来再退，别硬上。
+    command -v flock >/dev/null 2>&1 || return 0
+    exec 9>"$LOOPLOCK" || return 0
+    if ! flock -n 9; then
+        echo "[$(date '+%F %T')] 已有看护循环在跑（loop.lock 被 pid $(cat "$LOOPLOCK.owner" 2>/dev/null || echo '?') 持有），本进程退出" >&2
+        echo "  查: ps -eo pid,ppid,args | grep '[s]erve_up.sh --loop'" >&2
+        echo "  停: systemctl is-active --quiet lite-serve && systemctl stop lite-serve  或  $0 stop" >&2
+        return 1
+    fi
+    echo $$ > "$LOOPLOCK.owner"
+    return 0
+}
+
 supervise_loop() {
     cd "$DIR" || exit 1
+    acquire_loop_lock || exit 1
     export PATH="$HOME/.local/bin:$PATH"
     local bin; bin="$(lite_bin)"
     local pid self=$$
@@ -60,7 +80,7 @@ supervise_loop() {
     while :; do
         [ -f "$STOPF" ] && { echo "[$(date '+%F %T')] stop 标记 → 退出看护"; break; }
         echo "[$(date '+%F %T')] serve 起 host=$HOST port=$PORT bin=$bin"
-        LITE_SUPERVISED=1 "$bin" serve --host "$HOST" --port "$PORT" >>"$LOG" 2>&1 &
+        LITE_SUPERVISED=1 "$bin" serve --host "$HOST" --port "$PORT" 9>&- >>"$LOG" 2>&1 &
         pid=$!
         wait "$pid"; local rc=$?
         echo "[$(date '+%F %T')] serve 退 rc=$rc"
