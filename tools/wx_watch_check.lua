@@ -239,6 +239,26 @@ check(not W.is_reply_tail(blk("帮我看看 /tmp", 300, 400), blk("好", 300, 46
 check(not W.is_reply_tail(nil, blk("好", 300, 460), { tag = "lite:" }),
     "reply_tail: 只有一块（prev 为空）不炸")
 
+-- ⑤ 闪烁门的采样窗 / 快门：窗口只亮一两秒，「看多久」和「多久看一次」都得钉住。
+-- 踩过：用一个 10s 的睡眠等一个 1s 的闪烁，等于整段错过，只能靠 force 强检去 raise 微信
+-- （用户抱怨的那种打扰）。判据是几何的，不是口味：
+local win = W.gate_window_ms()
+check(win > W.BLINK_HALF_MS, ("gate window %dms > blink 半周期 %dms"):format(win, W.BLINK_HALF_MS))
+check(W.GATE.poll_ms <= 500, "gate 快门 ≤500ms（快轮询才追得上闪烁）")
+local duty = win / (win + W.GATE.poll_ms)
+check(duty >= 0.6, ("时间轴覆盖 %.0f%% ≥60%%"):format(duty * 100))
+check(W.FORCE_EVERY >= 60, "兜底强检不能太密（它要 raise 微信）")
+check(W.gate_window_ms({ tries = 3, gap_ms = 160 }) == 320,
+    "gate_window_ms 按 (帧数-1)×间隔 算")
+
+-- 静态：daemon 必须用这份共享参数，别自己写一个 15 帧长窗/10s 睡眠（两处数就是两份真相）。
+local DAEMON = LIB:gsub("[^/]+$", "") .. "wx_watch_daemon.lua"
+local df = io.open(DAEMON, "rb")
+local dsrc = df and df:read("*a") or ""
+if df then df:close() end
+check(dsrc:find("Watch%.GATE%.tries", 1) ~= nil, "daemon 门采样用 Watch.GATE")
+check(dsrc:find("sleep%(shallow and C%.gate_ms", 1) ~= nil, "daemon 浅轮睡快门、深轮睡 interval")
+
 if fails > 0 then
     io.stderr:write(("FAIL wx_watch (%d/%d)\n"):format(fails, total))
     os.exit(1)

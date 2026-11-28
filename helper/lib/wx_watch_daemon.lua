@@ -30,8 +30,10 @@
 -- —— 截图取的是屏幕像素，窗口最小化就读不到气泡，所以每轮得先 activate 再收起来，
 -- 窗口可见时长 ≈ 一次截屏 + OCR（1~2s）。
 --
--- 用法：tools/lite-lua helper/lib/wx_watch_daemon.lua --interval 10 [--wait 1800]
+-- 用法：tools/lite-lua helper/lib/wx_watch_daemon.lua --interval 10 [--gate-ms 300]
 --        [--prefix ""] [--dry-run] [--once] [--no-raise] [--no-hide]
+--   --interval 只决定「真的进了微信之后歇多久」；没进门的那一轮按 --gate-ms（默认 300）
+--   快轮询托盘像素 —— 闪烁只亮一两秒，用一个 10s 的睡眠去等它必然整段错过。
 --   不给 --prefix = 全收：文件传输助手里的新消息一律当指令（微信模式的默认行为）。
 -- 兼容旧调用：--port/--host/--no-spawn 还认，但已经是空转（派发不走 serve HTTP 了）。
 -- 由 helper/wechat_watch.lua 拉起/收掉，别手写 nohup（pidfile/日志在对面的状态目录里）。
@@ -70,10 +72,12 @@ local C = {
     -- 派完只让路 settle_min 秒（防「刚 paste 就被下一轮抢走窗口」），之后照常轮询；
     -- 不再有「等主进程 CPU 闲下来」的超时上限 —— 那个上限本身就意味着最长 30 分钟不看微信。
     settle_min = 15,
-    -- 兜底强检间隔：托盘「有未读」的闪烁只持续一两秒（实测），而轮询间隔 10s、采样窗 2.4s，
-    -- 整段错过是常态。只靠闪烁门 = 消息到了却永远不点开（用户看到的就是「微信模式没响应」）。
-    -- 所以再久也要定期进去看一眼；0=关掉（调试闪烁门本身时用）。
-    force_every = 120,
+    -- 兜底强检间隔（秒）：门有 ~27% 死区（见 wx_watch.lua 的 GATE），偶尔漏一次靠它补。
+    -- 它不打扰用户的前提是 surface() 判「窗口本来就被盖住才 raise」；0 = 关掉纯测门。
+    force_every = Watch.FORCE_EVERY,
+    -- **空闲快门**：没进门（图标没闪）的那一轮只花 ~0.8s 像素采样，睡 0.3s 再来 —— 覆盖
+    -- 73% 时间轴，消息到了 1~2s 内就进来。以前的 10s 一轮让闪烁整段漏掉，只能靠 force 强检。
+    gate_ms = Watch.GATE.poll_ms,
     cwd = os.getenv("LITE_CWD") or os.getenv("PWD") or ".",
     state = os.getenv("LITE_WX_STATE") or
         ((os.getenv("XDG_DATA_HOME") or (os.getenv("HOME") or "/tmp") .. "/.local/share")
@@ -84,6 +88,7 @@ do
     while arg and arg[i] do
         local a, v = arg[i], arg[i + 1]
         if a == "--interval" then C.interval = tonumber(v); i = i + 2
+        elseif a == "--gate-ms" then C.gate_ms = tonumber(v); i = i + 2
         elseif a == "--port" then C.port = tonumber(v); i = i + 2   -- 空转，留着不炸旧调用
         elseif a == "--host" then C.host = v; i = i + 2            -- 同上
         elseif a == "--wait" then i = i + 2                       -- 空转：不再等主进程干完活
@@ -600,7 +605,10 @@ local function news_pending()
     end
     local env, eerr = tray_ready()
     if not env then return false, eerr end
-    local blink, why, rect = tray.check(env.X11, env.dpy, env.root, env.sw, env.sh, tray_cache)
+    -- 门用**短窗**（Watch.GATE）：一轮只花 0.8s，才养得起「每 0.3s 看一次」的快轮询。
+    -- 15 帧 2.4s 的长窗只在 relocate 判「哪个绿块是真图标」时还值得用，那条路很少走。
+    local blink, why, rect = tray.check(env.X11, env.dpy, env.root, env.sw, env.sh, tray_cache,
+        { tries = Watch.GATE.tries, gap_ms = Watch.GATE.gap_ms })
     if blink then return true, why end
     if not rect and why then tray_err = why end
     return false, why
@@ -790,8 +798,9 @@ do
     if not C.once then                       -- 一次性模式不留 pidfile，免得插件以为还活着
         local f = io.open(PIDFILE, "wb"); if f then f:write(pid); f:close() end
     end
-    log("启动 pid=%s interval=%ds prefix=%q chat=%s dry=%s settle=%ds 派发=call_master",
-        pid, C.interval, C.prefix, C.chat, tostring(C.dry), C.settle_min)
+    log("启动 pid=%s interval=%ds gate=%dms window=%dms force=%ds prefix=%q chat=%s dry=%s settle=%ds",
+        pid, C.interval, C.gate_ms, Watch.gate_window_ms(), C.force_every, C.prefix, C.chat,
+        tostring(C.dry), C.settle_min)
 end
 
 if C.dump then
@@ -833,6 +842,11 @@ local last_real = os.time()          -- 上次真正进去检查的时刻（兜�
 while true do
     rounds = rounds + 1
     local added = 0
+    -- 本轮是不是「只过门、没进门」的浅轮：浅轮不碰窗口，睡 shutter(0.3s) 就再来；
+    -- 深轮（真的进了微信）才睡 C.interval。两个间隔分开是这次改动的**全部要点** ——
+    -- 一个数同时管「多久看一次托盘」和「进去之后歇多久」时，只能折中成 10s，
+    -- 而托盘闪烁只亮一两秒：那次 10s 的睡眠就是消息漏掉的地方。
+    local shallow = false
     touched = false                       -- 上一轮没收尾（ok=false）也要清零，别把旧状态带进来
     local ok, err = pcall(function()
         -- 先过廉价门：图标没闪就整轮不做 —— 不抢焦点、不截图、不 OCR。这一步放在
@@ -841,16 +855,18 @@ while true do
         -- dispatch 里阻塞等主进程闲，主进程一忙就整条轮询停摆（消息到了不触发、日志空）。
         local wait_s = settle_until - os.time()
         if wait_s > 0 then
+            shallow = true
             if not gate_quiet then log("让路中：%ds 后恢复检查", wait_s); gate_quiet = true end
             return
         end
         local pend, gwhy0 = news_pending()
-        -- 闪烁只亮一两秒，轮询 10s 一轮很容易整段错过；只靠闪烁门等于「消息到了不点开」。
-        -- 所以隔 force_every 秒兜底强检一次。0 = 关（专测闪烁门本身时用）。
+        -- 门有死区（采样窗只覆盖时间轴的 ~73%），隔 force_every 秒兜底进去看一眼。
+        -- 注意这不再是主要通路：门自己够快，正常消息不会等到这里。0 = 关（专测门时用）。
         if not pend and C.force_every > 0 and os.time() - last_real >= C.force_every then
             pend, gwhy0 = true, string.format("兜底强检（%ds 没进去过）", os.time() - last_real)
         end
         if not pend then
+            shallow = true
             -- 日志要写**真实原因**：以前这里固定成「图标没闪」，把 tray_err（定位失败）
             -- 也一起吞成这句，于是「一直在 skip」和「门本身就坏了」分不开。
             if not gate_quiet then log("skip: %s（没点开检查）", tostring(gwhy0)); gate_quiet = true end
@@ -872,6 +888,7 @@ while true do
     -- ok=false（认不出窗口/几何不对）不动它，免得搅用户自己的操作。
     if ok then hide_idle() end
     if C.once then break end
-    sleep(C.interval * 1000)
+    -- 浅轮睡快门（0.3s），深轮睡整间隔：见循环开头 shallow 的注释。
+    sleep(shallow and C.gate_ms or C.interval * 1000)
 end
 log("退出 rounds=%d", rounds)
