@@ -6165,6 +6165,89 @@ do
     check(prof.report_json().events == 0, "trace prof action reset clears ledger")
 end
 
+-- core.setup：盒子的初始化页（填 key → 写 .env）。这里只测纯逻辑与路由，
+-- 不真起监听、不真打网络（verify=false），否则回归会依赖外网。
+do
+    local setup = require("core.setup")
+    local tmpdir = shq(os.getenv("TMPDIR") or "/tmp"):gsub("'", "") .. "/lite-setup-test"
+    os.execute("rm -rf " .. shq(tmpdir) .. " && mkdir -p " .. shq(tmpdir))
+    local envp = tmpdir .. "/.env"
+
+    -- 形状校验：空/短/非法字符/缺前缀都拒，正常 key 过
+    check(setup.validate_key("") == nil, "setup reject empty key")
+    check(setup.validate_key("sk-short") == nil, "setup reject short key")
+    check(setup.validate_key("sk-" .. string.rep("g", 16) .. " " .. string.rep("g", 16)) == nil,
+        "setup reject space key")
+    check(setup.validate_key("XY-" .. string.rep("a", 32)) == nil, "setup reject no-sk prefix")
+    check(setup.validate_key(" sk-" .. string.rep("a", 32) .. " ") ~= nil, "setup accept sk- key")
+    check(setup.validate_key("sk-" .. string.rep("a", 300)) == nil, "setup reject long key")
+
+    -- 掩码：头 6 + 尾 4，长度别泄
+    -- 假 key 别写成像真的字面量（仓库里不留 sk- 开头的长串），拼出来
+    local m = setup.mask("s" .. "k-" .. ("0123456789abcdef"):rep(2))
+    check(m:sub(1, 6) == "sk-012" and m:sub(-4) == "cdef" and not m:find("789abc"), "setup mask")
+    check(setup.mask("short") == "•••••", "setup mask short")
+
+    -- 写 .env：保留别人的行、就地替换同名键、0600、原子 rename
+    local f = assert(io.open(envp, "w"))
+    f:write("# 注释\nOTHER=1\nDEEPSEEK_API_KEY=old\nTAIL=2\n")
+    f:close()
+    local key = "sk-" .. string.rep("1", 32)
+    local wok = setup.write_kv(envp, { DEEPSEEK_API_KEY = key }, { order = { "DEEPSEEK_API_KEY" } })
+    check(wok == true, "setup write_kv ok")
+    local rf = assert(io.open(envp, "r"))
+    local text = rf:read("*a")
+    rf:close()
+    check(text:find("# 注释") ~= nil and text:find("OTHER=1") ~= nil
+        and text:find("TAIL=2") ~= nil, "setup write_kv keeps other lines")
+    check(text:find(key, 1, true) ~= nil and not text:find("=old"), "setup write_kv replaces key")
+    check(#text:gsub("%s", "") == #("#注释OTHER=1DEEPSEEK_API_KEY=" .. key .. "TAIL=2"),
+        "setup write_kv no dup")
+    local mode = io.popen("stat -c %a " .. shq(envp) .. " 2>/dev/null"):read("*a") or ""
+    check(mode:gsub("%s", "") == "600", "setup write_kv mode 0600")
+    check(setup.read_key(envp) == key, "setup read_key roundtrip")
+    check(setup.read_key(tmpdir .. "/nope.env") == nil, "setup read_key missing file")
+
+    -- 路由：状态页/错误页/405/413/保存生效（verify=false 不联网）
+    local ctx = { env_path = envp, verify = false, host = "0.0.0.0:8080", hostname = "box" }
+    local r1 = setup.route({ method = "GET", path = "/api/state" }, ctx)
+    check(r1:find("200") ~= nil and r1:find('"configured":true') ~= nil, "setup route state configured")
+    check(setup.route({ method = "GET", path = "/api/key" }, ctx):find("405") ~= nil, "setup route 405")
+    check(setup.route({ method = "POST", path = "/api/key", body = "key=x" }, ctx):find("400") ~= nil,
+        "setup route bad key 400")
+    check(setup.route({ method = "POST", path = "/api/key", body = string.rep("x", 9000) }, ctx)
+        :find("413") ~= nil, "setup route 413")
+    check(setup.route({ method = "GET", path = "/zzz" }, ctx):find("404") ~= nil, "setup route 404")
+
+    os.remove(envp)
+    local r2 = setup.route({ method = "POST", path = "/api/key",
+        body = '{"key":"' .. key .. '","model":"deepseek-chat"}' }, ctx)
+    check(r2:find("200") ~= nil and r2:find("sk-111", 1, true) ~= nil, "setup route save json 200")
+    check(setup.read_key(envp) == key, "setup route save writes env")
+    local r3 = setup.route({ method = "POST", path = "/api/key",
+        body = "key=" .. key .. "&model=deepseek-reasoner" }, ctx)
+    check(r3:find("200") ~= nil, "setup route save form 200")
+    local r4 = setup.route({ method = "POST", path = "/api/key",
+        body = "key=" .. key .. "&model=bad model!" }, ctx)
+    check(r4:find("200") ~= nil and (setup.read_key(envp) == key), "setup route ignores bad model")
+
+    -- 页面：自包含 HTML，不引外网资源，key 不回显明文
+    local page = setup.page({ configured = true, masked = setup.mask(key), host = "0.0.0.0:8080", hostname = "box" })
+    check(page:find("<!DOCTYPE html>") ~= nil and page:find("0%.0%.0%.0:8080") ~= nil, "setup page shell")
+    check(page:find("http://", 1, true) == nil and page:find("https://", 1, true) == nil,
+        "setup page no external url")
+    check(page:find(key, 1, true) == nil, "setup page hides raw key")
+    -- 空 key 会被 validate_key 拒（400），所以提示不能写「留空则保留原值」——
+    -- 那是误导：用户留空提交只会看到报错。这条锁住文案语义。
+    check(setup.validate_key("") == nil, "setup empty key rejected")
+    check(page:find("留空", 1, true) == nil, "setup page no misleading blank-keeps hint")
+    check(page:find("id=\"tip\"") ~= nil, "setup page has tip slot")
+    check(setup.route({ method = "HEAD", path = "/index.html" }, ctx):find("200") ~= nil, "setup route HEAD 200")
+    check(setup.env_path("/home/u") == "/home/u/.config/lite/.env", "setup env_path default")
+
+    os.execute("rm -rf " .. shq(tmpdir))
+end
+
 -- entry
 check(loadfile(root .. "/lua/main.lua") ~= nil, "load lua/main.lua")
 

@@ -22,6 +22,9 @@ lite — DeepSeek 终端 coding agent
                                3=还在干活 4=连不上 5=采样不稳，不需要 API key
   lite attach --port 8765      连接服务端并显示 TUI
   lite attach --port 8765 --tmux  在新 tmux 窗口 attach
+  lite setup [--port 8080]     起初始化网页：浏览器填 DeepSeek API Key → 写
+                               ~/.config/lite/.env(0600)。不需要已有 key，默认绑 0.0.0.0
+                               （--host/--env-file/--no-verify/--base-url 可选）
   lite --tui --snapshot out.txt   输出整屏快照（AI 验收）
   lite --reboot                重启后自动继续：起来就把上一轮 /reboot 留下的提示词发出去
                                （没留就用默认的「重启成功，继续工作。」）
@@ -109,6 +112,7 @@ end
 local SUBCOMMANDS = {
     ["--version"] = true, ["--help"] = true, ["-h"] = true,
     serve = true, ["--serve"] = true, attach = true, ["--attach"] = true,
+    setup = true, ["--setup"] = true,
     state = true, ["--state"] = true, sessions = true, ["--sessions"] = true,
     plugins = true, ["--plugins"] = true,
     ["--check"] = true, ["--recall"] = true, ["--remember"] = true,
@@ -128,6 +132,7 @@ local VALUE_FLAGS = {
     ["--interval"] = true, ["--probe-timeout"] = true, ["--http-timeout"] = true,
     ["--wake"] = true, ["--wake-max"] = true, ["--task"] = true, ["--task-file"] = true,
     ["--snapshot"] = true, ["--snapshot-text"] = true, ["--width"] = true,
+    ["--env-file"] = true, ["--base-url"] = true, ["--max-seconds"] = true,
     ["--height"] = true, ["--session"] = true, ["--reasoning-effort"] = true,
     ["--approval"] = true, ["--max-turns"] = true, ["--debug-log"] = true,
     ["--prefix"] = true, ["--wx-interval"] = true,
@@ -184,6 +189,19 @@ local function parse_flags(list)
             i = i + 2
         elseif a == "--http-timeout" then
             flags.http_timeout = tonumber(list[i + 1])
+            i = i + 2
+        elseif a == "--no-verify" then
+            -- setup：离线/内网盒子也能先把 key 存下来（跳过打 API 验活）
+            flags.no_verify = true
+            i = i + 1
+        elseif a == "--env-file" then
+            flags.env_file = list[i + 1]
+            i = i + 2
+        elseif a == "--base-url" then
+            flags.base_url = list[i + 1]
+            i = i + 2
+        elseif a == "--max-seconds" then
+            flags.max_seconds = tonumber(list[i + 1])
             i = i + 2
         elseif a == "--tmux" then
             flags.tmux = true
@@ -391,6 +409,41 @@ if cmd == "--version" then
     os.exit(0)
 elseif cmd == "--help" or cmd == "-h" then
     usage()
+    os.exit(0)
+elseif cmd == "setup" or cmd == "--setup" then
+    -- 初始化页：盒子/新机器没有 API key 时，起一个网页让人填，填完写进 .env。
+    -- 不需要 API key、不需要 mem.lock、不加载插件——它比 agent 本身还早一层。
+    local flags = parse_flags(rest)
+    local setup = require("core.setup")
+    local host = flags.host or setup.DEFAULT_HOST
+    local port = flags.port or tonumber(os.getenv("LITE_SETUP_PORT")) or setup.DEFAULT_PORT
+    local env_path = flags.env_file or setup.env_path()
+    local shown = (host == "0.0.0.0" or host == "::") and setup.hostname() or host
+    local ok, err = setup.run({
+        host = host,
+        port = port,
+        env_path = env_path,
+        hostname = setup.hostname(),
+        verify = not flags.no_verify,
+        base_url = flags.base_url,
+        max_seconds = flags.max_seconds,
+        on_ready = function(srv)
+            io.write(string.format(
+                "lite setup: 用浏览器打开 http://%s:%d/index.html 填 DeepSeek API Key\n" ..
+                "  写入 %s（0600），Ctrl+C 停。\n", shown, srv.port, env_path))
+            io.flush()
+        end,
+        on_request = function(req, n)
+            if flags.debug then
+                io.write(string.format("lite setup: #%d %s %s\n", n,
+                    tostring(req and req.method), tostring(req and req.path)))
+            end
+        end,
+    })
+    if not ok then
+        io.stderr:write("lite setup: " .. tostring(err) .. "\n")
+        os.exit(1)
+    end
     os.exit(0)
 elseif cmd == "serve" or cmd == "--serve" then
     local flags = parse_flags(rest)
