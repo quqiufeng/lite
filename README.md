@@ -4,6 +4,11 @@
 骨架借 [Pi](https://github.com/badlogic/pi-mono)，DeepSeek 原生与缓存优先借
 [Reasonix](https://github.com/esengine/reasonix)，工具行为借 [opencode](https://github.com/anomalyco/opencode)。
 
+**跑在哪**：`x86_64` 是主场，`aarch64` / `armv7`（树莓派、Armbian 盒子、各种 ARM 小机器）
+同样支持 —— 本机一条命令交叉编，不用在目标机上装 dev 包，见
+[交叉编译](#交叉编译x86--arm64armv7)。**多台机器**也能一起用：每台常驻 `serve`，
+master 用一份 TSV 并行派活，见 [分布式](#分布式多机派活)。
+
 它把四件事当作硬约束，其余都围着这四条转：
 
 | | 做法 | 换来 |
@@ -32,6 +37,8 @@ export DEEPSEEK_API_KEY=...   # 或写进 .env / ~/.config/lite/.env
 ./tools/run.sh attach --port 8765              # 任意终端/tmux tab attach
 ./tools/run.sh serve --wake 300 --task "检查 CI"  # 无人值守定时唤醒
 ./tools/serve_up.sh start                      # 常驻 0.0.0.0:8765 + 自监督循环（reboot/崩溃自愈）
+./tools/cluster.sh --jobs 4 tasks.tsv          # 多机/多目录并行派活（TSV 一行一个槽，结果落盘）
+./build_arm64.sh --package --deploy root@盒子   # 交叉编 arm64 → 打包 → 灌进盒子（x86 本机跑）
 ./tools/test.sh               # 依赖 + 单元 + CLI + TUI(tmux) 冒烟
 ```
 
@@ -289,9 +296,37 @@ liblitehtml/gumbo 漏打包），package.sh 改成静态读 `DT_NEEDED` 再在 `
 仓库 `third_party/cjson/.../cjson.so` 是 x86 二进制，package.sh 按目标 `e_machine` 校验后
 改取 sysroot 里的系统副本；`tools/_arch.sh` 必须在包内（`install.sh` 第一行就 source 它）。
 
+## 分布式（多机派活）
+
+一台 master + N 台 slave，slave 只负责**跑**（`serve` 常驻），编和打包留在 master 或指定一台
+有源码树的 slave 上。两条派活通道，按「要不要一直在线」选：
+
+| 通道 | 适用 | 命令 |
+|---|---|---|
+| 一次性并行 | 批处理、跑完就收（结果落 `<out>/<task>.{jsonl,rc,sec}`） | `tools/cluster.sh --jobs 4 --out out tasks.tsv` |
+| 长驻 | 远端一直在线，随时插话/attach 接管 | 目标机 `serve_up.sh start`，master `curl -X POST :8765/prompt` |
+
+`tasks.tsv` 一行一个**槽**（槽 = 一台机器上的一个 work dir；同目录两个 lite 会抢 `mem.lock`，
+所以并发度 = 机器数 × 每台目录数，不是进程数）：
+
+```
+# box            dir                      prompt                      task
+123               /root/work              跑一遍 tools/test.sh        t1
+121               /root/lite              ./tools/build.sh            t2
+local             /home/me/proj           修 lint                     t3
+```
+
+`box` 给 `local` 或 `-` 就在 master 本机跑；`ssh` 目标写在 `~/.ssh/config` 里即可。
+退出码 0 = 全 ok / 1 = 有任务失败 / 2 = 用法错误，能直接进 CI。
+判远端闲置用 `lite serve --probe HOST:PORT`（采样 3 次；**单次采样不当判决**，退出码
+0=`wake` 3=`busy` 4=`unreachable` 5=`unstable`）。
+
+原理、sysroot 细节、两台盒子的实测账本、踩坑记录见 **[arm64.md](arm64.md)**（交叉编译 + 部署 + 集群全流程）。
+
 ## 状态
 
-P0 基础设施 · P1 无 UI agent · P1.5 上下文记忆 · P2 TUI · P3 serve/attach · 插件与自扩展 全部落地。
+P0 基础设施 · P1 无 UI agent · P1.5 上下文记忆 · P2 TUI · P3 serve/attach · 插件与自扩展 ·
+**arm64/armv7 交叉编译** · **多机集群派活** 全部落地。
 未做：无人值守下的完整审批/沙箱收口、上下文逐轮曲线落 KV。
 
 设计取舍见 [design.md](design.md)；开发/测试规范与插件细节见 [AGENTS.md](AGENTS.md)；
