@@ -41,7 +41,7 @@ MUST NOT：`python`/`sed -i` 改仓库文件（用 `edit`/`write`）；Chrome/We
 
 ```bash
 ./tools/build.sh        # 编 C（src/**）
-./build_arm64.sh        # 交叉编 arm64（--clean/--package/--deploy/--fetch-sysroot）
+./build_arm64.sh        # 交叉编 arm64（--clean/--package/--deploy/--fetch-sysroot/--lua-only）
 ./tools/test.sh         # 全量回归
 ./tools/release.sh      # build + package + install（跑安装版必须它，见 §5）
 ./tools/run.sh          # TUI：--once/--tui/--readonly/--gui/state/sessions/serve/attach

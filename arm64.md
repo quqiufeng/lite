@@ -34,6 +34,25 @@ ICMP 被上游封：`ping` 不通 ≠ 离线，判活一律用 `ssh` / `curl /he
 |---|---|---|---|
 | `./tools/build.sh` | 本机 | `build/` | 就地写 |
 | `./tools/build_arm64.sh` | 盒子 | `build-arm64/` | **一字节不碰** |
+| `./tools/build_arm64.sh --lua-only --deploy H` | 盒子 | 不编译，只送 `*.lua` | 一字节不碰 |
+
+### 1.x `--lua-only`：纯 Lua 改动不走编译
+
+改了 `lua/` 或 `helper/*.lua` 却端着一份 2GB sysroot 重走工具链，是纯浪费：`--lua-only` 跳过
+工具链/sysroot/编译/打包，用 `tar` 走 ssh 把 `lua/` + `helper/` 的 `*.lua` 送进远端安装根，
+再逐个 md5 对账（实测 131 个文件 **2.5s**，整包一轮是分钟级）。
+
+三条硬约束，缺一条就踩坑：
+
+- **只搬 `.lua`，绝不搬 `.so`/`.json`**。目标机 `helper/*.so` 是那块板子 `gcc -shared -fPIC` 现编的
+  arm64 二进制，本机同名文件是 x86 的；整目录同步会得到「`ffi.load` 成功、一调用就
+  `attempt to call field 'call' (a nil value)`」——加载期不查架构，调用期才炸。
+- **`helper/lib/app_*_map.lua` 排除**。那是 `uimap` 在哪台机器上真点出来的坐标，属于那台机器。
+- **重启 serve 才算生效**。工具 schema 启动时扫一次并 memo，`ls` 看到了不代表模型看得见。默认
+  `/health` 报 `busy:true` 就**不**重启（免得打断派活中的那一轮），只打印手工命令。
+
+安装根不写死：从远端 `~/.local/bin/lite` 软链 `readlink -f` 反推，换 `PREFIX` 的机器也不会打偏
+（打偏的现象是插件「送过去了但没加载」，而 `--version` 一切正常）。
 
 ---
 

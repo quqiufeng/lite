@@ -271,7 +271,13 @@ LITE_ORT_PREFER=cpu ./tools/ort_link.sh copy
 ./build_arm64.sh --fetch-sysroot root@<盒子>            # 只要 .so，不打包
 ./build_arm64.sh --clean --package --deploy root@<盒子> # 编 + 打包 + 覆盖安装
 ./build_arm64.sh --arch armv7 --luajit                  # armv7 / 顺带带上交叉编的 LuaJIT
+./build_arm64.sh --lua-only --deploy root@<盒子>         # 只改了 Lua：跳编译，2s 送 *.lua 再按需重启 serve
 ```
+
+`--lua-only` 只搬 `.lua`（`lua/` + `helper/`，排除 `app_*_map.lua`），**不搬 `.so`/`.json`**：目标机上
+`helper/*.so` 是那块板子自己编的 arm64 二进制，本机同名文件是 x86 的，整目录同步会覆盖成「加载成功、
+一调用就 `attempt to call field 'call' (a nil value)`」。搬完逐个 md5 对账，`/health` 空闲才重启 serve
+（清单启动时扫一次并 memo，不重启新插件进不了模型）。
 
 `build_arm64.sh`（软链到 `tools/build_arm64.sh`）是门面，重活仍在 `tools/cross.sh` + `tools/package.sh`，
 也可以按原样分步跑：
