@@ -31,6 +31,7 @@ export DEEPSEEK_API_KEY=...   # 或写进 .env / ~/.config/lite/.env
 ./tools/run.sh serve --port 8765               # headless 服务端
 ./tools/run.sh attach --port 8765              # 任意终端/tmux tab attach
 ./tools/run.sh serve --wake 300 --task "检查 CI"  # 无人值守定时唤醒
+./tools/serve_up.sh start                      # 常驻 0.0.0.0:8765 + 自监督循环（reboot/崩溃自愈）
 ./tools/test.sh               # 依赖 + 单元 + CLI + TUI(tmux) 冒烟
 ```
 
@@ -253,6 +254,40 @@ LITE_ORT_PREFER=cpu ./tools/ort_link.sh copy
 ```
 
 **构建期**：gcc / cmake / pkg-config / OpenMP、`libpng` `libjpeg` `libwebp` 开发包。
+
+### 交叉编译（x86 → arm64/armv7）
+
+不改本机 apt 源、不装 multiarch：从同架构的目标机 `rsync` 一份 sysroot 过来即可。
+
+```bash
+# 一键：拉 sysroot → 交叉编 .so（逐个 od 验 e_machine=183）→ 打包 → 灌目标机
+./build_arm64.sh --fetch-sysroot root@<盒子>            # 只要 .so，不打包
+./build_arm64.sh --clean --package --deploy root@<盒子> # 编 + 打包 + 覆盖安装
+./build_arm64.sh --arch armv7 --luajit                  # armv7 / 顺带带上交叉编的 LuaJIT
+```
+
+`build_arm64.sh`（软链到 `tools/build_arm64.sh`）是门面，重活仍在 `tools/cross.sh` + `tools/package.sh`，
+也可以按原样分步跑：
+
+```bash
+# ① 造 sysroot（在目标机上或 ssh 拉，约 2GB；litehtml/gumbo 一并带上，断链软链要重指）
+rsync -a --delete root@<盒子>:/usr/ $HOME/arm64-sysroot/usr/
+rsync -a root@<盒子>:/opt/litehtml $HOME/arm64-sysroot/opt/    # 源码树要 /opt/litehtml 才能编
+ln -sfn src/include $HOME/arm64-sysroot/opt/litehtml/include
+
+# ② 交叉编原生库（产物进 build-arm64/，逐个 od 验 e_machine=183）
+LITE_SYSROOT=$HOME/arm64-sysroot ./tools/cross.sh --clean        # --arch armv7 走 cmake-armv7.cmake
+
+# ③ 交叉打包 + 灌目标机（install.sh 认 tarball 是现成产物，不会二次打包）
+LITE_BUILD_DIR=$PWD/build-arm64 LITE_DIST_ARCH=arm64 LITE_SYSROOT=$HOME/arm64-sysroot ./tools/package.sh
+scp dist/lite-linux-arm64.tar.gz root@<盒子>:/root/ && ssh root@<盒子> '
+  cd /root && rm -rf lite-linux-arm64 && tar xzf lite-linux-arm64.tar.gz && ./lite-linux-arm64/tools/install.sh'
+```
+
+坑：跨架构**不能用 `ldd`**（foreign `.so` 只报 `not a dynamic executable`，依赖全空 →
+liblitehtml/gumbo 漏打包），package.sh 改成静态读 `DT_NEEDED` 再在 `$LITE_SYSROOT` 按名解析；
+仓库 `third_party/cjson/.../cjson.so` 是 x86 二进制，package.sh 按目标 `e_machine` 校验后
+改取 sysroot 里的系统副本；`tools/_arch.sh` 必须在包内（`install.sh` 第一行就 source 它）。
 
 ## 状态
 

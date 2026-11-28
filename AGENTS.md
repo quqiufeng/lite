@@ -41,6 +41,7 @@ MUST NOT：`python`/`sed -i` 改仓库文件（用 `edit`/`write`）；Chrome/We
 
 ```bash
 ./tools/build.sh        # 编 C（src/**）
+./build_arm64.sh        # 交叉编 arm64（--clean/--package/--deploy/--fetch-sysroot）
 ./tools/test.sh         # 全量回归
 ./tools/release.sh      # build + package + install（跑安装版必须它，见 §5）
 ./tools/run.sh          # TUI：--once/--tui/--readonly/--gui/state/sessions/serve/attach
@@ -161,6 +162,9 @@ cwd 之外的项目。
 一条队列和同一个 agent（谁先来谁先答）；**不鉴权**，暴露面由 `--host` 控（默认 `127.0.0.1`）。
 `GET /health` 探活不排队；`POST /prompt` 收 `{"prompt":"…"}`（也收裸文本）回 `{"ok":true,"text":…}`，
 超时（`LITE_SERVE_HTTP_TIMEOUT`，900s）回 504。
+
+盒子/长期在线用 `./tools/serve_up.sh start|stop|status|logs`（默认 `0.0.0.0:8765`，workdir
+`$HOME/.local/share/lite-serve`，setsid 自监督 → `reboot` 的 exit 75 与崩溃都自愈；不用 systemd）。
 
 判「远端闲置没」用 `lite serve --probe HOST:PORT`（采样 3 次、间隔 2s）：**单次采样不当判决**
 （`active_proc:alive()` 是「尽快」不是瞬时）。退出码 0=`wake`、3=`busy`、4=`unreachable`、
