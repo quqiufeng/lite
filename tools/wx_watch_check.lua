@@ -40,6 +40,21 @@ check(not W.is_reply("说", ""), "empty tag never matches")
 -- 所以开头噪声要剥；但只剥噪声/ASCII 标点，剥字母会把「lite 帮我…」这条指令也吞掉。
 check(W.is_reply("\239\191\189lite: 已 push", "lite:"), "U+FFFD before tag still a reply")
 check(W.is_reply('"lite: 引号包起来的回执', "lite:"), "leading quote before tag still a reply")
+-- 10:44 实测：回执被认成 `（\239\191\189lite: …` —— 全角括号 + 替换符。旧版只剥 ASCII
+-- 标点，首字节 ≥128 就 break，于是自己的回复又被派回来跑一遍。全角标点区段也要剥。
+check(W.is_reply("\239\191\189\239\191\189lite: 双替换符", "lite:"),
+    "two U+FFFD before tag still a reply")
+check(W.is_reply("（lite: 全角括号包住", "lite:"), "fullwidth paren before tag")
+check(W.is_reply("（\239\191\189lite: 括号+替换符", "lite:"),
+    "fullwidth paren + U+FFFD before tag (10:44 实测形态)")
+check(W.is_reply("「lite: 中文引号包住」", "lite:"), "CJK corner quotes before tag")
+check(W.is_reply("“lite: 弯引号也认", "lite:"), "curly quote before tag")
+check(W.is_reply("、lite: 顿号开头", "lite:"), "CJK punctuation before tag")
+-- 但**字母/汉字**照样不剥：全角字母在白名单外，汉字根本不在标点区段。
+check(not W.is_reply("ｌｉｔｅ：全角字母不算标记", "lite:"),
+    "fullwidth letters are not stripped (still not a reply)")
+check(not W.is_reply("帮我看下（lite: 在中间）", "lite:"),
+    "fullwidth paren stripping only touches the head, not mid-text")
 check(not W.is_reply("lite 帮我列一下 /tmp", "lite:"), "letters are never stripped (instruction stays instruction)")
 check(not W.is_reply("帮我看 lite: 这个库", "lite:"), "tag not at head is not a reply")
 

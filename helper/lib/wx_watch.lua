@@ -129,14 +129,55 @@ end
 --   * 开头连续的 ASCII 标点/空白（`"lite:`、`- lite:` 这种被引起来的回执）。
 -- 只剥前缀**之前**那几个字符，不碰正文；CJK 与字母一律不剥 —— 一旦允许剥字母，
 -- `lite 帮我…`（没冒号的**指令**）就又跟回执同形了，那正是 slim 用 norm 不用 key 要防的。
+-- 同一类噪声还有**全角/中文标点**：10:44 实测回执被 OCR 认成 `（\239\191\189lite: …`，
+-- 开头是全角括号 + 替换符，而旧版只剥 ASCII 标点（首字节 ≥128 直接 break）→ 前缀不比中 →
+-- 自己的回复又被派回去一次。所以把「首字符是标点」的判据扩到全角区段：
+--   U+2000–206F 通用标点（“ ” — –）、U+3000–303F CJK 标点（、。「」（）《》）、
+--   U+FF00–FF65 全角形式（！＂（）＊，：；？＃）、U+FEFF BOM。CJK 汉字（≥U+4E00）不在内，
+--   所以「帮我看下 /tmp」照旧不是回执。剥的仍是**前缀之前**的字符，正文一个字不动。
 local FFFD = "\239\191\189"
+-- 全角**字母/数字**（U+FF10–19、FF21–3A、FF41–5A）不在白名单里：字母一律不剥是硬规矩。
+local function is_punct_cp(cp)
+    if cp == 0xFFFD or cp == 0xFEFF then return true end
+    if cp >= 0x2000 and cp <= 0x206F then return true end
+    if cp >= 0x3000 and cp <= 0x303F then return true end
+    if cp >= 0xFF00 and cp <= 0xFF65 then
+        return not ((cp >= 0xFF10 and cp <= 0xFF19)
+            or (cp >= 0xFF21 and cp <= 0xFF3A)
+            or (cp >= 0xFF41 and cp <= 0xFF5A))
+    end
+    return false
+end
+-- 取首字符的字节长度（1/2/3/4）。破 UTF-8 时按 1 字节退，交给下一轮继续剥。
+local function cp_len(n)
+    local b = n:byte(1)
+    if not b then return 0 end
+    local len = (b >= 0xF0 and 4) or (b >= 0xE0 and 3) or (b >= 0xC0 and 2) or 1
+    if #n < len then return 1 end
+    return len
+end
 local function strip_noise(n)
-    for _ = 1, 3 do
-        if n:sub(1, 3) == FFFD then n = n:sub(4)
-        else
-            local c = n:sub(1, 1)
+    for _ = 1, 4 do
+        if n == "" then break end
+        local len = cp_len(n)
+        local c = n:sub(1, len)
+        if len == 1 then
             local b = c:byte(1)
-            if b and b < 128 and not c:match("[%w]") then n = n:sub(2) else break end
+            if b < 128 and not c:match("[%w]") then n = n:sub(2) else break end
+        else
+            -- 只剥白名单区段的全角标点；汉字/假名/字母一律保留（否则指令会跟回执同形）。
+            local ok, cp = pcall(function()
+                local bytes = { c:byte(1, len) }
+                if len == 3 then
+                    return (bytes[1] - 0xE0) * 0x1000 + (bytes[2] - 0x80) * 0x40 + (bytes[3] - 0x80)
+                elseif len == 2 then
+                    return (bytes[1] - 0xC0) * 0x40 + (bytes[2] - 0x80)
+                end
+                return (bytes[1] - 0xF0) * 0x40000 + (bytes[2] - 0x80) * 0x1000
+                    + (bytes[3] - 0x80) * 0x40 + (bytes[4] - 0x80)
+            end)
+            if not ok or not cp or not is_punct_cp(cp) then break end
+            n = n:sub(len + 1)
         end
     end
     return n
