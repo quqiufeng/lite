@@ -36,6 +36,12 @@ check(not W.is_reply("lite 测试四：只回一句话", "lite:"), "instruction 
 check(not W.is_reply("帮我看下 /tmp", "lite:"), "unprefixed text is not a reply")
 check(not W.is_reply("", "lite:"), "empty is not a reply")
 check(not W.is_reply("说", ""), "empty tag never matches")
+-- OCR 把标记首字符啃成 U+FFFD（09:26 实测 `\239\191\189lite:`）→ 认不出回执就自激派发，
+-- 所以开头噪声要剥；但只剥噪声/ASCII 标点，剥字母会把「lite 帮我…」这条指令也吞掉。
+check(W.is_reply("\239\191\189lite: 已 push", "lite:"), "U+FFFD before tag still a reply")
+check(W.is_reply('"lite: 引号包起来的回执', "lite:"), "leading quote before tag still a reply")
+check(not W.is_reply("lite 帮我列一下 /tmp", "lite:"), "letters are never stripped (instruction stays instruction)")
+check(not W.is_reply("帮我看 lite: 这个库", "lite:"), "tag not at head is not a reply")
 
 -- 默认**全收**（用户定：每条都敲 #lite 太麻烦）；显式 "#lite" 的形态仍然要对，
 -- 因为用户还能把它当过滤开关用。带 # 的前缀不能被抹平（用 norm 而非 key 比对）。
@@ -250,6 +256,18 @@ check(duty >= 0.6, ("时间轴覆盖 %.0f%% ≥60%%"):format(duty * 100))
 check(W.FORCE_EVERY >= 60, "兜底强检不能太密（它要 raise 微信）")
 check(W.gate_window_ms({ tries = 3, gap_ms = 160 }) == 320,
     "gate_window_ms 按 (帧数-1)×间隔 算")
+
+-- 派发去重：老气泡摊在原地不能每 60s 重派一次（踩过：同一条部署指令被派 30+ 次、烧钱），
+-- 但用户真重发同一句话必须照跑（新气泡 → 块数/纵坐标变，几何指纹 fp 随之变）。
+check(W.is_same_bubble("k", "#5@100", "k", "#5@100", 3600, 60) == true,
+    "同 key 同 fp = 同一块老气泡，过多久都不重派")
+check(W.is_same_bubble("k", "#6@120", "k", "#5@100", 5, 60) == true,
+    "同 key 新 fp 但还在时间窗内 → 仍按时间窗挡住")
+check(W.is_same_bubble("k", "#6@120", "k", "#5@100", 3600, 60) == false,
+    "同 key 新 fp 且过了时间窗 → 用户真重发，必须跑")
+check(W.is_same_bubble("k2", "#5@100", "k", "#5@100", 0, 60) == false, "不同 key 从不拦")
+check(W.is_same_bubble("", "", "k", "#5@100", 0, 60) == false, "空 key 不拦")
+check(W.is_same_bubble("k", nil, "k", nil, 5, 60) == true, "没给 fp 时退回纯时间窗（老调用点不变）")
 
 -- 静态：daemon 必须用这份共享参数，别自己写一个 15 帧长窗/10s 睡眠（两处数就是两份真相）。
 local DAEMON = LIB:gsub("[^/]+$", "") .. "wx_watch_daemon.lua"

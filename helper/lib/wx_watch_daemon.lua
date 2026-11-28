@@ -704,6 +704,11 @@ local function tick()
     --   ② 右键「复制」出来不是文本（截图里有字的图片只能靠这条兜住）。
     -- 同一条媒体消息只判一次：否则每轮 tick 都要右键单击 + 菜单 OCR 一遍（白烧 ~1.2s）。
     local fp = "#" .. #blocks .. "@" .. tostring(math.floor((b.cy or 0) / 8))
+    -- 派发去重指纹 = **块数**（实测 st.last_fp 一直是 "#6@0"：块上没有 cy/_cy，纵坐标恒 0）。
+    -- 位置不能用来判重：snapshot() 每次都滚到底，最新气泡的 y 基本恒定，拿它当指纹会把
+    -- 「用户重发同一句」误判成老气泡。块数才带真信息：新消息进来 ≥ 多一块，块数必变。
+    -- 块数没变 + 文字同上一条 = 老气泡摊在原地，按时间窗挡（is_same_bubble）。
+    local dfp = "#" .. #blocks
     local media_age = os.time() - (tonumber(st.media_t) or 0)
     if st.media == fp and media_age < 3600 then return 0 end
     if Watch.is_media(b.text) then
@@ -733,14 +738,15 @@ local function tick()
         local mcmd = Watch.mode_cmd_norm(body)
         st.seq = (st.seq or 0) + 1
         st.pending = { { id = st.seq, text = mcmd, raw = text, via = why, modecmd = true } }
-        st.last, st.last_t = "", 0
+        st.last, st.last_t, st.last_fp = "", 0, ""
         log("收到模式命令 #%d（%s）：%s → %s", st.seq, why, body, mcmd)
         save()
         return 1
     elseif not Watch.has_trigger(text, C.prefix) then
         log("忽略最新条（无触发前缀 %q）：%s", C.prefix, Watch.norm(text):sub(1, 60))
-    elseif key ~= "" and key == st.last and age < C.same_after then
-        log("最新条与 %ds 前派发的相同，跳过（想重跑：改几个字，或等 %ds）", age, C.same_after)
+    elseif Watch.is_same_bubble(key, dfp, st.last, st.last_fp, age, C.same_after) then
+        log("最新条是已派过的同一块气泡（%s，%ds 前），跳过：%s",
+            dfp, age, Watch.norm(text):sub(1, 60))
     else
         if Watch.trigger_form(text, C.prefix) == "loose" then
             log("warn: 触发前缀 %q 的 # 被 OCR 吞了，按指令处理", C.prefix)
@@ -749,7 +755,7 @@ local function tick()
         -- 只留最新一条：上一轮没派出去的（主进程忙、没起来）直接让位——用户没等到回复
         -- 会再发一句，过时的指令派出去只会拿旧话改现场。
         st.pending = { { id = st.seq, text = body, raw = text, via = why } }
-        st.last, st.last_t = key, os.time()
+        st.last, st.last_t, st.last_fp = key, os.time(), dfp
         log("收到指令 #%d（%s）：%s", st.seq, why, Watch.norm(body):sub(1, 120))
         save()
         return 1

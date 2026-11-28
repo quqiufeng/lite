@@ -122,10 +122,31 @@ local function slim(s)
     return (M.norm(s):gsub("：", ":"):gsub("，", ","):gsub("—", "-"))
 end
 
+-- OCR 常把回执标记的**第一个字符**啃成噪声（实测 09:26：`lite:` 认成 `\239\191\189lite:`，
+-- 即 U+FFFD 替换符 + lite:）。此时复制菜单又刚好失败（复制失败→退回 OCR），前缀不比中，
+-- 自己的回复就被当成新指令派回去 —— 自激环。所以剥掉**开头的噪声**再比：
+--   * U+FFFD 替换符（OCR 认不出的字就出它）；
+--   * 开头连续的 ASCII 标点/空白（`"lite:`、`- lite:` 这种被引起来的回执）。
+-- 只剥前缀**之前**那几个字符，不碰正文；CJK 与字母一律不剥 —— 一旦允许剥字母，
+-- `lite 帮我…`（没冒号的**指令**）就又跟回执同形了，那正是 slim 用 norm 不用 key 要防的。
+local FFFD = "\239\191\189"
+local function strip_noise(n)
+    for _ = 1, 3 do
+        if n:sub(1, 3) == FFFD then n = n:sub(4)
+        else
+            local c = n:sub(1, 1)
+            local b = c:byte(1)
+            if b and b < 128 and not c:match("[%w]") then n = n:sub(2) else break end
+        end
+    end
+    return n
+end
+
 function M.is_reply(text, tag)
     local n, kt = slim(text or ""):lower(), slim(tag or ""):lower()
     if kt == "" or n == "" then return false end
-    return n:sub(1, #kt) == kt
+    if n:sub(1, #kt) == kt then return true end
+    return strip_noise(n):sub(1, #kt) == kt
 end
 
 -- 回执的**续块**：一条长回复被 OCR 切成两块时，第二块丢了 lite: 前缀就成了「新指令」回声
@@ -145,6 +166,18 @@ function M.is_reply_tail(prev, cur, opt)
     local x1 = math.min((prev.x or 0) + (prev.w or 0), (cur.x or 0) + (cur.w or 0))
     local narrow = math.min(prev.w or 0, cur.w or 0)
     return narrow > 0 and (x1 - x0) >= 0.6 * narrow
+end
+
+-- 同一条气泡是否**已经派过**。daemon 原来只按时间窗去重（same_after=60s），挡不住
+-- 「老指令一直摊在聊天区最下面」：每过 60s 就被当成新消息再派一遍，副作用重复、还烧钱
+-- （实测 09:49 起同一条部署指令被派了 30+ 次）。判据加一条几何指纹 fp（块数@纵坐标）：
+--   * key 相同 + fp 相同 = 还是那块老气泡摊在原地 → 永久跳过（不必等时间窗过去）；
+--   * key 相同 + fp 变了  = 用户真重发了一句一样的话（新气泡挤进来，块数/纵坐标必变）→ 照跑。
+-- 两条都留：fp 缺省（没传）时退回纯时间窗，老调用点的行为不变。
+function M.is_same_bubble(key, fp, last_key, last_fp, age, window)
+    if not key or key == "" or key ~= last_key then return false end
+    if fp and fp ~= "" and last_fp and last_fp ~= "" and fp == last_fp then return true end
+    return (age or 0) < (window or 0)
 end
 
 -- 默认**全收**（prefix=""）：微信模式开着的时候，凡是新发到「文件传输助手」的消息都当指令
